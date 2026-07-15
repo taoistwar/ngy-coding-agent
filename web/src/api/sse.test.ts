@@ -166,6 +166,13 @@ describe("IncrementalSseParser", () => {
 
     expect(() => parser.finish()).toThrow(/truncated/i);
   });
+
+  it("treats a newline-terminated comment-only stream as a clean EOF", () => {
+    const parser = new IncrementalSseParser();
+
+    expect(parser.push(encoder.encode(": heartbeat\n"))).toEqual([]);
+    expect(parser.finish()).toEqual([]);
+  });
 });
 
 describe("computeBackoffDelay", () => {

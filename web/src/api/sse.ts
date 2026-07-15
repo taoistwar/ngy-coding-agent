@@ -181,6 +181,13 @@ export class IncrementalSseParser {
     }
 
     if (line.startsWith(":")) {
+      if (
+        this.#dataLines.length === 0 &&
+        this.#eventName.length === 0 &&
+        this.#eventId === undefined
+      ) {
+        this.#frameBytes = 0;
+      }
       return undefined;
     }
 
