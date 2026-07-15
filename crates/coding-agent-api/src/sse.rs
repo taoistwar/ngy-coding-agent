@@ -1,17 +1,22 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::response::sse::Event;
 use futures_util::{FutureExt as _, Stream, StreamExt as _};
-use tokio::time::{Instant, MissedTickBehavior, interval_at};
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 
-use crate::{LiveEventItem, SseBackend, StreamResetControl, TaskEventDto};
+use crate::{
+    LiveEventItem, ServiceStateControl, ServiceStateStream, SseBackend, StreamResetControl,
+    TaskEventDto,
+};
 
 const PAGE_SIZE: usize = 256;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_READY_SERVICE_UPDATES: usize = 64;
 
 pub(crate) type SseEventStream =
     Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
@@ -21,6 +26,8 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
     // stream becomes lazy. They buffer every commit/state transition that races the snapshot.
     let mut live = backend.subscribe_live();
     let mut service = backend.subscribe_service_state();
+    let mut heartbeat = interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     Box::pin(async_stream::stream! {
         let current = match backend.current_service_state().await {
@@ -35,12 +42,36 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
             return;
         };
         yield Ok(frame);
+        let mut service_closed = false;
 
-        let initial_high = match backend.latest_event_id().await {
-            Ok(high) => high,
-            Err(_) => {
-                log_backend_failure("latest_event_id");
-                return;
+        let high_read = backend.latest_event_id();
+        tokio::pin!(high_read);
+        let initial_high = loop {
+            match wait_backend(
+                high_read.as_mut(),
+                &mut heartbeat,
+                &mut service,
+                service_closed,
+            ).await {
+                BackendWait::Ready(result) => break match result {
+                    Ok(high) => high,
+                    Err(_) => {
+                        log_backend_failure("latest_event_id");
+                        return;
+                    }
+                },
+                BackendWait::Heartbeat => yield Ok(heartbeat_event()),
+                BackendWait::Service(next) => {
+                    if let Some(newest) = coalesce_service(next, &mut service, &mut service_closed)
+                        && newest.generation > service_generation
+                    {
+                        service_generation = newest.generation;
+                        let Some(frame) = control_event("service.state", &newest) else {
+                            return;
+                        };
+                        yield Ok(frame);
+                    }
+                }
             }
         };
         if after > initial_high {
@@ -53,7 +84,34 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
 
         let mut last = after;
         while last < initial_high {
-            let Some(page) = read_page(&backend, last, initial_high).await else {
+            let page_read = backend.events_between(last, initial_high, PAGE_SIZE);
+            tokio::pin!(page_read);
+            let page_result = loop {
+                match wait_backend(
+                    page_read.as_mut(),
+                    &mut heartbeat,
+                    &mut service,
+                    service_closed,
+                )
+                .await
+                {
+                    BackendWait::Ready(result) => break result,
+                    BackendWait::Heartbeat => yield Ok(heartbeat_event()),
+                    BackendWait::Service(next) => {
+                        if let Some(newest) =
+                            coalesce_service(next, &mut service, &mut service_closed)
+                            && newest.generation > service_generation
+                        {
+                            service_generation = newest.generation;
+                            let Some(frame) = control_event("service.state", &newest) else {
+                                return;
+                            };
+                            yield Ok(frame);
+                        }
+                    }
+                }
+            };
+            let Some(page) = normalize_page(page_result, "events_between") else {
                 return;
             };
             let before = last;
@@ -75,7 +133,6 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
         }
 
         let mut live_closed = false;
-        let mut service_closed = false;
         let mut buffered = BTreeMap::<i64, TaskEventDto>::new();
         let mut pending_refills = drain_ready_live(
             &mut live,
@@ -87,11 +144,37 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
         loop {
             if pending_refills > 0 {
                 pending_refills -= 1;
-                let high = match backend.latest_event_id().await {
-                    Ok(high) => high,
-                    Err(_) => {
-                        log_backend_failure("latest_event_id_after_lag");
-                        return;
+                let high_read = backend.latest_event_id();
+                tokio::pin!(high_read);
+                let high = loop {
+                    match wait_backend(
+                        high_read.as_mut(),
+                        &mut heartbeat,
+                        &mut service,
+                        service_closed,
+                    )
+                    .await
+                    {
+                        BackendWait::Ready(result) => break match result {
+                            Ok(high) => high,
+                            Err(_) => {
+                                log_backend_failure("latest_event_id_after_lag");
+                                return;
+                            }
+                        },
+                        BackendWait::Heartbeat => yield Ok(heartbeat_event()),
+                        BackendWait::Service(next) => {
+                            if let Some(newest) =
+                                coalesce_service(next, &mut service, &mut service_closed)
+                                && newest.generation > service_generation
+                            {
+                                service_generation = newest.generation;
+                                let Some(frame) = control_event("service.state", &newest) else {
+                                    return;
+                                };
+                                yield Ok(frame);
+                            }
+                        }
                     }
                 };
                 if last > high {
@@ -102,7 +185,34 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
                     return;
                 }
                 while last < high {
-                    let Some(page) = read_page(&backend, last, high).await else {
+                    let page_read = backend.events_between(last, high, PAGE_SIZE);
+                    tokio::pin!(page_read);
+                    let page_result = loop {
+                        match wait_backend(
+                            page_read.as_mut(),
+                            &mut heartbeat,
+                            &mut service,
+                            service_closed,
+                        )
+                        .await
+                        {
+                            BackendWait::Ready(result) => break result,
+                            BackendWait::Heartbeat => yield Ok(heartbeat_event()),
+                            BackendWait::Service(next) => {
+                                if let Some(newest) =
+                                    coalesce_service(next, &mut service, &mut service_closed)
+                                    && newest.generation > service_generation
+                                {
+                                    service_generation = newest.generation;
+                                    let Some(frame) = control_event("service.state", &newest) else {
+                                        return;
+                                    };
+                                    yield Ok(frame);
+                                }
+                            }
+                        }
+                    };
+                    let Some(page) = normalize_page(page_result, "events_between_after_lag") else {
                         return;
                     };
                     let before = last;
@@ -149,52 +259,26 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
             break;
         }
 
-        let mut heartbeat = interval_at(
-            Instant::now() + HEARTBEAT_INTERVAL,
-            HEARTBEAT_INTERVAL,
-        );
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
         loop {
             if live_closed && service_closed {
                 return;
             }
 
             tokio::select! {
-                biased;
-
                 next = service.next(), if !service_closed => {
-                    match next {
-                        Some(first) => {
-                            let mut newest = first;
-                            loop {
-                                match service.next().now_or_never() {
-                                    Some(Some(candidate)) => {
-                                        if candidate.generation > newest.generation {
-                                            newest = candidate;
-                                        }
-                                    }
-                                    Some(None) => {
-                                        service_closed = true;
-                                        break;
-                                    }
-                                    None => break,
-                                }
-                            }
-                            if newest.generation > service_generation {
-                                service_generation = newest.generation;
-                                let Some(frame) = control_event("service.state", &newest) else {
-                                    return;
-                                };
-                                yield Ok(frame);
-                            }
-                        }
-                        None => service_closed = true,
+                    if let Some(newest) = coalesce_service(next, &mut service, &mut service_closed)
+                        && newest.generation > service_generation
+                    {
+                        service_generation = newest.generation;
+                        let Some(frame) = control_event("service.state", &newest) else {
+                            return;
+                        };
+                        yield Ok(frame);
                     }
                 }
 
                 _ = heartbeat.tick() => {
-                    yield Ok(Event::default().comment("heartbeat"));
+                    yield Ok(heartbeat_event());
                 }
 
                 next = live.next(), if !live_closed => {
@@ -219,11 +303,41 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
 
                             while pending_refills > 0 {
                                 pending_refills -= 1;
-                                let high = match backend.latest_event_id().await {
-                                    Ok(high) => high,
-                                    Err(_) => {
-                                        log_backend_failure("latest_event_id_after_lag");
-                                        return;
+                                let high_read = backend.latest_event_id();
+                                tokio::pin!(high_read);
+                                let high = loop {
+                                    match wait_backend(
+                                        high_read.as_mut(),
+                                        &mut heartbeat,
+                                        &mut service,
+                                        service_closed,
+                                    )
+                                    .await
+                                    {
+                                        BackendWait::Ready(result) => break match result {
+                                            Ok(high) => high,
+                                            Err(_) => {
+                                                log_backend_failure("latest_event_id_after_lag");
+                                                return;
+                                            }
+                                        },
+                                        BackendWait::Heartbeat => yield Ok(heartbeat_event()),
+                                        BackendWait::Service(next) => {
+                                            if let Some(newest) = coalesce_service(
+                                                next,
+                                                &mut service,
+                                                &mut service_closed,
+                                            ) && newest.generation > service_generation
+                                            {
+                                                service_generation = newest.generation;
+                                                let Some(frame) =
+                                                    control_event("service.state", &newest)
+                                                else {
+                                                    return;
+                                                };
+                                                yield Ok(frame);
+                                            }
+                                        }
                                     }
                                 };
                                 if last > high {
@@ -234,7 +348,41 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
                                     return;
                                 }
                                 while last < high {
-                                    let Some(page) = read_page(&backend, last, high).await else {
+                                    let page_read = backend.events_between(last, high, PAGE_SIZE);
+                                    tokio::pin!(page_read);
+                                    let page_result = loop {
+                                        match wait_backend(
+                                            page_read.as_mut(),
+                                            &mut heartbeat,
+                                            &mut service,
+                                            service_closed,
+                                        )
+                                        .await
+                                        {
+                                            BackendWait::Ready(result) => break result,
+                                            BackendWait::Heartbeat => yield Ok(heartbeat_event()),
+                                            BackendWait::Service(next) => {
+                                                if let Some(newest) = coalesce_service(
+                                                    next,
+                                                    &mut service,
+                                                    &mut service_closed,
+                                                ) && newest.generation > service_generation
+                                                {
+                                                    service_generation = newest.generation;
+                                                    let Some(frame) =
+                                                        control_event("service.state", &newest)
+                                                    else {
+                                                        return;
+                                                    };
+                                                    yield Ok(frame);
+                                                }
+                                            }
+                                        }
+                                    };
+                                    let Some(page) = normalize_page(
+                                        page_result,
+                                        "events_between_after_lag",
+                                    ) else {
                                         return;
                                     };
                                     let before = last;
@@ -283,15 +431,65 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
     })
 }
 
-async fn read_page(
-    backend: &Arc<dyn SseBackend>,
-    after: i64,
-    through: i64,
+enum BackendWait<T> {
+    Ready(T),
+    Heartbeat,
+    Service(Option<ServiceStateControl>),
+}
+
+async fn wait_backend<F>(
+    future: Pin<&mut F>,
+    heartbeat: &mut Interval,
+    service: &mut ServiceStateStream,
+    service_closed: bool,
+) -> BackendWait<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        output = future => BackendWait::Ready(output),
+        _ = heartbeat.tick() => BackendWait::Heartbeat,
+        next = service.next(), if !service_closed => BackendWait::Service(next),
+    }
+}
+
+fn coalesce_service(
+    first: Option<ServiceStateControl>,
+    service: &mut ServiceStateStream,
+    service_closed: &mut bool,
+) -> Option<ServiceStateControl> {
+    let mut newest = match first {
+        Some(first) => first,
+        None => {
+            *service_closed = true;
+            return None;
+        }
+    };
+    for _ in 1..MAX_READY_SERVICE_UPDATES {
+        match service.next().now_or_never() {
+            Some(Some(candidate)) => {
+                if candidate.generation > newest.generation {
+                    newest = candidate;
+                }
+            }
+            Some(None) => {
+                *service_closed = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    Some(newest)
+}
+
+fn normalize_page(
+    result: crate::ApiResult<Vec<TaskEventDto>>,
+    operation: &'static str,
 ) -> Option<Vec<TaskEventDto>> {
-    let mut page = match backend.events_between(after, through, PAGE_SIZE).await {
+    let mut page = match result {
         Ok(page) => page,
         Err(_) => {
-            log_backend_failure("events_between");
+            log_backend_failure(operation);
             return None;
         }
     };
@@ -330,6 +528,10 @@ fn persisted_event(event: &TaskEventDto) -> Option<Event> {
             .event(event.event_name())
             .data(data),
     )
+}
+
+fn heartbeat_event() -> Event {
+    Event::default().comment("heartbeat")
 }
 
 fn control_event(name: &'static str, value: &impl serde::Serialize) -> Option<Event> {
