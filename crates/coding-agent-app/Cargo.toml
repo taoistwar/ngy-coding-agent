@@ -9,3 +9,10 @@ license.workspace = true
 coding-agent-api = { path = "../coding-agent-api" }
 coding-agent-domain = { path = "../coding-agent-domain" }
 coding-agent-store = { path = "../coding-agent-store" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
