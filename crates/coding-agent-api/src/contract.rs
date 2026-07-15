@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use coding_agent_domain::{
@@ -33,9 +34,18 @@ impl From<CanonicalPath> for CanonicalPathDto {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, ToSchema)]
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, ToSchema)]
 pub struct SessionExchangeRequest {
     pub token: String,
+}
+
+impl fmt::Debug for SessionExchangeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionExchangeRequest")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, ToSchema)]
@@ -755,7 +765,7 @@ pub enum SseMessage {
     ServiceState(ServiceStateControl),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct BootstrapResponse {
     pub csrf_token: String,
     pub repositories: Vec<RepositoryDto>,
@@ -765,6 +775,15 @@ pub struct BootstrapResponse {
     pub service_state: ServiceStateDto,
     pub service_state_generation: u64,
     pub max_concurrent_tasks: u32,
+}
+
+impl fmt::Debug for BootstrapResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapResponse")
+            .field("contents", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]

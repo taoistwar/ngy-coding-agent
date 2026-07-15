@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use coding_agent_api::{ApiError, AuthContext, RequestSecurity, SessionExchange};
+use coding_agent_api::{
+    ApiError, AuthContext, BootstrapResponse, RequestSecurity, ServiceStateDto, SessionExchange,
+    SessionExchangeRequest,
+};
 use coding_agent_app::{SecurityClock, SecurityManager, SecuritySeed};
 use http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, COOKIE, HOST, ORIGIN, SET_COOKIE};
 use http::{HeaderName, HeaderValue, Method, Request, StatusCode};
@@ -552,6 +555,7 @@ async fn secret_debug_output_is_redacted_and_exchange_adds_no_cors_header() {
     let exchange = exchange_initial(&fixture)
         .await
         .expect("exchange for logging fixture");
+    let logged_exchange = exchange.clone();
     let response = http::Response::builder()
         .header(SET_COOKIE, exchange.set_cookie.clone())
         .body(())
@@ -572,6 +576,19 @@ async fn secret_debug_output_is_redacted_and_exchange_adds_no_cors_header() {
         .manager
         .session_for(&auth)
         .expect("resolve trace session");
+    let exchange_request = SessionExchangeRequest {
+        token: token.as_str().to_owned(),
+    };
+    let bootstrap = BootstrapResponse {
+        csrf_token: session.csrf.clone(),
+        repositories: Vec::new(),
+        tasks: Vec::new(),
+        latest_event_id: 0,
+        server_started_at: support::timestamp().into(),
+        service_state: ServiceStateDto::Ready,
+        service_state_generation: 0,
+        max_concurrent_tasks: 4,
+    };
 
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let writer = TraceWriter(bytes.clone());
@@ -588,6 +605,10 @@ async fn secret_debug_output_is_redacted_and_exchange_adds_no_cors_header() {
             launch_token = ?token,
             launcher_secret = ?fixture.manager.launcher_secret(),
             session = ?record,
+            auth_context = ?auth,
+            session_exchange = ?logged_exchange,
+            session_exchange_request = ?exchange_request,
+            bootstrap_response = ?bootstrap,
             "security redaction fixture"
         );
     });
@@ -603,6 +624,19 @@ async fn secret_debug_output_is_redacted_and_exchange_adds_no_cors_header() {
     ] {
         assert!(!output.contains(secret), "info log leaked a process secret");
     }
+}
+
+#[tokio::test]
+async fn exchange_marks_the_set_cookie_header_as_sensitive() {
+    let fixture = support::SecurityFixture::production();
+    let exchange = exchange_initial(&fixture)
+        .await
+        .expect("exchange for sensitive-header fixture");
+
+    assert!(
+        exchange.set_cookie.is_sensitive(),
+        "generic HTTP diagnostics must redact the session cookie"
+    );
 }
 
 struct BrowserSession {

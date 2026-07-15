@@ -1,3 +1,4 @@
+use std::fmt;
 use std::pin::Pin;
 
 use coding_agent_domain::{RepositoryId, TaskId};
@@ -8,14 +9,32 @@ use crate::{
     ServiceStateControl, TaskDetailDto, TaskDto, TaskEventDto,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthContext {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for AuthContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthContext")
+            .field("session_id", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionExchange {
     pub set_cookie: http::HeaderValue,
+}
+
+impl fmt::Debug for SessionExchange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionExchange")
+            .field("set_cookie", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

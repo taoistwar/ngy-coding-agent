@@ -362,8 +362,9 @@ impl RequestSecurity for SecurityManager {
             .same_site(SameSite::Strict)
             .path("/")
             .build();
-        let set_cookie =
+        let mut set_cookie =
             HeaderValue::from_str(&cookie.to_string()).map_err(|_| internal_cookie_error())?;
+        set_cookie.set_sensitive(true);
         Ok(SessionExchange { set_cookie })
     }
 
