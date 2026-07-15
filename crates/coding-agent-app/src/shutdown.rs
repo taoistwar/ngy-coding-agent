@@ -164,8 +164,16 @@ impl DegradedCoordinator {
 
     async fn wait_to_retry(&self) -> Result<(), DegradedCoordinatorError> {
         let mut state = self.service_state.subscribe();
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or(DegradedCoordinatorError::ManagerClosed)?;
+        if manager.is_closed() {
+            return Err(DegradedCoordinatorError::ManagerClosed);
+        }
         tokio::select! {
             () = tokio::time::sleep(RECOVERY_RETRY_INTERVAL) => Ok(()),
+            () = manager.closed() => Err(DegradedCoordinatorError::ManagerClosed),
             result = state.changed() => {
                 if result.is_err() || state.borrow().state == ServiceState::Quiescing {
                     Err(DegradedCoordinatorError::Quiescing)
@@ -177,7 +185,11 @@ impl DegradedCoordinator {
     }
 
     fn ensure_not_quiescing(&self) -> Result<(), DegradedCoordinatorError> {
-        if self.manager.strong_count() == 0 {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or(DegradedCoordinatorError::ManagerClosed)?;
+        if manager.is_closed() {
             return Err(DegradedCoordinatorError::ManagerClosed);
         }
         if self.service_state.current().state == ServiceState::Quiescing {
@@ -334,6 +346,27 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
         ));
         assert_eq!(state.current().state, ServiceState::Quiescing);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_manager_receiver_stops_before_retrying_forever() {
+        let backend = Arc::new(ScriptedBackend::new(
+            [Err("write failed".to_owned())],
+            std::iter::empty(),
+        ));
+        let state = degraded_state();
+        let (manager, messages) = mpsc::channel(8);
+        let coordinator =
+            DegradedCoordinator::with_backend(backend.clone(), state, manager.downgrade());
+        drop(messages);
+
+        let result = tokio::time::timeout(Duration::from_millis(1), coordinator.run())
+            .await
+            .expect("a closed manager must be detected without waiting for a retry");
+
+        assert_eq!(result, Err(DegradedCoordinatorError::ManagerClosed));
+        assert_eq!(backend.recover_calls(), 0);
+        drop(manager);
     }
 
     fn degraded_state() -> ServiceStateController {

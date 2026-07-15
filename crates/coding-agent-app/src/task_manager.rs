@@ -179,7 +179,7 @@ impl TaskManagerHandle {
             service_state,
             runner,
             semaphore: Arc::new(Semaphore::new(concurrency)),
-            sender: sender.clone(),
+            sender: sender.downgrade(),
             receiver,
             active: HashMap::new(),
             coordinator,
@@ -192,6 +192,8 @@ impl TaskManagerHandle {
             next_launch_ordinal: 0,
             #[cfg(test)]
             claim_hooks: None,
+            #[cfg(test)]
+            exit_probe: None,
         };
         tokio::spawn(actor.run());
         Self {
@@ -233,7 +235,7 @@ impl TaskManagerHandle {
             service_state,
             runner,
             semaphore: Arc::new(Semaphore::new(concurrency)),
-            sender: sender.clone(),
+            sender: sender.downgrade(),
             receiver,
             active: HashMap::new(),
             coordinator,
@@ -245,6 +247,7 @@ impl TaskManagerHandle {
             #[cfg(feature = "test-support")]
             next_launch_ordinal: 0,
             claim_hooks: Some(claim_hooks),
+            exit_probe: None,
         };
         tokio::spawn(actor.run());
         Self {
@@ -255,6 +258,19 @@ impl TaskManagerHandle {
 
     pub fn subscribe_degraded_recovery(&self) -> broadcast::Receiver<DegradedRecoveryResult> {
         self.degraded_recoveries.subscribe()
+    }
+
+    #[cfg(test)]
+    async fn install_exit_probe(&self) -> oneshot::Receiver<()> {
+        let (exited, receiver) = oneshot::channel();
+        let (installed, installed_receiver) = oneshot::channel();
+        self.send(TaskManagerMessage::InstallExitProbe { exited, installed })
+            .await
+            .expect("install task-manager exit probe");
+        installed_receiver
+            .await
+            .expect("task manager acknowledges exit probe");
+        receiver
     }
 
     pub async fn notify_queued(&self, task_id: TaskId) -> Result<(), TaskManagerError> {
@@ -318,6 +334,11 @@ pub(crate) enum TaskManagerMessage {
         deadline: Instant,
         response: oneshot::Sender<Result<QuiesceResult, TaskManagerError>>,
     },
+    #[cfg(test)]
+    InstallExitProbe {
+        exited: oneshot::Sender<()>,
+        installed: oneshot::Sender<()>,
+    },
 }
 
 struct ActiveRunner {
@@ -333,7 +354,7 @@ struct TaskManager {
     service_state: ServiceStateController,
     runner: Arc<dyn TaskRunner>,
     semaphore: Arc<Semaphore>,
-    sender: mpsc::Sender<TaskManagerMessage>,
+    sender: mpsc::WeakSender<TaskManagerMessage>,
     receiver: mpsc::Receiver<TaskManagerMessage>,
     active: HashMap<TaskId, ActiveRunner>,
     coordinator: DegradedCoordinator,
@@ -346,6 +367,8 @@ struct TaskManager {
     next_launch_ordinal: u64,
     #[cfg(test)]
     claim_hooks: Option<Arc<ClaimTestHooks>>,
+    #[cfg(test)]
+    exit_probe: Option<oneshot::Sender<()>>,
 }
 
 impl TaskManager {
@@ -373,6 +396,11 @@ impl TaskManager {
                     tracing::warn!(error = %error, "task reconciliation scan failed");
                 }
             }
+        }
+
+        #[cfg(test)]
+        if let Some(exited) = self.exit_probe.take() {
+            let _ = exited.send(());
         }
     }
 
@@ -412,6 +440,11 @@ impl TaskManager {
             TaskManagerMessage::Quiesce { deadline, response } => {
                 let result = self.quiesce(deadline).await;
                 let _ = response.send(result);
+            }
+            #[cfg(test)]
+            TaskManagerMessage::InstallExitProbe { exited, installed } => {
+                self.exit_probe = Some(exited);
+                let _ = installed.send(());
             }
         }
     }
@@ -469,6 +502,15 @@ impl TaskManager {
             #[cfg(test)]
             self.pause_claim(ClaimPhase::HandleRegistered).await;
 
+            let Some(sender) = self.sender.upgrade() else {
+                self.remove_active(task.id);
+                break;
+            };
+            if sender.is_closed() {
+                self.remove_active(task.id);
+                break;
+            }
+
             let claim = self
                 .writer
                 .transition_with_event(
@@ -483,7 +525,7 @@ impl TaskManager {
                     TransitionOutcome::Applied { task, .. } => {
                         #[cfg(test)]
                         self.pause_claim(ClaimPhase::RunningCommitted).await;
-                        self.spawn_runner(task, repository, cancellation);
+                        self.spawn_runner(task, repository, cancellation, sender);
                     }
                     TransitionOutcome::Conflict { .. } => {
                         self.remove_active(task.id);
@@ -504,6 +546,7 @@ impl TaskManager {
         task: Task,
         repository: Repository,
         cancellation: CancellationToken,
+        sender: mpsc::Sender<TaskManagerMessage>,
     ) {
         let task_id = task.id;
         #[cfg(feature = "test-support")]
@@ -516,7 +559,6 @@ impl TaskManager {
             launch_ordinal
         };
         let runner = self.runner.clone();
-        let sender = self.sender.clone();
         let sink = RunnerEventSink {
             task_id,
             sender: sender.clone(),
@@ -941,6 +983,12 @@ mod tests {
         starts: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct ReleaseRunner {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
     #[async_trait::async_trait]
     impl TaskRunner for CancellingRunner {
         async fn run(&self, context: RunContext, _sink: RunnerEventSink) -> RunnerOutcome {
@@ -950,10 +998,109 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl TaskRunner for ReleaseRunner {
+        async fn run(&self, _context: RunContext, _sink: RunnerEventSink) -> RunnerOutcome {
+            self.started.notify_one();
+            self.release.notified().await;
+            RunnerOutcome::Succeeded
+        }
+    }
+
     #[test]
     fn unix_day_conversion_covers_epoch_and_leap_day() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_idle_handle_releases_the_manager_actor() {
+        let temp_dir = tempfile::tempdir().expect("create manager-exit fixture directory");
+        let store = Store::open(temp_dir.path().join("store.sqlite3"))
+            .await
+            .expect("open manager-exit store");
+        store.migrate().await.expect("migrate manager-exit store");
+        let dispatcher = EventDispatcherHandle::spawn(store.clone(), 16)
+            .await
+            .expect("spawn manager-exit dispatcher");
+        let writer = StoreWriterHandle::spawn(store.clone(), Arc::new(dispatcher.clone()), 8);
+        let manager = TaskManagerHandle::spawn(
+            store,
+            writer,
+            dispatcher,
+            ServiceStateController::new(ServiceState::Ready),
+            Arc::new(CancellingRunner::default()),
+            1,
+            8,
+        );
+        let mut exited = manager.install_exit_probe().await;
+
+        drop(manager);
+        match tokio::time::timeout(Duration::from_secs(2), &mut exited).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("manager dropped its exit probe without a clean actor exit"),
+            Err(_) => {
+                panic!("idle task-manager actor stayed alive after its final handle was dropped")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn active_runner_sender_keeps_actor_alive_until_terminal_cleanup() {
+        let temp_dir = tempfile::tempdir().expect("create active-exit fixture directory");
+        let store = Store::open(temp_dir.path().join("store.sqlite3"))
+            .await
+            .expect("open active-exit store");
+        store.migrate().await.expect("migrate active-exit store");
+        let repository = register_repository(&store, temp_dir.path().to_path_buf()).await;
+        let dispatcher = EventDispatcherHandle::spawn(store.clone(), 16)
+            .await
+            .expect("spawn active-exit dispatcher");
+        let writer = StoreWriterHandle::spawn(store.clone(), Arc::new(dispatcher.clone()), 8);
+        let runner = Arc::new(ReleaseRunner::default());
+        let manager = TaskManagerHandle::spawn(
+            store.clone(),
+            writer.clone(),
+            dispatcher,
+            ServiceStateController::new(ServiceState::Ready),
+            runner.clone(),
+            1,
+            8,
+        );
+        let task = writer
+            .create_task(
+                NewTask::try_new(ClientRequestId::new(), repository.id, "active exit")
+                    .expect("construct active-exit task"),
+                background_deadline(),
+            )
+            .await
+            .expect("create active-exit task")
+            .value
+            .task()
+            .clone();
+        manager.notify_queued(task.id).await.expect("notify actor");
+        runner.started.notified().await;
+        wait_for_status(&store, task.id, TaskStatus::Running).await;
+        let mut exited = manager.install_exit_probe().await;
+        let manager_sender = manager.sender.downgrade();
+
+        drop(manager);
+        assert!(matches!(
+            exited.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(manager_sender.strong_count() > 0);
+
+        runner.release.notify_one();
+        wait_for_status(&store, task.id, TaskStatus::Completed).await;
+        match tokio::time::timeout(Duration::from_secs(2), &mut exited).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("active manager dropped its exit probe without cleanup"),
+            Err(_) => panic!(
+                "manager actor stayed alive after active terminal cleanup; strong_senders={}",
+                manager_sender.strong_count()
+            ),
+        }
     }
 
     #[tokio::test(start_paused = true)]
