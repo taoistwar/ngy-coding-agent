@@ -228,6 +228,14 @@ function updateSummaryForEvent(
   event: TaskEvent,
 ): Pick<AgentState, "tasksById" | "taskOrder"> {
   if (isLifecycleEvent(event)) {
+    const current = state.tasksById[event.task_id];
+    if (
+      current !== undefined &&
+      (event.payload.task.last_event_id <= current.last_event_id ||
+        (isTerminalTask(current) && !isTerminalTask(event.payload.task)))
+    ) {
+      return { tasksById: state.tasksById, taskOrder: state.taskOrder };
+    }
     return withTask(state, event.payload.task);
   }
 

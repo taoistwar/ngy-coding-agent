@@ -266,6 +266,37 @@ describe("agentReducer", () => {
     ]);
   });
 
+  it("does not regress a summary when a REST detail snapshot is ahead of SSE", () => {
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap({
+        latest_event_id: 5,
+        tasks: [task("task-1", "running", 5)],
+      }),
+    });
+    state = agentReducer(state, { type: "task.selected", taskId: "task-1" });
+    state = agentReducer(state, {
+      type: "detail.received",
+      taskId: "task-1",
+      generation: state.selectionGeneration,
+      detail: detail(task("task-1", "completed", 20), 20),
+    });
+
+    state = agentReducer(state, {
+      type: "event.received",
+      event: lifecycleEvent(
+        10,
+        task("task-1", "running", 10),
+        "task.started",
+      ),
+    });
+
+    expect(state.appliedEventId).toBe(10);
+    expect(state.tasksById["task-1"]?.status).toBe("completed");
+    expect(state.tasksById["task-1"]?.last_event_id).toBe(20);
+    expect(state.selectedDetail?.task.status).toBe("completed");
+  });
+
   it("keeps service generation monotonic", () => {
     let state = agentReducer(initialAgentState, {
       type: "bootstrap.received",
