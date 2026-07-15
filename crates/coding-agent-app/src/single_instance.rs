@@ -943,7 +943,7 @@ fn remove_recovered_shutdown_marker(paths: &PlatformPaths) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with(&prefix)
-            && name.ends_with(".pending")
+            && (name.ends_with(".pending") || name.ends_with(".marker"))
             && let Err(error) = std::fs::remove_file(entry.path())
             && error.kind() != io::ErrorKind::NotFound
         {

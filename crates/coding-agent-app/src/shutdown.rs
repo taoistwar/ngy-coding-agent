@@ -164,6 +164,8 @@ impl ShutdownCoordinator {
             .is_ok()
         {
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.inner.runtime.mutation_gate.begin_quiescing();
+                self.inner.runtime.task_manager.freeze_and_cancel();
                 self.inner
                     .runtime
                     .cleanup
@@ -393,48 +395,25 @@ struct ShutdownMarker {
 }
 
 trait ShutdownMarkerWriter: Send + Sync + 'static {
-    fn prepare(
+    fn write(
         &self,
         path: &Path,
         instance_id: Uuid,
         timestamp: time::OffsetDateTime,
-    ) -> io::Result<PreparedShutdownMarker>;
+    ) -> io::Result<()>;
 }
 
 struct FilesystemShutdownMarkerWriter;
 
 impl ShutdownMarkerWriter for FilesystemShutdownMarkerWriter {
-    fn prepare(
+    fn write(
         &self,
         path: &Path,
         instance_id: Uuid,
         timestamp: time::OffsetDateTime,
-    ) -> io::Result<PreparedShutdownMarker> {
-        let staging_path = shutdown_marker_staging_path(path, instance_id)?;
-        write_shutdown_marker(&staging_path, instance_id, timestamp)?;
-        Ok(PreparedShutdownMarker {
-            staging_path,
-            canonical_path: path.to_owned(),
-        })
-    }
-}
-
-struct PreparedShutdownMarker {
-    staging_path: PathBuf,
-    canonical_path: PathBuf,
-}
-
-impl PreparedShutdownMarker {
-    fn publish(self) -> io::Result<()> {
-        std::fs::hard_link(&self.staging_path, &self.canonical_path)?;
-        let _ = std::fs::remove_file(&self.staging_path);
-        Ok(())
-    }
-}
-
-impl Drop for PreparedShutdownMarker {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.staging_path);
+    ) -> io::Result<()> {
+        let instance_path = shutdown_marker_instance_path(path, instance_id)?;
+        write_shutdown_marker(&instance_path, instance_id, timestamp)
     }
 }
 
@@ -455,31 +434,26 @@ async fn write_shutdown_marker_until(
     timestamp: time::OffsetDateTime,
     deadline: Instant,
 ) -> Result<(), ShutdownMarkerWriteError> {
-    let prepare =
-        tokio::task::spawn_blocking(move || writer.prepare(&path, instance_id, timestamp));
-    match timeout_at(deadline, prepare).await {
-        Ok(Ok(Ok(prepared))) if Instant::now() < deadline => {
-            prepared.publish().map_err(ShutdownMarkerWriteError::from)
-        }
-        Ok(Ok(Ok(_prepared))) => Err(ShutdownMarkerWriteError::Deadline),
-        Ok(Ok(Err(error))) => Err(ShutdownMarkerWriteError::from(error)),
+    let write = tokio::task::spawn_blocking(move || writer.write(&path, instance_id, timestamp));
+    match timeout_at(deadline, write).await {
+        Ok(Ok(result)) => result.map_err(ShutdownMarkerWriteError::from),
         Ok(Err(error)) => Err(ShutdownMarkerWriteError::Worker(error.to_string())),
         Err(_) => Err(ShutdownMarkerWriteError::Deadline),
     }
 }
 
-fn shutdown_marker_staging_path(path: &Path, instance_id: Uuid) -> io::Result<PathBuf> {
+fn shutdown_marker_instance_path(path: &Path, instance_id: Uuid) -> io::Result<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "shutdown marker path has no file name",
         )
     })?;
-    let mut staging_name = file_name.to_os_string();
-    staging_name.push(".");
-    staging_name.push(instance_id.hyphenated().to_string());
-    staging_name.push(".pending");
-    Ok(path.with_file_name(staging_name))
+    let mut instance_name = file_name.to_os_string();
+    instance_name.push(".");
+    instance_name.push(instance_id.hyphenated().to_string());
+    instance_name.push(".marker");
+    Ok(path.with_file_name(instance_name))
 }
 
 async fn publish_degraded_message_until(
@@ -757,12 +731,12 @@ mod tests {
     }
 
     impl ShutdownMarkerWriter for BlockingMarkerWriter {
-        fn prepare(
+        fn write(
             &self,
-            path: &Path,
+            _path: &Path,
             _instance_id: Uuid,
             _timestamp: time::OffsetDateTime,
-        ) -> io::Result<PreparedShutdownMarker> {
+        ) -> io::Result<()> {
             if let Some(entered) = self
                 .entered
                 .lock()
@@ -780,10 +754,7 @@ mod tests {
                     .wait(released)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            Ok(PreparedShutdownMarker {
-                staging_path: path.with_extension("pending"),
-                canonical_path: path.to_owned(),
-            })
+            Ok(())
         }
     }
 
@@ -816,6 +787,31 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         wake.notify_one();
+    }
+
+    #[tokio::test]
+    async fn a_successful_marker_write_uses_an_immutable_instance_path() {
+        let directory = tempfile::tempdir().expect("create instance-marker directory");
+        let canonical = directory.path().join("unclean-shutdown.json");
+        let instance_id = Uuid::new_v4();
+
+        write_shutdown_marker_until(
+            Arc::new(FilesystemShutdownMarkerWriter),
+            canonical.clone(),
+            instance_id,
+            time::macros::datetime!(2026-07-15 00:00 UTC),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("write immutable instance marker");
+
+        let instance_path = shutdown_marker_instance_path(&canonical, instance_id)
+            .expect("construct immutable instance marker path");
+        assert!(instance_path.is_file());
+        assert!(
+            !canonical.exists(),
+            "a shutdown worker must never publish or replace a shared canonical path"
+        );
     }
 
     #[tokio::test]

@@ -260,9 +260,24 @@ impl ShutdownFixture {
         .expect("install shutdown interruption failure trigger");
     }
 
-    pub fn make_marker_creation_fail(&self) {
-        std::fs::create_dir(&self.startup.paths.unclean_shutdown)
-            .expect("occupy shutdown marker path with a directory");
+    pub fn make_marker_creation_fail(&self) -> PathBuf {
+        let file_name = self
+            .startup
+            .paths
+            .unclean_shutdown
+            .file_name()
+            .expect("shutdown marker has a file name");
+        let mut instance_name = file_name.to_os_string();
+        instance_name.push(".");
+        instance_name.push(self.primary.instance_id().hyphenated().to_string());
+        instance_name.push(".marker");
+        let instance_path = self
+            .startup
+            .paths
+            .unclean_shutdown
+            .with_file_name(instance_name);
+        std::fs::create_dir(&instance_path).expect("occupy instance marker path with a directory");
+        instance_path
     }
 
     pub async fn reopen_task(&self, task_id: TaskId) -> Task {
