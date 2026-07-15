@@ -17,6 +17,8 @@ use crate::{
 const PAGE_SIZE: usize = 256;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_READY_SERVICE_UPDATES: usize = 64;
+const READY_LIVE_BATCH_SIZE: usize = 256;
+const MAX_BUFFERED_LIVE_EVENTS: usize = 4_096;
 
 pub(crate) type SseEventStream =
     Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
@@ -134,12 +136,18 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
 
         let mut live_closed = false;
         let mut buffered = BTreeMap::<i64, TaskEventDto>::new();
-        let mut pending_refills = drain_ready_live(
+        let Some(drain) = drain_ready_live(
             &mut live,
             &mut live_closed,
             last,
             &mut buffered,
-        );
+        ) else {
+            return;
+        };
+        if drain.exhausted {
+            tokio::task::yield_now().await;
+        }
+        let mut pending_refills = drain.lagged + usize::from(drain.exhausted);
 
         loop {
             if pending_refills > 0 {
@@ -233,12 +241,18 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
                     }
                 }
                 buffered.retain(|id, _| *id > last);
-                pending_refills += drain_ready_live(
+                let Some(drain) = drain_ready_live(
                     &mut live,
                     &mut live_closed,
                     last,
                     &mut buffered,
-                );
+                ) else {
+                    return;
+                };
+                if drain.exhausted {
+                    tokio::task::yield_now().await;
+                }
+                pending_refills += drain.lagged + usize::from(drain.exhausted);
                 if pending_refills > 0 {
                     continue;
                 }
@@ -294,12 +308,19 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
                         Some(LiveEventItem::Event(_)) => {}
                         Some(LiveEventItem::Lagged) => {
                             buffered.clear();
-                            pending_refills = 1 + drain_ready_live(
+                            let Some(drain) = drain_ready_live(
                                 &mut live,
                                 &mut live_closed,
                                 last,
                                 &mut buffered,
-                            );
+                            ) else {
+                                return;
+                            };
+                            if drain.exhausted {
+                                tokio::task::yield_now().await;
+                            }
+                            pending_refills =
+                                1 + drain.lagged + usize::from(drain.exhausted);
 
                             while pending_refills > 0 {
                                 pending_refills -= 1;
@@ -403,12 +424,19 @@ pub(crate) fn connect(backend: Arc<dyn SseBackend>, after: i64) -> SseEventStrea
                                     }
                                 }
                                 buffered.retain(|id, _| *id > last);
-                                pending_refills += drain_ready_live(
+                                let Some(drain) = drain_ready_live(
                                     &mut live,
                                     &mut live_closed,
                                     last,
                                     &mut buffered,
-                                );
+                                ) else {
+                                    return;
+                                };
+                                if drain.exhausted {
+                                    tokio::task::yield_now().await;
+                                }
+                                pending_refills +=
+                                    drain.lagged + usize::from(drain.exhausted);
                             }
 
                             for (_, event) in std::mem::take(&mut buffered) {
@@ -498,26 +526,57 @@ fn normalize_page(
     Some(page)
 }
 
+struct LiveDrain {
+    lagged: usize,
+    exhausted: bool,
+}
+
 fn drain_ready_live(
     live: &mut crate::LiveEventStream,
     live_closed: &mut bool,
     last: i64,
     buffered: &mut BTreeMap<i64, TaskEventDto>,
-) -> usize {
+) -> Option<LiveDrain> {
     let mut lagged = 0;
-    while !*live_closed {
+    for _ in 0..READY_LIVE_BATCH_SIZE {
+        if *live_closed {
+            return Some(LiveDrain {
+                lagged,
+                exhausted: false,
+            });
+        }
         match live.next().now_or_never() {
             Some(Some(LiveEventItem::Event(event))) => {
                 if event.id() > last {
+                    if !buffered.contains_key(&event.id())
+                        && buffered.len() >= MAX_BUFFERED_LIVE_EVENTS
+                    {
+                        tracing::error!(code = "SSE_LIVE_BUFFER_LIMIT", "SSE stream terminated");
+                        return None;
+                    }
                     buffered.insert(event.id(), event);
                 }
             }
             Some(Some(LiveEventItem::Lagged)) => lagged += 1,
-            Some(None) => *live_closed = true,
-            None => break,
+            Some(None) => {
+                *live_closed = true;
+                return Some(LiveDrain {
+                    lagged,
+                    exhausted: false,
+                });
+            }
+            None => {
+                return Some(LiveDrain {
+                    lagged,
+                    exhausted: false,
+                });
+            }
         }
     }
-    lagged
+    Some(LiveDrain {
+        lagged,
+        exhausted: true,
+    })
 }
 
 fn persisted_event(event: &TaskEventDto) -> Option<Event> {

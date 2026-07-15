@@ -349,6 +349,36 @@ struct LagPauseSse {
     service_receiver: Mutex<Option<mpsc::UnboundedReceiver<ServiceStateControl>>>,
 }
 
+struct HotLiveSse;
+
+#[async_trait::async_trait]
+impl SseBackend for HotLiveSse {
+    fn subscribe_live(&self) -> LiveEventStream {
+        Box::pin(stream::repeat_with(|| LiveEventItem::Event(queued(1))))
+    }
+
+    fn subscribe_service_state(&self) -> ServiceStateStream {
+        Box::pin(stream::pending())
+    }
+
+    async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
+        Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
+        Ok(0)
+    }
+
+    async fn events_between(
+        &self,
+        _: i64,
+        _: i64,
+        _: usize,
+    ) -> coding_agent_api::ApiResult<Vec<TaskEventDto>> {
+        Ok(Vec::new())
+    }
+}
+
 impl LagPauseSse {
     fn new() -> Arc<Self> {
         let (live_sender, live_receiver) = mpsc::unbounded_channel();
@@ -539,6 +569,31 @@ async fn lag_injected_during_recovery_forces_another_fresh_high_watermark_read()
     futures_util::pin_mut!(tail);
     assert!(poll!(tail.as_mut()).is_pending());
     assert_eq!(sse.latest_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuously_ready_live_batches_still_yield_the_heartbeat_without_unbounded_drain() {
+    let response = connect(Arc::new(HotLiveSse), 0).await;
+    let mut body = response.into_body().into_data_stream();
+    body.next().await.unwrap().unwrap();
+
+    let next = body.next();
+    futures_util::pin_mut!(next);
+    assert!(poll!(next.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(15)).await;
+
+    let mut heartbeat = None;
+    for _ in 0..64 {
+        match poll!(next.as_mut()) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                heartbeat = Some(String::from_utf8(bytes.to_vec()).unwrap());
+                break;
+            }
+            std::task::Poll::Pending => tokio::task::yield_now().await,
+            other => panic!("hot live stream closed unexpectedly: {other:?}"),
+        }
+    }
+    assert_eq!(heartbeat.as_deref(), Some(": heartbeat\n\n"));
 }
 
 #[tokio::test]
