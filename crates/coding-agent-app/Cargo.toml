@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 coding-agent-api = { path = "../coding-agent-api" }
 coding-agent-domain = { path = "../coding-agent-domain" }
 coding-agent-store = { path = "../coding-agent-store" }
@@ -15,4 +16,5 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+sqlx.workspace = true
 tempfile.workspace = true

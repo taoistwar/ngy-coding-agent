@@ -219,9 +219,11 @@ dependencies = [
 name = "coding-agent-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "coding-agent-api",
  "coding-agent-domain",
  "coding-agent-store",
+ "sqlx",
  "tempfile",
  "thiserror",
  "tokio",

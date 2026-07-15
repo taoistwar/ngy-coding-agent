@@ -1,20 +1,28 @@
 #![allow(dead_code)]
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use coding_agent_app::{EventDispatcherHandle, EventWake, StoreWriterHandle};
+use coding_agent_app::{
+    EventDispatcherHandle, EventWake, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink,
+    RunnerOutcome, ServiceState, ServiceStateController, StoreWriterHandle, TaskManagerHandle,
+    TaskRunner,
+};
 use coding_agent_domain::{
     ActivityEntry, ActivityLevel, CanonicalPath, ClientRequestId, EventCursor, EventId,
-    NewRepository, NewTask, Repository, RepositoryId, Task, TaskEventPayload, TaskFailure,
-    TaskStatus, UtcTimestamp,
+    NewRepository, NewTask, PlanSnapshot, Repository, RepositoryId, Task, TaskEventPayload,
+    TaskFailure, TaskId, TaskStatus, UtcTimestamp,
 };
 use coding_agent_store::{
     AppendEventOutcome, CreateTaskOutcome, RegisterRepositoryOutcome, Store, TaskTransition,
     TransitionOutcome,
 };
+use sqlx::pool::PoolConnection;
+use sqlx::{Sqlite, Transaction};
 use tempfile::TempDir;
+use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::time::{Duration, Instant};
 
 pub struct StoreFixture {
@@ -39,6 +47,22 @@ pub struct DispatcherFixture {
     pub startup_cursor: EventCursor,
     running_task: Task,
     _temp_dir: TempDir,
+}
+
+pub struct TaskManagerFixture {
+    pub store: Store,
+    pub repository: Repository,
+    pub writer: StoreWriterHandle,
+    pub manager: TaskManagerHandle,
+    pub runner: Arc<ControlledRunner>,
+    pub state: ServiceStateController,
+    busy_lock: AsyncMutex<Option<BusyLock>>,
+    _temp_dir: TempDir,
+}
+
+struct BusyLock {
+    transaction: Transaction<'static, Sqlite>,
+    legacy_connections: Vec<PoolConnection<Sqlite>>,
 }
 
 pub async fn store_fixture() -> StoreFixture {
@@ -117,6 +141,32 @@ pub async fn dispatcher_fixture() -> DispatcherFixture {
     }
 }
 
+pub async fn task_manager_fixture(concurrency: usize) -> TaskManagerFixture {
+    let fixture = store_fixture().await;
+    let writer =
+        StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(CountingWake::default()), 64);
+    let state = ServiceStateController::new(ServiceState::Ready);
+    let runner = Arc::new(ControlledRunner::default());
+    let manager = TaskManagerHandle::spawn(
+        fixture.store.clone(),
+        writer.clone(),
+        state.clone(),
+        runner.clone(),
+        concurrency,
+        64,
+    );
+    TaskManagerFixture {
+        store: fixture.store,
+        repository: fixture.repository,
+        writer,
+        manager,
+        runner,
+        state,
+        busy_lock: AsyncMutex::new(None),
+        _temp_dir: fixture._temp_dir,
+    }
+}
+
 impl WriterFixture {
     pub fn repository_input(&self, name: &str) -> NewRepository {
         repository_input_at(&self.root, name)
@@ -151,6 +201,378 @@ impl DispatcherFixture {
             event_ids.push(event_id);
         }
         event_ids
+    }
+}
+
+impl TaskManagerFixture {
+    pub async fn enqueue_tasks(&self, count: usize, notify: bool) -> Vec<Task> {
+        let mut tasks = Vec::with_capacity(count);
+        for index in 0..count {
+            let receipt = self
+                .writer
+                .create_task(
+                    new_task(self.repository.id, &format!("manager task {index}")),
+                    deadline(),
+                )
+                .await
+                .expect("create manager fixture task");
+            let task = receipt.value.task().clone();
+            if notify {
+                self.manager
+                    .notify_queued(task.id)
+                    .await
+                    .expect("notify manager of queued task");
+            }
+            tasks.push(task);
+        }
+        tasks
+    }
+
+    pub async fn load(&self, task_id: TaskId) -> Task {
+        self.load_detail(task_id).await.task
+    }
+
+    pub async fn load_detail(&self, task_id: TaskId) -> coding_agent_store::TaskDetail {
+        self.store
+            .task_detail(task_id)
+            .await
+            .expect("load manager fixture task")
+            .expect("manager fixture task exists")
+    }
+
+    pub async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self.load(task_id).await.status == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("task {task_id} did not reach {expected:?} before the timeout"));
+    }
+
+    pub async fn wait_for_running(&self, expected: usize) {
+        for _ in 0..5_000 {
+            let running = self
+                .store
+                .bootstrap_snapshot()
+                .await
+                .expect("read running task count")
+                .tasks
+                .into_iter()
+                .filter(|task| task.status == TaskStatus::Running)
+                .count();
+            if running == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("running task count did not reach {expected}");
+    }
+
+    pub async fn reconcile(&self) {
+        self.manager
+            .notify_queued(TaskId::new())
+            .await
+            .expect("request reconciliation scan");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub async fn set_created_at(&self, task_id: TaskId, timestamp: &str) {
+        sqlx::query("UPDATE tasks SET created_at = ? WHERE id = ?")
+            .bind(timestamp)
+            .bind(task_id.to_string())
+            .execute(self.store.pool())
+            .await
+            .expect("override task creation time");
+    }
+
+    pub async fn fail_started_event_inserts(&self, enabled: bool) {
+        let statement = if enabled {
+            "CREATE TRIGGER fail_task_started BEFORE INSERT ON task_events \
+             WHEN NEW.kind = 'task.started' BEGIN SELECT RAISE(ABORT, 'injected'); END"
+        } else {
+            "DROP TRIGGER IF EXISTS fail_task_started"
+        };
+        sqlx::query(statement)
+            .execute(self.store.pool())
+            .await
+            .expect("toggle task-start failure trigger");
+    }
+
+    pub async fn fail_started_event_for(&self, task_id: Option<TaskId>) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS test_claim_failures (task_id TEXT PRIMARY KEY NOT NULL)",
+        )
+        .execute(self.store.pool())
+        .await
+        .expect("create FIFO-head failure selector");
+        sqlx::query("DELETE FROM test_claim_failures")
+            .execute(self.store.pool())
+            .await
+            .expect("clear FIFO-head failure selector");
+        sqlx::query("DROP TRIGGER IF EXISTS fail_fifo_head_started")
+            .execute(self.store.pool())
+            .await
+            .expect("remove prior FIFO-head failure trigger");
+        if let Some(task_id) = task_id {
+            sqlx::query("INSERT INTO test_claim_failures (task_id) VALUES (?)")
+                .bind(task_id.to_string())
+                .execute(self.store.pool())
+                .await
+                .expect("select FIFO-head task for injected failure");
+            sqlx::query(
+                "CREATE TRIGGER fail_fifo_head_started BEFORE INSERT ON task_events \
+                 WHEN NEW.kind = 'task.started' AND EXISTS (\
+                     SELECT 1 FROM test_claim_failures WHERE task_id = NEW.task_id\
+                 ) BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
+            .execute(self.store.pool())
+            .await
+            .expect("install FIFO-head failure trigger");
+        }
+    }
+
+    pub async fn force_claim_busy(&self, enabled: bool) {
+        let mut held = self.busy_lock.lock().await;
+        if enabled {
+            assert!(held.is_none(), "busy lock is already held");
+            let options = self
+                .store
+                .pool()
+                .connect_options()
+                .as_ref()
+                .clone()
+                .busy_timeout(Duration::ZERO);
+            self.store.pool().set_connect_options(options);
+            let existing = self.store.pool().size();
+            let mut legacy_connections = Vec::with_capacity(existing as usize);
+            for _ in 0..existing {
+                legacy_connections.push(
+                    self.store
+                        .pool()
+                        .acquire()
+                        .await
+                        .expect("reserve connection with old busy timeout"),
+                );
+            }
+            let transaction = self
+                .store
+                .pool()
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .expect("hold SQLite writer lock");
+            *held = Some(BusyLock {
+                transaction,
+                legacy_connections,
+            });
+        } else if let Some(lock) = held.take() {
+            lock.transaction
+                .rollback()
+                .await
+                .expect("release SQLite writer lock");
+            drop(lock.legacy_connections);
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ControlledRunner {
+    scenarios: Mutex<VecDeque<RunnerScenario>>,
+    started: Mutex<HashMap<TaskId, usize>>,
+    releases: Mutex<HashMap<TaskId, Arc<Notify>>>,
+}
+
+type EventAppendResult = Result<coding_agent_domain::EventId, RunnerEventError>;
+type SharedEventResultReceiver = Arc<AsyncMutex<Option<oneshot::Receiver<EventAppendResult>>>>;
+
+enum RunnerScenario {
+    Blocking(Arc<Notify>),
+    Panic,
+    LateEvent {
+        release: Arc<Notify>,
+        result: oneshot::Sender<EventAppendResult>,
+    },
+    Events {
+        events: Vec<RunnerEvent>,
+        result: oneshot::Sender<Vec<coding_agent_domain::EventId>>,
+    },
+    CompletionGate(Arc<Notify>),
+    EventGate {
+        release: Arc<Notify>,
+        event: RunnerEvent,
+        result: oneshot::Sender<EventAppendResult>,
+    },
+}
+
+pub struct LateEventGate {
+    pub release: Arc<Notify>,
+    pub result: SharedEventResultReceiver,
+}
+
+pub struct CompletionGate {
+    pub release: Arc<Notify>,
+}
+
+pub struct EventGate {
+    pub release: Arc<Notify>,
+    pub result: oneshot::Receiver<EventAppendResult>,
+}
+
+pub struct EventResults(oneshot::Receiver<Vec<coding_agent_domain::EventId>>);
+
+impl EventResults {
+    pub async fn receive(self) -> Vec<coding_agent_domain::EventId> {
+        self.0.await.expect("runner sends event IDs")
+    }
+}
+
+impl ControlledRunner {
+    pub fn push_blocking(&self, count: usize) {
+        let mut scenarios = self
+            .scenarios
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scenarios.extend((0..count).map(|_| RunnerScenario::Blocking(Arc::new(Notify::new()))));
+    }
+
+    pub fn push_panic(&self) {
+        self.push(RunnerScenario::Panic);
+    }
+
+    pub fn push_late_event(&self) -> LateEventGate {
+        let release = Arc::new(Notify::new());
+        let (result, receiver) = oneshot::channel();
+        self.push(RunnerScenario::LateEvent {
+            release: release.clone(),
+            result,
+        });
+        LateEventGate {
+            release,
+            result: Arc::new(AsyncMutex::new(Some(receiver))),
+        }
+    }
+
+    pub fn push_events(&self, events: Vec<RunnerEvent>) -> EventResults {
+        let (result, receiver) = oneshot::channel();
+        self.push(RunnerScenario::Events { events, result });
+        EventResults(receiver)
+    }
+
+    pub fn push_completion_gate(&self) -> CompletionGate {
+        let release = Arc::new(Notify::new());
+        self.push(RunnerScenario::CompletionGate(release.clone()));
+        CompletionGate { release }
+    }
+
+    pub fn push_event_gate(&self, event: RunnerEvent) -> EventGate {
+        let release = Arc::new(Notify::new());
+        let (result, receiver) = oneshot::channel();
+        self.push(RunnerScenario::EventGate {
+            release: release.clone(),
+            event,
+            result,
+        });
+        EventGate {
+            release,
+            result: receiver,
+        }
+    }
+
+    pub fn release(&self, task_id: TaskId) {
+        let release = self
+            .releases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&task_id)
+            .cloned()
+            .expect("blocking runner has started");
+        release.notify_one();
+    }
+
+    pub fn started_count(&self, task_id: TaskId) -> usize {
+        self.started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&task_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn push(&self, scenario: RunnerScenario) {
+        self.scenarios
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(scenario);
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskRunner for ControlledRunner {
+    async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+        *self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(context.task.id)
+            .or_insert(0) += 1;
+        let scenario = self
+            .scenarios
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .expect("a runner scenario is queued for every started task");
+        match scenario {
+            RunnerScenario::Blocking(release) => {
+                self.releases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(context.task.id, release.clone());
+                tokio::select! {
+                    () = context.cancellation.cancelled() => RunnerOutcome::Cancelled,
+                    () = release.notified() => RunnerOutcome::Succeeded,
+                }
+            }
+            RunnerScenario::Panic => panic!("injected runner panic"),
+            RunnerScenario::LateEvent { release, result } => {
+                tokio::spawn(async move {
+                    release.notified().await;
+                    let _ = result.send(
+                        sink.append(RunnerEvent::PlanUpdated(PlanSnapshot {
+                            revision: 99,
+                            items: Vec::new(),
+                        }))
+                        .await,
+                    );
+                });
+                RunnerOutcome::Succeeded
+            }
+            RunnerScenario::Events { events, result } => {
+                let mut ids = Vec::with_capacity(events.len());
+                for event in events {
+                    ids.push(sink.append(event).await.expect("append running event"));
+                }
+                let _ = result.send(ids);
+                RunnerOutcome::Succeeded
+            }
+            RunnerScenario::CompletionGate(release) => {
+                release.notified().await;
+                RunnerOutcome::Succeeded
+            }
+            RunnerScenario::EventGate {
+                release,
+                event,
+                result,
+            } => {
+                release.notified().await;
+                let _ = result.send(sink.append(event).await);
+                RunnerOutcome::Succeeded
+            }
+        }
     }
 }
 
