@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use coding_agent_app::{
     CancelOutcome, CommandRunner, DegradedRecoveryResult, EventDispatcherHandle, EventWake,
-    FakeRunnerConfig, FakeTaskRunner, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink,
-    RunnerOutcome, ServiceState, ServiceStateController, StoreWriterHandle, TaskManagerHandle,
-    TaskRunner,
+    FakeRunnerConfig, FakeTaskRunner, LaunchToken, RunContext, RunnerEvent, RunnerEventError,
+    RunnerEventSink, RunnerOutcome, SecurityClock, SecurityManager, SecuritySeed, ServiceState,
+    ServiceStateController, StoreWriterHandle, TaskManagerHandle, TaskRunner,
 };
 #[cfg(feature = "test-support")]
 use coding_agent_app::{FakeScenario, ScriptedFakeRunner};
@@ -30,6 +30,57 @@ use sqlx::{Sqlite, Transaction};
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::time::{Duration, Instant};
+
+#[derive(Clone)]
+pub struct FakeSecurityClock {
+    now: Arc<Mutex<std::time::Instant>>,
+}
+
+impl FakeSecurityClock {
+    pub fn new() -> Self {
+        Self {
+            now: Arc::new(Mutex::new(std::time::Instant::now())),
+        }
+    }
+
+    pub fn advance(&self, duration: std::time::Duration) {
+        let mut now = self.now.lock().expect("lock fake security clock");
+        *now += duration;
+    }
+}
+
+impl SecurityClock for FakeSecurityClock {
+    fn now(&self) -> std::time::Instant {
+        *self.now.lock().expect("lock fake security clock")
+    }
+}
+
+pub struct SecurityFixture {
+    pub manager: SecurityManager,
+    pub initial_launch_token: LaunchToken,
+    pub clock: Arc<FakeSecurityClock>,
+    pub public_origin: String,
+    pub expected_host: String,
+}
+
+impl SecurityFixture {
+    pub fn production() -> Self {
+        let public_origin = "http://127.0.0.1:43121".to_owned();
+        let expected_host = "127.0.0.1:43121".to_owned();
+        let clock = Arc::new(FakeSecurityClock::new());
+        let seed = SecuritySeed::generate().expect("generate security seed");
+        let initial_launch_token = seed.initial_launch_token().clone();
+        let manager = SecurityManager::from_seed(seed, public_origin.clone(), clock.clone())
+            .expect("construct production security manager");
+        Self {
+            manager,
+            initial_launch_token,
+            clock,
+            public_origin,
+            expected_host,
+        }
+    }
+}
 
 pub struct StoreFixture {
     pub store: Store,

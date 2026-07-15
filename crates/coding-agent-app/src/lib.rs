@@ -14,6 +14,7 @@ mod fake_runner;
 mod native_dialog;
 mod platform;
 mod repository_service;
+mod security;
 mod service_state;
 mod shutdown;
 mod store_writer;
@@ -29,6 +30,10 @@ pub use native_dialog::{NativeDialogService, PickerError};
 pub use platform::{BrowserLaunchError, BrowserLauncher, PlatformPaths, PrivateFile};
 pub use repository_service::{
     CommandRunner, DiscoveredRepository, RepositoryDiscovery, RepositoryDiscoveryError,
+};
+pub use security::{
+    LaunchToken, LauncherSecret, SecurityClock, SecurityError, SecurityManager, SecuritySeed,
+    SessionRecord, SystemSecurityClock,
 };
 pub use service_state::{
     InvalidServiceTransition, ServiceState, ServiceStateController, ServiceStateSnapshot,

@@ -11,11 +11,16 @@ test-support = []
 
 [dependencies]
 async-trait.workspace = true
+axum-extra.workspace = true
+base64.workspace = true
 coding-agent-api = { path = "../coding-agent-api" }
 coding-agent-domain = { path = "../coding-agent-domain" }
 coding-agent-store = { path = "../coding-agent-store" }
 directories.workspace = true
+getrandom.workspace = true
+http.workspace = true
 rfd.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -28,3 +33,4 @@ windows-sys.workspace = true
 [dev-dependencies]
 sqlx.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
