@@ -9,9 +9,11 @@
 //! };
 //! ```
 
+mod event_dispatcher;
 mod service_state;
 mod store_writer;
 
+pub use event_dispatcher::{EventDispatcherError, EventDispatcherHandle};
 pub use service_state::{
     InvalidServiceTransition, ServiceState, ServiceStateController, ServiceStateSnapshot,
 };
