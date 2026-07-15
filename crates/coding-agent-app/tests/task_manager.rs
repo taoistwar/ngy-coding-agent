@@ -416,6 +416,10 @@ async fn a_degraded_service_does_not_claim_queued_tasks() {
 
 #[tokio::test]
 async fn fake_runner_emits_the_approved_panel_sequence() {
+    assert_eq!(
+        FakeRunnerConfig::default().emission_interval(),
+        Duration::from_millis(200)
+    );
     let fixture = support::fake_runner_fixture().await;
     let task = fixture.start().await;
     tokio::time::pause();
@@ -482,6 +486,12 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
             .iter()
             .all(|entry| entry.created_at == detail.task.started_at.unwrap())
     );
+    assert!(
+        detail
+            .activity
+            .iter()
+            .all(|entry| entry.level == ActivityLevel::Info)
+    );
     assert_eq!(
         detail.diff,
         Some(DiffSnapshot {
@@ -510,8 +520,31 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
         })
     );
     assert_eq!(
-        fixture.test_statuses(task.id).await,
-        vec![TestStatus::Running, TestStatus::Passed]
+        fixture.test_snapshots(task.id).await,
+        vec![
+            TestSnapshot {
+                revision: 1,
+                status: TestStatus::Running,
+                cases: vec![TestCase {
+                    id: "fake-test".to_owned(),
+                    name: "deterministic synthetic check".to_owned(),
+                    status: TestStatus::Running,
+                    duration_ms: 0,
+                    summary: "Synthetic checks are running".to_owned(),
+                }],
+            },
+            TestSnapshot {
+                revision: 2,
+                status: TestStatus::Passed,
+                cases: vec![TestCase {
+                    id: "fake-test".to_owned(),
+                    name: "deterministic synthetic check".to_owned(),
+                    status: TestStatus::Passed,
+                    duration_ms: 200,
+                    summary: "Synthetic checks passed".to_owned(),
+                }],
+            },
+        ]
     );
 }
 
@@ -652,4 +685,36 @@ async fn scripted_fake_runner_consumes_scenarios_in_task_creation_order_not_prom
     fixture
         .wait_for_status(tasks[1].id, TaskStatus::Completed)
         .await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_fake_runner_orders_scenarios_by_launch_when_inner_polls_are_reversed() {
+    const ITERATIONS: usize = 32;
+    let fixture = support::reverse_polled_scripted_fake_runner_fixture(
+        (0..ITERATIONS).flat_map(|_| [FakeScenario::Failure, FakeScenario::Blocking]),
+        2,
+    )
+    .await;
+    for iteration in 0..ITERATIONS {
+        let tasks = fixture.enqueue(&["created first", "created second"]).await;
+
+        let failed = fixture
+            .wait_for_one_failed(&[tasks[0].id, tasks[1].id])
+            .await;
+        assert_eq!(failed, tasks[0].id, "iteration {iteration}");
+        fixture
+            .wait_for_status(tasks[1].id, TaskStatus::Running)
+            .await;
+        let started = fixture.runner.started_task_ids();
+        assert_eq!(
+            &started[started.len() - 2..],
+            &[tasks[0].id, tasks[1].id],
+            "iteration {iteration}"
+        );
+        assert!(fixture.runner.release(tasks[1].id));
+        fixture
+            .wait_for_status(tasks[1].id, TaskStatus::Completed)
+            .await;
+    }
 }

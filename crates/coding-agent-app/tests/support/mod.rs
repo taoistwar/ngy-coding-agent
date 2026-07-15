@@ -15,7 +15,7 @@ use coding_agent_app::{FakeScenario, ScriptedFakeRunner};
 use coding_agent_domain::{
     ActivityEntry, ActivityLevel, CanonicalPath, ClientRequestId, EventCursor, EventId,
     NewRepository, NewTask, PlanSnapshot, Repository, RepositoryId, Task, TaskEventKind,
-    TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestStatus, UtcTimestamp,
+    TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestSnapshot, TestStatus, UtcTimestamp,
 };
 use coding_agent_store::{
     AppendEventOutcome, CreateTaskOutcome, RegisterRepositoryOutcome, Store, TaskTransition,
@@ -70,6 +70,14 @@ pub struct FakeRunnerFixture {
 pub struct ScriptedFakeRunnerFixture {
     core: RunnerFixtureCore,
     pub runner: Arc<ScriptedFakeRunner>,
+    reverse_poll: Option<Arc<ReversePollingRunner>>,
+}
+
+#[cfg(feature = "test-support")]
+struct ReversePollingRunner {
+    inner: Arc<ScriptedFakeRunner>,
+    first_task_id: Mutex<Option<TaskId>>,
+    later_entered: Notify,
 }
 
 struct RunnerFixtureCore {
@@ -210,6 +218,46 @@ pub async fn scripted_fake_runner_fixture(
     ScriptedFakeRunnerFixture {
         core: runner_fixture(runner.clone(), concurrency).await,
         runner,
+        reverse_poll: None,
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn reverse_polled_scripted_fake_runner_fixture(
+    scenarios: impl IntoIterator<Item = FakeScenario>,
+    concurrency: usize,
+) -> ScriptedFakeRunnerFixture {
+    let runner = Arc::new(ScriptedFakeRunner::new(
+        FakeRunnerConfig::default(),
+        scenarios,
+    ));
+    let reverse_poll = Arc::new(ReversePollingRunner {
+        inner: runner.clone(),
+        first_task_id: Mutex::new(None),
+        later_entered: Notify::new(),
+    });
+    ScriptedFakeRunnerFixture {
+        core: runner_fixture(reverse_poll.clone(), concurrency).await,
+        runner,
+        reverse_poll: Some(reverse_poll),
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+impl TaskRunner for ReversePollingRunner {
+    async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+        let is_first = self
+            .first_task_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|task_id| task_id == context.task.id);
+        if is_first {
+            self.later_entered.notified().await;
+        } else {
+            self.later_entered.notify_one();
+        }
+        self.inner.run(context, sink).await
     }
 }
 
@@ -235,7 +283,7 @@ async fn runner_fixture(runner: Arc<dyn TaskRunner>, concurrency: usize) -> Runn
 }
 
 impl RunnerFixtureCore {
-    async fn enqueue(&self, prompts: &[&str]) -> Vec<Task> {
+    async fn create_tasks(&self, prompts: &[&str]) -> Vec<Task> {
         let mut tasks = Vec::with_capacity(prompts.len());
         for prompt in prompts {
             let receipt = self
@@ -245,12 +293,21 @@ impl RunnerFixtureCore {
                 .expect("create runner fixture task");
             tasks.push(receipt.value.task().clone());
         }
-        for task in &tasks {
+        tasks
+    }
+
+    async fn notify_tasks(&self, tasks: &[Task]) {
+        for task in tasks {
             self.manager
                 .notify_queued(task.id)
                 .await
                 .expect("notify manager of runner fixture task");
         }
+    }
+
+    async fn enqueue(&self, prompts: &[&str]) -> Vec<Task> {
+        let tasks = self.create_tasks(prompts).await;
+        self.notify_tasks(&tasks).await;
         tasks
     }
 
@@ -366,6 +423,18 @@ impl FakeRunnerFixture {
             .collect()
     }
 
+    pub async fn test_snapshots(&self, task_id: TaskId) -> Vec<TestSnapshot> {
+        self.core
+            .events(task_id)
+            .await
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                TaskEventPayload::TestUpdated { tests } => Some(tests),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub async fn wait_for_terminal(&self, task_id: TaskId) {
         self.core.wait_for_terminal(task_id).await;
     }
@@ -374,7 +443,16 @@ impl FakeRunnerFixture {
 #[cfg(feature = "test-support")]
 impl ScriptedFakeRunnerFixture {
     pub async fn enqueue(&self, prompts: &[&str]) -> Vec<Task> {
-        self.core.enqueue(prompts).await
+        let tasks = self.core.create_tasks(prompts).await;
+        if let Some(reverse_poll) = &self.reverse_poll {
+            *reverse_poll
+                .first_task_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                tasks.first().map(|task| task.id);
+        }
+        self.core.notify_tasks(&tasks).await;
+        tasks
     }
 
     pub async fn start(&self, prompt: &str) -> Task {
@@ -414,6 +492,21 @@ impl ScriptedFakeRunnerFixture {
         })
         .await
         .unwrap_or_else(|_| panic!("scripted runner did not start task {task_id}"));
+    }
+
+    pub async fn wait_for_one_failed(&self, task_ids: &[TaskId]) -> TaskId {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                for task_id in task_ids {
+                    if self.core.load(*task_id).await.status == TaskStatus::Failed {
+                        return *task_id;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one scripted task becomes failed")
     }
 }
 

@@ -191,11 +191,12 @@ fn event_rejected_failure() -> TaskFailure {
 
 #[cfg(feature = "test-support")]
 mod scripted {
+    use std::cmp::Ordering;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use coding_agent_domain::TaskId;
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, watch};
 
     use super::{FakeRunnerConfig, run_success};
     use crate::{RunContext, RunnerEventSink, RunnerOutcome, TaskRunner};
@@ -211,9 +212,15 @@ mod scripted {
 
     pub struct ScriptedFakeRunner {
         config: FakeRunnerConfig,
-        scenarios: Mutex<VecDeque<FakeScenario>>,
+        scenario_state: Mutex<ScenarioState>,
+        next_ordinal: watch::Sender<u64>,
         started: Mutex<Vec<TaskId>>,
         releases: Mutex<HashMap<TaskId, Arc<Notify>>>,
+    }
+
+    struct ScenarioState {
+        scenarios: VecDeque<FakeScenario>,
+        next_ordinal: u64,
     }
 
     impl ScriptedFakeRunner {
@@ -221,9 +228,14 @@ mod scripted {
             config: FakeRunnerConfig,
             scenarios: impl IntoIterator<Item = FakeScenario>,
         ) -> Self {
+            let (next_ordinal, _) = watch::channel(0);
             Self {
                 config,
-                scenarios: Mutex::new(scenarios.into_iter().collect()),
+                scenario_state: Mutex::new(ScenarioState {
+                    scenarios: scenarios.into_iter().collect(),
+                    next_ordinal: 0,
+                }),
+                next_ordinal,
                 started: Mutex::new(Vec::new()),
                 releases: Mutex::new(HashMap::new()),
             }
@@ -250,12 +262,41 @@ mod scripted {
                 .clone()
         }
 
-        fn next_scenario(&self) -> FakeScenario {
-            self.scenarios
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front()
-                .expect("a scripted fake scenario is required for every task")
+        async fn scenario_for(&self, launch_ordinal: u64) -> FakeScenario {
+            let mut next_ordinal = self.next_ordinal.subscribe();
+            loop {
+                let assigned = {
+                    let mut state = self
+                        .scenario_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match launch_ordinal.cmp(&state.next_ordinal) {
+                        Ordering::Equal => {
+                            let scenario = state
+                                .scenarios
+                                .pop_front()
+                                .expect("a scripted fake scenario is required for every task");
+                            state.next_ordinal = state
+                                .next_ordinal
+                                .checked_add(1)
+                                .expect("scripted fake launch ordinal overflow");
+                            Some((scenario, state.next_ordinal))
+                        }
+                        Ordering::Greater => None,
+                        Ordering::Less => {
+                            panic!("scripted fake task launch ordinal was already consumed")
+                        }
+                    }
+                };
+                if let Some((scenario, next)) = assigned {
+                    self.next_ordinal.send_replace(next);
+                    return scenario;
+                }
+                next_ordinal
+                    .changed()
+                    .await
+                    .expect("scripted fake ordinal sender remains alive");
+            }
         }
 
         fn install_release(&self, task_id: TaskId) -> Arc<Notify> {
@@ -286,7 +327,7 @@ mod scripted {
     impl TaskRunner for ScriptedFakeRunner {
         async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
             let task_id = context.task.id;
-            let scenario = self.next_scenario();
+            let scenario = self.scenario_for(context.launch_ordinal()).await;
             let release = match scenario {
                 FakeScenario::Blocking | FakeScenario::IgnoresCancellation => {
                     Some(self.install_release(task_id))

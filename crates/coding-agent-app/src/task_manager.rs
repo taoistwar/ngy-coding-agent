@@ -109,6 +109,15 @@ pub struct RunContext {
     pub task: Task,
     pub repository: Repository,
     pub cancellation: CancellationToken,
+    #[cfg(feature = "test-support")]
+    launch_ordinal: u64,
+}
+
+#[cfg(feature = "test-support")]
+impl RunContext {
+    pub(crate) const fn launch_ordinal(&self) -> u64 {
+        self.launch_ordinal
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -163,6 +172,8 @@ impl TaskManagerHandle {
             scan_requested: false,
             degraded: false,
             frozen: false,
+            #[cfg(feature = "test-support")]
+            next_launch_ordinal: 0,
             #[cfg(test)]
             claim_hooks: None,
         };
@@ -198,6 +209,8 @@ impl TaskManagerHandle {
             scan_requested: false,
             degraded: false,
             frozen: false,
+            #[cfg(feature = "test-support")]
+            next_launch_ordinal: 0,
             claim_hooks: Some(claim_hooks),
         };
         tokio::spawn(actor.run());
@@ -282,6 +295,8 @@ struct TaskManager {
     scan_requested: bool,
     degraded: bool,
     frozen: bool,
+    #[cfg(feature = "test-support")]
+    next_launch_ordinal: u64,
     #[cfg(test)]
     claim_hooks: Option<Arc<ClaimTestHooks>>,
 }
@@ -433,8 +448,22 @@ impl TaskManager {
         Ok(())
     }
 
-    fn spawn_runner(&self, task: Task, repository: Repository, cancellation: CancellationToken) {
+    fn spawn_runner(
+        &mut self,
+        task: Task,
+        repository: Repository,
+        cancellation: CancellationToken,
+    ) {
         let task_id = task.id;
+        #[cfg(feature = "test-support")]
+        let launch_ordinal = {
+            let launch_ordinal = self.next_launch_ordinal;
+            self.next_launch_ordinal = self
+                .next_launch_ordinal
+                .checked_add(1)
+                .expect("task launch ordinal overflow");
+            launch_ordinal
+        };
         let runner = self.runner.clone();
         let sender = self.sender.clone();
         let sink = RunnerEventSink {
@@ -445,6 +474,8 @@ impl TaskManager {
             task,
             repository,
             cancellation,
+            #[cfg(feature = "test-support")]
+            launch_ordinal,
         };
         let join = tokio::spawn(async move { runner.run(context, sink).await });
         tokio::spawn(async move {
@@ -785,8 +816,10 @@ mod tests {
 
     use coding_agent_domain::{CanonicalPath, ClientRequestId, NewRepository, NewTask};
     use coding_agent_store::{CreateTaskOutcome, RegisterRepositoryOutcome};
+    use tokio::sync::mpsc::error::TryRecvError;
 
     use super::*;
+    use crate::{FakeRunnerConfig, FakeTaskRunner};
 
     struct NoopWake;
 
@@ -812,6 +845,102 @@ mod tests {
     fn unix_day_conversion_covers_epoch_and_leap_day() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fake_runner_uses_exact_deadlines_and_cancels_before_the_next_boundary() {
+        assert_eq!(
+            FakeRunnerConfig::default().emission_interval(),
+            Duration::from_millis(200)
+        );
+        let cancellation = CancellationToken::new();
+        let context = fake_run_context(cancellation.clone());
+        let task_id = context.task.id;
+        let (sender, mut receiver) = mpsc::channel(8);
+        let sink = RunnerEventSink { task_id, sender };
+        let run = tokio::spawn(async move { FakeTaskRunner::default().run(context, sink).await });
+
+        assert!(matches!(
+            acknowledge_runner_event(&mut receiver, 1).await,
+            RunnerEvent::PlanUpdated(_)
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(199)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            acknowledge_runner_event(&mut receiver, 2).await,
+            RunnerEvent::ActivityAppended(ActivityEntry { id, .. }) if id == "fake-plan-ready"
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(199)).await;
+        cancellation.cancel();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        assert_eq!(
+            run.await.expect("join fake runner"),
+            RunnerOutcome::Cancelled
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected)
+        ));
+    }
+
+    async fn acknowledge_runner_event(
+        receiver: &mut mpsc::Receiver<TaskManagerMessage>,
+        event_id: i64,
+    ) -> RunnerEvent {
+        let message = receiver.recv().await.expect("fake runner sends an event");
+        let TaskManagerMessage::RunnerEvent {
+            event, response, ..
+        } = message
+        else {
+            panic!("fake runner sink sends only runner events");
+        };
+        response
+            .send(Ok(EventId::new(event_id).expect("positive event ID")))
+            .expect("fake runner awaits event acknowledgement");
+        event
+    }
+
+    fn fake_run_context(cancellation: CancellationToken) -> RunContext {
+        let repository_id = coding_agent_domain::RepositoryId::new();
+        let timestamp = UtcTimestamp::parse_rfc3339("2026-07-15T00:00:00Z")
+            .expect("construct fake runner timestamp");
+        let root = std::env::current_dir().expect("read test current directory");
+        let task = Task::try_from_stored(Task {
+            id: TaskId::new(),
+            client_request_id: ClientRequestId::new(),
+            repository_id,
+            prompt: "direct fake runner test".to_owned(),
+            status: TaskStatus::Running,
+            attempt: 1,
+            retry_of: None,
+            created_at: timestamp,
+            started_at: Some(timestamp),
+            finished_at: None,
+            last_event_id: EventId::new(1).expect("positive event ID"),
+            failure: None,
+        })
+        .expect("construct valid running task");
+        RunContext {
+            task,
+            repository: Repository {
+                id: repository_id,
+                selected_path: canonical(root.join("fake-selected")),
+                display_name: "fake runner".to_owned(),
+                git_root: canonical(root.join("fake-git")),
+                cargo_workspace_root: canonical(root.join("fake-workspace")),
+                created_at: timestamp,
+                last_opened_at: timestamp,
+            },
+            cancellation,
+            #[cfg(feature = "test-support")]
+            launch_ordinal: 0,
+        }
     }
 
     #[tokio::test]
