@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coding_agent_app::{
-    CancelOutcome, EventDispatcherHandle, EventWake, FakeRunnerConfig, FakeTaskRunner, RunContext,
-    RunnerEvent, RunnerEventError, RunnerEventSink, RunnerOutcome, ServiceState,
-    ServiceStateController, StoreWriterHandle, TaskManagerHandle, TaskRunner,
+    CancelOutcome, DegradedRecoveryResult, EventDispatcherHandle, EventWake, FakeRunnerConfig,
+    FakeTaskRunner, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink, RunnerOutcome,
+    ServiceState, ServiceStateController, StoreWriterHandle, TaskManagerHandle, TaskRunner,
 };
 #[cfg(feature = "test-support")]
 use coding_agent_app::{FakeScenario, ScriptedFakeRunner};
@@ -62,6 +62,21 @@ pub struct TaskManagerFixture {
     _temp_dir: TempDir,
 }
 
+pub struct DegradedFixture {
+    pub store: Store,
+    pub writer: StoreWriterHandle,
+    pub dispatcher: EventDispatcherHandle,
+    pub manager: TaskManagerHandle,
+    pub runner: Arc<ControlledRunner>,
+    pub state: ServiceStateController,
+    repository: Repository,
+    completion_gates: AsyncMutex<HashMap<TaskId, CompletionGate>>,
+    recovery_results: AsyncMutex<tokio::sync::broadcast::Receiver<DegradedRecoveryResult>>,
+    busy_lock: AsyncMutex<Option<BusyLock>>,
+    database_path: PathBuf,
+    _temp_dir: TempDir,
+}
+
 pub struct FakeRunnerFixture {
     core: RunnerFixtureCore,
 }
@@ -91,6 +106,12 @@ struct RunnerFixtureCore {
 struct BusyLock {
     transaction: Transaction<'static, Sqlite>,
     legacy_connections: Vec<PoolConnection<Sqlite>>,
+}
+
+static DEGRADED_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+pub async fn degraded_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    DEGRADED_TEST_LOCK.lock().await
 }
 
 pub async fn store_fixture() -> StoreFixture {
@@ -171,13 +192,16 @@ pub async fn dispatcher_fixture() -> DispatcherFixture {
 
 pub async fn task_manager_fixture(concurrency: usize) -> TaskManagerFixture {
     let fixture = store_fixture().await;
-    let writer =
-        StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(CountingWake::default()), 64);
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
+        .await
+        .expect("spawn task-manager fixture dispatcher");
+    let writer = StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(dispatcher.clone()), 64);
     let state = ServiceStateController::new(ServiceState::Ready);
     let runner = Arc::new(ControlledRunner::default());
     let manager = TaskManagerHandle::spawn(
         fixture.store.clone(),
         writer.clone(),
+        dispatcher,
         state.clone(),
         runner.clone(),
         concurrency,
@@ -191,6 +215,41 @@ pub async fn task_manager_fixture(concurrency: usize) -> TaskManagerFixture {
         runner,
         state,
         busy_lock: AsyncMutex::new(None),
+        _temp_dir: fixture._temp_dir,
+    }
+}
+
+pub async fn degraded_fixture_with_concurrency(concurrency: usize) -> DegradedFixture {
+    let fixture = store_fixture().await;
+    let database_path = fixture.root.join("store.sqlite3");
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
+        .await
+        .expect("spawn degraded fixture dispatcher");
+    let writer = StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(dispatcher.clone()), 64);
+    let state = ServiceStateController::new(ServiceState::Ready);
+    let runner = Arc::new(ControlledRunner::default());
+    let manager = TaskManagerHandle::spawn(
+        fixture.store.clone(),
+        writer.clone(),
+        dispatcher.clone(),
+        state.clone(),
+        runner.clone(),
+        concurrency,
+        64,
+    );
+    let recovery_results = manager.subscribe_degraded_recovery();
+    DegradedFixture {
+        store: fixture.store,
+        writer,
+        dispatcher,
+        manager,
+        runner,
+        state,
+        repository: fixture.repository,
+        completion_gates: AsyncMutex::new(HashMap::new()),
+        recovery_results: AsyncMutex::new(recovery_results),
+        busy_lock: AsyncMutex::new(None),
+        database_path,
         _temp_dir: fixture._temp_dir,
     }
 }
@@ -263,11 +322,14 @@ impl TaskRunner for ReversePollingRunner {
 
 async fn runner_fixture(runner: Arc<dyn TaskRunner>, concurrency: usize) -> RunnerFixtureCore {
     let fixture = store_fixture().await;
-    let writer =
-        StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(CountingWake::default()), 64);
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
+        .await
+        .expect("spawn runner fixture dispatcher");
+    let writer = StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(dispatcher.clone()), 64);
     let manager = TaskManagerHandle::spawn(
         fixture.store.clone(),
         writer.clone(),
+        dispatcher,
         ServiceStateController::new(ServiceState::Ready),
         runner,
         concurrency,
@@ -720,6 +782,201 @@ impl TaskManagerFixture {
                 .expect("release SQLite writer lock");
             drop(lock.legacy_connections);
         }
+    }
+}
+
+impl DegradedFixture {
+    pub async fn start_success_task(&self) -> TaskId {
+        let gate = self.runner.push_completion_gate();
+        let task = self.create_task("degraded running task").await;
+        self.completion_gates.lock().await.insert(task.id, gate);
+        self.manager
+            .notify_queued(task.id)
+            .await
+            .expect("notify degraded fixture running task");
+        self.wait_for_status(task.id, TaskStatus::Running).await;
+        task.id
+    }
+
+    pub async fn start_event_task(&self, event: RunnerEvent) -> (TaskId, EventGate) {
+        let gate = self.runner.push_event_gate(event);
+        let task = self.create_task("degraded event task").await;
+        self.manager
+            .notify_queued(task.id)
+            .await
+            .expect("notify degraded fixture event task");
+        self.wait_for_status(task.id, TaskStatus::Running).await;
+        (task.id, gate)
+    }
+
+    pub async fn enqueue_task(&self) -> TaskId {
+        let task = self.create_task("degraded queued task").await;
+        self.manager
+            .notify_queued(task.id)
+            .await
+            .expect("notify degraded fixture queued task");
+        task.id
+    }
+
+    pub async fn finish_runner(&self, task_id: TaskId) {
+        self.completion_gates
+            .lock()
+            .await
+            .remove(&task_id)
+            .expect("completion gate exists")
+            .release
+            .notify_one();
+    }
+
+    pub async fn fail_all_background_writes(&self) {
+        let mut held = self.busy_lock.lock().await;
+        assert!(held.is_none(), "background-write lock is already held");
+        let options = self
+            .store
+            .pool()
+            .connect_options()
+            .as_ref()
+            .clone()
+            .busy_timeout(Duration::ZERO);
+        self.store.pool().set_connect_options(options);
+        let existing = self.store.pool().size();
+        let mut connections = Vec::with_capacity(existing as usize);
+        for _ in 0..existing {
+            connections.push(
+                self.store
+                    .pool()
+                    .acquire()
+                    .await
+                    .expect("reserve connection with old busy timeout"),
+            );
+        }
+        for connection in &mut connections {
+            sqlx::query("PRAGMA busy_timeout = 0")
+                .execute(&mut **connection)
+                .await
+                .expect("set zero busy timeout on an existing fixture connection");
+        }
+        drop(connections);
+        let transaction = self
+            .store
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold degraded fixture SQLite writer lock");
+        *held = Some(BusyLock {
+            transaction,
+            legacy_connections: Vec::new(),
+        });
+    }
+
+    pub async fn restore_writes(&self) {
+        let lock = self
+            .busy_lock
+            .lock()
+            .await
+            .take()
+            .expect("background-write lock is held");
+        lock.transaction
+            .rollback()
+            .await
+            .expect("release degraded fixture SQLite writer lock");
+        drop(lock.legacy_connections);
+    }
+
+    pub async fn install_non_transient_event_failure(&self) {
+        sqlx::query(
+            "CREATE TABLE degraded_failure_switch (enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)))",
+        )
+        .execute(self.store.pool())
+        .await
+        .expect("create non-transient degraded failure switch");
+        sqlx::query("INSERT INTO degraded_failure_switch (enabled) VALUES (1)")
+            .execute(self.store.pool())
+            .await
+            .expect("enable non-transient degraded failure");
+        sqlx::query(
+            "CREATE TRIGGER fail_degraded_events BEFORE INSERT ON task_events \
+             WHEN NEW.kind IN ('task.completed', 'task.cancelled', 'task.failed', 'task.interrupted') \
+             AND EXISTS (SELECT 1 FROM degraded_failure_switch WHERE enabled = 1) \
+             BEGIN SELECT RAISE(ABORT, 'injected non-transient failure'); END",
+        )
+        .execute(self.store.pool())
+        .await
+        .expect("install non-transient degraded failure");
+    }
+
+    pub async fn remove_non_transient_event_failure(&self) {
+        sqlx::query("UPDATE degraded_failure_switch SET enabled = 0")
+            .execute(self.store.pool())
+            .await
+            .expect("disable non-transient degraded failure");
+    }
+
+    pub async fn wait_for_state(&self, expected: ServiceState) {
+        let mut state = self.state.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state.borrow().state == expected {
+                    return;
+                }
+                state
+                    .changed()
+                    .await
+                    .expect("service-state sender remains open");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "service state did not reach {expected:?}; current={:?}",
+                self.state.current()
+            )
+        });
+    }
+
+    pub async fn load(&self, task_id: TaskId) -> Task {
+        self.store
+            .task_detail(task_id)
+            .await
+            .expect("load degraded fixture task")
+            .expect("degraded fixture task exists")
+            .task
+    }
+
+    pub async fn next_recovery(&self) -> DegradedRecoveryResult {
+        self.recovery_results
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("degraded recovery result is published")
+    }
+
+    pub fn database_path(&self) -> &std::path::Path {
+        &self.database_path
+    }
+
+    async fn create_task(&self, prompt: &str) -> Task {
+        self.writer
+            .create_task(new_task(self.repository.id, prompt), deadline())
+            .await
+            .expect("create degraded fixture task")
+            .value
+            .task()
+            .clone()
+    }
+
+    async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self.load(task_id).await.status == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("task {task_id} did not reach {expected:?}"));
     }
 }
 

@@ -9,11 +9,15 @@ use coding_agent_domain::{
 use coding_agent_store::{
     AppendEventOutcome, Store, StoreError, TaskTransition, TransitionOutcome,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ServiceState, ServiceStateController, StoreWriterError, StoreWriterHandle};
+use crate::{
+    DegradedCoordinator, DegradedCoordinatorError, DegradedRecoveryResult, EventDispatcherHandle,
+    PendingDurableResult, ServiceState, ServiceStateController, StoreWriterError,
+    StoreWriterHandle,
+};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 const BACKGROUND_WRITE_BUDGET: Duration = Duration::from_secs(5);
@@ -143,12 +147,14 @@ pub enum TaskManagerError {
 #[derive(Clone)]
 pub struct TaskManagerHandle {
     sender: mpsc::Sender<TaskManagerMessage>,
+    degraded_recoveries: broadcast::Sender<DegradedRecoveryResult>,
 }
 
 impl TaskManagerHandle {
     pub fn spawn(
         store: Store,
         writer: StoreWriterHandle,
+        dispatcher: EventDispatcherHandle,
         service_state: ServiceStateController,
         runner: Arc<dyn TaskRunner>,
         concurrency: usize,
@@ -160,6 +166,13 @@ impl TaskManagerHandle {
             "task-manager channel capacity must be positive"
         );
         let (sender, receiver) = mpsc::channel(capacity);
+        let coordinator = DegradedCoordinator::new(
+            writer.clone(),
+            dispatcher,
+            service_state.clone(),
+            sender.downgrade(),
+        );
+        let (degraded_recoveries, _) = broadcast::channel(16);
         let actor = TaskManager {
             store,
             writer,
@@ -169,6 +182,9 @@ impl TaskManagerHandle {
             sender: sender.clone(),
             receiver,
             active: HashMap::new(),
+            coordinator,
+            degraded_recoveries: degraded_recoveries.clone(),
+            pending_durable_results: Vec::new(),
             scan_requested: false,
             degraded: false,
             frozen: false,
@@ -178,25 +194,39 @@ impl TaskManagerHandle {
             claim_hooks: None,
         };
         tokio::spawn(actor.run());
-        Self { sender }
+        Self {
+            sender,
+            degraded_recoveries,
+        }
     }
 
     #[cfg(test)]
     fn spawn_with_claim_hooks(
-        store: Store,
-        writer: StoreWriterHandle,
-        service_state: ServiceStateController,
+        runtime: (
+            Store,
+            StoreWriterHandle,
+            EventDispatcherHandle,
+            ServiceStateController,
+        ),
         runner: Arc<dyn TaskRunner>,
         concurrency: usize,
         capacity: usize,
         claim_hooks: Arc<ClaimTestHooks>,
     ) -> Self {
+        let (store, writer, dispatcher, service_state) = runtime;
         assert!(concurrency > 0, "task-manager concurrency must be positive");
         assert!(
             capacity > 0,
             "task-manager channel capacity must be positive"
         );
         let (sender, receiver) = mpsc::channel(capacity);
+        let coordinator = DegradedCoordinator::new(
+            writer.clone(),
+            dispatcher,
+            service_state.clone(),
+            sender.downgrade(),
+        );
+        let (degraded_recoveries, _) = broadcast::channel(16);
         let actor = TaskManager {
             store,
             writer,
@@ -206,6 +236,9 @@ impl TaskManagerHandle {
             sender: sender.clone(),
             receiver,
             active: HashMap::new(),
+            coordinator,
+            degraded_recoveries: degraded_recoveries.clone(),
+            pending_durable_results: Vec::new(),
             scan_requested: false,
             degraded: false,
             frozen: false,
@@ -214,7 +247,14 @@ impl TaskManagerHandle {
             claim_hooks: Some(claim_hooks),
         };
         tokio::spawn(actor.run());
-        Self { sender }
+        Self {
+            sender,
+            degraded_recoveries,
+        }
+    }
+
+    pub fn subscribe_degraded_recovery(&self) -> broadcast::Receiver<DegradedRecoveryResult> {
+        self.degraded_recoveries.subscribe()
     }
 
     pub async fn notify_queued(&self, task_id: TaskId) -> Result<(), TaskManagerError> {
@@ -252,7 +292,7 @@ impl TaskManagerHandle {
     }
 }
 
-enum TaskManagerMessage {
+pub(crate) enum TaskManagerMessage {
     NotifyQueued {
         _task_id: TaskId,
         response: oneshot::Sender<Result<(), TaskManagerError>>,
@@ -269,6 +309,10 @@ enum TaskManagerMessage {
     RunnerFinished {
         task_id: TaskId,
         outcome: RunnerOutcome,
+    },
+    FinalizeDegraded {
+        recovery: coding_agent_store::RecoveryOutcome,
+        response: oneshot::Sender<Result<DegradedRecoveryResult, DegradedCoordinatorError>>,
     },
     Quiesce {
         deadline: Instant,
@@ -292,6 +336,9 @@ struct TaskManager {
     sender: mpsc::Sender<TaskManagerMessage>,
     receiver: mpsc::Receiver<TaskManagerMessage>,
     active: HashMap<TaskId, ActiveRunner>,
+    coordinator: DegradedCoordinator,
+    degraded_recoveries: broadcast::Sender<DegradedRecoveryResult>,
+    pending_durable_results: Vec<PendingDurableResult>,
     scan_requested: bool,
     degraded: bool,
     frozen: bool,
@@ -357,6 +404,10 @@ impl TaskManager {
             }
             TaskManagerMessage::RunnerFinished { task_id, outcome } => {
                 self.finish_runner(task_id, outcome).await;
+            }
+            TaskManagerMessage::FinalizeDegraded { recovery, response } => {
+                let result = self.finalize_degraded(recovery);
+                let _ = response.send(result);
             }
             TaskManagerMessage::Quiesce { deadline, response } => {
                 let result = self.quiesce(deadline).await;
@@ -559,13 +610,24 @@ impl TaskManager {
         task_id: TaskId,
         event: RunnerEvent,
     ) -> Result<EventId, RunnerEventError> {
-        if self.frozen || self.degraded || self.service_state.current().state != ServiceState::Ready
-        {
+        if self.frozen {
+            return Err(RunnerEventError::StoreDegraded);
+        }
+        if self.degraded {
+            self.pending_durable_results
+                .push(PendingDurableResult::RunnerEvent { task_id, event });
+            return Err(RunnerEventError::StoreDegraded);
+        }
+        if self.service_state.current().state != ServiceState::Ready {
             return Err(RunnerEventError::StoreDegraded);
         }
         if !self.active.contains_key(&task_id) {
             return Err(RunnerEventError::TaskNotRunning);
         }
+        let pending = PendingDurableResult::RunnerEvent {
+            task_id,
+            event: event.clone(),
+        };
         let receipt = self
             .writer
             .append_running_event(task_id, event.into_payload(), background_deadline())
@@ -577,7 +639,7 @@ impl TaskManager {
             },
             Err(error) => {
                 tracing::error!(task_id = %task_id, error = %error, "runner event persistence failed");
-                self.enter_degraded();
+                self.enter_degraded(pending);
                 Err(RunnerEventError::StoreDegraded)
             }
         }
@@ -591,6 +653,16 @@ impl TaskManager {
             self.remove_active(task_id);
             return;
         }
+        if self.degraded {
+            self.pending_durable_results
+                .push(PendingDurableResult::RunnerTerminal { task_id, outcome });
+            self.remove_active(task_id);
+            return;
+        }
+        let pending = PendingDurableResult::RunnerTerminal {
+            task_id,
+            outcome: outcome.clone(),
+        };
         let transition = match outcome {
             RunnerOutcome::Succeeded => TaskTransition::Completed,
             RunnerOutcome::Cancelled => TaskTransition::Cancelled,
@@ -613,7 +685,7 @@ impl TaskManager {
             }
             Err(error) => {
                 tracing::error!(task_id = %task_id, error = %error, "runner result persistence failed");
-                self.enter_degraded();
+                self.enter_degraded(pending);
             }
         }
         self.remove_active(task_id);
@@ -681,13 +753,56 @@ impl TaskManager {
         }
     }
 
-    fn enter_degraded(&mut self) {
+    fn enter_degraded(&mut self, pending: PendingDurableResult) {
+        self.pending_durable_results.push(pending);
+        if self.degraded {
+            return;
+        }
         self.degraded = true;
         self.scan_requested = false;
         let _ = self.service_state.set(ServiceState::StoreDegraded);
         for active in self.active.values() {
             active.cancellation.cancel();
         }
+        let coordinator = self.coordinator.clone();
+        tokio::spawn(async move {
+            if let Err(error) = coordinator.run().await
+                && error != DegradedCoordinatorError::Quiescing
+            {
+                tracing::error!(error = %error, "degraded recovery coordinator stopped");
+            }
+        });
+    }
+
+    fn finalize_degraded(
+        &mut self,
+        recovery: coding_agent_store::RecoveryOutcome,
+    ) -> Result<DegradedRecoveryResult, DegradedCoordinatorError> {
+        if self.frozen || self.service_state.current().state == ServiceState::Quiescing {
+            return Err(DegradedCoordinatorError::Quiescing);
+        }
+        if !self.degraded {
+            return Err(DegradedCoordinatorError::ManagerClosed);
+        }
+        let pending = std::mem::take(&mut self.pending_durable_results);
+        self.degraded = false;
+        self.scan_requested = true;
+        let ready = match self.service_state.set(ServiceState::Ready) {
+            Ok(ready) => ready,
+            Err(_) => {
+                self.pending_durable_results = pending;
+                self.degraded = true;
+                self.scan_requested = false;
+                return Err(DegradedCoordinatorError::Quiescing);
+            }
+        };
+        let result = DegradedRecoveryResult {
+            recovery,
+            discarded_pending_count: pending.len(),
+            ready_generation: ready.generation,
+        };
+        let _ = self.degraded_recoveries.send(result.clone());
+        Ok(result)
     }
 
     fn claims_allowed(&self) -> bool {
@@ -770,7 +885,7 @@ fn shutdown_failure() -> TaskFailure {
     }
 }
 
-fn current_timestamp() -> Result<UtcTimestamp, &'static str> {
+pub(crate) fn current_timestamp() -> Result<UtcTimestamp, &'static str> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "system clock predates the Unix epoch")?;
@@ -820,12 +935,6 @@ mod tests {
 
     use super::*;
     use crate::{FakeRunnerConfig, FakeTaskRunner};
-
-    struct NoopWake;
-
-    impl crate::EventWake for NoopWake {
-        fn wake(&self) {}
-    }
 
     #[derive(Default)]
     struct CancellingRunner {
@@ -956,13 +1065,19 @@ mod tests {
                 .expect("open claim-pause store");
             store.migrate().await.expect("migrate claim-pause store");
             let repository = register_repository(&store, temp_dir.path().to_path_buf()).await;
-            let writer = StoreWriterHandle::spawn(store.clone(), Arc::new(NoopWake), 8);
+            let dispatcher = EventDispatcherHandle::spawn(store.clone(), 64)
+                .await
+                .expect("spawn claim-pause dispatcher");
+            let writer = StoreWriterHandle::spawn(store.clone(), Arc::new(dispatcher.clone()), 8);
             let runner = Arc::new(CancellingRunner::default());
             let hooks = Arc::new(ClaimTestHooks::new(phase));
             let manager = TaskManagerHandle::spawn_with_claim_hooks(
-                store.clone(),
-                writer.clone(),
-                ServiceStateController::new(ServiceState::Ready),
+                (
+                    store.clone(),
+                    writer.clone(),
+                    dispatcher,
+                    ServiceStateController::new(ServiceState::Ready),
+                ),
                 runner.clone(),
                 1,
                 8,
