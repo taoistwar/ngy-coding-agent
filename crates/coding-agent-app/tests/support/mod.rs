@@ -9,10 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coding_agent_app::{
-    CancelOutcome, CommandRunner, DegradedRecoveryResult, EventDispatcherHandle, EventWake,
-    FakeRunnerConfig, FakeTaskRunner, LaunchToken, RunContext, RunnerEvent, RunnerEventError,
-    RunnerEventSink, RunnerOutcome, SecurityClock, SecurityManager, SecuritySeed, ServiceState,
-    ServiceStateController, StoreWriterHandle, TaskManagerHandle, TaskRunner,
+    BrowserLaunchError, BrowserLauncher, BrowserOpener, CancelOutcome, CommandRunner,
+    DegradedRecoveryResult, EventDispatcherHandle, EventWake, FakeRunnerConfig, FakeTaskRunner,
+    LaunchToken, ListenerFactory, NativeMessageSink, PlatformPaths, RunContext, RunnerEvent,
+    RunnerEventError, RunnerEventSink, RunnerOutcome, SecurityClock, SecurityManager, SecuritySeed,
+    ServiceState, ServiceStateController, StartupDependencies, StartupPaths, StoreFactory,
+    StoreWriterHandle, TaskManagerHandle, TaskRunner, WallClock,
 };
 #[cfg(feature = "test-support")]
 use coding_agent_app::{FakeScenario, ScriptedFakeRunner};
@@ -79,6 +81,209 @@ impl SecurityFixture {
             public_origin,
             expected_host,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StartupBehavior {
+    pub prepare_error: Option<io::ErrorKind>,
+    pub panic_on_store_open: bool,
+    pub browser_fails: bool,
+    pub listener_failures: usize,
+}
+
+#[derive(Default)]
+pub struct StartupCalls {
+    store_opens: AtomicUsize,
+    listener_binds: AtomicUsize,
+    browser_urls: Mutex<Vec<String>>,
+    messages: Mutex<Vec<(String, String)>>,
+}
+
+impl StartupCalls {
+    pub fn store_opens(&self) -> usize {
+        self.store_opens.load(Ordering::SeqCst)
+    }
+
+    pub fn listener_binds(&self) -> usize {
+        self.listener_binds.load(Ordering::SeqCst)
+    }
+
+    pub fn browser_urls(&self) -> Vec<String> {
+        self.browser_urls
+            .lock()
+            .expect("lock startup browser URLs")
+            .clone()
+    }
+
+    pub fn messages(&self) -> Vec<(String, String)> {
+        self.messages.lock().expect("lock startup messages").clone()
+    }
+}
+
+pub struct StartupFixture {
+    pub paths: PlatformPaths,
+    pub calls: Arc<StartupCalls>,
+    _temp: Arc<TempDir>,
+}
+
+impl StartupFixture {
+    pub fn new() -> Self {
+        let temp = Arc::new(tempfile::tempdir().expect("create startup fixture"));
+        let paths = PlatformPaths::new(temp.path().join("data"), temp.path().join("runtime"));
+        Self {
+            paths,
+            calls: Arc::new(StartupCalls::default()),
+            _temp: temp,
+        }
+    }
+
+    pub fn prepare(&self) {
+        self.paths.prepare().expect("prepare startup fixture paths");
+    }
+
+    pub fn dependencies(&self, behavior: StartupBehavior) -> StartupDependencies {
+        StartupDependencies {
+            paths: Arc::new(FixedStartupPaths {
+                paths: self.paths.clone(),
+                prepare_error: behavior.prepare_error,
+            }),
+            stores: Arc::new(CountingStoreFactory {
+                calls: self.calls.clone(),
+                panic_on_open: behavior.panic_on_store_open,
+            }),
+            listeners: Arc::new(CountingListenerFactory {
+                calls: self.calls.clone(),
+                failures_remaining: Mutex::new(behavior.listener_failures),
+            }),
+            browser: Arc::new(RecordingBrowser {
+                calls: self.calls.clone(),
+                fails: behavior.browser_fails,
+            }),
+            messages: Arc::new(RecordingMessages {
+                calls: self.calls.clone(),
+            }),
+            wall_clock: Arc::new(FixedWallClock),
+            security_clock: Arc::new(FakeSecurityClock::new()),
+            runner: Arc::new(FakeTaskRunner::default()),
+            dialog: None,
+        }
+    }
+}
+
+impl Default for StartupFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct FixedStartupPaths {
+    paths: PlatformPaths,
+    prepare_error: Option<io::ErrorKind>,
+}
+
+impl StartupPaths for FixedStartupPaths {
+    fn discover(&self) -> io::Result<PlatformPaths> {
+        Ok(self.paths.clone())
+    }
+
+    fn prepare(&self, paths: &PlatformPaths) -> io::Result<()> {
+        if let Some(kind) = self.prepare_error {
+            return Err(io::Error::new(kind, "injected path preparation failure"));
+        }
+        paths.prepare()
+    }
+}
+
+struct CountingStoreFactory {
+    calls: Arc<StartupCalls>,
+    panic_on_open: bool,
+}
+
+#[async_trait::async_trait]
+impl StoreFactory for CountingStoreFactory {
+    async fn open(&self, path: &Path) -> Result<Store, coding_agent_store::StoreError> {
+        self.calls.store_opens.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.panic_on_open,
+            "secondary startup must never construct a Store"
+        );
+        Store::open(path).await
+    }
+}
+
+struct CountingListenerFactory {
+    calls: Arc<StartupCalls>,
+    failures_remaining: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl ListenerFactory for CountingListenerFactory {
+    async fn bind(&self, address: std::net::SocketAddrV4) -> io::Result<tokio::net::TcpListener> {
+        self.calls.listener_binds.fetch_add(1, Ordering::SeqCst);
+        let should_fail = {
+            let mut remaining = self
+                .failures_remaining
+                .lock()
+                .expect("lock listener failure script");
+            if *remaining == 0 {
+                false
+            } else {
+                *remaining -= 1;
+                true
+            }
+        };
+        if should_fail {
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "injected listener bind failure",
+            ))
+        } else {
+            tokio::net::TcpListener::bind(address).await
+        }
+    }
+}
+
+struct RecordingBrowser {
+    calls: Arc<StartupCalls>,
+    fails: bool,
+}
+
+impl BrowserOpener for RecordingBrowser {
+    fn open(&self, port: u16, token: &str) -> Result<(), BrowserLaunchError> {
+        let url = BrowserLauncher::url(port, token);
+        self.calls
+            .browser_urls
+            .lock()
+            .expect("lock startup browser URLs")
+            .push(url.clone());
+        if self.fails {
+            Err(BrowserLaunchError::for_url(url))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct RecordingMessages {
+    calls: Arc<StartupCalls>,
+}
+
+impl NativeMessageSink for RecordingMessages {
+    fn show_error(&self, title: &'static str, body: String) {
+        self.calls
+            .messages
+            .lock()
+            .expect("lock startup messages")
+            .push((title.to_owned(), body));
+    }
+}
+
+pub struct FixedWallClock;
+
+impl WallClock for FixedWallClock {
+    fn now_utc(&self) -> time::OffsetDateTime {
+        time::macros::datetime!(2026-07-15 00:00 UTC)
     }
 }
 

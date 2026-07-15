@@ -14,7 +14,7 @@ use http::{HeaderName, HeaderValue, StatusCode, Uri};
 use subtle::{Choice, ConstantTimeEq};
 
 const SECRET_BYTES: usize = 32;
-const LAUNCH_TOKEN_LIFETIME: Duration = Duration::from_secs(120);
+pub(crate) const LAUNCH_TOKEN_LIFETIME: Duration = Duration::from_secs(120);
 const SESSION_COOKIE_NAME: &str = "coding_agent_session";
 const CSRF_HEADER: HeaderName = HeaderName::from_static("x-csrf-token");
 const LAUNCHER_SECRET_HEADER: HeaderName = HeaderName::from_static("x-launcher-secret");

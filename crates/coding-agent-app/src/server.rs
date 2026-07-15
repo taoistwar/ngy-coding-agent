@@ -3,11 +3,16 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::extract::{Request, State};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use coding_agent_api::{
-    AddRepositoryRequest, ApiBackend, ApiError, ApiResult, AuthContext, BootstrapResponse,
-    CancelResult, CreateResult, CreateTaskRequest, LiveEventStream, QuitAcceptance, RepositoryDto,
-    ServiceStateControl, ServiceStateDto, ServiceStateStream, SseBackend, TaskDetailDto, TaskDto,
-    TaskEventDto,
+    AddRepositoryRequest, ApiBackend, ApiError, ApiErrorResponse, ApiResult, AuthContext,
+    BootstrapResponse, CancelResult, CreateResult, CreateTaskRequest, LiveEventStream,
+    QuitAcceptance, RepositoryDto, ServiceStateControl, ServiceStateDto, ServiceStateStream,
+    SseBackend, TaskDetailDto, TaskDto, TaskEventDto,
 };
 use coding_agent_domain::{
     CanonicalPath, DomainError, EventCursor, NewRepository, NewTask, RepositoryId, TaskId,
@@ -16,16 +21,206 @@ use coding_agent_domain::{
 use coding_agent_store::{
     CreateTaskOutcome, RegisterRepositoryOutcome, RetryTaskOutcome, Store, StoreError,
 };
-use http::StatusCode;
+use http::{HeaderValue, StatusCode};
+use serde::Serialize;
 use tokio::sync::Notify;
 use tokio::time::Instant;
+use uuid::Uuid;
 
+use crate::security::LAUNCH_TOKEN_LIFETIME;
 use crate::store_writer::sqlite_code_is_retryable;
 use crate::{
     CancelOutcome, EventDispatcherHandle, NativeDialogService, PickerError, RepositoryDiscovery,
-    RepositoryDiscoveryError, SecurityManager, ServiceState, ServiceStateController,
-    StoreWriterError, StoreWriterHandle, TaskManagerError, TaskManagerHandle,
+    RepositoryDiscoveryError, SecurityManager, ServiceState, ServiceStateController, StartupPhase,
+    StartupPhaseController, StoreWriterError, StoreWriterHandle, TaskManagerError,
+    TaskManagerHandle, WallClock,
 };
+
+const REQUEST_ID_HEADER: &str = "x-request-id";
+const LOCAL_READY_PATH: &str = "/_local/ready";
+const LOCAL_REOPEN_PATH: &str = "/_local/reopen";
+
+#[derive(Clone)]
+struct RuntimeRouterState {
+    instance_id: Uuid,
+    phase: StartupPhaseController,
+    security: SecurityManager,
+    wall_clock: Arc<dyn WallClock>,
+}
+
+#[derive(Clone)]
+struct RuntimeRequestId(String);
+
+#[derive(Serialize)]
+struct ReadyResponse {
+    instance_id: Uuid,
+    state: StartupPhase,
+}
+
+#[derive(Serialize)]
+struct ReopenResponse {
+    url: String,
+    expires_at: String,
+}
+
+/// Wraps the business API with the process-local startup and launcher endpoints.
+///
+/// The guard is deliberately outside the supplied API router: every request, including
+/// requests rejected while the process is starting, must pass exact Host validation.
+pub fn build_runtime_router(
+    api_router: Router,
+    instance_id: Uuid,
+    phase: StartupPhaseController,
+    security: SecurityManager,
+    wall_clock: Arc<dyn WallClock>,
+) -> Router {
+    let state = RuntimeRouterState {
+        instance_id,
+        phase,
+        security,
+        wall_clock,
+    };
+    let local_router = Router::new()
+        .route(LOCAL_READY_PATH, get(local_ready))
+        .route(LOCAL_REOPEN_PATH, post(local_reopen))
+        .with_state(state.clone());
+
+    local_router
+        .merge(api_router)
+        .layer(middleware::from_fn_with_state(state, runtime_guard))
+}
+
+async fn runtime_guard(
+    State(state): State<RuntimeRouterState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let request_id = choose_runtime_request_id(request.headers());
+    request
+        .extensions_mut()
+        .insert(RuntimeRequestId(request_id.clone()));
+    let (parts, body) = request.into_parts();
+    let host_result = state.security.validate_host(&parts);
+    let local_startup_path = matches!(parts.uri.path(), LOCAL_READY_PATH | LOCAL_REOPEN_PATH);
+    let request = Request::from_parts(parts, body);
+
+    let response = if let Err(error) = host_result {
+        runtime_error_response(error, &request_id)
+    } else if state.phase.current() == StartupPhase::Starting && !local_startup_path {
+        runtime_error_response(app_starting(), &request_id)
+    } else {
+        next.run(request).await
+    };
+
+    with_request_id(response, &request_id)
+}
+
+async fn local_ready(State(state): State<RuntimeRouterState>, request: Request) -> Response {
+    let request_id = runtime_request_id(&request);
+    let (parts, _) = request.into_parts();
+    if let Err(error) = state.security.authorize_launcher(&parts) {
+        return runtime_error_response(error, &request_id);
+    }
+    Json(ReadyResponse {
+        instance_id: state.instance_id,
+        state: state.phase.current(),
+    })
+    .into_response()
+}
+
+async fn local_reopen(State(state): State<RuntimeRouterState>, request: Request) -> Response {
+    let request_id = runtime_request_id(&request);
+    let (parts, _) = request.into_parts();
+    if let Err(error) = state.security.authorize_launcher(&parts) {
+        return runtime_error_response(error, &request_id);
+    }
+    if state.phase.current() != StartupPhase::Ready {
+        return runtime_error_response(app_starting(), &request_id);
+    }
+
+    // Build the externally reported deadline before issuing the token. This makes the
+    // advertised lifetime no longer than the monotonic two-minute security lifetime.
+    let expires_at = match UtcTimestamp::new(
+        state
+            .wall_clock
+            .now_utc()
+            .saturating_add(time::Duration::seconds(
+                i64::try_from(LAUNCH_TOKEN_LIFETIME.as_secs())
+                    .expect("launch-token lifetime fits an i64"),
+            )),
+    ) {
+        Ok(value) => value.to_string(),
+        Err(_) => return runtime_error_response(internal_error(), &request_id),
+    };
+    let token = match state.security.issue_launch_token() {
+        Ok(token) => token,
+        Err(_) => {
+            return runtime_error_response(
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "SECURITY_RANDOM_UNAVAILABLE",
+                    "secure random generation is temporarily unavailable",
+                    false,
+                ),
+                &request_id,
+            );
+        }
+    };
+    Json(ReopenResponse {
+        url: format!(
+            "{}/#token={}",
+            state.security.public_origin(),
+            token.as_str()
+        ),
+        expires_at,
+    })
+    .into_response()
+}
+
+fn runtime_request_id(request: &Request) -> String {
+    request
+        .extensions()
+        .get::<RuntimeRequestId>()
+        .map(|value| value.0.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn choose_runtime_request_id(headers: &http::HeaderMap) -> String {
+    let mut values = headers.get_all(REQUEST_ID_HEADER).iter();
+    let first = values.next();
+    let only_one = values.next().is_none();
+    first
+        .filter(|_| only_one)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok().map(|id| (value, id)))
+        .filter(|(value, id)| *value == id.to_string())
+        .map(|(_, id)| id.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn runtime_error_response(error: ApiError, request_id: &str) -> Response {
+    (
+        error.status,
+        Json(ApiErrorResponse {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+            request_id: request_id.to_owned(),
+            details: error.details,
+        }),
+    )
+        .into_response()
+}
+
+fn with_request_id(mut response: Response, request_id: &str) -> Response {
+    if !response.headers().contains_key(REQUEST_ID_HEADER) {
+        response.headers_mut().insert(
+            REQUEST_ID_HEADER,
+            HeaderValue::from_str(request_id).expect("UUID request ID is a valid header"),
+        );
+    }
+    response
+}
 
 #[derive(Clone)]
 pub struct MutationGate {
@@ -712,6 +907,15 @@ fn app_shutting_down() -> ApiError {
     )
 }
 
+fn app_starting() -> ApiError {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "APP_STARTING",
+        "the application is starting",
+        true,
+    )
+}
+
 fn internal_error() -> ApiError {
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -737,7 +941,86 @@ fn log_failure(operation: &'static str, error: &ApiError) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use http::Method;
+    use http_body_util::BodyExt as _;
+    use serde_json::{Value, json};
+    use tower::ServiceExt as _;
+
+    use crate::{SecuritySeed, SystemSecurityClock, SystemWallClock};
+
     use super::*;
+
+    struct RuntimeFixture {
+        router: Router,
+        phase: StartupPhaseController,
+        security: SecurityManager,
+        instance_id: Uuid,
+        host: String,
+        launcher_secret: String,
+    }
+
+    impl RuntimeFixture {
+        fn new() -> Self {
+            let instance_id = Uuid::new_v4();
+            let host = "127.0.0.1:43121".to_owned();
+            let seed = SecuritySeed::generate().expect("generate runtime secrets");
+            let launcher_secret = seed.launcher_secret().as_str().to_owned();
+            let security = SecurityManager::from_seed(
+                seed,
+                format!("http://{host}"),
+                Arc::new(SystemSecurityClock),
+            )
+            .expect("construct runtime security");
+            let phase = StartupPhaseController::new();
+            let api_router =
+                Router::new().route("/api/ping", get(|| async { StatusCode::NO_CONTENT }));
+            let router = build_runtime_router(
+                api_router,
+                instance_id,
+                phase.clone(),
+                security.clone(),
+                Arc::new(SystemWallClock),
+            );
+            Self {
+                router,
+                phase,
+                security,
+                instance_id,
+                host,
+                launcher_secret,
+            }
+        }
+
+        fn request(&self, method: Method, path: &str) -> http::Request<Body> {
+            http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(http::header::HOST, &self.host)
+                .header("x-launcher-secret", &self.launcher_secret)
+                .body(Body::empty())
+                .expect("build runtime request")
+        }
+    }
+
+    async fn json_body(response: Response) -> Value {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect response body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("decode response JSON")
+    }
+
+    async fn error_code(response: Response) -> String {
+        json_body(response).await["code"]
+            .as_str()
+            .expect("error code is a string")
+            .to_owned()
+    }
 
     #[test]
     fn sqlite_busy_codes_map_to_the_retryable_store_busy_contract() {
@@ -761,5 +1044,146 @@ mod tests {
         assert_eq!(pool_timeout.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(pool_timeout.code, "INTERNAL_ERROR");
         assert!(!pool_timeout.retryable);
+    }
+
+    #[tokio::test]
+    async fn starting_ready_probe_returns_only_instance_and_phase() {
+        let fixture = RuntimeFixture::new();
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(fixture.request(Method::GET, LOCAL_READY_PATH))
+            .await
+            .expect("call ready probe");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(REQUEST_ID_HEADER));
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+        let body = json_body(response).await;
+        assert_eq!(body.as_object().expect("ready object").len(), 2);
+        assert_eq!(body["instance_id"], json!(fixture.instance_id));
+        assert_eq!(body["state"], "starting");
+    }
+
+    #[tokio::test]
+    async fn starting_blocks_reopen_and_api_after_exact_host_validation() {
+        let fixture = RuntimeFixture::new();
+        let reopen = fixture
+            .router
+            .clone()
+            .oneshot(fixture.request(Method::POST, LOCAL_REOPEN_PATH))
+            .await
+            .expect("call reopen while starting");
+        assert_eq!(reopen.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(reopen).await, "APP_STARTING");
+
+        let api = fixture
+            .router
+            .clone()
+            .oneshot(fixture.request(Method::GET, "/api/ping"))
+            .await
+            .expect("call API while starting");
+        assert_eq!(api.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(api).await, "APP_STARTING");
+
+        let wrong_host = http::Request::builder()
+            .uri("/api/ping")
+            .header(http::header::HOST, "localhost:43121")
+            .body(Body::empty())
+            .expect("build wrong-host request");
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(wrong_host)
+            .await
+            .expect("call API with wrong Host");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error_code(response).await, "SECURITY_INVALID_HOST");
+    }
+
+    #[tokio::test]
+    async fn launcher_endpoints_reject_wrong_or_duplicated_security_headers() {
+        let fixture = RuntimeFixture::new();
+        let wrong_secret = http::Request::builder()
+            .uri(LOCAL_READY_PATH)
+            .header(http::header::HOST, &fixture.host)
+            .header("x-launcher-secret", "not-a-valid-secret")
+            .body(Body::empty())
+            .expect("build wrong-secret request");
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(wrong_secret)
+            .await
+            .expect("call with wrong launcher secret");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            error_code(response).await,
+            "SECURITY_INVALID_LAUNCHER_SECRET"
+        );
+
+        let mut duplicated = fixture.request(Method::GET, LOCAL_READY_PATH);
+        duplicated.headers_mut().append(
+            "x-launcher-secret",
+            HeaderValue::from_str(&fixture.launcher_secret).expect("launcher header value"),
+        );
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(duplicated)
+            .await
+            .expect("call with duplicate launcher secret");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(response).await, "SECURITY_DUPLICATE_HEADER");
+    }
+
+    #[tokio::test]
+    async fn ready_reopen_issues_a_fresh_two_minute_fragment_url_and_opens_api_gate() {
+        let fixture = RuntimeFixture::new();
+        assert!(fixture.phase.mark_ready());
+        let requested_at = time::OffsetDateTime::now_utc();
+
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(fixture.request(Method::POST, LOCAL_REOPEN_PATH))
+            .await
+            .expect("call ready reopen");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body.as_object().expect("reopen object").len(), 2);
+        let url = body["url"].as_str().expect("fragment URL");
+        let expected_prefix = format!("{}/#token=", fixture.security.public_origin());
+        let token = url
+            .strip_prefix(&expected_prefix)
+            .expect("URL uses exact public origin and token fragment");
+        assert!(!token.is_empty());
+        let expires_at = UtcTimestamp::parse_rfc3339(
+            body["expires_at"]
+                .as_str()
+                .expect("RFC3339 expiration string"),
+        )
+        .expect("parse RFC3339 expiration");
+        let observed_at = time::OffsetDateTime::now_utc();
+        assert!(
+            expires_at.as_offset_date_time()
+                >= requested_at.saturating_add(time::Duration::seconds(119))
+        );
+        assert!(
+            expires_at.as_offset_date_time()
+                <= observed_at.saturating_add(time::Duration::seconds(121))
+        );
+
+        let api = fixture
+            .router
+            .clone()
+            .oneshot(fixture.request(Method::GET, "/api/ping"))
+            .await
+            .expect("call API after ready");
+        assert_eq!(api.status(), StatusCode::NO_CONTENT);
     }
 }

@@ -11,6 +11,9 @@
 
 mod event_dispatcher;
 mod fake_runner;
+mod local_client;
+#[cfg(target_os = "macos")]
+mod macos_acl;
 mod native_dialog;
 mod platform;
 mod repository_service;
@@ -18,6 +21,7 @@ mod security;
 mod server;
 mod service_state;
 mod shutdown;
+mod single_instance;
 mod store_writer;
 mod task_manager;
 
@@ -28,7 +32,9 @@ pub use fake_runner::{FakeScenario, ScriptedFakeRunner};
 #[cfg(target_os = "macos")]
 pub use native_dialog::NativeDialogMainThreadHost;
 pub use native_dialog::{NativeDialogService, PickerError};
-pub use platform::{BrowserLaunchError, BrowserLauncher, PlatformPaths, PrivateFile};
+pub use platform::{
+    BrowserLaunchError, BrowserLauncher, PlatformPaths, PrivateFile, SystemWallClock, WallClock,
+};
 pub use repository_service::{
     CommandRunner, DiscoveredRepository, RepositoryDiscovery, RepositoryDiscoveryError,
 };
@@ -36,12 +42,17 @@ pub use security::{
     LaunchToken, LauncherSecret, SecurityClock, SecurityError, SecurityManager, SecuritySeed,
     SessionRecord, SystemSecurityClock,
 };
-pub use server::{ApplicationBackend, MutationGate, MutationGuard};
+pub use server::{ApplicationBackend, MutationGate, MutationGuard, build_runtime_router};
 pub use service_state::{
     InvalidServiceTransition, ServiceState, ServiceStateController, ServiceStateSnapshot,
 };
 pub use shutdown::{
     DegradedCoordinator, DegradedCoordinatorError, DegradedRecoveryResult, PendingDurableResult,
+};
+pub use single_instance::{
+    BrowserOpener, InstanceLock, ListenerFactory, NativeMessageSink, PrimaryRuntime,
+    RuntimeDescriptor, RuntimeDescriptorError, SecondaryRuntime, StartupDependencies, StartupError,
+    StartupOutcome, StartupPaths, StartupPhase, StartupPhaseController, StoreFactory, launch,
 };
 pub use store_writer::{EventWake, StoreWriterError, StoreWriterHandle, WriteReceipt};
 pub use task_manager::{
