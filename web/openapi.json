@@ -1,0 +1,1221 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "coding-agent-api",
+    "description": "",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {},
+  "components": {
+    "schemas": {
+      "ActivityAppendedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ActivityAppendedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/ActivityAppendedPayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ActivityAppendedKind": {
+        "type": "string",
+        "enum": [
+          "activity.appended"
+        ]
+      },
+      "ActivityAppendedPayloadDto": {
+        "type": "object",
+        "required": [
+          "entry"
+        ],
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/ActivityEntryDto"
+          }
+        }
+      },
+      "ActivityEntryDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "level",
+          "message",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "string"
+          },
+          "level": {
+            "$ref": "#/components/schemas/ActivityLevelDto"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "ActivityLevelDto": {
+        "type": "string",
+        "enum": [
+          "info",
+          "warning",
+          "error"
+        ]
+      },
+      "AddRepositoryRequest": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "ApiErrorResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable",
+          "request_id",
+          "details"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BootstrapResponse": {
+        "type": "object",
+        "required": [
+          "csrf_token",
+          "repositories",
+          "tasks",
+          "latest_event_id",
+          "server_started_at",
+          "service_state",
+          "service_state_generation",
+          "max_concurrent_tasks"
+        ],
+        "properties": {
+          "csrf_token": {
+            "type": "string"
+          },
+          "latest_event_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max_concurrent_tasks": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepositoryDto"
+            }
+          },
+          "server_started_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "service_state": {
+            "$ref": "#/components/schemas/ServiceStateDto"
+          },
+          "service_state_generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskDto"
+            }
+          }
+        }
+      },
+      "CancellationAcceptedResponse": {
+        "type": "object",
+        "required": [
+          "task",
+          "cancellation_requested"
+        ],
+        "properties": {
+          "cancellation_requested": {
+            "type": "boolean"
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskDto"
+          }
+        }
+      },
+      "CanonicalPathDto": {
+        "type": "string"
+      },
+      "CreateTaskRequest": {
+        "type": "object",
+        "required": [
+          "client_request_id",
+          "repository_id",
+          "prompt"
+        ],
+        "properties": {
+          "client_request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "repository_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "DiffFileDto": {
+        "type": "object",
+        "required": [
+          "path",
+          "status",
+          "patch",
+          "additions",
+          "deletions"
+        ],
+        "properties": {
+          "additions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "deletions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "patch": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DiffFileStatusDto"
+          }
+        }
+      },
+      "DiffFileStatusDto": {
+        "type": "string",
+        "enum": [
+          "added",
+          "modified",
+          "deleted"
+        ]
+      },
+      "DiffSnapshotDto": {
+        "type": "object",
+        "required": [
+          "revision",
+          "files"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffFileDto"
+            }
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "DiffUpdatedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DiffUpdatedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/DiffUpdatedPayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "DiffUpdatedKind": {
+        "type": "string",
+        "enum": [
+          "diff.updated"
+        ]
+      },
+      "DiffUpdatedPayloadDto": {
+        "type": "object",
+        "required": [
+          "diff"
+        ],
+        "properties": {
+          "diff": {
+            "$ref": "#/components/schemas/DiffSnapshotDto"
+          }
+        }
+      },
+      "PlanItemDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PlanItemStatusDto"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "PlanItemStatusDto": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "running",
+          "completed"
+        ]
+      },
+      "PlanSnapshotDto": {
+        "type": "object",
+        "required": [
+          "revision",
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlanItemDto"
+            }
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "PlanUpdatedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/PlanUpdatedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PlanUpdatedPayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "PlanUpdatedKind": {
+        "type": "string",
+        "enum": [
+          "plan.updated"
+        ]
+      },
+      "PlanUpdatedPayloadDto": {
+        "type": "object",
+        "required": [
+          "plan"
+        ],
+        "properties": {
+          "plan": {
+            "$ref": "#/components/schemas/PlanSnapshotDto"
+          }
+        }
+      },
+      "QuitResponse": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/QuitStatus"
+          }
+        }
+      },
+      "QuitStatus": {
+        "type": "string",
+        "enum": [
+          "shutting_down"
+        ]
+      },
+      "RepositoryDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "selected_path",
+          "display_name",
+          "git_root",
+          "cargo_workspace_root",
+          "created_at",
+          "last_opened_at"
+        ],
+        "properties": {
+          "cargo_workspace_root": {
+            "$ref": "#/components/schemas/CanonicalPathDto"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "git_root": {
+            "$ref": "#/components/schemas/CanonicalPathDto"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_opened_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "selected_path": {
+            "$ref": "#/components/schemas/CanonicalPathDto"
+          }
+        }
+      },
+      "ServiceStateControl": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "kind",
+          "state",
+          "generation"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ServiceStateKind"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/ServiceStateDto"
+          }
+        }
+      },
+      "ServiceStateDto": {
+        "type": "string",
+        "enum": [
+          "ready",
+          "store_degraded",
+          "quiescing"
+        ]
+      },
+      "ServiceStateKind": {
+        "type": "string",
+        "enum": [
+          "service.state"
+        ]
+      },
+      "SessionExchangeRequest": {
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        }
+      },
+      "SseMessage": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TaskEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/StreamResetControl"
+          },
+          {
+            "$ref": "#/components/schemas/ServiceStateControl"
+          }
+        ]
+      },
+      "StreamResetControl": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "kind",
+          "latest_event_id"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/StreamResetKind"
+          },
+          "latest_event_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "StreamResetKind": {
+        "type": "string",
+        "enum": [
+          "stream.reset"
+        ]
+      },
+      "TaskCancelledEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskCancelledKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/TaskLifecyclePayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TaskCancelledKind": {
+        "type": "string",
+        "enum": [
+          "task.cancelled"
+        ]
+      },
+      "TaskCompletedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskCompletedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/TaskLifecyclePayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TaskCompletedKind": {
+        "type": "string",
+        "enum": [
+          "task.completed"
+        ]
+      },
+      "TaskDetailDto": {
+        "type": "object",
+        "required": [
+          "task",
+          "activity",
+          "timeline",
+          "event_cursor"
+        ],
+        "properties": {
+          "activity": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityEntryDto"
+            }
+          },
+          "diff": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DiffSnapshotDto"
+              }
+            ]
+          },
+          "event_cursor": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "plan": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanSnapshotDto"
+              }
+            ]
+          },
+          "task": {
+            "$ref": "#/components/schemas/TaskDto"
+          },
+          "tests": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TestSnapshotDto"
+              }
+            ]
+          },
+          "timeline": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TimelineEntryDto"
+            }
+          }
+        }
+      },
+      "TaskDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "client_request_id",
+          "repository_id",
+          "prompt",
+          "status",
+          "attempt",
+          "created_at",
+          "last_event_id"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "client_request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskFailureDto"
+              }
+            ]
+          },
+          "finished_at": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UtcTimestampDto"
+              }
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_event_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "repository_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "retry_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "started_at": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UtcTimestampDto"
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatusDto"
+          }
+        }
+      },
+      "TaskEventDto": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TaskQueuedEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/TaskStartedEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/PlanUpdatedEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/ActivityAppendedEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/DiffUpdatedEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/TestUpdatedEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/TaskCompletedEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/TaskFailedEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/TaskCancelledEventDto"
+          },
+          {
+            "$ref": "#/components/schemas/TaskInterruptedEventDto"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind"
+        }
+      },
+      "TaskEventKindDto": {
+        "type": "string",
+        "enum": [
+          "task.queued",
+          "task.started",
+          "plan.updated",
+          "activity.appended",
+          "diff.updated",
+          "test.updated",
+          "task.completed",
+          "task.failed",
+          "task.cancelled",
+          "task.interrupted"
+        ]
+      },
+      "TaskFailedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskFailedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/TaskLifecyclePayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TaskFailedKind": {
+        "type": "string",
+        "enum": [
+          "task.failed"
+        ]
+      },
+      "TaskFailureDto": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TaskInterruptedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskInterruptedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/TaskLifecyclePayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TaskInterruptedKind": {
+        "type": "string",
+        "enum": [
+          "task.interrupted"
+        ]
+      },
+      "TaskLifecyclePayloadDto": {
+        "type": "object",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "$ref": "#/components/schemas/TaskDto"
+          }
+        }
+      },
+      "TaskQueuedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskQueuedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/TaskLifecyclePayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TaskQueuedKind": {
+        "type": "string",
+        "enum": [
+          "task.queued"
+        ]
+      },
+      "TaskStartedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskStartedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/TaskLifecyclePayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TaskStartedKind": {
+        "type": "string",
+        "enum": [
+          "task.started"
+        ]
+      },
+      "TaskStatusDto": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "completed",
+          "failed",
+          "cancelled",
+          "interrupted"
+        ]
+      },
+      "TestCaseDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "status",
+          "duration_ms",
+          "summary"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TestStatusDto"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "TestSnapshotDto": {
+        "type": "object",
+        "required": [
+          "revision",
+          "status",
+          "cases"
+        ],
+        "properties": {
+          "cases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TestCaseDto"
+            }
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/TestStatusDto"
+          }
+        }
+      },
+      "TestStatusDto": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "passed",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "TestUpdatedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TestUpdatedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/TestUpdatedPayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "TestUpdatedKind": {
+        "type": "string",
+        "enum": [
+          "test.updated"
+        ]
+      },
+      "TestUpdatedPayloadDto": {
+        "type": "object",
+        "required": [
+          "tests"
+        ],
+        "properties": {
+          "tests": {
+            "$ref": "#/components/schemas/TestSnapshotDto"
+          }
+        }
+      },
+      "TimelineEntryDto": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "kind",
+          "label",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "event_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskFailureDto"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskEventKindDto"
+          },
+          "label": {
+            "type": "string"
+          }
+        }
+      },
+      "UtcTimestampDto": {
+        "type": "string",
+        "format": "date-time"
+      }
+    }
+  }
+}
