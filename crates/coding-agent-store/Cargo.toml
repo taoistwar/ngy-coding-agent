@@ -1,0 +1,9 @@
+[package]
+name = "coding-agent-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+coding-agent-domain = { path = "../coding-agent-domain" }

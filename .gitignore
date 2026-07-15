@@ -2,6 +2,8 @@
 /.worktrees/
 /web/node_modules/
 /web/dist/
+/web/playwright-report/
+/web/test-results/
 /.superpowers/
 .env
 *.local.toml
