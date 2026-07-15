@@ -9,7 +9,6 @@ use axum::extract::{Extension, FromRequest, Request, State};
 use axum::http::header::{CONTENT_TYPE, SET_COOKIE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
 use coding_agent_domain::{RepositoryId, TaskId};
 use futures_util::FutureExt as _;
@@ -448,13 +447,8 @@ async fn events(
     let (parts, _) = request.into_parts();
     let result = async {
         let _auth = state.security.authorize_read(&parts)?;
-        let _after = after_query(&parts)?;
-        let control = state.sse.current_service_state().await?;
-        let data = serde_json::to_string(&control).map_err(internal_serialization_error)?;
-        let output = stream::once(async move {
-            Ok::<Event, Infallible>(Event::default().event("service.state").data(data))
-        });
-        Ok(Sse::new(output).into_response())
+        let after = after_query(&parts)?;
+        Ok(Sse::new(crate::sse::connect(state.sse.clone(), after)).into_response())
     }
     .await;
     finish(result, &request_id)

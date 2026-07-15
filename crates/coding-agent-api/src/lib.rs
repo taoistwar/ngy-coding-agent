@@ -4,6 +4,7 @@ mod backend;
 mod contract;
 mod error;
 mod router;
+mod sse;
 
 pub use backend::{
     ApiBackend, AuthContext, CancelResult, CreateResult, LiveEventItem, LiveEventStream,

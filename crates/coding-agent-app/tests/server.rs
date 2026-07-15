@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use axum::body::Body;
 use coding_agent_api::{
-    ApiBackend, AuthContext, CreateResult, CreateTaskRequest, RequestSecurity, SessionExchange,
-    build_api_router,
+    ApiBackend, AuthContext, CreateResult, CreateTaskRequest, LiveEventItem, RequestSecurity,
+    SessionExchange, SseBackend, build_api_router,
 };
 use coding_agent_app::{ApplicationBackend, MutationGate, RepositoryDiscovery, ServiceState};
 use coding_agent_domain::{ClientRequestId, NewTask, TaskStatus};
 use coding_agent_store::{CreateTaskOutcome, TaskTransition, TransitionOutcome};
+use futures_util::StreamExt as _;
 use http::header::{COOKIE, HOST, ORIGIN};
 use http::{Method, Request, StatusCode};
 use http_body_util::BodyExt as _;
@@ -29,6 +30,7 @@ fn application_backend(
     Arc::new(ApplicationBackend::new(
         fixture.store.clone(),
         fixture.writer.clone(),
+        fixture.dispatcher.clone(),
         fixture.manager.clone(),
         RepositoryDiscovery::new(std::env::temp_dir()),
         None,
@@ -40,6 +42,53 @@ fn application_backend(
         write_budget,
         Arc::new(move || quit_signal.store(true, Ordering::SeqCst)),
     ))
+}
+
+#[tokio::test]
+async fn application_backend_adapts_dispatcher_and_service_watch_to_sse_ports() {
+    let fixture = support::task_manager_fixture(1).await;
+    let security = support::SecurityFixture::production();
+    let backend = application_backend(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mut live = backend.subscribe_live();
+    let mut service = backend.subscribe_service_state();
+
+    fixture.state.set(ServiceState::StoreDegraded).unwrap();
+    let control = tokio::time::timeout(Duration::from_secs(1), service.next())
+        .await
+        .expect("service update")
+        .expect("open service stream");
+    assert_eq!(
+        control.state,
+        coding_agent_api::ServiceStateDto::StoreDegraded
+    );
+    assert_eq!(control.generation, 1);
+    fixture.state.set(ServiceState::Ready).unwrap();
+
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture
+        .dispatcher
+        .flush_to(coding_agent_domain::EventCursor::new(task.last_event_id.get()).unwrap())
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(1), live.next())
+        .await
+        .expect("live event")
+        .expect("open live stream");
+    match event {
+        LiveEventItem::Event(event) => {
+            assert_eq!(
+                serde_json::to_value(event).unwrap()["id"],
+                task.last_event_id.get()
+            );
+        }
+        LiveEventItem::Lagged => panic!("fresh subscriber must not lag"),
+    }
 }
 
 async fn occupied_fixture() -> support::TaskManagerFixture {

@@ -16,16 +16,15 @@ use coding_agent_domain::{
 use coding_agent_store::{
     CreateTaskOutcome, RegisterRepositoryOutcome, RetryTaskOutcome, Store, StoreError,
 };
-use futures_util::stream;
 use http::StatusCode;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::store_writer::sqlite_code_is_retryable;
 use crate::{
-    CancelOutcome, NativeDialogService, PickerError, RepositoryDiscovery, RepositoryDiscoveryError,
-    SecurityManager, ServiceState, ServiceStateController, StoreWriterError, StoreWriterHandle,
-    TaskManagerError, TaskManagerHandle,
+    CancelOutcome, EventDispatcherHandle, NativeDialogService, PickerError, RepositoryDiscovery,
+    RepositoryDiscoveryError, SecurityManager, ServiceState, ServiceStateController,
+    StoreWriterError, StoreWriterHandle, TaskManagerError, TaskManagerHandle,
 };
 
 #[derive(Clone)]
@@ -153,6 +152,7 @@ impl Drop for MutationGuard {
 pub struct ApplicationBackend {
     store: Store,
     writer: StoreWriterHandle,
+    dispatcher: EventDispatcherHandle,
     task_manager: TaskManagerHandle,
     discovery: RepositoryDiscovery,
     dialog: Option<NativeDialogService>,
@@ -170,6 +170,7 @@ impl ApplicationBackend {
     pub fn new(
         store: Store,
         writer: StoreWriterHandle,
+        dispatcher: EventDispatcherHandle,
         task_manager: TaskManagerHandle,
         discovery: RepositoryDiscovery,
         dialog: Option<NativeDialogService>,
@@ -189,6 +190,7 @@ impl ApplicationBackend {
         Self {
             store,
             writer,
+            dispatcher,
             task_manager,
             discovery,
             dialog,
@@ -474,11 +476,34 @@ impl ApiBackend for ApplicationBackend {
 #[async_trait::async_trait]
 impl SseBackend for ApplicationBackend {
     fn subscribe_live(&self) -> LiveEventStream {
-        Box::pin(stream::empty())
+        let mut receiver = self.dispatcher.subscribe();
+        Box::pin(async_stream::stream! {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => yield coding_agent_api::LiveEventItem::Event(event.into()),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        yield coding_agent_api::LiveEventItem::Lagged;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        })
     }
 
     fn subscribe_service_state(&self) -> ServiceStateStream {
-        Box::pin(stream::empty())
+        let mut receiver = self.service_state.subscribe();
+        Box::pin(async_stream::stream! {
+            loop {
+                if receiver.changed().await.is_err() {
+                    return;
+                }
+                let snapshot = *receiver.borrow_and_update();
+                yield ServiceStateControl::new(
+                    service_state(snapshot.state),
+                    snapshot.generation,
+                );
+            }
+        })
     }
 
     async fn current_service_state(&self) -> ApiResult<ServiceStateControl> {

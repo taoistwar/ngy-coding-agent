@@ -548,6 +548,38 @@ pub enum TaskEventDto {
     TaskInterrupted(TaskInterruptedEventDto),
 }
 
+impl TaskEventDto {
+    pub(crate) const fn id(&self) -> i64 {
+        match self {
+            Self::TaskQueued(event) => event.id,
+            Self::TaskStarted(event) => event.id,
+            Self::PlanUpdated(event) => event.id,
+            Self::ActivityAppended(event) => event.id,
+            Self::DiffUpdated(event) => event.id,
+            Self::TestUpdated(event) => event.id,
+            Self::TaskCompleted(event) => event.id,
+            Self::TaskFailed(event) => event.id,
+            Self::TaskCancelled(event) => event.id,
+            Self::TaskInterrupted(event) => event.id,
+        }
+    }
+
+    pub(crate) const fn event_name(&self) -> &'static str {
+        match self {
+            Self::TaskQueued(_) => "task.queued",
+            Self::TaskStarted(_) => "task.started",
+            Self::PlanUpdated(_) => "plan.updated",
+            Self::ActivityAppended(_) => "activity.appended",
+            Self::DiffUpdated(_) => "diff.updated",
+            Self::TestUpdated(_) => "test.updated",
+            Self::TaskCompleted(_) => "task.completed",
+            Self::TaskFailed(_) => "task.failed",
+            Self::TaskCancelled(_) => "task.cancelled",
+            Self::TaskInterrupted(_) => "task.interrupted",
+        }
+    }
+}
+
 impl PartialSchema for TaskEventDto {
     fn schema() -> utoipa::openapi::RefOr<Schema> {
         OneOfBuilder::new()

@@ -10,6 +10,7 @@ default = []
 test-support = []
 
 [dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 axum-extra.workspace = true
@@ -26,6 +27,7 @@ rfd.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
 tower-http.workspace = true
