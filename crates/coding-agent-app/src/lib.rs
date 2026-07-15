@@ -48,11 +48,15 @@ pub use service_state::{
 };
 pub use shutdown::{
     DegradedCoordinator, DegradedCoordinatorError, DegradedRecoveryResult, PendingDurableResult,
+    ShutdownCoordinator, ShutdownOutcome,
 };
+#[cfg(feature = "test-support")]
+pub use single_instance::PrimaryRuntimeTestHandles;
 pub use single_instance::{
     BrowserOpener, InstanceLock, ListenerFactory, NativeMessageSink, PrimaryRuntime,
     RuntimeDescriptor, RuntimeDescriptorError, SecondaryRuntime, StartupDependencies, StartupError,
     StartupOutcome, StartupPaths, StartupPhase, StartupPhaseController, StoreFactory, launch,
+    run_degraded_shutdown_warning_if_requested,
 };
 pub use store_writer::{EventWake, StoreWriterError, StoreWriterHandle, WriteReceipt};
 pub use task_manager::{

@@ -53,6 +53,14 @@ pub enum StoreError {
     TaskAttemptOverflow,
     #[error("store invariant failed: {0}")]
     InvariantViolation(&'static str),
+    #[error(
+        "SQLite WAL checkpoint did not complete (busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames})"
+    )]
+    WalCheckpointIncomplete {
+        busy: i64,
+        log_frames: i64,
+        checkpointed_frames: i64,
+    },
 }
 
 #[derive(Clone)]
@@ -84,8 +92,46 @@ impl Store {
         migrate::run(&self.pool).await
     }
 
+    /// Checkpoints the WAL and then closes every handle sharing this store's pool.
+    ///
+    /// Pool closure is unconditional: callers receive the checkpoint error only after
+    /// SQLx has closed the shared pool, so a failed checkpoint cannot leave SQLite
+    /// handles live during process shutdown.
+    pub async fn checkpoint_and_close(&self) -> Result<(), StoreError> {
+        let checkpoint = async {
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+                sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .fetch_one(&self.pool)
+                    .await?;
+            validate_wal_checkpoint(busy, log_frames, checkpointed_frames)
+        }
+        .await;
+
+        self.pool.close().await;
+        checkpoint
+    }
+
     #[doc(hidden)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+}
+
+fn validate_wal_checkpoint(
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+) -> Result<(), StoreError> {
+    let no_wal = log_frames == -1 && checkpointed_frames == -1;
+    let complete_wal =
+        log_frames >= 0 && checkpointed_frames >= 0 && log_frames == checkpointed_frames;
+    if busy == 0 && (no_wal || complete_wal) {
+        Ok(())
+    } else {
+        Err(StoreError::WalCheckpointIncomplete {
+            busy,
+            log_frames,
+            checkpointed_frames,
+        })
     }
 }

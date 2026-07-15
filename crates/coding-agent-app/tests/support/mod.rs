@@ -17,7 +17,10 @@ use coding_agent_app::{
     StoreWriterHandle, TaskManagerHandle, TaskRunner, WallClock,
 };
 #[cfg(feature = "test-support")]
-use coding_agent_app::{FakeScenario, ScriptedFakeRunner};
+use coding_agent_app::{
+    FakeScenario, InstanceLock, PrimaryRuntime, PrimaryRuntimeTestHandles, ScriptedFakeRunner,
+    StartupOutcome, launch,
+};
 use coding_agent_domain::{
     ActivityEntry, ActivityLevel, CanonicalPath, ClientRequestId, EventCursor, EventId,
     NewRepository, NewTask, PlanSnapshot, Repository, RepositoryId, Task, TaskEventKind,
@@ -127,6 +130,15 @@ pub struct StartupFixture {
     _temp: Arc<TempDir>,
 }
 
+#[cfg(feature = "test-support")]
+pub struct ShutdownFixture {
+    pub primary: Box<PrimaryRuntime>,
+    pub startup: StartupFixture,
+    pub handles: PrimaryRuntimeTestHandles,
+    pub runner: Arc<ScriptedFakeRunner>,
+    pub repository: Repository,
+}
+
 impl StartupFixture {
     pub fn new() -> Self {
         let temp = Arc::new(tempfile::tempdir().expect("create startup fixture"));
@@ -174,6 +186,132 @@ impl StartupFixture {
 impl Default for StartupFixture {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ShutdownFixture {
+    pub async fn start_task(&self, prompt: &str) -> Task {
+        let receipt = self
+            .handles
+            .writer
+            .create_task(new_task(self.repository.id, prompt), deadline())
+            .await
+            .expect("create shutdown fixture task");
+        let task = receipt.value.task().clone();
+        self.handles
+            .task_manager
+            .notify_queued(task.id)
+            .await
+            .expect("notify shutdown fixture task");
+        self.wait_for_status(task.id, TaskStatus::Running).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !self.runner.started_task_ids().contains(&task.id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown fixture runner starts");
+        task
+    }
+
+    pub async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = self
+                    .handles
+                    .store
+                    .task_detail(task_id)
+                    .await
+                    .expect("load shutdown fixture task")
+                    .expect("shutdown fixture task exists")
+                    .task
+                    .status;
+                if status == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("task {task_id} did not reach {expected:?}"));
+    }
+
+    pub async fn event_kinds(&self, task_id: TaskId) -> Vec<TaskEventKind> {
+        self.handles
+            .store
+            .task_events_after(task_id, EventCursor::ZERO, usize::MAX)
+            .await
+            .expect("load shutdown fixture task events")
+            .events
+            .into_iter()
+            .map(|event| event.payload.kind())
+            .collect()
+    }
+
+    pub async fn install_interrupted_event_failure(&self) {
+        sqlx::query(
+            "CREATE TRIGGER fail_shutdown_interrupted BEFORE INSERT ON task_events \
+             WHEN NEW.kind = 'task.interrupted' \
+             BEGIN SELECT RAISE(ABORT, 'injected shutdown persistence failure'); END",
+        )
+        .execute(self.handles.store.pool())
+        .await
+        .expect("install shutdown interruption failure trigger");
+    }
+
+    pub fn make_marker_creation_fail(&self) {
+        std::fs::create_dir(&self.startup.paths.unclean_shutdown)
+            .expect("occupy shutdown marker path with a directory");
+    }
+
+    pub async fn reopen_task(&self, task_id: TaskId) -> Task {
+        let store = Store::open(&self.startup.paths.database_path)
+            .await
+            .expect("reopen shutdown fixture store");
+        let task = store
+            .task_detail(task_id)
+            .await
+            .expect("load reopened shutdown fixture task")
+            .expect("reopened shutdown fixture task exists")
+            .task;
+        store.pool().close().await;
+        task
+    }
+
+    pub async fn assert_runtime_cleanup(&self) {
+        assert!(
+            !self.startup.paths.instance_descriptor.exists(),
+            "shutdown must remove the runtime descriptor"
+        );
+        let reopened = InstanceLock::try_acquire(&self.startup.paths.instance_lock)
+            .expect("reopen shutdown fixture instance lock");
+        assert!(
+            reopened.is_some(),
+            "shutdown must release the permanent instance lock"
+        );
+        drop(reopened);
+        assert!(
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, self.primary.port(),))
+                .await
+                .is_err(),
+            "shutdown must close the loopback listener"
+        );
+    }
+
+    pub async fn wait_for_messages(&self, expected: usize) -> Vec<(String, String)> {
+        for _ in 0..20_000 {
+            let messages = self.startup.calls.messages();
+            if messages.len() >= expected {
+                return messages;
+            }
+            std::thread::yield_now();
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "expected at least {expected} native messages, got {:?}",
+            self.startup.calls.messages()
+        );
     }
 }
 
@@ -699,6 +837,45 @@ pub async fn degraded_fixture_with_concurrency(concurrency: usize) -> DegradedFi
         busy_lock: AsyncMutex::new(None),
         database_path,
         _temp_dir: fixture._temp_dir,
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn shutdown_fixture(
+    scenarios: impl IntoIterator<Item = FakeScenario>,
+) -> ShutdownFixture {
+    let startup = StartupFixture::new();
+    let runner = Arc::new(ScriptedFakeRunner::new(
+        FakeRunnerConfig::default(),
+        scenarios,
+    ));
+    let mut dependencies = startup.dependencies(StartupBehavior::default());
+    dependencies.runner = runner.clone();
+    let primary = match launch(dependencies).await.expect("launch shutdown fixture") {
+        StartupOutcome::Primary(primary) => primary,
+        StartupOutcome::Secondary(_) => panic!("shutdown fixture must own the primary lock"),
+    };
+    let handles = primary.test_handles();
+    let repository = match handles
+        .writer
+        .register_repository(
+            repository_input_at(startup._temp.path(), "shutdown"),
+            deadline(),
+        )
+        .await
+        .expect("register shutdown fixture repository")
+        .value
+    {
+        RegisterRepositoryOutcome::Created(repository)
+        | RegisterRepositoryOutcome::Existing(repository) => repository,
+    };
+
+    ShutdownFixture {
+        primary,
+        startup,
+        handles,
+        runner,
+        repository,
     }
 }
 

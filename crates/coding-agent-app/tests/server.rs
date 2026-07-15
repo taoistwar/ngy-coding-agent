@@ -91,6 +91,28 @@ async fn application_backend_adapts_dispatcher_and_service_watch_to_sse_ports() 
     }
 }
 
+#[tokio::test]
+async fn both_sse_sources_close_after_publishing_quiescing() {
+    let fixture = support::task_manager_fixture(1).await;
+    let security = support::SecurityFixture::production();
+    let backend = application_backend(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mut live = backend.subscribe_live();
+    let mut service = backend.subscribe_service_state();
+
+    fixture.state.set(ServiceState::Quiescing).unwrap();
+
+    let control = service.next().await.expect("publish Quiescing once");
+    assert_eq!(control.state, coding_agent_api::ServiceStateDto::Quiescing);
+    assert!(service.next().await.is_none());
+    assert!(live.next().await.is_none());
+}
+
 async fn occupied_fixture() -> support::TaskManagerFixture {
     let fixture = support::task_manager_fixture(1).await;
     fixture.runner.push_blocking(1);

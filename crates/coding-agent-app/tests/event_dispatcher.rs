@@ -220,3 +220,55 @@ async fn startup_high_watermark_is_not_replayed_as_a_live_event() {
 
     assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
 }
+
+#[tokio::test]
+async fn close_is_concurrent_idempotent_and_rejects_late_flushes() {
+    let fixture = support::dispatcher_fixture().await;
+    let first = fixture.dispatcher.clone();
+    let second = fixture.dispatcher.clone();
+
+    let first_close = tokio::spawn(async move { first.close().await });
+    let second_close = tokio::spawn(async move { second.close().await });
+
+    first_close.await.unwrap().unwrap();
+    second_close.await.unwrap().unwrap();
+    fixture.dispatcher.close().await.unwrap();
+    assert!(matches!(
+        fixture.dispatcher.flush_to(fixture.startup_cursor).await,
+        Err(EventDispatcherError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn close_follows_a_reachable_flush_in_fifo_order() {
+    let fixture = support::dispatcher_fixture().await;
+    let mut receiver = fixture.dispatcher.subscribe();
+    let event_id = fixture
+        .commit_events_without_wake(&messages(&["flush before close"]))
+        .await[0];
+    let target = EventCursor::new(event_id.get()).unwrap();
+    let flush = fixture.dispatcher.flush_to(target);
+    tokio::pin!(flush);
+    let first_poll = futures_util::poll!(&mut flush);
+
+    fixture.dispatcher.close().await.unwrap();
+
+    match first_poll {
+        std::task::Poll::Ready(result) => result.unwrap(),
+        std::task::Poll::Pending => flush.await.unwrap(),
+    }
+    assert_eq!(receiver.recv().await.unwrap().id, event_id);
+}
+
+#[tokio::test]
+async fn close_fails_a_pending_unreachable_flush() {
+    let fixture = support::dispatcher_fixture().await;
+    let target = cursor_after(fixture.startup_cursor, 1);
+    let flush = fixture.dispatcher.flush_to(target);
+    tokio::pin!(flush);
+    assert!(futures_util::poll!(&mut flush).is_pending());
+
+    fixture.dispatcher.close().await.unwrap();
+
+    assert!(matches!(flush.await, Err(EventDispatcherError::Closed)));
+}

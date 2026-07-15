@@ -309,7 +309,7 @@ impl MutationGate {
         }
     }
 
-    fn begin_quiescing(&self) -> bool {
+    pub(crate) fn begin_quiescing(&self) -> bool {
         let mut lifecycle = self
             .inner
             .lifecycle
@@ -672,14 +672,27 @@ impl ApiBackend for ApplicationBackend {
 impl SseBackend for ApplicationBackend {
     fn subscribe_live(&self) -> LiveEventStream {
         let mut receiver = self.dispatcher.subscribe();
+        let mut service = self.service_state.subscribe();
         Box::pin(async_stream::stream! {
             loop {
-                match receiver.recv().await {
-                    Ok(event) => yield coding_agent_api::LiveEventItem::Event(event.into()),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        yield coding_agent_api::LiveEventItem::Lagged;
+                if service.borrow().state == ServiceState::Quiescing {
+                    return;
+                }
+                tokio::select! {
+                    event = receiver.recv() => match event {
+                        Ok(event) => yield coding_agent_api::LiveEventItem::Event(event.into()),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield coding_agent_api::LiveEventItem::Lagged;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    },
+                    changed = service.changed() => {
+                        if changed.is_err()
+                            || service.borrow_and_update().state == ServiceState::Quiescing
+                        {
+                            return;
+                        }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         })
@@ -697,6 +710,9 @@ impl SseBackend for ApplicationBackend {
                     service_state(snapshot.state),
                     snapshot.generation,
                 );
+                if snapshot.state == ServiceState::Quiescing {
+                    return;
+                }
             }
         })
     }

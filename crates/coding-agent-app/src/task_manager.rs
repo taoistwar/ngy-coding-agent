@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coding_agent_domain::{
@@ -148,6 +149,36 @@ pub enum TaskManagerError {
 pub struct TaskManagerHandle {
     sender: mpsc::Sender<TaskManagerMessage>,
     degraded_recoveries: broadcast::Sender<DegradedRecoveryResult>,
+    shutdown: Arc<TaskManagerShutdownControl>,
+}
+
+struct TaskManagerShutdownControl {
+    frozen: AtomicBool,
+    cancellation: CancellationToken,
+}
+
+impl TaskManagerShutdownControl {
+    fn new() -> Self {
+        Self {
+            frozen: AtomicBool::new(false),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    fn try_freeze(&self) -> bool {
+        self.frozen
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn freeze_and_cancel(&self) {
+        self.frozen.store(true, Ordering::Release);
+        self.cancellation.cancel();
+    }
 }
 
 impl TaskManagerHandle {
@@ -166,6 +197,7 @@ impl TaskManagerHandle {
             "task-manager channel capacity must be positive"
         );
         let (sender, receiver) = mpsc::channel(capacity);
+        let shutdown = Arc::new(TaskManagerShutdownControl::new());
         let coordinator = DegradedCoordinator::new(
             writer.clone(),
             dispatcher,
@@ -188,6 +220,7 @@ impl TaskManagerHandle {
             scan_requested: false,
             degraded: false,
             frozen: false,
+            shutdown: shutdown.clone(),
             #[cfg(feature = "test-support")]
             next_launch_ordinal: 0,
             #[cfg(test)]
@@ -199,6 +232,7 @@ impl TaskManagerHandle {
         Self {
             sender,
             degraded_recoveries,
+            shutdown,
         }
     }
 
@@ -222,6 +256,7 @@ impl TaskManagerHandle {
             "task-manager channel capacity must be positive"
         );
         let (sender, receiver) = mpsc::channel(capacity);
+        let shutdown = Arc::new(TaskManagerShutdownControl::new());
         let coordinator = DegradedCoordinator::new(
             writer.clone(),
             dispatcher,
@@ -246,6 +281,7 @@ impl TaskManagerHandle {
             scan_requested: false,
             degraded: false,
             frozen: false,
+            shutdown: shutdown.clone(),
             #[cfg(feature = "test-support")]
             next_launch_ordinal: 0,
             claim_hooks: Some(claim_hooks),
@@ -255,11 +291,16 @@ impl TaskManagerHandle {
         Self {
             sender,
             degraded_recoveries,
+            shutdown,
         }
     }
 
     pub fn subscribe_degraded_recovery(&self) -> broadcast::Receiver<DegradedRecoveryResult> {
         self.degraded_recoveries.subscribe()
+    }
+
+    pub(crate) fn freeze_and_cancel(&self) {
+        self.shutdown.freeze_and_cancel();
     }
 
     #[cfg(test)]
@@ -365,6 +406,7 @@ struct TaskManager {
     scan_requested: bool,
     degraded: bool,
     frozen: bool,
+    shutdown: Arc<TaskManagerShutdownControl>,
     #[cfg(feature = "test-support")]
     next_launch_ordinal: u64,
     #[cfg(test)]
@@ -409,7 +451,7 @@ impl TaskManager {
     async fn handle_message(&mut self, message: TaskManagerMessage) {
         match message {
             TaskManagerMessage::NotifyQueued { response, .. } => {
-                let result = if self.frozen {
+                let result = if self.is_frozen() {
                     Err(TaskManagerError::Frozen)
                 } else if self.degraded || self.service_state.current().state != ServiceState::Ready
                 {
@@ -478,13 +520,17 @@ impl TaskManager {
             };
             #[cfg(test)]
             self.pause_claim(ClaimPhase::PermitAcquired).await;
+            if self.is_frozen() {
+                drop(permit);
+                break;
+            }
             let Some(repository) = repositories.get(&task.repository_id).cloned() else {
                 tracing::error!(task_id = %task.id, "queued task references a missing repository");
                 drop(permit);
                 continue;
             };
 
-            let cancellation = CancellationToken::new();
+            let cancellation = self.shutdown.cancellation.child_token();
             let (done_sender, done_receiver) = oneshot::channel();
             self.active.insert(
                 task.id,
@@ -503,12 +549,20 @@ impl TaskManager {
             }
             #[cfg(test)]
             self.pause_claim(ClaimPhase::HandleRegistered).await;
+            if self.is_frozen() {
+                self.remove_active(task.id);
+                break;
+            }
 
             let Some(sender) = self.sender.upgrade() else {
                 self.remove_active(task.id);
                 break;
             };
             if sender.is_closed() {
+                self.remove_active(task.id);
+                break;
+            }
+            if self.is_frozen() {
                 self.remove_active(task.id);
                 break;
             }
@@ -527,6 +581,10 @@ impl TaskManager {
                     TransitionOutcome::Applied { task, .. } => {
                         #[cfg(test)]
                         self.pause_claim(ClaimPhase::RunningCommitted).await;
+                        if self.is_frozen() {
+                            self.remove_active(task.id);
+                            break;
+                        }
                         self.spawn_runner(task, repository, cancellation, sender);
                     }
                     TransitionOutcome::Conflict { .. } => {
@@ -588,7 +646,7 @@ impl TaskManager {
     }
 
     async fn cancel_task(&mut self, task_id: TaskId) -> Result<CancelOutcome, TaskManagerError> {
-        if self.frozen {
+        if self.is_frozen() {
             return Err(TaskManagerError::Frozen);
         }
         if self.degraded {
@@ -654,7 +712,7 @@ impl TaskManager {
         task_id: TaskId,
         event: RunnerEvent,
     ) -> Result<EventId, RunnerEventError> {
-        if self.frozen {
+        if self.is_frozen() {
             return Err(RunnerEventError::StoreDegraded);
         }
         if self.degraded {
@@ -693,7 +751,7 @@ impl TaskManager {
         if !self.active.contains_key(&task_id) {
             return;
         }
-        if self.frozen {
+        if self.is_frozen() {
             self.remove_active(task_id);
             return;
         }
@@ -739,7 +797,7 @@ impl TaskManager {
     }
 
     async fn quiesce(&mut self, deadline: Instant) -> Result<QuiesceResult, TaskManagerError> {
-        if self.frozen {
+        if self.frozen || !self.shutdown.try_freeze() {
             return Err(TaskManagerError::Frozen);
         }
         self.frozen = true;
@@ -822,7 +880,7 @@ impl TaskManager {
         &mut self,
         recovery: coding_agent_store::RecoveryOutcome,
     ) -> Result<DegradedRecoveryResult, DegradedCoordinatorError> {
-        if self.frozen || self.service_state.current().state == ServiceState::Quiescing {
+        if self.is_frozen() || self.service_state.current().state == ServiceState::Quiescing {
             return Err(DegradedCoordinatorError::Quiescing);
         }
         if !self.degraded {
@@ -850,7 +908,13 @@ impl TaskManager {
     }
 
     fn claims_allowed(&self) -> bool {
-        !self.degraded && !self.frozen && self.service_state.current().state == ServiceState::Ready
+        !self.degraded
+            && !self.is_frozen()
+            && self.service_state.current().state == ServiceState::Ready
+    }
+
+    fn is_frozen(&self) -> bool {
+        self.frozen || self.shutdown.is_frozen()
     }
 
     async fn load_task(&self, task_id: TaskId) -> Result<Task, TaskManagerError> {
@@ -1003,6 +1067,7 @@ mod tests {
     #[derive(Default)]
     struct CancellingRunner {
         starts: AtomicUsize,
+        cancelled: tokio::sync::Notify,
     }
 
     #[derive(Default)]
@@ -1016,6 +1081,7 @@ mod tests {
         async fn run(&self, context: RunContext, _sink: RunnerEventSink) -> RunnerOutcome {
             self.starts.fetch_add(1, Ordering::SeqCst);
             context.cancellation.cancelled().await;
+            self.cancelled.notify_one();
             RunnerOutcome::Cancelled
         }
     }
@@ -1123,6 +1189,68 @@ mod tests {
                 manager_sender.strong_count()
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn out_of_band_freeze_cancels_active_runners_without_a_store_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("create forced-freeze fixture directory");
+        let store = Store::open(temp_dir.path().join("store.sqlite3"))
+            .await
+            .expect("open forced-freeze store");
+        store.migrate().await.expect("migrate forced-freeze store");
+        let repository = register_repository(&store, temp_dir.path().to_path_buf()).await;
+        let dispatcher = EventDispatcherHandle::spawn(store.clone(), 16)
+            .await
+            .expect("spawn forced-freeze dispatcher");
+        let writer = StoreWriterHandle::spawn(store.clone(), Arc::new(dispatcher.clone()), 8);
+        let runner = Arc::new(CancellingRunner::default());
+        let manager = TaskManagerHandle::spawn(
+            store.clone(),
+            writer.clone(),
+            dispatcher,
+            ServiceStateController::new(ServiceState::Ready),
+            runner.clone(),
+            1,
+            8,
+        );
+        let task = writer
+            .create_task(
+                NewTask::try_new(ClientRequestId::new(), repository.id, "forced freeze")
+                    .expect("construct forced-freeze task"),
+                background_deadline(),
+            )
+            .await
+            .expect("create forced-freeze task")
+            .value
+            .task()
+            .clone();
+        manager.notify_queued(task.id).await.expect("notify actor");
+        wait_for_status(&store, task.id, TaskStatus::Running).await;
+
+        manager.freeze_and_cancel();
+        manager.freeze_and_cancel();
+
+        tokio::time::timeout(Duration::from_secs(2), runner.cancelled.notified())
+            .await
+            .expect("forced freeze cancels the active runner");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store
+                .task_detail(task.id)
+                .await
+                .expect("read forced-freeze task")
+                .expect("forced-freeze task exists")
+                .task
+                .status,
+            TaskStatus::Running,
+            "the late cancellation result must not persist after the in-memory freeze"
+        );
+        assert!(matches!(
+            manager.notify_queued(task.id).await,
+            Err(TaskManagerError::Frozen)
+        ));
     }
 
     #[tokio::test]
@@ -1370,6 +1498,75 @@ mod tests {
             wait_for_status(&store, task.id, TaskStatus::Cancelled).await;
             assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
             assert_eq!(hooks.active_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_band_freeze_at_every_claim_phase_never_starts_a_new_runner() {
+        for phase in [
+            ClaimPhase::PermitAcquired,
+            ClaimPhase::HandleRegistered,
+            ClaimPhase::RunningCommitted,
+        ] {
+            let temp_dir = tempfile::tempdir().expect("create frozen-claim fixture directory");
+            let store = Store::open(temp_dir.path().join("store.sqlite3"))
+                .await
+                .expect("open frozen-claim store");
+            store.migrate().await.expect("migrate frozen-claim store");
+            let repository = register_repository(&store, temp_dir.path().to_path_buf()).await;
+            let dispatcher = EventDispatcherHandle::spawn(store.clone(), 64)
+                .await
+                .expect("spawn frozen-claim dispatcher");
+            let writer = StoreWriterHandle::spawn(store.clone(), Arc::new(dispatcher.clone()), 8);
+            let runner = Arc::new(CancellingRunner::default());
+            let hooks = Arc::new(ClaimTestHooks::new(phase));
+            let manager = TaskManagerHandle::spawn_with_claim_hooks(
+                (
+                    store.clone(),
+                    writer.clone(),
+                    dispatcher,
+                    ServiceStateController::new(ServiceState::Ready),
+                ),
+                runner.clone(),
+                1,
+                8,
+                hooks.clone(),
+            );
+            let task = writer
+                .create_task(
+                    NewTask::try_new(ClientRequestId::new(), repository.id, "frozen claim")
+                        .expect("construct frozen-claim task"),
+                    background_deadline(),
+                )
+                .await
+                .expect("create frozen-claim task")
+                .value
+                .task()
+                .clone();
+
+            manager.notify_queued(task.id).await.expect("notify actor");
+            hooks.wait_until_reached().await;
+            manager.freeze_and_cancel();
+            hooks.resume();
+            assert!(matches!(
+                manager.notify_queued(task.id).await,
+                Err(TaskManagerError::Frozen)
+            ));
+
+            let persisted = store
+                .task_detail(task.id)
+                .await
+                .expect("read frozen-claim task")
+                .expect("frozen-claim task exists")
+                .task;
+            let expected = match phase {
+                ClaimPhase::PermitAcquired | ClaimPhase::HandleRegistered => TaskStatus::Queued,
+                ClaimPhase::RunningCommitted => TaskStatus::Running,
+            };
+            assert_eq!(persisted.status, expected, "phase {phase:?}");
+            assert_eq!(runner.starts.load(Ordering::SeqCst), 0, "phase {phase:?}");
+            assert_eq!(hooks.active_count(), 0, "phase {phase:?}");
+            assert_eq!(hooks.available_permits(), 1, "phase {phase:?}");
         }
     }
 

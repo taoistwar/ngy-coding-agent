@@ -344,6 +344,29 @@ async fn durable_quiesce_interrupts_incomplete_tasks_and_returns_live_handles() 
 }
 
 #[tokio::test]
+async fn durable_quiesce_does_not_cancel_runners_before_the_shutdown_owner_decides() {
+    let fixture = support::task_manager_fixture(1).await;
+    fixture.runner.push_blocking(1);
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+
+    let result = fixture
+        .manager
+        .quiesce_and_interrupt(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    let active = match result {
+        QuiesceResult::Durable { active, .. } => active,
+        QuiesceResult::Frozen { .. } => panic!("quiesce should commit"),
+    };
+
+    assert_eq!(active.len(), 1);
+    assert!(!active[0].cancellation.is_cancelled());
+    active[0].cancellation.cancel();
+    active.into_iter().next().unwrap().done.await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_quiesce_is_frozen_and_returns_the_same_active_handles() {
     let fixture = support::task_manager_fixture(1).await;
     fixture.runner.push_blocking(1);

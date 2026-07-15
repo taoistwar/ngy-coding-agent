@@ -1,12 +1,13 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -24,12 +25,13 @@ use uuid::Uuid;
 
 use crate::platform::{PrivateFile, harden_private_file, validate_private_file};
 use crate::security::{LauncherSecret, SecurityClock, SecurityError, SystemSecurityClock};
+use crate::shutdown::ShutdownCleanup;
 use crate::{
     ApplicationBackend, BrowserLaunchError, BrowserLauncher, EventDispatcherError,
     EventDispatcherHandle, FakeTaskRunner, MutationGate, NativeDialogService, PlatformPaths,
     RepositoryDiscovery, SecurityManager, SecuritySeed, ServiceState, ServiceStateController,
-    StoreWriterHandle, SystemWallClock, TaskManagerHandle, TaskRunner, WallClock,
-    build_runtime_router,
+    ShutdownCoordinator, ShutdownOutcome, StoreWriterHandle, SystemWallClock, TaskManagerHandle,
+    TaskRunner, WallClock, build_runtime_router,
 };
 
 const MAX_DESCRIPTOR_BYTES: u64 = 4 * 1024;
@@ -42,6 +44,42 @@ const EVENT_BROADCAST_CAPACITY: usize = 1_024;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
 const MAX_CONCURRENT_TASKS: usize = 4;
 const WRITE_BUDGET: Duration = Duration::from_secs(5);
+const DEGRADED_SHUTDOWN_WARNING_ARGUMENT: &str =
+    "--coding-agent-internal-degraded-shutdown-warning";
+const DEGRADED_SHUTDOWN_TITLE: &str = "Coding Agent did not shut down cleanly";
+const DEGRADED_SHUTDOWN_MESSAGE: &str = "Some terminal task states could not be persisted. They will be recovered the next time Coding Agent starts.";
+
+/// Handles the private child-process mode used to keep the degraded-shutdown
+/// warning alive after the primary process exits.
+pub fn run_degraded_shutdown_warning_if_requested() -> bool {
+    if !is_degraded_shutdown_warning_invocation(std::env::args_os()) {
+        return false;
+    }
+
+    let _ = io::stdout().write_all(b"R");
+    let _ = io::stdout().flush();
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(DEGRADED_SHUTDOWN_TITLE)
+        .set_description(DEGRADED_SHUTDOWN_MESSAGE)
+        .show();
+    true
+}
+
+fn is_degraded_shutdown_warning_invocation<I, S>(arguments: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut arguments = arguments.into_iter();
+    let Some(_executable) = arguments.next() else {
+        return false;
+    };
+    arguments
+        .next()
+        .is_some_and(|argument| argument.as_ref() == OsStr::new(DEGRADED_SHUTDOWN_WARNING_ARGUMENT))
+        && arguments.next().is_none()
+}
 
 /// Owns the operating-system lock on the permanent `instance.lock` file.
 ///
@@ -507,6 +545,14 @@ pub trait BrowserOpener: Send + Sync + 'static {
 
 pub trait NativeMessageSink: Send + Sync + 'static {
     fn show_error(&self, title: &'static str, body: String);
+
+    fn publish_degraded_shutdown(&self) -> io::Result<()> {
+        self.show_error(
+            DEGRADED_SHUTDOWN_TITLE,
+            DEGRADED_SHUTDOWN_MESSAGE.to_owned(),
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -634,19 +680,23 @@ async fn launch_inner(dependencies: StartupDependencies) -> Result<StartupOutcom
 }
 
 pub struct PrimaryRuntime {
-    paths: PlatformPaths,
-    _lock: InstanceLock,
     descriptor: RuntimeDescriptor,
     startup_phase: StartupPhaseController,
-    _service_state: ServiceStateController,
-    _store: Store,
-    _writer: StoreWriterHandle,
-    _dispatcher: EventDispatcherHandle,
-    _task_manager: TaskManagerHandle,
-    _security: SecurityManager,
-    server: ServerRuntime,
+    shutdown: ShutdownCoordinator,
     quit_requested: Arc<Notify>,
     browser_opened: bool,
+    #[cfg(feature = "test-support")]
+    test_handles: PrimaryRuntimeTestHandles,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct PrimaryRuntimeTestHandles {
+    pub store: Store,
+    pub writer: StoreWriterHandle,
+    pub dispatcher: EventDispatcherHandle,
+    pub task_manager: TaskManagerHandle,
+    pub mutation_gate: MutationGate,
 }
 
 impl PrimaryRuntime {
@@ -669,19 +719,24 @@ impl PrimaryRuntime {
     pub async fn wait_for_quit_request(&self) {
         self.quit_requested.notified().await;
     }
+
+    pub fn shutdown_coordinator(&self) -> ShutdownCoordinator {
+        self.shutdown.clone()
+    }
+
+    pub async fn shutdown(&self) -> ShutdownOutcome {
+        self.shutdown.shutdown().await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_handles(&self) -> PrimaryRuntimeTestHandles {
+        self.test_handles.clone()
+    }
 }
 
 impl Drop for PrimaryRuntime {
     fn drop(&mut self) {
-        self.server.stop();
-        if let Err(error) = std::fs::remove_file(&self.paths.instance_descriptor)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                error_code = "DESCRIPTOR_REMOVE_FAILED",
-                "runtime cleanup failed"
-            );
-        }
+        self.shutdown.force_cleanup();
     }
 }
 
@@ -722,6 +777,7 @@ async fn start_primary(
             },
         )
         .await?;
+    remove_recovered_shutdown_marker(&paths);
 
     let seed = SecuritySeed::generate()?;
     let initial_launch_token = seed.initial_launch_token().clone();
@@ -766,7 +822,7 @@ async fn start_primary(
         dependencies.dialog.clone(),
         security.clone(),
         service_state.clone(),
-        mutation_gate,
+        mutation_gate.clone(),
         started_at,
         MAX_CONCURRENT_TASKS as u32,
         WRITE_BUDGET,
@@ -820,21 +876,84 @@ async fn start_primary(
         port.get(),
         initial_launch_token.as_str(),
     );
+    #[cfg(feature = "test-support")]
+    let test_handles = PrimaryRuntimeTestHandles {
+        store: store.clone(),
+        writer: writer.clone(),
+        dispatcher: dispatcher.clone(),
+        task_manager: task_manager.clone(),
+        mutation_gate: mutation_gate.clone(),
+    };
+    let cleanup = Arc::new(PrimaryRuntimeCleanup::new(
+        server,
+        lock,
+        paths.instance_descriptor.clone(),
+    ));
+    let shutdown = ShutdownCoordinator::new(
+        mutation_gate,
+        task_manager,
+        dispatcher,
+        store,
+        cleanup,
+        &paths,
+        instance_id,
+        dependencies.wall_clock.clone(),
+        dependencies.messages.clone(),
+    );
     Ok(PrimaryRuntime {
-        paths,
-        _lock: lock,
         descriptor,
         startup_phase,
-        _service_state: service_state,
-        _store: store,
-        _writer: writer,
-        _dispatcher: dispatcher,
-        _task_manager: task_manager,
-        _security: security,
-        server,
+        shutdown,
         quit_requested,
         browser_opened,
+        #[cfg(feature = "test-support")]
+        test_handles,
     })
+}
+
+fn remove_recovered_shutdown_marker(paths: &PlatformPaths) {
+    if let Err(error) = std::fs::remove_file(&paths.unclean_shutdown)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            error_code = "SHUTDOWN_MARKER_REMOVE_FAILED",
+            "recovered shutdown marker could not be removed"
+        );
+    }
+
+    let Some(parent) = paths.unclean_shutdown.parent() else {
+        return;
+    };
+    let Some(file_name) = paths.unclean_shutdown.file_name().and_then(OsStr::to_str) else {
+        return;
+    };
+    let prefix = format!("{file_name}.");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                error_code = "SHUTDOWN_MARKER_STAGING_SCAN_FAILED",
+                "staged shutdown markers could not be scanned"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix)
+            && name.ends_with(".pending")
+            && let Err(error) = std::fs::remove_file(entry.path())
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                error = %error,
+                error_code = "SHUTDOWN_MARKER_STAGING_REMOVE_FAILED",
+                "a staged shutdown marker could not be removed"
+            );
+        }
+    }
 }
 
 async fn start_secondary(
@@ -1006,7 +1125,7 @@ fn process_is_dead(_pid: NonZeroU32) -> bool {
 
 struct ServerRuntime {
     shutdown: CancellationToken,
-    task: JoinHandle<io::Result<()>>,
+    task: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl ServerRuntime {
@@ -1019,18 +1138,93 @@ impl ServerRuntime {
                 .with_graceful_shutdown(server_shutdown.cancelled_owned())
                 .await
         });
-        Self { shutdown, task }
+        Self {
+            shutdown,
+            task: Some(task),
+        }
+    }
+
+    async fn shutdown(mut self, deadline: Instant) {
+        self.shutdown.cancel();
+        if let Some(mut task) = self.task.take()
+            && tokio::time::timeout_at(deadline, &mut task).await.is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     fn stop(&mut self) {
         self.shutdown.cancel();
-        self.task.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
 impl Drop for ServerRuntime {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+struct PrimaryRuntimeCleanup {
+    descriptor_path: PathBuf,
+    resources: Mutex<PrimaryRuntimeResources>,
+}
+
+struct PrimaryRuntimeResources {
+    server: Option<ServerRuntime>,
+    lock: Option<InstanceLock>,
+}
+
+impl PrimaryRuntimeCleanup {
+    fn new(server: ServerRuntime, lock: InstanceLock, descriptor_path: PathBuf) -> Self {
+        Self {
+            descriptor_path,
+            resources: Mutex::new(PrimaryRuntimeResources {
+                server: Some(server),
+                lock: Some(lock),
+            }),
+        }
+    }
+
+    fn remove_descriptor(&self) {
+        if let Err(error) = std::fs::remove_file(&self.descriptor_path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                error_code = "DESCRIPTOR_REMOVE_FAILED",
+                "runtime descriptor cleanup failed"
+            );
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ShutdownCleanup for PrimaryRuntimeCleanup {
+    async fn stop_http(&self, deadline: Instant) {
+        let server = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .server
+            .take();
+        if let Some(server) = server {
+            server.shutdown(deadline).await;
+        }
+    }
+
+    fn remove_descriptor_and_release_lock(&self) {
+        let mut resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut server) = resources.server.take() {
+            server.stop();
+        }
+        self.remove_descriptor();
+        resources.lock.take();
     }
 }
 
@@ -1082,11 +1276,72 @@ impl NativeMessageSink for SystemNativeMessageSink {
             .set_description(body)
             .show();
     }
+
+    fn publish_degraded_shutdown(&self) -> io::Result<()> {
+        let executable = std::env::current_exe()?;
+        let mut command = Command::new(executable);
+        command
+            .arg(DEGRADED_SHUTDOWN_WARNING_ARGUMENT)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            use windows_sys::Win32::System::Threading::{
+                CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+            };
+
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+
+            command.process_group(0);
+        }
+
+        let mut child = command.spawn()?;
+        let mut ready = [0_u8; 1];
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("shutdown warning helper stdout was unavailable"))?
+            .read_exact(&mut ready)?;
+        if ready == *b"R" {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shutdown warning helper returned an invalid acknowledgement",
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degraded_warning_helper_requires_the_exact_private_switch() {
+        assert!(is_degraded_shutdown_warning_invocation([
+            "coding-agent",
+            DEGRADED_SHUTDOWN_WARNING_ARGUMENT,
+        ]));
+        assert!(!is_degraded_shutdown_warning_invocation(["coding-agent"]));
+        assert!(!is_degraded_shutdown_warning_invocation([
+            "coding-agent",
+            DEGRADED_SHUTDOWN_WARNING_ARGUMENT,
+            "unexpected",
+        ]));
+        assert!(!is_degraded_shutdown_warning_invocation([
+            "coding-agent",
+            "--not-the-private-warning-switch",
+        ]));
+    }
 
     #[test]
     fn reopen_grant_accepts_only_the_exact_fresh_loopback_fragment_url() {

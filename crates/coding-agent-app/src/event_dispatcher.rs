@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use coding_agent_domain::{EventCursor, TaskEvent};
 use coding_agent_store::{Store, StoreError};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
+use tokio_util::sync::CancellationToken;
 
 use crate::EventWake;
 
@@ -27,9 +29,24 @@ impl From<StoreError> for EventDispatcherError {
 
 #[derive(Clone)]
 pub struct EventDispatcherHandle {
-    flushes: mpsc::UnboundedSender<FlushCommand>,
+    commands: mpsc::UnboundedSender<DispatcherCommand>,
     wake: Arc<Notify>,
     events: broadcast::Sender<TaskEvent>,
+    lifecycle: Arc<DispatcherLifecycle>,
+}
+
+struct DispatcherLifecycle {
+    close_requested: AtomicBool,
+    closed: CancellationToken,
+}
+
+impl DispatcherLifecycle {
+    fn new() -> Self {
+        Self {
+            close_requested: AtomicBool::new(false),
+            closed: CancellationToken::new(),
+        }
+    }
 }
 
 impl EventDispatcherHandle {
@@ -42,20 +59,22 @@ impl EventDispatcherHandle {
             "event-dispatcher broadcast capacity must be positive"
         );
         let cursor = store.latest_event_id().await?;
-        let (flushes, receiver) = mpsc::unbounded_channel();
+        let (commands, receiver) = mpsc::unbounded_channel();
         let wake = Arc::new(Notify::new());
         let (events, _) = broadcast::channel(broadcast_capacity);
-        tokio::spawn(run_dispatcher(
-            store,
-            cursor,
-            receiver,
-            wake.clone(),
-            events.clone(),
-        ));
+        let lifecycle = Arc::new(DispatcherLifecycle::new());
+        let actor_lifecycle = lifecycle.clone();
+        let actor_wake = wake.clone();
+        let actor_events = events.clone();
+        tokio::spawn(async move {
+            run_dispatcher(store, cursor, receiver, actor_wake, actor_events).await;
+            actor_lifecycle.closed.cancel();
+        });
         Ok(Self {
-            flushes,
+            commands,
             wake,
             events,
+            lifecycle,
         })
     }
 
@@ -68,11 +87,43 @@ impl EventDispatcherHandle {
     }
 
     pub async fn flush_to(&self, target: EventCursor) -> Result<(), EventDispatcherError> {
+        if self.lifecycle.close_requested.load(Ordering::Acquire)
+            || self.lifecycle.closed.is_cancelled()
+        {
+            return Err(EventDispatcherError::Closed);
+        }
         let (response, receiver) = oneshot::channel();
-        self.flushes
-            .send(FlushCommand { target, response })
+        self.commands
+            .send(DispatcherCommand::Flush { target, response })
             .map_err(|_| EventDispatcherError::Closed)?;
         receiver.await.map_err(|_| EventDispatcherError::Closed)?
+    }
+
+    pub async fn close(&self) -> Result<(), EventDispatcherError> {
+        if self.lifecycle.closed.is_cancelled() {
+            return Ok(());
+        }
+
+        if self
+            .lifecycle
+            .close_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let (response, receiver) = oneshot::channel();
+            if self
+                .commands
+                .send(DispatcherCommand::Close { response })
+                .is_err()
+            {
+                self.lifecycle.closed.cancel();
+                return Ok(());
+            }
+            let _ = receiver.await;
+        }
+
+        self.lifecycle.closed.cancelled().await;
+        Ok(())
     }
 }
 
@@ -82,9 +133,14 @@ impl EventWake for EventDispatcherHandle {
     }
 }
 
-struct FlushCommand {
-    target: EventCursor,
-    response: oneshot::Sender<Result<(), EventDispatcherError>>,
+enum DispatcherCommand {
+    Flush {
+        target: EventCursor,
+        response: oneshot::Sender<Result<(), EventDispatcherError>>,
+    },
+    Close {
+        response: oneshot::Sender<()>,
+    },
 }
 
 struct FlushWaiter {
@@ -95,7 +151,7 @@ struct FlushWaiter {
 async fn run_dispatcher(
     store: Store,
     mut cursor: EventCursor,
-    mut flushes: mpsc::UnboundedReceiver<FlushCommand>,
+    mut commands: mpsc::UnboundedReceiver<DispatcherCommand>,
     wake: Arc<Notify>,
     events: broadcast::Sender<TaskEvent>,
 ) {
@@ -105,16 +161,24 @@ async fn run_dispatcher(
 
     loop {
         let should_poll = tokio::select! {
-            command = flushes.recv() => match command {
-                Some(FlushCommand { target, response }) if cursor >= target => {
+            command = commands.recv() => match command {
+                Some(DispatcherCommand::Flush { target, response }) if cursor >= target => {
                     let _ = response.send(Ok(()));
                     false
                 }
-                Some(FlushCommand { target, response }) => {
+                Some(DispatcherCommand::Flush { target, response }) => {
                     waiters.push(FlushWaiter { target, response });
                     true
                 }
-                None => break,
+                Some(DispatcherCommand::Close { response }) => {
+                    fail_waiters(&mut waiters, EventDispatcherError::Closed);
+                    let _ = response.send(());
+                    return;
+                }
+                None => {
+                    fail_waiters(&mut waiters, EventDispatcherError::Closed);
+                    return;
+                },
             },
             () = wake.notified() => true,
             _ = poll.tick() => true,
@@ -127,7 +191,7 @@ async fn run_dispatcher(
         if let Err(error) = publish_available(&store, &events, &mut cursor, &mut waiters).await {
             let error = Arc::new(error);
             tracing::error!(error = %error, "event dispatcher failed to read persisted events");
-            fail_waiters(&mut waiters, error);
+            fail_waiters(&mut waiters, EventDispatcherError::Store(error));
         }
     }
 }
@@ -171,10 +235,8 @@ fn complete_waiters(waiters: &mut Vec<FlushWaiter>, cursor: EventCursor) {
     *waiters = pending;
 }
 
-fn fail_waiters(waiters: &mut Vec<FlushWaiter>, error: Arc<StoreError>) {
+fn fail_waiters(waiters: &mut Vec<FlushWaiter>, error: EventDispatcherError) {
     for waiter in waiters.drain(..) {
-        let _ = waiter
-            .response
-            .send(Err(EventDispatcherError::Store(error.clone())));
+        let _ = waiter.response.send(Err(error.clone()));
     }
 }

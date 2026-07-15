@@ -1,8 +1,15 @@
 use std::process::ExitCode;
 
-use coding_agent_app::{NativeDialogService, StartupDependencies, StartupOutcome, launch};
+use coding_agent_app::{
+    NativeDialogService, StartupDependencies, StartupOutcome, launch,
+    run_degraded_shutdown_warning_if_requested,
+};
 
 fn main() -> ExitCode {
+    if run_degraded_shutdown_warning_if_requested() {
+        return ExitCode::SUCCESS;
+    }
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -22,6 +29,7 @@ fn main() -> ExitCode {
     };
 
     let code = run_on_platform_main_thread(&runtime);
+    runtime.shutdown_background();
     if code == 0 {
         ExitCode::SUCCESS
     } else {
@@ -83,23 +91,49 @@ where
 async fn run_application(dependencies: StartupDependencies) -> i32 {
     match launch(dependencies).await {
         Ok(StartupOutcome::Primary(primary)) => {
-            let exit_code = tokio::select! {
-                signal = tokio::signal::ctrl_c() => {
-                    if signal.is_err() {
-                        tracing::warn!(error_code = "SIGNAL_LISTENER_FAILED", "shutdown signal listener failed");
-                        1
-                    } else {
-                        0
-                    }
-                }
-                () = primary.wait_for_quit_request() => 0
+            let signal = tokio::select! {
+                signal = wait_for_shutdown_signal() => signal,
+                () = primary.wait_for_quit_request() => Ok(()),
             };
-            drop(primary);
-            exit_code
+            let outcome = primary.shutdown().await;
+            if signal.is_err() {
+                tracing::warn!(
+                    error_code = "SIGNAL_LISTENER_FAILED",
+                    "shutdown signal listener failed"
+                );
+                1
+            } else {
+                outcome.exit_code()
+            }
         }
         Ok(StartupOutcome::Secondary(_)) => 0,
         Err(_) => 1,
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        signal = terminate.recv() => signal.ok_or_else(|| std::io::Error::other("termination signal stream closed")),
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    let mut close = tokio::signal::windows::ctrl_close()?;
+    let mut shutdown = tokio::signal::windows::ctrl_shutdown()?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        signal = close.recv() => signal.ok_or_else(|| std::io::Error::other("console close signal stream closed")),
+        signal = shutdown.recv() => signal.ok_or_else(|| std::io::Error::other("system shutdown signal stream closed")),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 fn show_early_error(body: &str) {

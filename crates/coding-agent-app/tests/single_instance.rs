@@ -221,8 +221,12 @@ async fn path_preparation_failure_reports_once_before_lock_store_or_listener() {
 async fn database_open_or_migration_failure_stops_before_listener_publication() {
     let fixture = support::StartupFixture::new();
     fixture.prepare();
-    std::fs::write(&fixture.paths.database_path, b"not a SQLite database")
+    let invalid_database = b"not a SQLite database";
+    let shutdown_marker = b"{\"error_code\":\"SHUTDOWN_PERSISTENCE_FAILED\"}";
+    std::fs::write(&fixture.paths.database_path, invalid_database)
         .expect("install invalid database");
+    std::fs::write(&fixture.paths.unclean_shutdown, shutdown_marker)
+        .expect("install existing shutdown marker");
 
     let result = launch(fixture.dependencies(support::StartupBehavior::default())).await;
 
@@ -232,6 +236,14 @@ async fn database_open_or_migration_failure_stops_before_listener_publication() 
     assert_eq!(fixture.calls.browser_urls(), Vec::<String>::new());
     assert_eq!(fixture.calls.messages().len(), 1);
     assert!(!fixture.paths.instance_descriptor.exists());
+    assert_eq!(
+        std::fs::read(&fixture.paths.database_path).expect("read preserved invalid database"),
+        invalid_database
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.unclean_shutdown).expect("read preserved shutdown marker"),
+        shutdown_marker
+    );
     assert!(
         InstanceLock::try_acquire(&fixture.paths.instance_lock)
             .expect("database failure releases lock")
