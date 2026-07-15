@@ -6,14 +6,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coding_agent_app::{
-    EventDispatcherHandle, EventWake, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink,
-    RunnerOutcome, ServiceState, ServiceStateController, StoreWriterHandle, TaskManagerHandle,
-    TaskRunner,
+    CancelOutcome, EventDispatcherHandle, EventWake, FakeRunnerConfig, FakeTaskRunner, RunContext,
+    RunnerEvent, RunnerEventError, RunnerEventSink, RunnerOutcome, ServiceState,
+    ServiceStateController, StoreWriterHandle, TaskManagerHandle, TaskRunner,
 };
+#[cfg(feature = "test-support")]
+use coding_agent_app::{FakeScenario, ScriptedFakeRunner};
 use coding_agent_domain::{
     ActivityEntry, ActivityLevel, CanonicalPath, ClientRequestId, EventCursor, EventId,
-    NewRepository, NewTask, PlanSnapshot, Repository, RepositoryId, Task, TaskEventPayload,
-    TaskFailure, TaskId, TaskStatus, UtcTimestamp,
+    NewRepository, NewTask, PlanSnapshot, Repository, RepositoryId, Task, TaskEventKind,
+    TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestStatus, UtcTimestamp,
 };
 use coding_agent_store::{
     AppendEventOutcome, CreateTaskOutcome, RegisterRepositoryOutcome, Store, TaskTransition,
@@ -57,6 +59,24 @@ pub struct TaskManagerFixture {
     pub runner: Arc<ControlledRunner>,
     pub state: ServiceStateController,
     busy_lock: AsyncMutex<Option<BusyLock>>,
+    _temp_dir: TempDir,
+}
+
+pub struct FakeRunnerFixture {
+    core: RunnerFixtureCore,
+}
+
+#[cfg(feature = "test-support")]
+pub struct ScriptedFakeRunnerFixture {
+    core: RunnerFixtureCore,
+    pub runner: Arc<ScriptedFakeRunner>,
+}
+
+struct RunnerFixtureCore {
+    store: Store,
+    repository: Repository,
+    writer: StoreWriterHandle,
+    manager: TaskManagerHandle,
     _temp_dir: TempDir,
 }
 
@@ -164,6 +184,236 @@ pub async fn task_manager_fixture(concurrency: usize) -> TaskManagerFixture {
         state,
         busy_lock: AsyncMutex::new(None),
         _temp_dir: fixture._temp_dir,
+    }
+}
+
+pub async fn fake_runner_fixture() -> FakeRunnerFixture {
+    fake_runner_fixture_with_config(FakeRunnerConfig::default()).await
+}
+
+pub async fn fake_runner_fixture_with_config(config: FakeRunnerConfig) -> FakeRunnerFixture {
+    let runner = Arc::new(FakeTaskRunner::new(config));
+    FakeRunnerFixture {
+        core: runner_fixture(runner, 4).await,
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn scripted_fake_runner_fixture(
+    scenarios: impl IntoIterator<Item = FakeScenario>,
+    concurrency: usize,
+) -> ScriptedFakeRunnerFixture {
+    let runner = Arc::new(ScriptedFakeRunner::new(
+        FakeRunnerConfig::default(),
+        scenarios,
+    ));
+    ScriptedFakeRunnerFixture {
+        core: runner_fixture(runner.clone(), concurrency).await,
+        runner,
+    }
+}
+
+async fn runner_fixture(runner: Arc<dyn TaskRunner>, concurrency: usize) -> RunnerFixtureCore {
+    let fixture = store_fixture().await;
+    let writer =
+        StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(CountingWake::default()), 64);
+    let manager = TaskManagerHandle::spawn(
+        fixture.store.clone(),
+        writer.clone(),
+        ServiceStateController::new(ServiceState::Ready),
+        runner,
+        concurrency,
+        64,
+    );
+    RunnerFixtureCore {
+        store: fixture.store,
+        repository: fixture.repository,
+        writer,
+        manager,
+        _temp_dir: fixture._temp_dir,
+    }
+}
+
+impl RunnerFixtureCore {
+    async fn enqueue(&self, prompts: &[&str]) -> Vec<Task> {
+        let mut tasks = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            let receipt = self
+                .writer
+                .create_task(new_task(self.repository.id, prompt), deadline())
+                .await
+                .expect("create runner fixture task");
+            tasks.push(receipt.value.task().clone());
+        }
+        for task in &tasks {
+            self.manager
+                .notify_queued(task.id)
+                .await
+                .expect("notify manager of runner fixture task");
+        }
+        tasks
+    }
+
+    async fn load(&self, task_id: TaskId) -> Task {
+        self.detail(task_id).await.task
+    }
+
+    async fn detail(&self, task_id: TaskId) -> coding_agent_store::TaskDetail {
+        self.store
+            .task_detail(task_id)
+            .await
+            .expect("load runner fixture task")
+            .expect("runner fixture task exists")
+    }
+
+    async fn event_kinds(&self, task_id: TaskId) -> Vec<TaskEventKind> {
+        self.events(task_id)
+            .await
+            .into_iter()
+            .map(|event| event.payload.kind())
+            .collect()
+    }
+
+    async fn events(&self, task_id: TaskId) -> Vec<coding_agent_domain::TaskEvent> {
+        self.store
+            .task_events_after(task_id, EventCursor::ZERO, usize::MAX)
+            .await
+            .expect("load runner fixture events")
+            .events
+    }
+
+    async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self.load(task_id).await.status == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("task {task_id} did not reach {expected:?}"));
+    }
+
+    async fn wait_for_terminal(&self, task_id: TaskId) {
+        for _ in 0..20_000 {
+            if matches!(
+                self.load(task_id).await.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        let status = self.load(task_id).await.status;
+        let kinds = self.event_kinds(task_id).await;
+        panic!("task {task_id} did not become terminal: status={status:?}, events={kinds:?}");
+    }
+}
+
+impl FakeRunnerFixture {
+    pub async fn start(&self) -> Task {
+        let task = self
+            .core
+            .enqueue(&["run the deterministic fake task"])
+            .await
+            .remove(0);
+        self.core
+            .wait_for_status(task.id, TaskStatus::Running)
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self.core.detail(task.id).await.plan.is_some() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake runner emits its first snapshot");
+        task
+    }
+
+    pub async fn cancel(&self, task_id: TaskId) -> CancelOutcome {
+        self.core
+            .manager
+            .cancel(task_id)
+            .await
+            .expect("cancel fake runner task")
+    }
+
+    pub async fn load(&self, task_id: TaskId) -> Task {
+        self.core.load(task_id).await
+    }
+
+    pub async fn detail(&self, task_id: TaskId) -> coding_agent_store::TaskDetail {
+        self.core.detail(task_id).await
+    }
+
+    pub async fn event_kinds(&self, task_id: TaskId) -> Vec<TaskEventKind> {
+        self.core.event_kinds(task_id).await
+    }
+
+    pub async fn test_statuses(&self, task_id: TaskId) -> Vec<TestStatus> {
+        self.core
+            .events(task_id)
+            .await
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                TaskEventPayload::TestUpdated { tests } => Some(tests.status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub async fn wait_for_terminal(&self, task_id: TaskId) {
+        self.core.wait_for_terminal(task_id).await;
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ScriptedFakeRunnerFixture {
+    pub async fn enqueue(&self, prompts: &[&str]) -> Vec<Task> {
+        self.core.enqueue(prompts).await
+    }
+
+    pub async fn start(&self, prompt: &str) -> Task {
+        let task = self.core.enqueue(&[prompt]).await.remove(0);
+        self.core
+            .wait_for_status(task.id, TaskStatus::Running)
+            .await;
+        self.wait_for_runner_start(task.id).await;
+        task
+    }
+
+    pub async fn cancel(&self, task_id: TaskId) -> CancelOutcome {
+        self.core
+            .manager
+            .cancel(task_id)
+            .await
+            .expect("cancel scripted fake task")
+    }
+
+    pub async fn load(&self, task_id: TaskId) -> Task {
+        self.core.load(task_id).await
+    }
+
+    pub async fn event_kinds(&self, task_id: TaskId) -> Vec<TaskEventKind> {
+        self.core.event_kinds(task_id).await
+    }
+
+    pub async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
+        self.core.wait_for_status(task_id, expected).await;
+    }
+
+    pub async fn wait_for_runner_start(&self, task_id: TaskId) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !self.runner.started_task_ids().contains(&task_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("scripted runner did not start task {task_id}"));
     }
 }
 

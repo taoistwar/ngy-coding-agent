@@ -1,11 +1,14 @@
 mod support;
 
+#[cfg(feature = "test-support")]
+use coding_agent_app::FakeScenario;
 use coding_agent_app::{
-    CancelOutcome, QuiesceResult, RunnerEvent, RunnerEventError, ServiceState, StoreWriterError,
-    TaskManagerError,
+    CancelOutcome, FakeRunnerConfig, QuiesceResult, RunnerEvent, RunnerEventError, ServiceState,
+    StoreWriterError, TaskManagerError,
 };
 use coding_agent_domain::{
-    ActivityEntry, ActivityLevel, DiffSnapshot, PlanSnapshot, TaskFailure, TaskStatus, TestSnapshot,
+    ActivityEntry, ActivityLevel, DiffFile, DiffFileStatus, DiffSnapshot, PlanItem, PlanItemStatus,
+    PlanSnapshot, TaskEventKind, TaskFailure, TaskStatus, TestCase, TestSnapshot, TestStatus,
 };
 use tokio::time::{Duration, Instant};
 
@@ -409,4 +412,244 @@ async fn a_degraded_service_does_not_claim_queued_tasks() {
     fixture.state.set(ServiceState::Ready).unwrap();
     fixture.manager.notify_queued(task.id).await.unwrap();
     fixture.wait_for_status(task.id, TaskStatus::Running).await;
+}
+
+#[tokio::test]
+async fn fake_runner_emits_the_approved_panel_sequence() {
+    let fixture = support::fake_runner_fixture().await;
+    let task = fixture.start().await;
+    tokio::time::pause();
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::resume();
+    fixture.wait_for_terminal(task.id).await;
+
+    assert_eq!(
+        fixture.event_kinds(task.id).await,
+        vec![
+            TaskEventKind::TaskQueued,
+            TaskEventKind::TaskStarted,
+            TaskEventKind::PlanUpdated,
+            TaskEventKind::ActivityAppended,
+            TaskEventKind::ActivityAppended,
+            TaskEventKind::ActivityAppended,
+            TaskEventKind::DiffUpdated,
+            TaskEventKind::TestUpdated,
+            TaskEventKind::TestUpdated,
+            TaskEventKind::TaskCompleted,
+        ]
+    );
+
+    let detail = fixture.detail(task.id).await;
+    assert_eq!(
+        detail.plan,
+        Some(PlanSnapshot {
+            revision: 1,
+            items: vec![
+                PlanItem {
+                    id: "fake-plan".to_owned(),
+                    title: "Prepare deterministic plan".to_owned(),
+                    status: PlanItemStatus::Completed,
+                },
+                PlanItem {
+                    id: "fake-diff".to_owned(),
+                    title: "Generate synthetic diff".to_owned(),
+                    status: PlanItemStatus::Completed,
+                },
+                PlanItem {
+                    id: "fake-tests".to_owned(),
+                    title: "Report synthetic tests".to_owned(),
+                    status: PlanItemStatus::Completed,
+                },
+            ],
+        })
+    );
+    assert_eq!(
+        detail
+            .activity
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.message.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("fake-plan-ready", "Prepared deterministic plan"),
+            ("fake-diff-ready", "Generated synthetic diff"),
+            ("fake-tests-ready", "Started synthetic tests"),
+        ]
+    );
+    assert!(
+        detail
+            .activity
+            .iter()
+            .all(|entry| entry.created_at == detail.task.started_at.unwrap())
+    );
+    assert_eq!(
+        detail.diff,
+        Some(DiffSnapshot {
+            revision: 1,
+            files: vec![DiffFile {
+                path: "synthetic/example.rs".to_owned(),
+                status: DiffFileStatus::Added,
+                patch: "diff --git a/synthetic/example.rs b/synthetic/example.rs\nnew file mode 100644\n--- /dev/null\n+++ b/synthetic/example.rs\n@@ -0,0 +1 @@\n+// deterministic fake change\n".to_owned(),
+                additions: 1,
+                deletions: 0,
+            }],
+        })
+    );
+    assert_eq!(
+        detail.tests,
+        Some(TestSnapshot {
+            revision: 2,
+            status: TestStatus::Passed,
+            cases: vec![TestCase {
+                id: "fake-test".to_owned(),
+                name: "deterministic synthetic check".to_owned(),
+                status: TestStatus::Passed,
+                duration_ms: 200,
+                summary: "Synthetic checks passed".to_owned(),
+            }],
+        })
+    );
+    assert_eq!(
+        fixture.test_statuses(task.id).await,
+        vec![TestStatus::Running, TestStatus::Passed]
+    );
+}
+
+#[tokio::test]
+async fn fake_runner_cancellation_during_an_interval_emits_no_late_panel_event() {
+    let fixture =
+        support::fake_runner_fixture_with_config(FakeRunnerConfig::new(Duration::from_secs(10)))
+            .await;
+    let task = fixture.start().await;
+
+    assert!(matches!(
+        fixture.cancel(task.id).await,
+        CancelOutcome::Accepted { .. }
+    ));
+    fixture.wait_for_terminal(task.id).await;
+
+    assert_eq!(fixture.load(task.id).await.status, TaskStatus::Cancelled);
+    assert_eq!(
+        fixture.event_kinds(task.id).await,
+        vec![
+            TaskEventKind::TaskQueued,
+            TaskEventKind::TaskStarted,
+            TaskEventKind::PlanUpdated,
+            TaskEventKind::TaskCancelled,
+        ]
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn scripted_fake_runner_failure_uses_the_fixed_safe_failure() {
+    let fixture = support::scripted_fake_runner_fixture([FakeScenario::Failure], 1).await;
+    let task = fixture.start("ordinary prompt").await;
+    fixture.wait_for_status(task.id, TaskStatus::Failed).await;
+
+    assert_eq!(
+        fixture.load(task.id).await.failure,
+        Some(TaskFailure {
+            code: "FAKE_RUNNER_FAILURE".to_owned(),
+            message: "deterministic fake runner failure".to_owned(),
+            retryable: true,
+        })
+    );
+    assert_eq!(
+        fixture.event_kinds(task.id).await,
+        vec![
+            TaskEventKind::TaskQueued,
+            TaskEventKind::TaskStarted,
+            TaskEventKind::TaskFailed,
+        ]
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn scripted_fake_runner_blocking_observes_cancellation_without_a_release() {
+    let fixture = support::scripted_fake_runner_fixture([FakeScenario::Blocking], 1).await;
+    let task = fixture.start("ordinary prompt").await;
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+
+    assert!(matches!(
+        fixture.cancel(task.id).await,
+        CancelOutcome::Accepted { .. }
+    ));
+    fixture
+        .wait_for_status(task.id, TaskStatus::Cancelled)
+        .await;
+    assert!(!fixture.runner.release(task.id));
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn scripted_fake_runner_can_ignore_cancellation_until_explicit_release() {
+    let fixture =
+        support::scripted_fake_runner_fixture([FakeScenario::IgnoresCancellation], 1).await;
+    let task = fixture.start("ordinary prompt").await;
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+
+    assert!(matches!(
+        fixture.cancel(task.id).await,
+        CancelOutcome::Accepted { .. }
+    ));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(fixture.load(task.id).await.status, TaskStatus::Running);
+    assert!(fixture.runner.release(task.id));
+    fixture
+        .wait_for_status(task.id, TaskStatus::Completed)
+        .await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn scripted_fake_runner_panic_is_isolated_from_another_task() {
+    let fixture =
+        support::scripted_fake_runner_fixture([FakeScenario::Panic, FakeScenario::Blocking], 2)
+            .await;
+    let tasks = fixture.enqueue(&["first prompt", "second prompt"]).await;
+
+    fixture
+        .wait_for_status(tasks[0].id, TaskStatus::Failed)
+        .await;
+    fixture
+        .wait_for_status(tasks[1].id, TaskStatus::Running)
+        .await;
+    assert_eq!(
+        fixture.load(tasks[0].id).await.failure.unwrap().code,
+        "RUNNER_PANICKED"
+    );
+    assert!(fixture.runner.release(tasks[1].id));
+    fixture
+        .wait_for_status(tasks[1].id, TaskStatus::Completed)
+        .await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn scripted_fake_runner_consumes_scenarios_in_task_creation_order_not_prompt_text() {
+    let fixture =
+        support::scripted_fake_runner_fixture([FakeScenario::Failure, FakeScenario::Blocking], 1)
+            .await;
+    let tasks = fixture
+        .enqueue(&["please block forever", "please return a failure"])
+        .await;
+
+    fixture
+        .wait_for_status(tasks[0].id, TaskStatus::Failed)
+        .await;
+    fixture
+        .wait_for_status(tasks[1].id, TaskStatus::Running)
+        .await;
+    assert_eq!(
+        fixture.runner.started_task_ids(),
+        vec![tasks[0].id, tasks[1].id]
+    );
+    assert!(fixture.runner.release(tasks[1].id));
+    fixture
+        .wait_for_status(tasks[1].id, TaskStatus::Completed)
+        .await;
 }

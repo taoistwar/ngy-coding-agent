@@ -10,11 +10,15 @@
 //! ```
 
 mod event_dispatcher;
+mod fake_runner;
 mod service_state;
 mod store_writer;
 mod task_manager;
 
 pub use event_dispatcher::{EventDispatcherError, EventDispatcherHandle};
+pub use fake_runner::{FakeRunnerConfig, FakeTaskRunner};
+#[cfg(feature = "test-support")]
+pub use fake_runner::{FakeScenario, ScriptedFakeRunner};
 pub use service_state::{
     InvalidServiceTransition, ServiceState, ServiceStateController, ServiceStateSnapshot,
 };
