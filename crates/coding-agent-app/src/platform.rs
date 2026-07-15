@@ -50,6 +50,13 @@ pub struct PrivateFile(File);
 
 impl PrivateFile {
     pub fn create_new(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::create_new_with_after_open(path, || Ok(()))
+    }
+
+    fn create_new_with_after_open(
+        path: impl AsRef<Path>,
+        after_open: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<Self> {
         let path = path.as_ref();
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
@@ -58,8 +65,16 @@ impl PrivateFile {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+            use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+
+            options.access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC);
+        }
         let file = options.open(path)?;
-        if let Err(error) = make_private(path, false) {
+        if let Err(error) = after_open().and_then(|()| make_private_file(&file)) {
             drop(file);
             let _ = std::fs::remove_file(path);
             return Err(error);
@@ -166,20 +181,79 @@ fn make_private(path: &Path, directory: bool) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
+#[cfg(unix)]
+fn make_private_file(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
 #[cfg(windows)]
-fn make_private(path: &Path, _directory: bool) -> io::Result<()> {
-    use std::mem::size_of;
+fn make_private(path: &Path, directory: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let mut wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    with_windows_owner_only_acl(directory, |acl| unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn make_private_file(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    with_windows_owner_only_acl(false, |acl| unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn with_windows_owner_only_acl(
+    directory: bool,
+    apply: impl FnOnce(*mut windows_sys::Win32::Security::ACL) -> u32,
+) -> io::Result<()> {
+    use std::mem::size_of;
     use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
-        SetNamedSecurityInfoW, TRUSTEE_W,
+        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, SET_ACCESS, SetEntriesInAclW, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, NO_INHERITANCE,
-        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        ACL, GetTokenInformation, NO_INHERITANCE, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -221,7 +295,11 @@ fn make_private(path: &Path, _directory: bool) -> io::Result<()> {
     let access = EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_ALL_ACCESS,
         grfAccessMode: SET_ACCESS,
-        grfInheritance: NO_INHERITANCE,
+        grfInheritance: if directory {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        } else {
+            NO_INHERITANCE
+        },
         Trustee: trustee,
     };
     let mut acl: *mut ACL = null_mut();
@@ -230,22 +308,7 @@ fn make_private(path: &Path, _directory: bool) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(acl_status as i32));
     }
 
-    let mut wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let status = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_mut_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            acl,
-            null(),
-        )
-    };
+    let status = apply(acl);
     unsafe { LocalFree(acl.cast()) };
     if status == ERROR_SUCCESS {
         Ok(())
@@ -256,6 +319,8 @@ fn make_private(path: &Path, _directory: bool) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -272,5 +337,161 @@ mod tests {
             Some("http://127.0.0.1:42123/#token=launch-token")
         );
         assert_eq!(error.url(), delegated.unwrap());
+    }
+
+    #[test]
+    fn private_file_permissions_stay_bound_to_the_opened_file_during_a_path_swap() {
+        let temp = tempfile::tempdir().expect("create handle-bound permission fixture");
+        let path = temp.path().join("instance.json");
+        let opened_path = temp.path().join("opened-instance.json");
+        let victim = temp.path().join("victim.json");
+        std::fs::write(&victim, b"victim contents").expect("create permission victim");
+        make_test_file_broad(&victim);
+        let victim_permissions = permission_fingerprint(&victim);
+
+        let mut private = PrivateFile::create_new_with_after_open(&path, || {
+            std::fs::rename(&path, &opened_path).map_err(|error| {
+                io::Error::new(error.kind(), format!("rename opened file: {error}"))
+            })?;
+            create_test_file_symlink(&victim, &path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("install replacement symlink: {error}"),
+                )
+            })
+        })
+        .expect("create private file while its name is replaced");
+
+        assert_eq!(
+            permission_fingerprint(&victim),
+            victim_permissions,
+            "permission hardening must not follow the replacement path"
+        );
+        assert_ne!(
+            permission_fingerprint(&opened_path),
+            victim_permissions,
+            "the opened file itself must be hardened"
+        );
+        private
+            .write_all(b"opened file contents")
+            .expect("write through the original opened handle");
+        drop(private);
+        assert_eq!(
+            std::fs::read(&opened_path).unwrap(),
+            b"opened file contents"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim contents");
+    }
+
+    #[cfg(unix)]
+    fn make_test_file_broad(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
+            .expect("make Unix permission victim broad");
+    }
+
+    #[cfg(unix)]
+    fn permission_fingerprint(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn create_test_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn make_test_file_broad(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::null_mut;
+
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+        let mut wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        assert_eq!(
+            status, ERROR_SUCCESS,
+            "give the permission victim a null DACL"
+        );
+    }
+
+    #[cfg(windows)]
+    fn permission_fingerprint(path: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::{null_mut, slice_from_raw_parts};
+
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS, "read permission victim DACL");
+
+        let mut text = null_mut();
+        let mut length = 0u32;
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    &mut length,
+                )
+            },
+            0,
+            "convert DACL to a stable fingerprint"
+        );
+        let fingerprint =
+            String::from_utf16_lossy(unsafe { &*slice_from_raw_parts(text, length as usize) });
+        unsafe {
+            LocalFree(text.cast());
+            LocalFree(descriptor.cast());
+        }
+        fingerprint
+    }
+
+    #[cfg(windows)]
+    fn create_test_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
     }
 }

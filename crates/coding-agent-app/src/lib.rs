@@ -23,6 +23,8 @@ pub use event_dispatcher::{EventDispatcherError, EventDispatcherHandle};
 pub use fake_runner::{FakeRunnerConfig, FakeTaskRunner};
 #[cfg(feature = "test-support")]
 pub use fake_runner::{FakeScenario, ScriptedFakeRunner};
+#[cfg(target_os = "macos")]
+pub use native_dialog::NativeDialogMainThreadHost;
 pub use native_dialog::{NativeDialogService, PickerError};
 pub use platform::{BrowserLaunchError, BrowserLauncher, PlatformPaths, PrivateFile};
 pub use repository_service::{
