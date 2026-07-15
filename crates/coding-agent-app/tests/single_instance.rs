@@ -15,7 +15,10 @@ use coding_agent_domain::{
     CanonicalPath, ClientRequestId, NewRepository, NewTask, TaskEventKind, TaskStatus, UtcTimestamp,
 };
 use coding_agent_store::{CreateTaskOutcome, RegisterRepositoryOutcome, Store};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
+
+const DEVELOPMENT_PUBLIC_ORIGIN: &str = "http://127.0.0.1:5173";
 
 #[test]
 fn permanent_lock_selects_exactly_one_primary_without_replacing_the_lock_file() {
@@ -345,6 +348,7 @@ async fn primary_composes_real_listener_and_stays_alive_when_browser_open_fails(
     assert_eq!(descriptor.port().get(), primary.port());
     let urls = fixture.calls.browser_urls();
     assert_eq!(urls.len(), 1);
+    assert!(urls[0].starts_with(&format!("http://127.0.0.1:{}/#token=", primary.port())));
     let messages = fixture.calls.messages();
     assert_eq!(messages.len(), 1);
     assert!(messages[0].1.contains(&urls[0]));
@@ -364,6 +368,100 @@ async fn primary_composes_real_listener_and_stays_alive_when_browser_open_fails(
     .await
     .expect("server task releases its lock keepalive after abort");
     drop(reacquired);
+}
+
+#[tokio::test]
+async fn development_primary_uses_vite_origin_listener_proxy_host_and_vite_browser_target() {
+    let fixture = support::StartupFixture::new();
+    let dependencies = fixture
+        .dependencies(support::StartupBehavior::default())
+        .with_development_public_origin(DEVELOPMENT_PUBLIC_ORIGIN);
+    let outcome = launch(dependencies)
+        .await
+        .expect("start development primary");
+    let StartupOutcome::Primary(primary) = outcome else {
+        panic!("the first development process must become primary");
+    };
+
+    let urls = fixture.calls.browser_urls();
+    assert_eq!(urls.len(), 1);
+    assert!(
+        urls[0].starts_with(&format!("{DEVELOPMENT_PUBLIC_ORIGIN}/#token=")),
+        "development must open the Vite public origin"
+    );
+    let token = fragment_token(&urls[0]);
+    let listener_host = format!("127.0.0.1:{}", primary.port());
+
+    assert_eq!(
+        exchange_session_status(
+            primary.port(),
+            "127.0.0.1:5173",
+            DEVELOPMENT_PUBLIC_ORIGIN,
+            token,
+        )
+        .await,
+        403,
+        "Vite must rewrite Host to the exact Axum listener authority"
+    );
+    assert_eq!(
+        exchange_session_status(
+            primary.port(),
+            &listener_host,
+            &format!("http://{listener_host}"),
+            token,
+        )
+        .await,
+        403,
+        "development must reject the listener origin"
+    );
+    assert_eq!(
+        exchange_session_status(
+            primary.port(),
+            &listener_host,
+            DEVELOPMENT_PUBLIC_ORIGIN,
+            token,
+        )
+        .await,
+        204,
+        "the one Vite public origin and listener proxy Host must be accepted"
+    );
+
+    let secondary = launch(
+        fixture
+            .dependencies(support::StartupBehavior::default())
+            .with_development_public_origin(DEVELOPMENT_PUBLIC_ORIGIN),
+    )
+    .await
+    .expect("start development secondary");
+    let StartupOutcome::Secondary(secondary) = secondary else {
+        panic!("the contending development process must become secondary");
+    };
+    assert_eq!(secondary.instance_id(), primary.instance_id());
+    assert!(secondary.browser_opened());
+    let urls = fixture.calls.browser_urls();
+    assert_eq!(urls.len(), 2);
+    assert!(
+        urls.iter()
+            .all(|url| url.starts_with(&format!("{DEVELOPMENT_PUBLIC_ORIGIN}/#token="))),
+        "both primary and reopen must target Vite"
+    );
+
+    drop(primary);
+}
+
+#[tokio::test]
+async fn invalid_development_public_origin_fails_before_descriptor_or_browser_publication() {
+    let fixture = support::StartupFixture::new();
+    let result = launch(
+        fixture
+            .dependencies(support::StartupBehavior::default())
+            .with_development_public_origin("http://localhost:5173"),
+    )
+    .await;
+
+    assert!(matches!(result, Err(StartupError::Security(_))));
+    assert!(!fixture.paths.instance_descriptor.exists());
+    assert!(fixture.calls.browser_urls().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -519,6 +617,40 @@ async fn drive_until_finished<T>(task: &tokio::task::JoinHandle<T>) {
         tokio::task::yield_now().await;
     }
     assert!(task.is_finished(), "task did not finish under virtual time");
+}
+
+fn fragment_token(url: &str) -> &str {
+    url.split_once("/#token=")
+        .map(|(_, token)| token)
+        .expect("browser URL carries a fragment token")
+}
+
+async fn exchange_session_status(port: u16, host: &str, origin: &str, token: &str) -> u16 {
+    let body = serde_json::to_string(&serde_json::json!({ "token": token }))
+        .expect("encode exchange body");
+    let request = format!(
+        "POST /api/session/exchange HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("connect to development primary");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write exchange request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read exchange response");
+    let response = String::from_utf8(response).expect("HTTP response is UTF-8");
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .expect("response has a numeric HTTP status")
 }
 
 struct FakePrimary {

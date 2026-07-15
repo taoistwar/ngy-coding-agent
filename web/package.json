@@ -10,6 +10,7 @@
     "dev": "vite",
     "api:generate": "node scripts/generate-api.mjs",
     "api:check": "node scripts/generate-api.mjs --check",
+    "config:check": "node scripts/check-vite-config.mjs",
     "typecheck": "tsc -b",
     "test": "vitest",
     "test:run": "vitest run",

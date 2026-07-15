@@ -566,6 +566,23 @@ pub struct StartupDependencies {
     pub security_clock: Arc<dyn SecurityClock>,
     pub runner: Arc<dyn TaskRunner>,
     pub dialog: Option<NativeDialogService>,
+    public_origin: StartupPublicOrigin,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum StartupPublicOrigin {
+    #[default]
+    Listener,
+    Development(String),
+}
+
+impl StartupPublicOrigin {
+    fn browser_port(&self, listener_port: u16) -> Option<u16> {
+        match self {
+            Self::Listener => NonZeroU16::new(listener_port).map(NonZeroU16::get),
+            Self::Development(public_origin) => canonical_loopback_origin_port(public_origin),
+        }
+    }
 }
 
 impl StartupDependencies {
@@ -580,7 +597,18 @@ impl StartupDependencies {
             security_clock: Arc::new(SystemSecurityClock),
             runner: Arc::new(FakeTaskRunner::default()),
             dialog,
+            public_origin: StartupPublicOrigin::Listener,
         }
+    }
+
+    /// Routes browser requests through one exact development origin while Axum
+    /// continues to require the dynamically-bound listener authority as Host.
+    ///
+    /// The value is validated by [`SecurityManager`] when a primary starts; no
+    /// localhost alias, wildcard origin, or authentication bypass is introduced.
+    pub fn with_development_public_origin(mut self, public_origin: impl Into<String>) -> Self {
+        self.public_origin = StartupPublicOrigin::Development(public_origin.into());
+        self
     }
 }
 
@@ -785,9 +813,24 @@ async fn start_primary(
     let listener = bind_loopback(&*dependencies.listeners).await?;
     let local_address = listener.local_addr().map_err(StartupError::Listener)?;
     let port = NonZeroU16::new(local_address.port()).ok_or(StartupError::InvalidListener)?;
-    let public_origin = format!("http://127.0.0.1:{port}");
-    let security =
-        SecurityManager::from_seed(seed, public_origin, dependencies.security_clock.clone())?;
+    let listener_host = format!("127.0.0.1:{port}");
+    let security = match &dependencies.public_origin {
+        StartupPublicOrigin::Listener => SecurityManager::from_seed(
+            seed,
+            format!("http://{listener_host}"),
+            dependencies.security_clock.clone(),
+        ),
+        StartupPublicOrigin::Development(public_origin) => {
+            SecurityManager::from_seed_for_development(
+                seed,
+                public_origin.clone(),
+                listener_host,
+                dependencies.security_clock.clone(),
+            )
+        }
+    }?;
+    let browser_port = canonical_loopback_origin_port(security.public_origin())
+        .expect("SecurityManager guarantees a canonical nonzero loopback public origin");
 
     let dispatcher = EventDispatcherHandle::spawn(store.clone(), EVENT_BROADCAST_CAPACITY).await?;
     debug_assert_eq!(store.latest_event_id().await?, recovery.high_watermark);
@@ -873,7 +916,7 @@ async fn start_primary(
     let browser_opened = open_browser_or_report(
         &*dependencies.browser,
         &*dependencies.messages,
-        port.get(),
+        browser_port,
         initial_launch_token.as_str(),
     );
     #[cfg(feature = "test-support")]
@@ -978,13 +1021,16 @@ async fn start_secondary(
             && let Ok((status, Some(grant))) =
                 crate::local_client::request_reopen(&descriptor, deadline).await
             && status == http::StatusCode::OK
+            && let Some(browser_port) = dependencies
+                .public_origin
+                .browser_port(descriptor.port().get())
             && let Some(token) =
-                validate_reopen_grant(&descriptor, &grant, dependencies.wall_clock.now_utc())
+                validate_reopen_grant(&grant, dependencies.wall_clock.now_utc(), browser_port)
         {
             let browser_opened = open_browser_or_report(
                 &*dependencies.browser,
                 &*dependencies.messages,
-                descriptor.port().get(),
+                browser_port,
                 &token,
             );
             return Ok(SecondaryRuntime {
@@ -1000,14 +1046,14 @@ async fn start_secondary(
 }
 
 fn validate_reopen_grant(
-    descriptor: &RuntimeDescriptor,
     grant: &crate::local_client::ReopenGrant,
     now: time::OffsetDateTime,
+    browser_port: u16,
 ) -> Option<String> {
-    let prefix = format!("http://127.0.0.1:{}/#token=", descriptor.port());
+    let prefix = BrowserLauncher::url(browser_port, "");
     let token = grant.url.strip_prefix(&prefix)?;
     validate_launcher_secret(token).ok()?;
-    if BrowserLauncher::url(descriptor.port().get(), token) != grant.url {
+    if BrowserLauncher::url(browser_port, token) != grant.url {
         return None;
     }
 
@@ -1018,6 +1064,16 @@ fn validate_reopen_grant(
         return None;
     }
     Some(token.to_owned())
+}
+
+fn canonical_loopback_origin_port(public_origin: &str) -> Option<u16> {
+    let uri = public_origin.parse::<http::Uri>().ok()?;
+    let authority = uri.authority()?;
+    let port = authority.port_u16().filter(|port| *port != 0)?;
+    (uri.scheme_str() == Some("http")
+        && authority.host() == "127.0.0.1"
+        && public_origin == format!("http://127.0.0.1:{port}"))
+    .then_some(port)
 }
 
 fn open_browser_or_report(
@@ -1363,8 +1419,21 @@ mod tests {
             expires_at,
         };
         assert_eq!(
-            validate_reopen_grant(&descriptor, &valid, now).as_deref(),
+            validate_reopen_grant(&valid, now, descriptor.port().get()).as_deref(),
             Some(token.as_str())
+        );
+
+        let development = crate::local_client::ReopenGrant {
+            url: BrowserLauncher::url(5_173, &token),
+            expires_at,
+        };
+        assert_eq!(
+            validate_reopen_grant(&development, now, 5_173).as_deref(),
+            Some(token.as_str())
+        );
+        assert!(
+            validate_reopen_grant(&valid, now, 5_173).is_none(),
+            "a listener-origin grant must not be accepted in development"
         );
 
         for url in [
@@ -1373,7 +1442,7 @@ mod tests {
             format!("http://127.0.0.1:{}/#token={token}extra", descriptor.port()),
         ] {
             let invalid = crate::local_client::ReopenGrant { url, expires_at };
-            assert!(validate_reopen_grant(&descriptor, &invalid, now).is_none());
+            assert!(validate_reopen_grant(&invalid, now, descriptor.port().get()).is_none());
         }
 
         let stale = crate::local_client::ReopenGrant {
@@ -1381,6 +1450,6 @@ mod tests {
             expires_at: UtcTimestamp::new(now.saturating_add(time::Duration::seconds(5)))
                 .expect("construct stale expiration"),
         };
-        assert!(validate_reopen_grant(&descriptor, &stale, now).is_none());
+        assert!(validate_reopen_grant(&stale, now, descriptor.port().get()).is_none());
     }
 }

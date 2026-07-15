@@ -1,9 +1,15 @@
+#[cfg(all(not(debug_assertions), not(feature = "embedded-web")))]
+compile_error!("release builds require the `embedded-web` feature");
+
 use std::process::ExitCode;
 
 use coding_agent_app::{
     NativeDialogService, StartupDependencies, StartupOutcome, launch,
     run_degraded_shutdown_warning_if_requested,
 };
+
+#[cfg(all(debug_assertions, not(feature = "embedded-web")))]
+const VITE_PUBLIC_ORIGIN: &str = "http://127.0.0.1:5173";
 
 fn main() -> ExitCode {
     if run_degraded_shutdown_warning_if_requested() {
@@ -39,7 +45,7 @@ fn main() -> ExitCode {
 
 #[cfg(not(target_os = "macos"))]
 fn run_on_platform_main_thread(runtime: &tokio::runtime::Runtime) -> i32 {
-    runtime.block_on(run_application(StartupDependencies::production(Some(
+    runtime.block_on(run_application(startup_dependencies(Some(
         NativeDialogService::new(),
     ))))
 }
@@ -56,10 +62,17 @@ fn run_on_platform_main_thread(runtime: &tokio::runtime::Runtime) -> i32 {
     let dialog_host_keepalive = dialog.clone();
     runtime.block_on(select_application_and_dialog_host(
         dialog_host_keepalive,
-        run_application(StartupDependencies::production(Some(dialog))),
+        run_application(startup_dependencies(Some(dialog))),
         host.run(),
         || show_early_error("The native dialog host stopped unexpectedly."),
     ))
+}
+
+fn startup_dependencies(dialog: Option<NativeDialogService>) -> StartupDependencies {
+    let dependencies = StartupDependencies::production(dialog);
+    #[cfg(all(debug_assertions, not(feature = "embedded-web")))]
+    let dependencies = dependencies.with_development_public_origin(VITE_PUBLIC_ORIGIN);
+    dependencies
 }
 
 #[cfg(any(target_os = "macos", test))]

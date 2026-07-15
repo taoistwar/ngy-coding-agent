@@ -22,6 +22,7 @@ mod server;
 mod service_state;
 mod shutdown;
 mod single_instance;
+mod static_assets;
 mod store_writer;
 mod task_manager;
 
@@ -58,6 +59,7 @@ pub use single_instance::{
     StartupOutcome, StartupPaths, StartupPhase, StartupPhaseController, StoreFactory, launch,
     run_degraded_shutdown_warning_if_requested,
 };
+pub use static_assets::StaticAssetService;
 pub use store_writer::{EventWake, StoreWriterError, StoreWriterHandle, WriteReceipt};
 pub use task_manager::{
     CancelOutcome, QuiesceResult, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink,

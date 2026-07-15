@@ -7,7 +7,9 @@ license.workspace = true
 
 [features]
 default = []
+embedded-web = ["dep:rust-embed"]
 test-support = []
+e2e = ["embedded-web", "rust-embed/debug-embed", "test-support"]
 
 [dependencies]
 async-stream.workspace = true
@@ -25,7 +27,9 @@ http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+mime_guess.workspace = true
 rfd.workspace = true
+rust-embed = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true

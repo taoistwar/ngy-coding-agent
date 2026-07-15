@@ -155,31 +155,30 @@ impl StartupFixture {
     }
 
     pub fn dependencies(&self, behavior: StartupBehavior) -> StartupDependencies {
-        StartupDependencies {
-            paths: Arc::new(FixedStartupPaths {
-                paths: self.paths.clone(),
-                prepare_error: behavior.prepare_error,
-            }),
-            stores: Arc::new(CountingStoreFactory {
-                calls: self.calls.clone(),
-                panic_on_open: behavior.panic_on_store_open,
-            }),
-            listeners: Arc::new(CountingListenerFactory {
-                calls: self.calls.clone(),
-                failures_remaining: Mutex::new(behavior.listener_failures),
-            }),
-            browser: Arc::new(RecordingBrowser {
-                calls: self.calls.clone(),
-                fails: behavior.browser_fails,
-            }),
-            messages: Arc::new(RecordingMessages {
-                calls: self.calls.clone(),
-            }),
-            wall_clock: Arc::new(FixedWallClock),
-            security_clock: Arc::new(FakeSecurityClock::new()),
-            runner: Arc::new(FakeTaskRunner::default()),
-            dialog: None,
-        }
+        let mut dependencies = StartupDependencies::production(None);
+        dependencies.paths = Arc::new(FixedStartupPaths {
+            paths: self.paths.clone(),
+            prepare_error: behavior.prepare_error,
+        });
+        dependencies.stores = Arc::new(CountingStoreFactory {
+            calls: self.calls.clone(),
+            panic_on_open: behavior.panic_on_store_open,
+        });
+        dependencies.listeners = Arc::new(CountingListenerFactory {
+            calls: self.calls.clone(),
+            failures_remaining: Mutex::new(behavior.listener_failures),
+        });
+        dependencies.browser = Arc::new(RecordingBrowser {
+            calls: self.calls.clone(),
+            fails: behavior.browser_fails,
+        });
+        dependencies.messages = Arc::new(RecordingMessages {
+            calls: self.calls.clone(),
+        });
+        dependencies.wall_clock = Arc::new(FixedWallClock);
+        dependencies.security_clock = Arc::new(FakeSecurityClock::new());
+        dependencies.runner = Arc::new(FakeTaskRunner::default());
+        dependencies
     }
 }
 

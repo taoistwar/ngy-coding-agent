@@ -39,6 +39,7 @@ use crate::{
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const LOCAL_READY_PATH: &str = "/_local/ready";
 const LOCAL_REOPEN_PATH: &str = "/_local/reopen";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
 
 #[derive(Clone)]
 struct RuntimeRouterState {
@@ -87,6 +88,7 @@ pub fn build_runtime_router(
 
     local_router
         .merge(api_router)
+        .fallback_service(crate::StaticAssetService::new())
         .layer(middleware::from_fn_with_state(state, runtime_guard))
 }
 
@@ -100,6 +102,8 @@ async fn runtime_guard(
         .extensions_mut()
         .insert(RuntimeRequestId(request_id.clone()));
     let (parts, body) = request.into_parts();
+    let no_store_request =
+        path_is_within(parts.uri.path(), "/api") || path_is_within(parts.uri.path(), "/_local");
     let host_result = state.security.validate_host(&parts);
     let local_startup_path = matches!(parts.uri.path(), LOCAL_READY_PATH | LOCAL_REOPEN_PATH);
     let request = Request::from_parts(parts, body);
@@ -112,7 +116,54 @@ async fn runtime_guard(
         next.run(request).await
     };
 
-    with_request_id(response, &request_id)
+    apply_response_policy(with_request_id(response, &request_id), no_store_request)
+}
+
+fn apply_response_policy(mut response: Response, no_store_request: bool) -> Response {
+    let html_response = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"));
+    let headers = response.headers_mut();
+
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    if no_store_request || html_response {
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+    }
+
+    for header in [
+        "access-control-allow-credentials",
+        "access-control-allow-headers",
+        "access-control-allow-methods",
+        "access-control-allow-origin",
+        "access-control-allow-private-network",
+        "access-control-expose-headers",
+        "access-control-max-age",
+    ] {
+        headers.remove(header);
+    }
+
+    response
+}
+
+fn path_is_within(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 async fn local_ready(State(state): State<RuntimeRouterState>, request: Request) -> Response {
@@ -968,6 +1019,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::body::Body;
+    use axum::response::Html;
     use http::Method;
     use http_body_util::BodyExt as _;
     use serde_json::{Value, json};
@@ -999,8 +1051,19 @@ mod tests {
             )
             .expect("construct runtime security");
             let phase = StartupPhaseController::new();
-            let api_router =
-                Router::new().route("/api/ping", get(|| async { StatusCode::NO_CONTENT }));
+            let api_router = Router::new()
+                .route("/api/ping", get(|| async { StatusCode::NO_CONTENT }))
+                .route(
+                    "/page",
+                    get(|| async {
+                        let mut response = Html("<!doctype html>").into_response();
+                        response.headers_mut().insert(
+                            http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                            HeaderValue::from_static("*"),
+                        );
+                        response
+                    }),
+                );
             let router = build_runtime_router(
                 api_router,
                 instance_id,
@@ -1082,6 +1145,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().contains_key(REQUEST_ID_HEADER));
+        assert_eq!(
+            response.headers().get(http::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
         assert!(
             !response
                 .headers()
@@ -1091,6 +1158,89 @@ mod tests {
         assert_eq!(body.as_object().expect("ready object").len(), 2);
         assert_eq!(body["instance_id"], json!(fixture.instance_id));
         assert_eq!(body["state"], "starting");
+    }
+
+    #[tokio::test]
+    async fn outer_response_policy_covers_success_errors_html_and_api_without_cors() {
+        const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+
+        fn assert_common_policy(response: &Response) {
+            assert_eq!(
+                response.headers().get("x-content-type-options"),
+                Some(&HeaderValue::from_static("nosniff"))
+            );
+            assert_eq!(
+                response.headers().get("referrer-policy"),
+                Some(&HeaderValue::from_static("no-referrer"))
+            );
+            assert_eq!(
+                response.headers().get("content-security-policy"),
+                Some(&HeaderValue::from_static(EXPECTED_CSP))
+            );
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            );
+        }
+
+        let fixture = RuntimeFixture::new();
+        assert!(fixture.phase.mark_ready());
+
+        let api = fixture
+            .router
+            .clone()
+            .oneshot(fixture.request(Method::GET, "/api/ping"))
+            .await
+            .expect("call API");
+        assert_common_policy(&api);
+        assert_eq!(
+            api.headers().get(http::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+
+        let missing_api = fixture
+            .router
+            .clone()
+            .oneshot(fixture.request(Method::GET, "/api/not-a-route"))
+            .await
+            .expect("call missing API route");
+        assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
+        assert_common_policy(&missing_api);
+        assert_eq!(
+            missing_api.headers().get(http::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+
+        let html = fixture
+            .router
+            .clone()
+            .oneshot(fixture.request(Method::GET, "/page"))
+            .await
+            .expect("call HTML route");
+        assert_common_policy(&html);
+        assert_eq!(
+            html.headers().get(http::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+
+        let wrong_host = http::Request::builder()
+            .uri("/api/ping")
+            .header(http::header::HOST, "localhost:43121")
+            .body(Body::empty())
+            .expect("build wrong-host request");
+        let error = fixture
+            .router
+            .clone()
+            .oneshot(wrong_host)
+            .await
+            .expect("call API with wrong Host");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        assert_common_policy(&error);
+        assert_eq!(
+            error.headers().get(http::header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
     }
 
     #[tokio::test]
