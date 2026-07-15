@@ -2,11 +2,15 @@
 
 use std::path::{Path, PathBuf};
 
-use coding_agent_domain::{CanonicalPath, NewRepository};
-use coding_agent_store::Store;
+use coding_agent_domain::{
+    CanonicalPath, ClientRequestId, NewRepository, NewTask, Repository, RepositoryId, Task,
+    TaskFailure, TaskStatus, UtcTimestamp,
+};
+use coding_agent_store::{RegisterRepositoryOutcome, Store, TaskTransition, TransitionOutcome};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
 use tempfile::TempDir;
+use time::OffsetDateTime;
 
 pub struct FileStoreFixture {
     pub store: Store,
@@ -20,6 +24,115 @@ pub async fn memory_store() -> Store {
         .expect("open in-memory store");
     store.migrate().await.expect("migrate in-memory store");
     store
+}
+
+pub async fn seeded_store() -> Store {
+    let store = memory_store().await;
+    register_repository(&store, "repo").await;
+    store
+}
+
+pub async fn register_repository(store: &Store, name: &str) -> Repository {
+    let root = std::env::temp_dir().join(format!(
+        "coding-agent-store-{name}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let input = NewRepository {
+        selected_path: CanonicalPath::try_from_canonical(root.join("selected"))
+            .expect("construct selected path"),
+        display_name: name.to_owned(),
+        git_root: CanonicalPath::try_from_canonical(root.join("git")).expect("construct git root"),
+        cargo_workspace_root: CanonicalPath::try_from_canonical(root.join("workspace"))
+            .expect("construct workspace root"),
+    };
+
+    match store
+        .register_repository(input)
+        .await
+        .expect("register fixture repository")
+    {
+        RegisterRepositoryOutcome::Created(repository)
+        | RegisterRepositoryOutcome::Existing(repository) => repository,
+    }
+}
+
+pub fn new_task(repository_id: RepositoryId, prompt: &str) -> NewTask {
+    NewTask::try_new(ClientRequestId::new(), repository_id, prompt).expect("construct fixture task")
+}
+
+pub async fn queued_task(store: &Store) -> Task {
+    let repository = store
+        .list_repositories()
+        .await
+        .expect("list fixture repositories")
+        .into_iter()
+        .next()
+        .expect("fixture repository");
+    store
+        .create_task(new_task(repository.id, "fixture prompt"))
+        .await
+        .expect("create queued fixture task")
+        .task()
+        .clone()
+}
+
+pub async fn running_task(store: &Store) -> Task {
+    let queued = queued_task(store).await;
+    match store
+        .transition_with_event(queued.id, TaskStatus::Queued, TaskTransition::Running)
+        .await
+        .expect("start fixture task")
+    {
+        TransitionOutcome::Applied { task, .. } => task,
+        TransitionOutcome::Conflict { .. } => panic!("fixture start must apply"),
+    }
+}
+
+pub async fn terminal_task(store: &Store, status: TaskStatus) -> Task {
+    let (task, expected, transition) = match status {
+        TaskStatus::Completed => (
+            running_task(store).await,
+            TaskStatus::Running,
+            TaskTransition::Completed,
+        ),
+        TaskStatus::Failed => (
+            running_task(store).await,
+            TaskStatus::Running,
+            TaskTransition::Failed(failure("FIXTURE_FAILED")),
+        ),
+        TaskStatus::Cancelled => (
+            queued_task(store).await,
+            TaskStatus::Queued,
+            TaskTransition::Cancelled,
+        ),
+        TaskStatus::Interrupted => (
+            queued_task(store).await,
+            TaskStatus::Queued,
+            TaskTransition::Interrupted(failure("FIXTURE_INTERRUPTED")),
+        ),
+        TaskStatus::Queued | TaskStatus::Running => panic!("fixture status must be terminal"),
+    };
+
+    match store
+        .transition_with_event(task.id, expected, transition)
+        .await
+        .expect("finish fixture task")
+    {
+        TransitionOutcome::Applied { task, .. } => task,
+        TransitionOutcome::Conflict { .. } => panic!("fixture terminal transition must apply"),
+    }
+}
+
+pub fn failure(code: &str) -> TaskFailure {
+    TaskFailure {
+        code: code.to_owned(),
+        message: format!("safe message for {code}"),
+        retryable: true,
+    }
+}
+
+pub fn current_timestamp() -> UtcTimestamp {
+    UtcTimestamp::new(OffsetDateTime::now_utc()).expect("construct current timestamp")
 }
 
 pub async fn file_store() -> FileStoreFixture {
