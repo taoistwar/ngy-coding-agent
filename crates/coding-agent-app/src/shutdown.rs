@@ -223,12 +223,35 @@ mod tests {
         flush: Mutex<VecDeque<Result<(), String>>>,
         recover_calls: AtomicUsize,
         flush_calls: AtomicUsize,
+        first_recover_barrier: Option<Arc<RecoverBarrier>>,
+    }
+
+    #[derive(Default)]
+    struct RecoverBarrier {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl RecoverBarrier {
+        async fn wait_until_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
     }
 
     #[async_trait::async_trait]
     impl RecoveryBackend for ScriptedBackend {
         async fn recover(&self) -> Result<RecoveryOutcome, String> {
-            self.recover_calls.fetch_add(1, Ordering::SeqCst);
+            let attempt = self.recover_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 1
+                && let Some(barrier) = &self.first_recover_barrier
+            {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
             self.recover
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -256,7 +279,13 @@ mod tests {
                 flush: Mutex::new(flush.into_iter().collect()),
                 recover_calls: AtomicUsize::new(0),
                 flush_calls: AtomicUsize::new(0),
+                first_recover_barrier: None,
             }
+        }
+
+        fn with_first_recover_barrier(mut self, barrier: Arc<RecoverBarrier>) -> Self {
+            self.first_recover_barrier = Some(barrier);
+            self
         }
 
         fn recover_calls(&self) -> usize {
@@ -349,23 +378,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn closed_manager_receiver_stops_before_retrying_forever() {
-        let backend = Arc::new(ScriptedBackend::new(
-            [Err("write failed".to_owned())],
-            std::iter::empty(),
-        ));
+    async fn manager_closure_during_recovery_backoff_stops_without_retrying() {
+        let recover_barrier = Arc::new(RecoverBarrier::default());
+        let backend = Arc::new(
+            ScriptedBackend::new([Err("write failed".to_owned())], std::iter::empty())
+                .with_first_recover_barrier(recover_barrier.clone()),
+        );
         let state = degraded_state();
         let (manager, messages) = mpsc::channel(8);
+        let weak_manager = manager.downgrade();
         let coordinator =
-            DegradedCoordinator::with_backend(backend.clone(), state, manager.downgrade());
+            DegradedCoordinator::with_backend(backend.clone(), state, weak_manager.clone());
+        let run = tokio::spawn(async move { coordinator.run().await });
+
+        recover_barrier.wait_until_entered().await;
+        assert_eq!(backend.recover_calls(), 1);
+        recover_barrier.release();
+        wait_for_strong_senders(&weak_manager, 2).await;
+
         drop(messages);
 
-        let result = tokio::time::timeout(Duration::from_millis(1), coordinator.run())
+        let result = tokio::time::timeout(Duration::from_millis(1), run)
             .await
-            .expect("a closed manager must be detected without waiting for a retry");
+            .expect("manager closure must wake the recovery backoff")
+            .expect("join degraded coordinator");
 
         assert_eq!(result, Err(DegradedCoordinatorError::ManagerClosed));
-        assert_eq!(backend.recover_calls(), 0);
+        assert_eq!(backend.recover_calls(), 1);
         drop(manager);
     }
 
@@ -413,6 +452,19 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("call count did not reach {expected}");
+    }
+
+    async fn wait_for_strong_senders(
+        sender: &mpsc::WeakSender<TaskManagerMessage>,
+        expected: usize,
+    ) {
+        for _ in 0..100 {
+            if sender.strong_count() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("strong sender count did not reach {expected}");
     }
 
     async fn settle() {

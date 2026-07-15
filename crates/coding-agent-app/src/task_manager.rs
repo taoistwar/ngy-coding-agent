@@ -229,12 +229,14 @@ impl TaskManagerHandle {
             sender.downgrade(),
         );
         let (degraded_recoveries, _) = broadcast::channel(16);
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        claim_hooks.install_semaphore(semaphore.clone());
         let actor = TaskManager {
             store,
             writer,
             service_state,
             runner,
-            semaphore: Arc::new(Semaphore::new(concurrency)),
+            semaphore,
             sender: sender.downgrade(),
             receiver,
             active: HashMap::new(),
@@ -874,6 +876,7 @@ struct ClaimTestHooks {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
     active_count: std::sync::atomic::AtomicUsize,
+    semaphore: std::sync::Mutex<Option<Arc<Semaphore>>>,
 }
 
 #[cfg(test)]
@@ -884,7 +887,17 @@ impl ClaimTestHooks {
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             active_count: std::sync::atomic::AtomicUsize::new(0),
+            semaphore: std::sync::Mutex::new(None),
         }
+    }
+
+    fn install_semaphore(&self, semaphore: Arc<Semaphore>) {
+        let previous = self
+            .semaphore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(semaphore);
+        assert!(previous.is_none(), "claim semaphore installed twice");
     }
 
     async fn pause(&self, phase: ClaimPhase) {
@@ -904,6 +917,15 @@ impl ClaimTestHooks {
 
     fn active_count(&self) -> usize {
         self.active_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn available_permits(&self) -> usize {
+        self.semaphore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("claim semaphore installed")
+            .available_permits()
     }
 }
 
@@ -1101,6 +1123,74 @@ mod tests {
                 manager_sender.strong_count()
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_handle_during_registered_claim_cleans_provisional_state() {
+        let temp_dir = tempfile::tempdir().expect("create dropped-claim fixture directory");
+        let store = Store::open(temp_dir.path().join("store.sqlite3"))
+            .await
+            .expect("open dropped-claim store");
+        store.migrate().await.expect("migrate dropped-claim store");
+        let repository = register_repository(&store, temp_dir.path().to_path_buf()).await;
+        let dispatcher = EventDispatcherHandle::spawn(store.clone(), 16)
+            .await
+            .expect("spawn dropped-claim dispatcher");
+        let writer = StoreWriterHandle::spawn(store.clone(), Arc::new(dispatcher.clone()), 8);
+        let runner = Arc::new(CancellingRunner::default());
+        let hooks = Arc::new(ClaimTestHooks::new(ClaimPhase::HandleRegistered));
+        let manager = TaskManagerHandle::spawn_with_claim_hooks(
+            (
+                store.clone(),
+                writer.clone(),
+                dispatcher,
+                ServiceStateController::new(ServiceState::Ready),
+            ),
+            runner.clone(),
+            1,
+            8,
+            hooks.clone(),
+        );
+        let mut exited = manager.install_exit_probe().await;
+        let task = writer
+            .create_task(
+                NewTask::try_new(ClientRequestId::new(), repository.id, "drop during claim")
+                    .expect("construct dropped-claim task"),
+                background_deadline(),
+            )
+            .await
+            .expect("create dropped-claim task")
+            .value
+            .task()
+            .clone();
+
+        manager.notify_queued(task.id).await.expect("notify actor");
+        hooks.wait_until_reached().await;
+        assert_eq!(hooks.active_count(), 1);
+        assert_eq!(hooks.available_permits(), 0);
+        let weak_manager = manager.sender.downgrade();
+        assert_eq!(weak_manager.strong_count(), 1);
+
+        drop(manager);
+        assert_eq!(weak_manager.strong_count(), 0);
+        assert!(weak_manager.upgrade().is_none());
+        hooks.resume();
+
+        match tokio::time::timeout(Duration::from_secs(2), &mut exited).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("manager dropped its exit probe before claim cleanup"),
+            Err(_) => panic!("manager did not exit after failed claim sender upgrade"),
+        }
+        let persisted = store
+            .task_detail(task.id)
+            .await
+            .expect("read dropped-claim task")
+            .expect("dropped-claim task exists")
+            .task;
+        assert_eq!(persisted.status, TaskStatus::Queued);
+        assert_eq!(runner.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(hooks.active_count(), 0);
+        assert_eq!(hooks.available_permits(), 1);
     }
 
     #[tokio::test(start_paused = true)]
