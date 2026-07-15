@@ -577,7 +577,7 @@ async fn fake_runner_cancellation_during_an_interval_emits_no_late_panel_event()
 #[tokio::test]
 async fn scripted_fake_runner_failure_uses_the_fixed_safe_failure() {
     let fixture = support::scripted_fake_runner_fixture([FakeScenario::Failure], 1).await;
-    let task = fixture.start("ordinary prompt").await;
+    let task = fixture.enqueue(&["ordinary prompt"]).await.remove(0);
     fixture.wait_for_status(task.id, TaskStatus::Failed).await;
 
     assert_eq!(

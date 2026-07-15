@@ -127,6 +127,8 @@ pub trait SseBackend: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 pub trait RequestSecurity: Send + Sync + 'static {
+    fn validate_host(&self, parts: &http::request::Parts) -> ApiResult<()>;
+
     async fn exchange(
         &self,
         parts: &http::request::Parts,

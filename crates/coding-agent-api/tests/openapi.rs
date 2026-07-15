@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use coding_agent_api::{
     ApiDoc, CanonicalPathDto, QuitAcceptance, ServiceStateControl, ServiceStateDto,
-    StreamResetControl, TaskEventDto, UtcTimestampDto,
+    StreamResetControl, TaskEventDto, UtcTimestampDto, api_openapi,
 };
 use coding_agent_domain::{
     CanonicalPath, EventId, PlanItem, PlanItemStatus, PlanSnapshot, TaskEvent, TaskEventPayload,
@@ -361,7 +361,7 @@ fn run_export(output: &Path) {
 }
 
 fn canonical_openapi_bytes() -> Vec<u8> {
-    let mut bytes = serde_json::to_vec_pretty(&ApiDoc::openapi()).unwrap();
+    let mut bytes = serde_json::to_vec_pretty(&api_openapi()).unwrap();
     bytes.push(b'\n');
     bytes
 }

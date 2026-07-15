@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use coding_agent_api::ApiDoc;
-use utoipa::OpenApi;
+use coding_agent_api::api_openapi;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -38,7 +37,7 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), ExportError>
         return Err(ExportError::Usage);
     }
 
-    let mut bytes = serde_json::to_vec_pretty(&ApiDoc::openapi())?;
+    let mut bytes = serde_json::to_vec_pretty(&api_openapi())?;
     bytes.push(b'\n');
     atomic_write(Path::new(&output), &bytes)?;
     Ok(())

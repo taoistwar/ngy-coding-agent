@@ -15,6 +15,7 @@ mod native_dialog;
 mod platform;
 mod repository_service;
 mod security;
+mod server;
 mod service_state;
 mod shutdown;
 mod store_writer;
@@ -35,6 +36,7 @@ pub use security::{
     LaunchToken, LauncherSecret, SecurityClock, SecurityError, SecurityManager, SecuritySeed,
     SessionRecord, SystemSecurityClock,
 };
+pub use server::{ApplicationBackend, MutationGate, MutationGuard};
 pub use service_state::{
     InvalidServiceTransition, ServiceState, ServiceStateController, ServiceStateSnapshot,
 };

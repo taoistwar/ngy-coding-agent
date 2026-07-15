@@ -352,6 +352,10 @@ impl SecurityManager {
 
 #[async_trait::async_trait]
 impl RequestSecurity for SecurityManager {
+    fn validate_host(&self, parts: &Parts) -> ApiResult<()> {
+        SecurityManager::validate_host(self, parts)
+    }
+
     async fn exchange(&self, parts: &Parts, token: &str) -> ApiResult<SessionExchange> {
         self.validate_host(parts)?;
         self.validate_origin(parts)?;

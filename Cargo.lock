@@ -233,11 +233,16 @@ dependencies = [
  "coding-agent-domain",
  "futures-util",
  "http",
+ "http-body-util",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
  "utoipa",
  "utoipa-axum",
  "uuid",
@@ -249,21 +254,27 @@ name = "coding-agent-app"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "axum-extra",
  "base64",
  "coding-agent-api",
  "coding-agent-domain",
  "coding-agent-store",
  "directories",
+ "futures-util",
  "getrandom 0.4.3",
  "http",
+ "http-body-util",
  "rfd",
+ "serde_json",
  "sqlx",
  "subtle",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "webbrowser",
@@ -2078,6 +2089,26 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+dependencies = [
+ "bitflags",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "percent-encoding",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

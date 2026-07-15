@@ -1006,6 +1006,13 @@ impl TaskManagerFixture {
                         .expect("reserve connection with old busy timeout"),
                 );
             }
+            for connection in &mut legacy_connections {
+                sqlx::query("PRAGMA busy_timeout = 0")
+                    .execute(&mut **connection)
+                    .await
+                    .expect("set zero busy timeout on an existing fixture connection");
+            }
+            drop(legacy_connections);
             let transaction = self
                 .store
                 .pool()
@@ -1014,7 +1021,7 @@ impl TaskManagerFixture {
                 .expect("hold SQLite writer lock");
             *held = Some(BusyLock {
                 transaction,
-                legacy_connections,
+                legacy_connections: Vec::new(),
             });
         } else if let Some(lock) = held.take() {
             lock.transaction
