@@ -840,7 +840,19 @@
           }
         ],
         "discriminator": {
-          "propertyName": "kind"
+          "propertyName": "kind",
+          "mapping": {
+            "activity.appended": "#/components/schemas/ActivityAppendedEventDto",
+            "diff.updated": "#/components/schemas/DiffUpdatedEventDto",
+            "plan.updated": "#/components/schemas/PlanUpdatedEventDto",
+            "task.cancelled": "#/components/schemas/TaskCancelledEventDto",
+            "task.completed": "#/components/schemas/TaskCompletedEventDto",
+            "task.failed": "#/components/schemas/TaskFailedEventDto",
+            "task.interrupted": "#/components/schemas/TaskInterruptedEventDto",
+            "task.queued": "#/components/schemas/TaskQueuedEventDto",
+            "task.started": "#/components/schemas/TaskStartedEventDto",
+            "test.updated": "#/components/schemas/TestUpdatedEventDto"
+          }
         }
       },
       "TaskEventKindDto": {

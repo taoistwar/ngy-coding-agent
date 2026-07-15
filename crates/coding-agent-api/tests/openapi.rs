@@ -92,6 +92,28 @@ fn task_event_schema_is_a_discriminated_union_of_ten_flat_envelopes() {
 }
 
 #[test]
+fn task_event_discriminator_explicitly_maps_every_dotted_kind_to_its_envelope() {
+    let value = openapi_value();
+    let discriminator = &value["components"]["schemas"]["TaskEventDto"]["discriminator"];
+
+    assert_eq!(
+        discriminator["mapping"],
+        json!({
+            "task.queued": "#/components/schemas/TaskQueuedEventDto",
+            "task.started": "#/components/schemas/TaskStartedEventDto",
+            "plan.updated": "#/components/schemas/PlanUpdatedEventDto",
+            "activity.appended": "#/components/schemas/ActivityAppendedEventDto",
+            "diff.updated": "#/components/schemas/DiffUpdatedEventDto",
+            "test.updated": "#/components/schemas/TestUpdatedEventDto",
+            "task.completed": "#/components/schemas/TaskCompletedEventDto",
+            "task.failed": "#/components/schemas/TaskFailedEventDto",
+            "task.cancelled": "#/components/schemas/TaskCancelledEventDto",
+            "task.interrupted": "#/components/schemas/TaskInterruptedEventDto",
+        })
+    );
+}
+
+#[test]
 fn event_kind_component_literals_match_runtime_discriminators() {
     let value = openapi_value();
     let schemas = &value["components"]["schemas"];

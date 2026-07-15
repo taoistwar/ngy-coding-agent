@@ -551,7 +551,33 @@ impl PartialSchema for TaskEventDto {
             .item(Ref::from_schema_name("TaskFailedEventDto"))
             .item(Ref::from_schema_name("TaskCancelledEventDto"))
             .item(Ref::from_schema_name("TaskInterruptedEventDto"))
-            .discriminator(Some(Discriminator::new("kind")))
+            .discriminator(Some(Discriminator::with_mapping(
+                "kind",
+                [
+                    ("task.queued", "#/components/schemas/TaskQueuedEventDto"),
+                    ("task.started", "#/components/schemas/TaskStartedEventDto"),
+                    ("plan.updated", "#/components/schemas/PlanUpdatedEventDto"),
+                    (
+                        "activity.appended",
+                        "#/components/schemas/ActivityAppendedEventDto",
+                    ),
+                    ("diff.updated", "#/components/schemas/DiffUpdatedEventDto"),
+                    ("test.updated", "#/components/schemas/TestUpdatedEventDto"),
+                    (
+                        "task.completed",
+                        "#/components/schemas/TaskCompletedEventDto",
+                    ),
+                    ("task.failed", "#/components/schemas/TaskFailedEventDto"),
+                    (
+                        "task.cancelled",
+                        "#/components/schemas/TaskCancelledEventDto",
+                    ),
+                    (
+                        "task.interrupted",
+                        "#/components/schemas/TaskInterruptedEventDto",
+                    ),
+                ],
+            )))
             .into()
     }
 }
