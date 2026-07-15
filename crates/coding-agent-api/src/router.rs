@@ -121,7 +121,8 @@ async fn exchange_session(
         (status = 400, body = crate::ApiErrorResponse),
         (status = 401, body = crate::ApiErrorResponse),
         (status = 403, body = crate::ApiErrorResponse),
-        (status = 500, body = crate::ApiErrorResponse)
+        (status = 500, body = crate::ApiErrorResponse),
+        (status = 503, body = crate::ApiErrorResponse)
     )
 )]
 async fn bootstrap(
@@ -146,7 +147,8 @@ async fn bootstrap(
         (status = 400, body = crate::ApiErrorResponse),
         (status = 401, body = crate::ApiErrorResponse),
         (status = 403, body = crate::ApiErrorResponse),
-        (status = 500, body = crate::ApiErrorResponse)
+        (status = 500, body = crate::ApiErrorResponse),
+        (status = 503, body = crate::ApiErrorResponse)
     )
 )]
 async fn repositories(
@@ -239,7 +241,8 @@ async fn pick_repository(
         (status = 400, body = crate::ApiErrorResponse),
         (status = 401, body = crate::ApiErrorResponse),
         (status = 403, body = crate::ApiErrorResponse),
-        (status = 500, body = crate::ApiErrorResponse)
+        (status = 500, body = crate::ApiErrorResponse),
+        (status = 503, body = crate::ApiErrorResponse)
     )
 )]
 async fn tasks(
@@ -250,7 +253,7 @@ async fn tasks(
     let (parts, _) = request.into_parts();
     let result = async {
         let auth = state.security.authorize_read(&parts)?;
-        let repository_id = query_value(parts.uri.query(), "repository_id")
+        let repository_id = query_value(parts.uri.query(), "repository_id")?
             .map(parse_repository_id)
             .transpose()?;
         Ok(Json(state.backend.list_tasks(&auth, repository_id).await?).into_response())
@@ -304,7 +307,8 @@ async fn create_task(
         (status = 401, body = crate::ApiErrorResponse),
         (status = 403, body = crate::ApiErrorResponse),
         (status = 404, body = crate::ApiErrorResponse),
-        (status = 500, body = crate::ApiErrorResponse)
+        (status = 500, body = crate::ApiErrorResponse),
+        (status = 503, body = crate::ApiErrorResponse)
     )
 )]
 async fn task_detail(
@@ -404,7 +408,8 @@ async fn retry_task(
         (status = 401, body = crate::ApiErrorResponse),
         (status = 403, body = crate::ApiErrorResponse),
         (status = 404, body = crate::ApiErrorResponse),
-        (status = 500, body = crate::ApiErrorResponse)
+        (status = 500, body = crate::ApiErrorResponse),
+        (status = 503, body = crate::ApiErrorResponse)
     )
 )]
 async fn task_events(
@@ -657,7 +662,7 @@ fn task_id_at(parts: &http::request::Parts, segment: usize) -> ApiResult<TaskId>
 }
 
 fn after_query(parts: &http::request::Parts) -> ApiResult<i64> {
-    let after = query_value(parts.uri.query(), "after")
+    let after = query_value(parts.uri.query(), "after")?
         .unwrap_or("0")
         .parse::<i64>()
         .map_err(|_| invalid_query())?;
@@ -668,11 +673,22 @@ fn after_query(parts: &http::request::Parts) -> ApiResult<i64> {
     }
 }
 
-fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
-    query?.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name == key).then_some(value)
-    })
+fn query_value<'a>(query: Option<&'a str>, key: &str) -> ApiResult<Option<&'a str>> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').ok_or_else(invalid_query)?;
+        if name != key {
+            continue;
+        }
+        if value.is_empty() || found.is_some() {
+            return Err(invalid_query());
+        }
+        found = Some(value);
+    }
+    Ok(found)
 }
 
 fn parse_repository_id(value: &str) -> ApiResult<RepositoryId> {

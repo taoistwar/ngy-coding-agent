@@ -21,6 +21,7 @@ use http::StatusCode;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::store_writer::sqlite_code_is_retryable;
 use crate::{
     CancelOutcome, NativeDialogService, PickerError, RepositoryDiscovery, RepositoryDiscoveryError,
     SecurityManager, ServiceState, ServiceStateController, StoreWriterError, StoreWriterHandle,
@@ -564,6 +565,12 @@ fn map_domain_error(error: DomainError) -> ApiError {
 }
 
 fn map_store_error(error: StoreError) -> ApiError {
+    if let StoreError::Database(database) = &error {
+        let code = database.as_database_error().and_then(|error| error.code());
+        if let Some(error) = map_database_code(code.as_deref()) {
+            return error;
+        }
+    }
     match error {
         StoreError::Domain(error) => map_domain_error(error),
         StoreError::IdempotencyConflict => api_error(
@@ -585,15 +592,15 @@ fn map_store_error(error: StoreError) -> ApiError {
 
 fn map_writer_error(error: StoreWriterError) -> ApiError {
     match error {
-        StoreWriterError::Busy => api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "STORE_BUSY",
-            "the local store is busy; retry the request",
-            true,
-        ),
+        StoreWriterError::Busy => store_busy(),
         StoreWriterError::Store(error) => map_store_error(error),
         StoreWriterError::Closed => app_shutting_down(),
     }
+}
+
+fn map_database_code(code: Option<&str>) -> Option<ApiError> {
+    code.filter(|code| sqlite_code_is_retryable(code))
+        .map(|_| store_busy())
 }
 
 fn map_manager_error(error: TaskManagerError) -> ApiError {
@@ -662,6 +669,15 @@ fn store_degraded() -> ApiError {
     )
 }
 
+fn store_busy() -> ApiError {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "STORE_BUSY",
+        "the local store is busy; retry the request",
+        true,
+    )
+}
+
 fn app_shutting_down() -> ApiError {
     api_error(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -692,4 +708,33 @@ fn api_error(status: StatusCode, code: &str, message: &str, retryable: bool) -> 
 
 fn log_failure(operation: &'static str, error: &ApiError) {
     tracing::info!(operation, error_code = %error.code, "application mutation rejected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_busy_codes_map_to_the_retryable_store_busy_contract() {
+        for code in ["5", "6", "261", "262"] {
+            let error = map_database_code(Some(code)).expect("busy code must map");
+            assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE, "code={code}");
+            assert_eq!(error.code, "STORE_BUSY", "code={code}");
+            assert!(error.retryable, "code={code}");
+        }
+
+        for code in [None, Some("4"), Some("7"), Some("260"), Some("not-a-code")] {
+            assert!(map_database_code(code).is_none(), "code={code:?}");
+        }
+
+        let fallback = map_store_error(StoreError::InvariantViolation("test fallback"));
+        assert_eq!(fallback.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(fallback.code, "INTERNAL_ERROR");
+        assert!(!fallback.retryable);
+
+        let pool_timeout = map_store_error(StoreError::Database(sqlx::Error::PoolTimedOut));
+        assert_eq!(pool_timeout.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(pool_timeout.code, "INTERNAL_ERROR");
+        assert!(!pool_timeout.retryable);
+    }
 }

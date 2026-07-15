@@ -473,7 +473,7 @@ fn classify_store_error(error: StoreError) -> StoreWriterError {
     StoreWriterError::Store(error)
 }
 
-fn sqlite_code_is_retryable(code: &str) -> bool {
+pub(crate) fn sqlite_code_is_retryable(code: &str) -> bool {
     code.parse::<i32>()
         .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
 }
@@ -781,6 +781,9 @@ mod tests {
                 Instant::now() + Duration::from_millis(10),
             )
             .await;
+        // The retry deadline above deliberately uses paused Tokio time. Restore real time before
+        // asking SQLx for a pooled connection so its acquire timeout cannot auto-advance first.
+        tokio::time::resume();
 
         assert!(matches!(result, Err(StoreWriterError::Busy)));
         assert_eq!(backend.attempts(), 1);

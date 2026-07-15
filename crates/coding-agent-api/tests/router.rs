@@ -54,12 +54,12 @@ fn openapi_paths_and_cancel_responses_are_exact() {
         (
             "/api/bootstrap",
             "get",
-            &["200", "400", "401", "403", "500"],
+            &["200", "400", "401", "403", "500", "503"],
         ),
         (
             "/api/repositories",
             "get",
-            &["200", "400", "401", "403", "500"],
+            &["200", "400", "401", "403", "500", "503"],
         ),
         (
             "/api/repositories",
@@ -75,7 +75,11 @@ fn openapi_paths_and_cancel_responses_are_exact() {
                 "200", "201", "204", "400", "401", "403", "409", "422", "500", "503",
             ],
         ),
-        ("/api/tasks", "get", &["200", "400", "401", "403", "500"]),
+        (
+            "/api/tasks",
+            "get",
+            &["200", "400", "401", "403", "500", "503"],
+        ),
         (
             "/api/tasks",
             "post",
@@ -86,7 +90,7 @@ fn openapi_paths_and_cancel_responses_are_exact() {
         (
             "/api/tasks/{id}",
             "get",
-            &["200", "400", "401", "403", "404", "500"],
+            &["200", "400", "401", "403", "404", "500", "503"],
         ),
         (
             "/api/tasks/{id}/cancel",
@@ -105,7 +109,7 @@ fn openapi_paths_and_cancel_responses_are_exact() {
         (
             "/api/tasks/{id}/events",
             "get",
-            &["200", "400", "401", "403", "404", "500"],
+            &["200", "400", "401", "403", "404", "500", "503"],
         ),
         ("/api/events", "get", &["200", "400", "401", "403", "500"]),
         (
@@ -154,11 +158,11 @@ async fn exchange_requires_exact_boundary_and_returns_sensitive_cookie() {
     assert!(!response.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN));
 
     for (header, value, code) in [
-        (HOST, "evil.invalid", "INVALID_HOST"),
+        (HOST, "evil.invalid", "SECURITY_INVALID_HOST"),
         (
             http::header::ORIGIN,
             "http://evil.invalid",
-            "INVALID_ORIGIN",
+            "SECURITY_INVALID_ORIGIN",
         ),
     ] {
         let mut request = support::request(Method::POST, "/api/session/exchange")
@@ -223,7 +227,37 @@ async fn every_read_route_requires_session_and_has_the_expected_media_type() {
             .unwrap();
         let (status, _, body) = support::json(support::send(router(&ports), request).await).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "GET {uri}");
-        assert_eq!(body["code"], "INVALID_SESSION");
+        assert_eq!(body["code"], "SECURITY_INVALID_SESSION");
+    }
+}
+
+#[tokio::test]
+async fn malformed_and_ambiguous_query_parameters_are_rejected() {
+    let ports = Ports::new();
+    let repository_id = ports.backend.repository().id;
+    let task_id = ports.backend.task().id;
+    let cases = [
+        "/api/tasks?repository_id".to_owned(),
+        "/api/tasks?repository_id=".to_owned(),
+        format!("/api/tasks?repository_id={repository_id}&repository_id={repository_id}"),
+        "/api/tasks?unknown".to_owned(),
+        "/api/events?after".to_owned(),
+        "/api/events?after=".to_owned(),
+        "/api/events?after=0&after=1".to_owned(),
+        format!("/api/tasks/{task_id}/events?after=0&after=1"),
+    ];
+
+    for uri in cases {
+        let response =
+            support::send(router(&ports), support::read_request(Method::GET, &uri)).await;
+        let (status, _, body) = support::json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "GET {uri}");
+        assert_eq!(body["code"], "INVALID_QUERY", "GET {uri}");
+    }
+
+    for uri in ["/api/tasks?unknown=value", "/api/events?unknown=value"] {
+        let response = support::send(router(&ports), support::read_request(Method::GET, uri)).await;
+        assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
     }
 }
 

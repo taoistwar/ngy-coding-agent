@@ -295,12 +295,12 @@ impl RequestSecurity for FakeSecurity {
             ORIGIN,
             ORIGIN_VALUE,
             StatusCode::FORBIDDEN,
-            "INVALID_ORIGIN",
+            "SECURITY_INVALID_ORIGIN",
         )?;
         if token != "launch-token" {
             return Err(error(
                 StatusCode::UNAUTHORIZED,
-                "INVALID_LAUNCH_TOKEN",
+                "SECURITY_INVALID_LAUNCH_TOKEN",
                 false,
             ));
         }
@@ -318,7 +318,7 @@ impl RequestSecurity for FakeSecurity {
             COOKIE,
             COOKIE_VALUE,
             StatusCode::UNAUTHORIZED,
-            "INVALID_SESSION",
+            "SECURITY_INVALID_SESSION",
         )?;
         Ok(AuthContext {
             session_id: "test-session".to_owned(),
@@ -332,14 +332,14 @@ impl RequestSecurity for FakeSecurity {
             ORIGIN,
             ORIGIN_VALUE,
             StatusCode::FORBIDDEN,
-            "INVALID_ORIGIN",
+            "SECURITY_INVALID_ORIGIN",
         )?;
         require_header(
             parts,
             http::HeaderName::from_static("x-csrf-token"),
             CSRF_VALUE,
             StatusCode::FORBIDDEN,
-            "INVALID_CSRF_TOKEN",
+            "SECURITY_INVALID_CSRF",
         )?;
         Ok(auth)
     }
@@ -482,7 +482,7 @@ fn require_host(parts: &Parts) -> ApiResult<()> {
         HOST,
         HOST_VALUE,
         StatusCode::FORBIDDEN,
-        "INVALID_HOST",
+        "SECURITY_INVALID_HOST",
     )
 }
 
