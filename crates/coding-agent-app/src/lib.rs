@@ -11,6 +11,9 @@
 
 mod event_dispatcher;
 mod fake_runner;
+mod native_dialog;
+mod platform;
+mod repository_service;
 mod service_state;
 mod shutdown;
 mod store_writer;
@@ -20,6 +23,11 @@ pub use event_dispatcher::{EventDispatcherError, EventDispatcherHandle};
 pub use fake_runner::{FakeRunnerConfig, FakeTaskRunner};
 #[cfg(feature = "test-support")]
 pub use fake_runner::{FakeScenario, ScriptedFakeRunner};
+pub use native_dialog::{NativeDialogService, PickerError};
+pub use platform::{BrowserLaunchError, BrowserLauncher, PlatformPaths, PrivateFile};
+pub use repository_service::{
+    CommandRunner, DiscoveredRepository, RepositoryDiscovery, RepositoryDiscoveryError,
+};
 pub use service_state::{
     InvalidServiceTransition, ServiceState, ServiceStateController, ServiceStateSnapshot,
 };

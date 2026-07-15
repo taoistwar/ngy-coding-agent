@@ -1,14 +1,18 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coding_agent_app::{
-    CancelOutcome, DegradedRecoveryResult, EventDispatcherHandle, EventWake, FakeRunnerConfig,
-    FakeTaskRunner, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink, RunnerOutcome,
-    ServiceState, ServiceStateController, StoreWriterHandle, TaskManagerHandle, TaskRunner,
+    CancelOutcome, CommandRunner, DegradedRecoveryResult, EventDispatcherHandle, EventWake,
+    FakeRunnerConfig, FakeTaskRunner, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink,
+    RunnerOutcome, ServiceState, ServiceStateController, StoreWriterHandle, TaskManagerHandle,
+    TaskRunner,
 };
 #[cfg(feature = "test-support")]
 use coding_agent_app::{FakeScenario, ScriptedFakeRunner};
@@ -75,6 +79,192 @@ pub struct DegradedFixture {
     busy_lock: AsyncMutex<Option<BusyLock>>,
     database_path: PathBuf,
     _temp_dir: TempDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandCall {
+    pub program: String,
+    pub args: Vec<OsString>,
+    pub current_dir: PathBuf,
+}
+
+#[derive(Default)]
+pub struct RecordingRunner {
+    results: Mutex<VecDeque<Result<Vec<u8>, io::ErrorKind>>>,
+    calls: Mutex<Vec<CommandCall>>,
+}
+
+impl RecordingRunner {
+    pub fn scripted(results: impl IntoIterator<Item = Result<Vec<u8>, io::ErrorKind>>) -> Self {
+        Self {
+            results: Mutex::new(results.into_iter().collect()),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<CommandCall> {
+        self.calls.lock().expect("lock command calls").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for RecordingRunner {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[OsString],
+        current_dir: &Path,
+    ) -> io::Result<Vec<u8>> {
+        self.calls
+            .lock()
+            .expect("lock command calls")
+            .push(CommandCall {
+                program: program.to_owned(),
+                args: args.to_vec(),
+                current_dir: current_dir.to_path_buf(),
+            });
+        self.results
+            .lock()
+            .expect("lock command results")
+            .pop_front()
+            .expect("scripted command result")
+            .map_err(io::Error::from)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LockState {
+    Missing,
+    Stale,
+    Dirty,
+}
+
+pub struct RealRepositoryFixture {
+    _temp: TempDir,
+    pub git_root: PathBuf,
+    pub workspace: PathBuf,
+    pub selected: PathBuf,
+    pub runtime: PathBuf,
+}
+
+impl RealRepositoryFixture {
+    pub fn new(lock_state: LockState) -> Self {
+        let temp = tempfile::tempdir().expect("create real discovery fixture");
+        let git_root = temp.path().join("repository");
+        let workspace = git_root.join("workspace");
+        let selected = workspace.join("selected").join("deep");
+        let runtime = temp.path().join("neutral-runtime");
+        std::fs::create_dir_all(&selected).expect("create selected directory");
+        std::fs::create_dir(&runtime).expect("create neutral runtime directory");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            b"[workspace]\nmembers = []\nresolver = \"3\"\n",
+        )
+        .expect("write workspace manifest");
+        std::fs::write(
+            git_root.join("rust-toolchain.toml"),
+            b"[toolchain]\nchannel = \"coding-agent-intentionally-unavailable\"\n",
+        )
+        .expect("write unavailable toolchain override");
+        let lock = workspace.join("Cargo.lock");
+        if !matches!(lock_state, LockState::Missing) {
+            std::fs::write(&lock, b"# deliberately stale lock bytes\n")
+                .expect("write initial lock bytes");
+        }
+        fixture_command(&git_root, "git", ["init", "--quiet"]);
+        fixture_command(
+            &git_root,
+            "git",
+            ["config", "user.email", "fixture@example.invalid"],
+        );
+        fixture_command(&git_root, "git", ["config", "user.name", "Fixture"]);
+        fixture_command(&git_root, "git", ["add", "."]);
+        fixture_command(&git_root, "git", ["commit", "--quiet", "-m", "fixture"]);
+        if matches!(lock_state, LockState::Dirty) {
+            std::fs::write(&lock, b"dirty lock bytes that must survive\n")
+                .expect("dirty tracked lock");
+        }
+        Self {
+            _temp: temp,
+            git_root,
+            workspace,
+            selected,
+            runtime,
+        }
+    }
+
+    pub fn fingerprint(&self) -> RepositoryFingerprint {
+        let mut files = Vec::new();
+        collect_fixture_files(&self.git_root, &self.git_root, &mut files);
+        files.sort();
+        let mut locks = files
+            .iter()
+            .filter(|path| path.file_name() == Some(OsStr::new("Cargo.lock")))
+            .map(|path| {
+                (
+                    path.clone(),
+                    std::fs::read(self.git_root.join(path)).expect("read lock bytes"),
+                )
+            })
+            .collect::<Vec<_>>();
+        locks.sort_by(|left, right| left.0.cmp(&right.0));
+        let status = fixture_output(&self.git_root, "git", ["status", "--porcelain=v1"]);
+        RepositoryFingerprint {
+            files,
+            locks,
+            status,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RepositoryFingerprint {
+    files: Vec<PathBuf>,
+    locks: Vec<(PathBuf, Vec<u8>)>,
+    status: Vec<u8>,
+}
+
+fn collect_fixture_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(directory).expect("read fixture directory") {
+        let entry = entry.expect("read fixture entry");
+        let path = entry.path();
+        let relative = path.strip_prefix(root).expect("relative fixture path");
+        if relative.components().next() == Some(std::path::Component::Normal(OsStr::new(".git"))) {
+            continue;
+        }
+        if entry.file_type().expect("read fixture file type").is_dir() {
+            collect_fixture_files(root, &path, files);
+        } else {
+            files.push(relative.to_path_buf());
+        }
+    }
+}
+
+fn fixture_command<I, S>(current_dir: &Path, program: &str, args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(current_dir)
+        .status()
+        .expect("run fixture command");
+    assert!(status.success(), "fixture command failed: {program}");
+}
+
+fn fixture_output<I, S>(current_dir: &Path, program: &str, args: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .expect("run fixture command");
+    assert!(output.status.success(), "fixture command failed: {program}");
+    output.stdout
 }
 
 pub struct FakeRunnerFixture {

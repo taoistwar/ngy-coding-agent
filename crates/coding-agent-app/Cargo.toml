@@ -14,10 +14,16 @@ async-trait.workspace = true
 coding-agent-api = { path = "../coding-agent-api" }
 coding-agent-domain = { path = "../coding-agent-domain" }
 coding-agent-store = { path = "../coding-agent-store" }
+directories.workspace = true
+rfd.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+webbrowser.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true
