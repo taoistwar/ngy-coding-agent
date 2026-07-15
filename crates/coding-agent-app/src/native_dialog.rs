@@ -26,7 +26,7 @@ impl PickerError {
 
 #[async_trait::async_trait]
 trait PickerBackend: Send + Sync + 'static {
-    async fn pick_repository(&self, gate: PickerGate) -> Result<Option<PathBuf>, PickerError>;
+    async fn pick_repository(&self) -> Result<Option<PathBuf>, PickerError>;
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -43,6 +43,7 @@ impl DialogRequest {
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[derive(Clone)]
 struct DialogDispatcher {
     requests: tokio::sync::mpsc::UnboundedSender<DialogRequest>,
 }
@@ -55,9 +56,8 @@ impl DialogDispatcher {
     }
 }
 
-#[async_trait::async_trait]
 #[cfg(any(target_os = "macos", test))]
-impl PickerBackend for DialogDispatcher {
+impl DialogDispatcher {
     async fn pick_repository(&self, gate: PickerGate) -> Result<Option<PathBuf>, PickerError> {
         let (response, selected) = tokio::sync::oneshot::channel();
         self.requests
@@ -68,6 +68,13 @@ impl PickerBackend for DialogDispatcher {
             .map_err(|_| PickerError::Unavailable)?;
         selected.await.map_err(|_| PickerError::Unavailable)
     }
+}
+
+#[derive(Clone)]
+enum DialogBackend {
+    Direct(Arc<dyn PickerBackend>),
+    #[cfg(any(target_os = "macos", test))]
+    Dispatched(DialogDispatcher),
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -88,27 +95,25 @@ struct RfdPicker;
 #[async_trait::async_trait]
 #[cfg(not(target_os = "macos"))]
 impl PickerBackend for RfdPicker {
-    async fn pick_repository(&self, gate: PickerGate) -> Result<Option<PathBuf>, PickerError> {
-        let selected = rfd::AsyncFileDialog::new()
+    async fn pick_repository(&self) -> Result<Option<PathBuf>, PickerError> {
+        Ok(rfd::AsyncFileDialog::new()
             .set_title("Select a Cargo repository")
             .pick_folder()
             .await
-            .map(|handle| handle.path().to_path_buf());
-        drop(gate);
-        Ok(selected)
+            .map(|handle| handle.path().to_path_buf()))
     }
 }
 
 #[derive(Clone)]
 pub struct NativeDialogService {
-    backend: Arc<dyn PickerBackend>,
+    backend: DialogBackend,
 }
 
 impl NativeDialogService {
     #[cfg(not(target_os = "macos"))]
     pub fn new() -> Self {
         Self {
-            backend: Arc::new(RfdPicker),
+            backend: DialogBackend::Direct(Arc::new(RfdPicker)),
         }
     }
 
@@ -120,7 +125,7 @@ impl NativeDialogService {
         let (dispatcher, host) = DialogDispatcher::channel();
         Ok((
             Self {
-                backend: Arc::new(dispatcher),
+                backend: DialogBackend::Dispatched(dispatcher),
             },
             NativeDialogMainThreadHost {
                 host,
@@ -131,12 +136,35 @@ impl NativeDialogService {
 
     pub async fn pick_repository(&self) -> Result<Option<PathBuf>, PickerError> {
         let gate = PickerGate::acquire()?;
-        self.backend.pick_repository(gate).await
+        let backend = self.backend.clone();
+        let (response, selected) = tokio::sync::oneshot::channel();
+        drop(tokio::spawn(async move {
+            let result = match backend {
+                DialogBackend::Direct(backend) => {
+                    let result = backend.pick_repository().await;
+                    drop(gate);
+                    result
+                }
+                #[cfg(any(target_os = "macos", test))]
+                DialogBackend::Dispatched(dispatcher) => dispatcher.pick_repository(gate).await,
+            };
+            let _ = response.send(result);
+        }));
+        selected.await.unwrap_or(Err(PickerError::Unavailable))
     }
 
     #[cfg(test)]
     fn with_backend(backend: Arc<dyn PickerBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend: DialogBackend::Direct(backend),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_dispatcher(dispatcher: DialogDispatcher) -> Self {
+        Self {
+            backend: DialogBackend::Dispatched(dispatcher),
+        }
     }
 }
 
@@ -214,14 +242,15 @@ mod tests {
     struct BlockingPicker {
         opened: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
     impl PickerBackend for BlockingPicker {
-        async fn pick_repository(&self, gate: PickerGate) -> Result<Option<PathBuf>, PickerError> {
+        async fn pick_repository(&self) -> Result<Option<PathBuf>, PickerError> {
             self.opened.notify_one();
             self.release.notified().await;
-            drop(gate);
+            self.finished.notify_one();
             Ok(None)
         }
     }
@@ -230,8 +259,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PickerBackend for ImmediatePicker {
-        async fn pick_repository(&self, gate: PickerGate) -> Result<Option<PathBuf>, PickerError> {
-            drop(gate);
+        async fn pick_repository(&self) -> Result<Option<PathBuf>, PickerError> {
             Ok(Some(self.0.clone()))
         }
     }
@@ -261,11 +289,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborting_a_picker_future_releases_the_global_gate() {
+    async fn aborting_a_picker_caller_keeps_the_gate_until_the_backend_finishes() {
         let _test_guard = TEST_LOCK.lock().await;
         let picker = Arc::new(BlockingPicker::default());
         let service = NativeDialogService::with_backend(picker.clone());
-        let first = tokio::spawn(async move { service.pick_repository().await });
+        let first_service = service.clone();
+        let first = tokio::spawn(async move { first_service.pick_repository().await });
         picker.opened.notified().await;
         first.abort();
         assert!(
@@ -274,6 +303,18 @@ mod tests {
                 .expect_err("picker task was aborted")
                 .is_cancelled()
         );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service.pick_repository(),
+        )
+        .await
+        .expect("a second caller must fail immediately")
+        .expect_err("the detached backend owner still holds the picker gate");
+        assert_eq!(second, PickerError::AlreadyOpen);
+
+        picker.release.notify_one();
+        picker.finished.notified().await;
 
         let selected = PathBuf::from("selected-after-abort");
         let next = NativeDialogService::with_backend(Arc::new(ImmediatePicker(selected.clone())));
@@ -284,7 +325,7 @@ mod tests {
     async fn dispatched_picker_waits_for_the_main_thread_host_reply() {
         let _test_guard = TEST_LOCK.lock().await;
         let (dispatcher, mut host) = DialogDispatcher::channel();
-        let service = NativeDialogService::with_backend(Arc::new(dispatcher));
+        let service = NativeDialogService::with_dispatcher(dispatcher);
         let picker = tokio::spawn(async move { service.pick_repository().await });
 
         let request = host
@@ -305,7 +346,7 @@ mod tests {
     async fn a_closed_main_thread_host_is_a_safe_stable_error() {
         let _test_guard = TEST_LOCK.lock().await;
         let (dispatcher, host) = DialogDispatcher::channel();
-        let service = NativeDialogService::with_backend(Arc::new(dispatcher));
+        let service = NativeDialogService::with_dispatcher(dispatcher);
         drop(host);
 
         let error = service
@@ -320,7 +361,7 @@ mod tests {
     async fn aborting_the_http_waiter_keeps_the_gate_until_the_host_finishes() {
         let _test_guard = TEST_LOCK.lock().await;
         let (dispatcher, mut host) = DialogDispatcher::channel();
-        let service = NativeDialogService::with_backend(Arc::new(dispatcher));
+        let service = NativeDialogService::with_dispatcher(dispatcher);
         let first_service = service.clone();
         let first = tokio::spawn(async move { first_service.pick_repository().await });
         let first_request = host

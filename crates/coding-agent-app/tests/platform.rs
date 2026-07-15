@@ -48,9 +48,10 @@ fn provisioning_is_idempotent_and_makes_both_directories_private() {
 
     #[cfg(windows)]
     {
-        std::fs::File::create(&paths.database_path)
+        let inherited_child = paths.data_dir.join("inherited-child.tmp");
+        std::fs::File::create(&inherited_child)
             .expect("create a child file through the private directory DACL");
-        assert_inherited_private_file(&paths.database_path);
+        assert_inherited_private_file(&inherited_child);
     }
 }
 
