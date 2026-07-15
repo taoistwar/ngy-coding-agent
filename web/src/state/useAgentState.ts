@@ -79,16 +79,26 @@ function commandError(error: unknown): {
   code: string;
   message: string;
   retryable: boolean;
+  requestId: string | null;
 } {
   if (typeof error !== "object" || error === null) {
-    return { code: "REQUEST_FAILED", message: errorMessage(error), retryable: false };
+    return {
+      code: "REQUEST_FAILED",
+      message: errorMessage(error),
+      retryable: false,
+      requestId: null,
+    };
   }
   const code = "code" in error && typeof error.code === "string" ? error.code : "REQUEST_FAILED";
   const retryable =
     "retryable" in error && typeof error.retryable === "boolean"
       ? error.retryable
       : false;
-  return { code, message: errorMessage(error), retryable };
+  const requestId =
+    "requestId" in error && typeof error.requestId === "string"
+      ? error.requestId
+      : null;
+  return { code, message: errorMessage(error), retryable, requestId };
 }
 
 function isSessionExpired(error: unknown): boolean {

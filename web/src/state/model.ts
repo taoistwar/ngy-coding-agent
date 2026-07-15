@@ -26,6 +26,7 @@ export interface CommandError {
   code: string;
   message: string;
   retryable: boolean;
+  requestId: string | null;
 }
 
 export type CancelCommandState =

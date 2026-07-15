@@ -381,7 +381,12 @@ describe("agentReducer", () => {
     state = agentReducer(state, {
       type: "cancel.failed",
       taskId: "task-1",
-      error: { code: "STORE_BUSY", message: "busy", retryable: true },
+      error: {
+        code: "STORE_BUSY",
+        message: "busy",
+        retryable: true,
+        requestId: null,
+      },
     });
     expect(state.commands.cancelByTaskId["task-1"]).toEqual(
       expect.objectContaining({ phase: "error", optimistic: false }),
@@ -403,7 +408,12 @@ describe("agentReducer", () => {
     state = agentReducer(state, {
       type: "cancel.failed",
       taskId: "task-1",
-      error: { code: "STORE_BUSY", message: "late response", retryable: true },
+      error: {
+        code: "STORE_BUSY",
+        message: "late response",
+        retryable: true,
+        requestId: null,
+      },
     });
     expect(state.commands.cancelByTaskId["task-1"]).toBeUndefined();
     expect(state.tasksById["task-1"]?.status).toBe("completed");

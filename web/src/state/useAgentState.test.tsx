@@ -258,6 +258,7 @@ describe("useAgentState", () => {
       code: "STORE_BUSY",
       message: "busy",
       retryable: true,
+      requestId: "cancel-request-id",
     });
     const { result } = renderHook(() => useAgentState(testFixture.dependencies));
     await waitFor(() => expect(testFixture.start).toHaveBeenCalled());
@@ -273,7 +274,11 @@ describe("useAgentState", () => {
 
     expect(rejection).toEqual(expect.objectContaining({ code: "STORE_BUSY" }));
     expect(result.current.state.commands.cancelByTaskId["task-1"]).toEqual(
-      expect.objectContaining({ phase: "error", optimistic: false }),
+      expect.objectContaining({
+        phase: "error",
+        optimistic: false,
+        error: expect.objectContaining({ requestId: "cancel-request-id" }),
+      }),
     );
   });
 
