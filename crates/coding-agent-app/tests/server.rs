@@ -111,6 +111,19 @@ async fn both_sse_sources_close_after_publishing_quiescing() {
     assert_eq!(control.state, coding_agent_api::ServiceStateDto::Quiescing);
     assert!(service.next().await.is_none());
     assert!(live.next().await.is_none());
+
+    let mut late_live = backend.subscribe_live();
+    let mut late_service = backend.subscribe_service_state();
+    let late_control = tokio::time::timeout(Duration::from_secs(1), late_service.next())
+        .await
+        .expect("a late service subscriber must not wait for another transition")
+        .expect("a late service subscriber receives Quiescing once");
+    assert_eq!(
+        late_control.state,
+        coding_agent_api::ServiceStateDto::Quiescing
+    );
+    assert!(late_service.next().await.is_none());
+    assert!(late_live.next().await.is_none());
 }
 
 async fn occupied_fixture() -> support::TaskManagerFixture {

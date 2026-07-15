@@ -701,6 +701,14 @@ impl SseBackend for ApplicationBackend {
     fn subscribe_service_state(&self) -> ServiceStateStream {
         let mut receiver = self.service_state.subscribe();
         Box::pin(async_stream::stream! {
+            let current = *receiver.borrow();
+            if current.state == ServiceState::Quiescing {
+                yield ServiceStateControl::new(
+                    service_state(current.state),
+                    current.generation,
+                );
+                return;
+            }
             loop {
                 if receiver.changed().await.is_err() {
                     return;
