@@ -1,10 +1,11 @@
 mod support;
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coding_agent_domain::{CanonicalPath, UtcTimestamp};
 use coding_agent_store::RegisterRepositoryOutcome;
+use time::OffsetDateTime;
 
 #[tokio::test]
 async fn registering_the_same_workspace_reuses_the_row() {
@@ -19,6 +20,74 @@ async fn registering_the_same_workspace_reuses_the_row() {
     assert!(matches!(first, RegisterRepositoryOutcome::Created(_)));
     assert!(matches!(second, RegisterRepositoryOutcome::Existing(_)));
     assert_eq!(fixture.store.list_repositories().await.unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_waiters_sample_last_opened_at_after_the_writer_lock() {
+    let fixture = support::store_fixture().await;
+    let input = fixture.canonical_repository_input("serialized-time").await;
+    let created = match fixture
+        .store
+        .register_repository(input.clone())
+        .await
+        .unwrap()
+    {
+        RegisterRepositoryOutcome::Created(repository) => repository,
+        RegisterRepositoryOutcome::Existing(_) => panic!("first registration must create a row"),
+    };
+
+    let mut first_connection = fixture.store.pool().acquire().await.unwrap();
+    let mut second_connection = fixture.store.pool().acquire().await.unwrap();
+    second_connection.return_to_pool().await;
+    first_connection.return_to_pool().await;
+    let mut lock_holder = fixture
+        .store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    let idle_connections_while_locked = fixture.store.pool().num_idle();
+    assert!(idle_connections_while_locked > 0);
+    let waiting_store = fixture.store.clone();
+    let waiting_input = input.clone();
+    let waiter =
+        tokio::spawn(async move { waiting_store.register_repository(waiting_input).await });
+
+    wait_for_idle_connection_to_be_checked_out(fixture.store.pool(), idle_connections_while_locked)
+        .await;
+    let waiter_is_blocked_at = current_timestamp();
+    let persisted_timestamp = wait_for_timestamp_after(waiter_is_blocked_at).await;
+    sqlx::query(
+        "UPDATE repositories \
+         SET created_at = ?, last_opened_at = ? \
+         WHERE id = ?",
+    )
+    .bind(persisted_timestamp.to_string())
+    .bind(persisted_timestamp.to_string())
+    .bind(created.id.to_string())
+    .execute(&mut *lock_holder)
+    .await
+    .unwrap();
+
+    wait_for_timestamp_after(persisted_timestamp).await;
+    lock_holder.commit().await.unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("waiting registration should finish after the lock is released")
+        .expect("waiting registration task should not panic")
+        .expect("waiting registration should succeed");
+    let existing = match outcome {
+        RegisterRepositoryOutcome::Existing(repository) => repository,
+        RegisterRepositoryOutcome::Created(_) => panic!("the identity already exists"),
+    };
+
+    assert!(
+        existing.last_opened_at >= existing.created_at,
+        "a later transaction wrote stale last_opened_at {} before created_at {}",
+        existing.last_opened_at,
+        existing.created_at
+    );
 }
 
 #[tokio::test]
@@ -243,4 +312,34 @@ async fn unix_identity_preserves_path_case() {
 #[cfg(not(windows))]
 fn uppercase_path(path: &CanonicalPath) -> CanonicalPath {
     CanonicalPath::try_from_canonical(PathBuf::from(path.to_string().to_uppercase())).unwrap()
+}
+
+fn current_timestamp() -> UtcTimestamp {
+    UtcTimestamp::new(OffsetDateTime::now_utc()).unwrap()
+}
+
+async fn wait_for_idle_connection_to_be_checked_out(pool: &sqlx::SqlitePool, initial_idle: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pool.num_idle() >= initial_idle {
+        assert!(
+            Instant::now() < deadline,
+            "registration never checked out a connection while waiting for the writer lock"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_timestamp_after(reference: UtcTimestamp) -> UtcTimestamp {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let candidate = current_timestamp();
+        if candidate > reference {
+            return candidate;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "system clock did not advance while arranging the lock interleaving"
+        );
+        tokio::task::yield_now().await;
+    }
 }

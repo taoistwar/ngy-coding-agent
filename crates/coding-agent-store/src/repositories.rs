@@ -20,9 +20,9 @@ impl Store {
     ) -> Result<RegisterRepositoryOutcome, StoreError> {
         let git_identity_key = identity_key(&input.git_root);
         let cargo_identity_key = identity_key(&input.cargo_workspace_root);
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = UtcTimestamp::new(OffsetDateTime::now_utc())?;
         let now_text = now.to_string();
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let existing: Option<RepositoryRecord> = sqlx::query_as(
             "SELECT id, selected_path, display_name, git_root, cargo_workspace_root, \
