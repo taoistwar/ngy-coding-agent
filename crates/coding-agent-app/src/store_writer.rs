@@ -43,9 +43,8 @@ pub enum StoreWriterError {
     Closed,
 }
 
-#[doc(hidden)]
 #[derive(Debug, Clone)]
-pub enum StoreWriterOperation {
+enum StoreWriterOperation {
     RegisterRepository(NewRepository),
     CreateTask(NewTask),
     RetryTask(TaskId),
@@ -64,9 +63,8 @@ pub enum StoreWriterOperation {
     },
 }
 
-#[doc(hidden)]
 #[derive(Debug)]
-pub enum StoreWriterOperationOutcome {
+enum StoreWriterOperationOutcome {
     RegisterRepository(RegisterRepositoryOutcome),
     CreateTask(CreateTaskOutcome),
     RetryTask(RetryTaskOutcome),
@@ -75,13 +73,11 @@ pub enum StoreWriterOperationOutcome {
     RecoverIncomplete(RecoveryOutcome),
 }
 
-#[doc(hidden)]
-pub type StoreWriterBackendFuture<'a> = Pin<
+type StoreWriterBackendFuture<'a> = Pin<
     Box<dyn Future<Output = Result<StoreWriterOperationOutcome, StoreWriterError>> + Send + 'a>,
 >;
 
-#[doc(hidden)]
-pub trait StoreWriterBackend: Send + Sync + 'static {
+trait StoreWriterBackend: Send + Sync + 'static {
     fn execute(&self, operation: StoreWriterOperation) -> StoreWriterBackendFuture<'_>;
 }
 
@@ -133,8 +129,7 @@ impl StoreWriterHandle {
         Self::spawn_with_backend(Arc::new(store), wake, capacity)
     }
 
-    #[doc(hidden)]
-    pub fn spawn_with_backend(
+    fn spawn_with_backend(
         backend: Arc<dyn StoreWriterBackend>,
         wake: Arc<dyn EventWake>,
         capacity: usize,
@@ -471,13 +466,16 @@ fn receipt_and_wake<T>(
 fn classify_store_error(error: StoreError) -> StoreWriterError {
     if let StoreError::Database(database) = &error
         && let Some(code) = database.as_database_error().and_then(|error| error.code())
-        && code
-            .parse::<i32>()
-            .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
+        && sqlite_code_is_retryable(&code)
     {
         return StoreWriterError::Busy;
     }
     StoreWriterError::Store(error)
+}
+
+fn sqlite_code_is_retryable(code: &str) -> bool {
+    code.parse::<i32>()
+        .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
 }
 
 fn unexpected_outcome() -> StoreWriterError {
@@ -537,5 +535,343 @@ fn expect_recovery(
     match outcome {
         StoreWriterOperationOutcome::RecoverIncomplete(value) => Ok(value),
         _ => Err(unexpected_outcome()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use coding_agent_domain::{CanonicalPath, ClientRequestId, Repository};
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    struct UnitFixture {
+        store: Store,
+        repository: Repository,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    async fn unit_fixture() -> UnitFixture {
+        let temp_dir = tempfile::tempdir().expect("create writer unit-test directory");
+        let store = Store::open(temp_dir.path().join("store.sqlite3"))
+            .await
+            .expect("open writer unit-test store");
+        store
+            .migrate()
+            .await
+            .expect("migrate writer unit-test store");
+        let repository = match store
+            .register_repository(NewRepository {
+                selected_path: canonical(temp_dir.path().join("selected")),
+                display_name: "unit repository".to_owned(),
+                git_root: canonical(temp_dir.path().join("git")),
+                cargo_workspace_root: canonical(temp_dir.path().join("workspace")),
+            })
+            .await
+            .expect("register writer unit-test repository")
+        {
+            RegisterRepositoryOutcome::Created(repository)
+            | RegisterRepositoryOutcome::Existing(repository) => repository,
+        };
+        UnitFixture {
+            store,
+            repository,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    fn canonical(path: PathBuf) -> CanonicalPath {
+        CanonicalPath::try_from_canonical(path).expect("construct unit-test canonical path")
+    }
+
+    fn new_task(repository: &Repository, prompt: &str) -> NewTask {
+        NewTask::try_new(ClientRequestId::new(), repository.id, prompt)
+            .expect("construct writer unit-test task")
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    #[derive(Default)]
+    struct CountingWake(AtomicUsize);
+
+    impl CountingWake {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl EventWake for CountingWake {
+        fn wake(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum InjectedAttempt {
+        KnownUncommittedBusy,
+        TerminalRollback,
+    }
+
+    struct FaultControlledBackend {
+        inner: Store,
+        attempts: AtomicUsize,
+        injected: Mutex<VecDeque<InjectedAttempt>>,
+        pause: Option<Arc<PausePoint>>,
+    }
+
+    impl FaultControlledBackend {
+        fn new(inner: Store, injected: impl IntoIterator<Item = InjectedAttempt>) -> Self {
+            Self {
+                inner,
+                attempts: AtomicUsize::new(0),
+                injected: Mutex::new(injected.into_iter().collect()),
+                pause: None,
+            }
+        }
+
+        fn paused(inner: Store, pause: Arc<PausePoint>) -> Self {
+            Self {
+                inner,
+                attempts: AtomicUsize::new(0),
+                injected: Mutex::new(VecDeque::new()),
+                pause: Some(pause),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StoreWriterBackend for FaultControlledBackend {
+        fn execute(&self, operation: StoreWriterOperation) -> StoreWriterBackendFuture<'_> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                if let Some(pause) = &self.pause {
+                    pause.started.notify_one();
+                    pause.release.notified().await;
+                }
+                let injected = self
+                    .injected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front();
+                match injected {
+                    Some(InjectedAttempt::KnownUncommittedBusy) => Err(StoreWriterError::Busy),
+                    Some(InjectedAttempt::TerminalRollback) => Err(StoreWriterError::Store(
+                        StoreError::InvariantViolation("injected rolled-back attempt"),
+                    )),
+                    None => StoreWriterBackend::execute(&self.inner, operation).await,
+                }
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct PausePoint {
+        started: Notify,
+        release: Notify,
+    }
+
+    #[test]
+    fn sqlite_retry_classification_is_limited_to_busy_and_locked_families() {
+        for code in ["5", "6", "261", "517", "262"] {
+            assert!(sqlite_code_is_retryable(code), "retry SQLite code {code}");
+        }
+        for code in ["4", "7", "260", "516", "787", "not-a-code"] {
+            assert!(
+                !sqlite_code_is_retryable(code),
+                "do not retry SQLite code {code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_two_known_uncommitted_busy_attempts_then_commits_once() {
+        let fixture = unit_fixture().await;
+        let backend = Arc::new(FaultControlledBackend::new(
+            fixture.store.clone(),
+            [
+                InjectedAttempt::KnownUncommittedBusy,
+                InjectedAttempt::KnownUncommittedBusy,
+            ],
+        ));
+        let wake = Arc::new(CountingWake::default());
+        let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
+
+        let receipt = writer
+            .create_task(
+                new_task(&fixture.repository, "retry transient busy"),
+                deadline(),
+            )
+            .await
+            .expect("third attempt commits");
+
+        assert!(matches!(receipt.value, CreateTaskOutcome::Created { .. }));
+        assert_eq!(backend.attempts(), 3);
+        assert_eq!(
+            fixture
+                .store
+                .bootstrap_snapshot()
+                .await
+                .unwrap()
+                .tasks
+                .len(),
+            1
+        );
+        assert_eq!(wake.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_schedule_is_exact_and_bounded() {
+        let fixture = unit_fixture().await;
+        tokio::time::pause();
+        let backend = Arc::new(FaultControlledBackend::new(
+            fixture.store.clone(),
+            [InjectedAttempt::KnownUncommittedBusy; 6],
+        ));
+        let writer = StoreWriterHandle::spawn_with_backend(
+            backend.clone(),
+            Arc::new(CountingWake::default()),
+            4,
+        );
+        let request = tokio::spawn({
+            let writer = writer.clone();
+            let input = new_task(&fixture.repository, "bounded retries");
+            async move { writer.create_task(input, deadline()).await }
+        });
+
+        wait_for_attempts(&backend, 1).await;
+        for (index, delay_ms) in [25_u64, 50, 100, 200, 400].into_iter().enumerate() {
+            tokio::time::advance(Duration::from_millis(delay_ms - 1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(backend.attempts(), index + 1);
+            tokio::time::advance(Duration::from_millis(2)).await;
+            wait_for_attempts(&backend, index + 2).await;
+        }
+
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(StoreWriterError::Busy)
+        ));
+        assert_eq!(backend.attempts(), 6);
+    }
+
+    #[tokio::test]
+    async fn deadline_expiring_during_backoff_prevents_the_next_attempt() {
+        let fixture = unit_fixture().await;
+        tokio::time::pause();
+        let backend = Arc::new(FaultControlledBackend::new(
+            fixture.store.clone(),
+            [InjectedAttempt::KnownUncommittedBusy],
+        ));
+        let wake = Arc::new(CountingWake::default());
+        let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
+
+        let result = writer
+            .create_task(
+                new_task(&fixture.repository, "deadline during backoff"),
+                Instant::now() + Duration::from_millis(10),
+            )
+            .await;
+
+        assert!(matches!(result, Err(StoreWriterError::Busy)));
+        assert_eq!(backend.attempts(), 1);
+        assert!(
+            fixture
+                .store
+                .bootstrap_snapshot()
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+        assert_eq!(wake.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_rolled_back_attempt_is_not_retried_or_woken() {
+        let fixture = unit_fixture().await;
+        let backend = Arc::new(FaultControlledBackend::new(
+            fixture.store.clone(),
+            [InjectedAttempt::TerminalRollback],
+        ));
+        let wake = Arc::new(CountingWake::default());
+        let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
+
+        let result = writer
+            .create_task(new_task(&fixture.repository, "rolled back"), deadline())
+            .await;
+
+        assert!(matches!(result, Err(StoreWriterError::Store(_))));
+        assert_eq!(backend.attempts(), 1);
+        assert!(
+            fixture
+                .store
+                .bootstrap_snapshot()
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+        assert_eq!(wake.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_request_future_does_not_cancel_a_started_attempt() {
+        let fixture = unit_fixture().await;
+        let pause = Arc::new(PausePoint::default());
+        let backend = Arc::new(FaultControlledBackend::paused(
+            fixture.store.clone(),
+            pause.clone(),
+        ));
+        let writer =
+            StoreWriterHandle::spawn_with_backend(backend, Arc::new(CountingWake::default()), 4);
+        let request = tokio::spawn({
+            let writer = writer.clone();
+            let input = new_task(&fixture.repository, "detached request");
+            async move { writer.create_task(input, deadline()).await }
+        });
+        pause.started.notified().await;
+        request.abort();
+        pause.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !fixture
+                    .store
+                    .bootstrap_snapshot()
+                    .await
+                    .unwrap()
+                    .tasks
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actor completes an already-started transaction");
+    }
+
+    async fn wait_for_attempts(backend: &FaultControlledBackend, expected: usize) {
+        for _ in 0..100 {
+            if backend.attempts() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "store attempts did not reach {expected}; observed {}",
+            backend.attempts()
+        );
     }
 }

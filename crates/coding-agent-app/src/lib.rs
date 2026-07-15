@@ -1,4 +1,13 @@
 //! Application composition responsibilities for the coding agent.
+//!
+//! Store mutation internals are deliberately unavailable to application consumers:
+//!
+//! ```compile_fail
+//! use coding_agent_app::{
+//!     StoreWriterBackend, StoreWriterBackendFuture, StoreWriterOperation,
+//!     StoreWriterOperationOutcome,
+//! };
+//! ```
 
 mod service_state;
 mod store_writer;
@@ -6,7 +15,4 @@ mod store_writer;
 pub use service_state::{
     InvalidServiceTransition, ServiceState, ServiceStateController, ServiceStateSnapshot,
 };
-pub use store_writer::{
-    EventWake, StoreWriterBackend, StoreWriterBackendFuture, StoreWriterError, StoreWriterHandle,
-    StoreWriterOperation, StoreWriterOperationOutcome, WriteReceipt,
-};
+pub use store_writer::{EventWake, StoreWriterError, StoreWriterHandle, WriteReceipt};

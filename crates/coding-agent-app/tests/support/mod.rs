@@ -1,21 +1,16 @@
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
-use coding_agent_app::{
-    EventWake, StoreWriterBackend, StoreWriterBackendFuture, StoreWriterError, StoreWriterHandle,
-    StoreWriterOperation,
-};
+use coding_agent_app::{EventWake, StoreWriterHandle};
 use coding_agent_domain::{
     CanonicalPath, ClientRequestId, NewRepository, NewTask, Repository, RepositoryId, TaskFailure,
     UtcTimestamp,
 };
 use coding_agent_store::{RegisterRepositoryOutcome, Store};
 use tempfile::TempDir;
-use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
 
 pub struct StoreFixture {
@@ -135,71 +130,4 @@ impl EventWake for PanickingWake {
     fn wake(&self) {
         panic!("injected wake panic");
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum InjectedFault {
-    Busy,
-    Terminal,
-}
-
-pub struct FaultControlledStore {
-    inner: Store,
-    faults: Mutex<VecDeque<InjectedFault>>,
-    attempts: AtomicUsize,
-    pause: Option<Arc<PausePoint>>,
-}
-
-impl FaultControlledStore {
-    pub fn new(inner: Store, faults: impl IntoIterator<Item = InjectedFault>) -> Self {
-        Self {
-            inner,
-            faults: Mutex::new(faults.into_iter().collect()),
-            attempts: AtomicUsize::new(0),
-            pause: None,
-        }
-    }
-
-    pub fn paused(inner: Store, pause: Arc<PausePoint>) -> Self {
-        Self {
-            inner,
-            faults: Mutex::new(VecDeque::new()),
-            attempts: AtomicUsize::new(0),
-            pause: Some(pause),
-        }
-    }
-
-    pub fn attempts(&self) -> usize {
-        self.attempts.load(Ordering::SeqCst)
-    }
-}
-
-impl StoreWriterBackend for FaultControlledStore {
-    fn execute(&self, operation: StoreWriterOperation) -> StoreWriterBackendFuture<'_> {
-        Box::pin(async move {
-            self.attempts.fetch_add(1, Ordering::SeqCst);
-            if let Some(pause) = &self.pause {
-                pause.started.notify_one();
-                pause.release.notified().await;
-            }
-            let fault = self
-                .faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front();
-            match fault {
-                Some(InjectedFault::Busy) => Err(StoreWriterError::Busy),
-                Some(InjectedFault::Terminal) => Err(StoreWriterError::Store(
-                    coding_agent_store::StoreError::InvariantViolation("injected rollback"),
-                )),
-                None => StoreWriterBackend::execute(&self.inner, operation).await,
-            }
-        })
-    }
-}
-
-#[derive(Default)]
-pub struct PausePoint {
-    pub started: Notify,
-    pub release: Notify,
 }

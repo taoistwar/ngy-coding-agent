@@ -5,10 +5,8 @@ use std::sync::Arc;
 use coding_agent_app::{ServiceState, ServiceStateController, StoreWriterError, StoreWriterHandle};
 use coding_agent_domain::{PlanSnapshot, TaskEventPayload, TaskStatus};
 use coding_agent_store::{
-    AppendEventOutcome, CreateTaskOutcome, RegisterRepositoryOutcome, TaskTransition,
-    TransitionOutcome,
+    AppendEventOutcome, RegisterRepositoryOutcome, TaskTransition, TransitionOutcome,
 };
-use support::{FaultControlledStore, InjectedFault};
 use tokio::time::{Duration, Instant};
 
 #[tokio::test]
@@ -28,119 +26,11 @@ async fn writer_serializes_concurrent_creates() {
 }
 
 #[tokio::test]
-async fn writer_retries_two_busy_attempts_then_commits_once() {
-    let fixture = support::store_fixture().await;
-    let backend = Arc::new(FaultControlledStore::new(
-        fixture.store.clone(),
-        [InjectedFault::Busy, InjectedFault::Busy],
-    ));
-    let wake = Arc::new(support::CountingWake::default());
-    let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
-
-    let receipt = writer
-        .create_task(
-            support::new_task(fixture.repository.id, "retry transient busy"),
-            support::deadline(),
-        )
-        .await
-        .expect("third attempt commits");
-
-    assert!(matches!(receipt.value, CreateTaskOutcome::Created { .. }));
-    assert_eq!(backend.attempts(), 3);
-    assert_eq!(
-        fixture
-            .store
-            .bootstrap_snapshot()
-            .await
-            .unwrap()
-            .tasks
-            .len(),
-        1
-    );
-    assert_eq!(wake.count(), 1);
-}
-
-#[tokio::test]
-async fn writer_uses_the_exact_bounded_retry_schedule() {
-    let fixture = support::store_fixture().await;
-    tokio::time::pause();
-    let backend = Arc::new(FaultControlledStore::new(
-        fixture.store.clone(),
-        [
-            InjectedFault::Busy,
-            InjectedFault::Busy,
-            InjectedFault::Busy,
-            InjectedFault::Busy,
-            InjectedFault::Busy,
-            InjectedFault::Busy,
-        ],
-    ));
-    let writer = StoreWriterHandle::spawn_with_backend(
-        backend.clone(),
-        Arc::new(support::CountingWake::default()),
-        4,
-    );
-    let request = tokio::spawn({
-        let writer = writer.clone();
-        let input = support::new_task(fixture.repository.id, "bounded retries");
-        async move { writer.create_task(input, support::deadline()).await }
-    });
-
-    wait_for_attempts(&backend, 1).await;
-    for (index, delay_ms) in [25_u64, 50, 100, 200, 400].into_iter().enumerate() {
-        tokio::time::advance(Duration::from_millis(delay_ms - 1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(backend.attempts(), index + 1);
-        // Tokio's paused timer wheel wakes a deadline on the following 1 ms tick.
-        tokio::time::advance(Duration::from_millis(2)).await;
-        wait_for_attempts(&backend, index + 2).await;
-    }
-    let result = request.await.unwrap();
-
-    assert!(matches!(result, Err(StoreWriterError::Busy)));
-    assert_eq!(backend.attempts(), 6);
-}
-
-#[tokio::test]
-async fn deadline_expiring_during_backoff_prevents_the_next_attempt() {
-    let fixture = support::store_fixture().await;
-    tokio::time::pause();
-    let backend = Arc::new(FaultControlledStore::new(
-        fixture.store.clone(),
-        [InjectedFault::Busy],
-    ));
-    let wake = Arc::new(support::CountingWake::default());
-    let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
-
-    let result = writer
-        .create_task(
-            support::new_task(fixture.repository.id, "deadline during backoff"),
-            Instant::now() + Duration::from_millis(10),
-        )
-        .await;
-
-    assert!(matches!(result, Err(StoreWriterError::Busy)));
-    assert_eq!(backend.attempts(), 1);
-    assert!(
-        fixture
-            .store
-            .bootstrap_snapshot()
-            .await
-            .unwrap()
-            .tasks
-            .is_empty()
-    );
-    assert_eq!(wake.count(), 0);
-}
-
-#[tokio::test]
 async fn expired_deadline_skips_transaction_and_leaves_task_uncommitted() {
-    let fixture = support::store_fixture().await;
-    let backend = Arc::new(FaultControlledStore::new(fixture.store.clone(), []));
-    let wake = Arc::new(support::CountingWake::default());
-    let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
+    let fixture = support::writer_fixture().await;
 
-    let result = writer
+    let result = fixture
+        .writer
         .create_task(
             support::new_task(fixture.repository.id, "must not commit"),
             Instant::now(),
@@ -148,7 +38,6 @@ async fn expired_deadline_skips_transaction_and_leaves_task_uncommitted() {
         .await;
 
     assert!(matches!(result, Err(StoreWriterError::Busy)));
-    assert_eq!(backend.attempts(), 0);
     assert!(
         fixture
             .store
@@ -158,28 +47,48 @@ async fn expired_deadline_skips_transaction_and_leaves_task_uncommitted() {
             .tasks
             .is_empty()
     );
-    assert_eq!(wake.count(), 0);
+    assert_eq!(fixture.wake.count(), 0);
 }
 
 #[tokio::test]
-async fn terminal_rolled_back_write_is_not_retried_or_woken() {
-    let fixture = support::store_fixture().await;
-    let backend = Arc::new(FaultControlledStore::new(
-        fixture.store.clone(),
-        [InjectedFault::Terminal],
-    ));
-    let wake = Arc::new(support::CountingWake::default());
-    let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
+async fn real_sqlite_busy_exhaustion_is_uncommitted_and_does_not_wake() {
+    let fixture = support::writer_fixture().await;
+    let options = fixture
+        .store
+        .pool()
+        .connect_options()
+        .as_ref()
+        .clone()
+        .busy_timeout(Duration::ZERO);
+    fixture.store.pool().set_connect_options(options);
+    let existing_connections = fixture.store.pool().size();
+    let mut legacy_connections = Vec::with_capacity(existing_connections as usize);
+    for _ in 0..existing_connections {
+        legacy_connections.push(
+            fixture
+                .store
+                .pool()
+                .acquire()
+                .await
+                .expect("reserve connection with the original busy timeout"),
+        );
+    }
+    let transaction = fixture
+        .store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("hold the SQLite writer lock");
 
-    let result = writer
+    let result = fixture
+        .writer
         .create_task(
-            support::new_task(fixture.repository.id, "rolled back"),
+            support::new_task(fixture.repository.id, "real SQLite busy"),
             support::deadline(),
         )
         .await;
 
-    assert!(matches!(result, Err(StoreWriterError::Store(_))));
-    assert_eq!(backend.attempts(), 1);
+    assert!(matches!(result, Err(StoreWriterError::Busy)));
     assert!(
         fixture
             .store
@@ -189,7 +98,9 @@ async fn terminal_rolled_back_write_is_not_retried_or_woken() {
             .tasks
             .is_empty()
     );
-    assert_eq!(wake.count(), 0);
+    assert_eq!(fixture.wake.count(), 0);
+    transaction.rollback().await.unwrap();
+    drop(legacy_connections);
 }
 
 #[tokio::test]
@@ -401,58 +312,4 @@ async fn service_state_same_value_is_unchanged_and_quiescing_is_terminal() {
     assert_eq!(quiescing.generation, degraded.generation + 1);
     assert!(state.set(ServiceState::Ready).is_err());
     assert_eq!(state.current(), quiescing);
-}
-
-#[tokio::test]
-async fn started_attempt_finishes_even_if_request_future_is_dropped() {
-    let fixture = support::store_fixture().await;
-    let pause = Arc::new(support::PausePoint::default());
-    let backend = Arc::new(FaultControlledStore::paused(
-        fixture.store.clone(),
-        pause.clone(),
-    ));
-    let writer = StoreWriterHandle::spawn_with_backend(
-        backend,
-        Arc::new(support::CountingWake::default()),
-        4,
-    );
-    let request = tokio::spawn({
-        let writer = writer.clone();
-        let input = support::new_task(fixture.repository.id, "detached request");
-        async move { writer.create_task(input, support::deadline()).await }
-    });
-    pause.started.notified().await;
-    request.abort();
-    pause.release.notify_one();
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if !fixture
-                .store
-                .bootstrap_snapshot()
-                .await
-                .unwrap()
-                .tasks
-                .is_empty()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("actor completes an already-started transaction");
-}
-
-async fn wait_for_attempts(backend: &FaultControlledStore, expected: usize) {
-    for _ in 0..100 {
-        if backend.attempts() == expected {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!(
-        "store attempts did not reach {expected}; observed {}",
-        backend.attempts()
-    );
 }
