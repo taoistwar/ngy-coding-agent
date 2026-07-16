@@ -458,16 +458,29 @@ test("the quit barrier interrupts a claim paused after handle registration", asy
       await addRepositoryThroughUi(page, app);
 
       const prompt = "Quit after the claim handle is registered";
-      const created = await createTaskThroughUi(page, app, prompt);
+      const creation = await beginTaskCreationThroughUi(page, app, prompt);
       if (claimReleasePath.length === 0) {
         throw new Error("claim release path was not configured");
       }
       const claimReached = await waitForReachedSignal(app.runtimeDir, claimReleasePath);
+      const created = await waitForTaskByPrompt(context.request, app.origin, prompt);
+      await page
+        .getByRole("button", { name: `${prompt} Attempt 1`, exact: true })
+        .click();
       expect((await readTask(context.request, app.origin, created.id)).status).toBe("queued");
       await expect(page.locator(".task-status-label")).toHaveText("Status: queued");
 
       await quitThroughUiUntilBarrier(page, app);
-      await releaseActorAndAwaitCleanExit(app, claimReached);
+      const [createdFromResponse] = await Promise.all([
+        within(
+          creation.response,
+          "the paused task-create response after releasing the claim",
+        ).then(taskFromResponse),
+        releaseActorAndAwaitCleanExit(app, claimReached),
+      ]);
+      expect(createdFromResponse).toEqual(
+        expect.objectContaining({ id: created.id, prompt, status: "queued" }),
+      );
 
       await app.restart(emptyScenario());
       await openWorkspace(page, app);
@@ -639,6 +652,22 @@ async function createTaskThroughUi(
   return taskFromResponse(await response);
 }
 
+async function beginTaskCreationThroughUi(
+  page: Page,
+  app: LocalApp,
+  prompt: string,
+): Promise<{ response: Promise<Response> }> {
+  await page.getByLabel("Task description").fill(prompt);
+  const response = page.waitForResponse(
+    (candidate) =>
+      candidate.request().method() === "POST" && candidate.url() === `${app.origin}/api/tasks`,
+    { timeout: 0 },
+  );
+  void response.catch(() => undefined);
+  await page.getByRole("button", { name: "Create task", exact: true }).click();
+  return { response };
+}
+
 async function taskFromResponse(response: Response): Promise<TaskView> {
   expect(response.status()).toBe(201);
   return parseTask(await response.json());
@@ -650,6 +679,36 @@ async function listTasks(api: APIRequestContext, origin: string): Promise<TaskVi
   const candidate = (await response.json()) as unknown;
   if (!Array.isArray(candidate)) throw new Error("task list response was not an array");
   return candidate.map(parseTask);
+}
+
+async function waitForTaskByPrompt(
+  api: APIRequestContext,
+  origin: string,
+  prompt: string,
+): Promise<TaskView> {
+  const deadline = Date.now() + API_TIMEOUT_MS;
+  while (true) {
+    const matches = (await listTasks(api, origin)).filter((task) => task.prompt === prompt);
+    if (matches.length === 1) return matches[0]!;
+    if (matches.length > 1) throw new Error(`multiple tasks matched prompt ${prompt}`);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`timed out waiting for task prompt ${prompt}`);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)));
+  }
+}
+
+async function within<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), API_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function readTask(

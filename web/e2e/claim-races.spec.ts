@@ -101,11 +101,15 @@ for (const race of CLAIM_RACES) {
         await addRepositoryThroughUi(page, app);
 
         const prompt = `Cancel race at ${race.pause}`;
-        const created = await createTaskThroughUi(page, app, prompt);
+        const creation = await beginTaskCreationThroughUi(page, app, prompt);
         if (actorReleasePath.length === 0 || cancelEnqueuedReleasePath.length === 0) {
           throw new Error("claim/cancel actor release paths were not initialized");
         }
         const claimReached = await waitForReachedSignal(app.runtimeDir, actorReleasePath);
+        const created = await waitForTaskByPrompt(context.request, app.origin, prompt);
+        await page
+          .getByRole("button", { name: `${prompt} Attempt 1`, exact: true })
+          .click();
 
         const paused = await readTask(context.request, app.origin, created.id);
         expect(paused.status).toBe(race.statusAtPause);
@@ -115,7 +119,9 @@ for (const race of CLAIM_RACES) {
         const cancelResponse = page.waitForResponse(
           (response) =>
             response.request().method() === "POST" && response.url() === cancelUrl,
+          { timeout: 0 },
         );
+        void cancelResponse.catch(() => undefined);
         await page.getByRole("button", { name: "Cancel task", exact: true }).click();
 
         // The process marker is published only after mpsc::send succeeds, so
@@ -129,10 +135,19 @@ for (const race of CLAIM_RACES) {
           .toBeDisabled();
 
         await publishReleaseSignal(claimReached);
+        const createResponse = await within(
+          creation.response,
+          "the paused task-create response after releasing the claim",
+        );
+        expect(createResponse.status()).toBe(201);
+        const createdFromResponse = parseTask(await createResponse.json());
+        expect(createdFromResponse).toEqual(
+          expect.objectContaining({ id: created.id, prompt, status: "queued" }),
+        );
         await waitForTaskStatus(context.request, app.origin, created.id, "cancelled");
         await publishReleaseSignal(cancelEnqueuedReached);
 
-        const response = await cancelResponse;
+        const response = await within(cancelResponse, "the cancel response after releasing the actor");
         const accepted = await cancellationAccepted(response);
         expect(accepted).toEqual({
           cancellation_requested: true,
@@ -318,6 +333,22 @@ async function createTaskThroughUi(
   return task;
 }
 
+async function beginTaskCreationThroughUi(
+  page: Page,
+  app: LocalApp,
+  prompt: string,
+): Promise<{ response: Promise<Response> }> {
+  await page.getByLabel("Task description").fill(prompt);
+  const response = page.waitForResponse(
+    (candidate) =>
+      candidate.request().method() === "POST" && candidate.url() === `${app.origin}/api/tasks`,
+    { timeout: 0 },
+  );
+  void response.catch(() => undefined);
+  await page.getByRole("button", { name: "Create task", exact: true }).click();
+  return { response };
+}
+
 async function cancellationAccepted(response: Response): Promise<{
   cancellation_requested: true;
   task: TaskView;
@@ -355,6 +386,36 @@ async function listTasks(api: APIRequestContext, origin: string): Promise<TaskVi
   const candidate = (await response.json()) as unknown;
   if (!Array.isArray(candidate)) throw new Error("task list response was not an array");
   return candidate.map(parseTask);
+}
+
+async function waitForTaskByPrompt(
+  api: APIRequestContext,
+  origin: string,
+  prompt: string,
+): Promise<TaskView> {
+  const deadline = Date.now() + API_TIMEOUT_MS;
+  while (true) {
+    const matches = (await listTasks(api, origin)).filter((task) => task.prompt === prompt);
+    if (matches.length === 1) return matches[0]!;
+    if (matches.length > 1) throw new Error(`multiple tasks matched prompt ${prompt}`);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`timed out waiting for task prompt ${prompt}`);
+    await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)));
+  }
+}
+
+async function within<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), API_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function taskEventKinds(
