@@ -25,6 +25,8 @@ mod single_instance;
 mod static_assets;
 mod store_writer;
 mod task_manager;
+#[cfg(feature = "test-support")]
+mod test_support;
 
 pub use event_dispatcher::{EventDispatcherError, EventDispatcherHandle};
 pub use fake_runner::{FakeRunnerConfig, FakeTaskRunner};
@@ -61,7 +63,19 @@ pub use single_instance::{
 };
 pub use static_assets::StaticAssetService;
 pub use store_writer::{EventWake, StoreWriterError, StoreWriterHandle, WriteReceipt};
+#[cfg(feature = "test-support")]
+pub use store_writer::{
+    StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterOperationKind,
+    StoreWriterTestConfigError, StoreWriterTestController,
+};
 pub use task_manager::{
     CancelOutcome, QuiesceResult, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink,
     RunnerOutcome, RunnerShutdownHandle, TaskManagerError, TaskManagerHandle, TaskRunner,
+};
+#[cfg(feature = "test-support")]
+pub use test_support::{
+    ActorPausePoint, ProcessTestConfig, ProcessTestConfigError, ProcessTestEnvironment,
+    TEST_APP_DATA_ENV, TEST_BROWSER_PROBE_FILE, TEST_PICKER_PROBE_FILE, TEST_RUNTIME_ENV,
+    TEST_SCENARIO_ENV, TEST_STARTUP_RECOVERY_PROBE_FILE, VirtualReleaseSignal,
+    VirtualReleaseTarget,
 };

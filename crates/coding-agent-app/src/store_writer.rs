@@ -73,12 +73,334 @@ enum StoreWriterOperationOutcome {
     RecoverIncomplete(RecoveryOutcome),
 }
 
+#[cfg(feature = "test-support")]
+impl StoreWriterOperation {
+    fn test_kind(&self) -> StoreWriterOperationKind {
+        match self {
+            Self::RegisterRepository(_) => StoreWriterOperationKind::RegisterRepository,
+            Self::CreateTask(_) => StoreWriterOperationKind::CreateTask,
+            Self::RetryTask(_) => StoreWriterOperationKind::RetryTask,
+            Self::TransitionWithEvent { transition, .. } => match transition {
+                TaskTransition::Running => StoreWriterOperationKind::StartTask,
+                TaskTransition::Completed | TaskTransition::Failed(_) => {
+                    StoreWriterOperationKind::FinishTask
+                }
+                TaskTransition::Cancelled => StoreWriterOperationKind::CancelTask,
+                TaskTransition::Interrupted(_) => StoreWriterOperationKind::InterruptTask,
+            },
+            Self::AppendRunningEvent { .. } => StoreWriterOperationKind::AppendRunningEvent,
+            Self::RecoverIncomplete { .. } => StoreWriterOperationKind::RecoverIncomplete,
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl StoreWriterOperationOutcome {
+    fn has_durable_event(&self) -> bool {
+        match self {
+            Self::RegisterRepository(_) => false,
+            Self::CreateTask(CreateTaskOutcome::Created { .. })
+            | Self::RetryTask(RetryTaskOutcome::Created { .. })
+            | Self::TransitionWithEvent(TransitionOutcome::Applied { .. })
+            | Self::AppendRunningEvent(AppendEventOutcome::Applied { .. }) => true,
+            Self::CreateTask(CreateTaskOutcome::Existing { .. })
+            | Self::RetryTask(RetryTaskOutcome::Existing { .. })
+            | Self::TransitionWithEvent(TransitionOutcome::Conflict { .. })
+            | Self::AppendRunningEvent(AppendEventOutcome::NotRunning { .. }) => false,
+            Self::RecoverIncomplete(outcome) => outcome.last_event_id.is_some(),
+        }
+    }
+}
+
 type StoreWriterBackendFuture<'a> = Pin<
     Box<dyn Future<Output = Result<StoreWriterOperationOutcome, StoreWriterError>> + Send + 'a>,
 >;
 
 trait StoreWriterBackend: Send + Sync + 'static {
     fn execute(&self, operation: StoreWriterOperation) -> StoreWriterBackendFuture<'_>;
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreWriterFaultPoint {
+    FailBeforeExecute,
+    BusyBeforeExecute,
+    PauseBeforeExecute,
+    PauseAfterCommitBeforeWake,
+    DropWakeAfterCommit,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreWriterOperationKind {
+    RegisterRepository,
+    CreateTask,
+    RetryTask,
+    StartTask,
+    FinishTask,
+    CancelTask,
+    InterruptTask,
+    AppendRunningEvent,
+    RecoverIncomplete,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreWriterFaultSpec {
+    pub point: StoreWriterFaultPoint,
+    #[serde(default)]
+    pub operation: Option<StoreWriterOperationKind>,
+    pub count: u32,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum StoreWriterTestConfigError {
+    #[error("StoreWriter fault counts must be positive")]
+    ZeroCount,
+}
+
+#[cfg(feature = "test-support")]
+pub struct StoreWriterTestController {
+    state: std::sync::Mutex<StoreWriterTestState>,
+    generation: tokio::sync::watch::Sender<u64>,
+    dropped_wakes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "test-support")]
+struct StoreWriterTestState {
+    scripts: Vec<StoreWriterFaultScript>,
+    hit_counts: std::collections::HashMap<(StoreWriterFaultPoint, StoreWriterOperationKind), u32>,
+    pause_gates: std::collections::HashMap<StoreWriterFaultPoint, Arc<tokio::sync::Semaphore>>,
+}
+
+#[cfg(feature = "test-support")]
+struct StoreWriterFaultScript {
+    spec: StoreWriterFaultSpec,
+    remaining: u32,
+}
+
+#[cfg(feature = "test-support")]
+struct ConsumedStoreWriterFault {
+    pause_gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+#[cfg(feature = "test-support")]
+impl StoreWriterTestController {
+    pub fn try_new(
+        faults: impl IntoIterator<Item = StoreWriterFaultSpec>,
+    ) -> Result<Self, StoreWriterTestConfigError> {
+        let mut scripts = Vec::new();
+        let mut pause_gates = std::collections::HashMap::new();
+        for spec in faults {
+            if spec.count == 0 {
+                return Err(StoreWriterTestConfigError::ZeroCount);
+            }
+            if matches!(
+                spec.point,
+                StoreWriterFaultPoint::PauseBeforeExecute
+                    | StoreWriterFaultPoint::PauseAfterCommitBeforeWake
+            ) {
+                pause_gates
+                    .entry(spec.point)
+                    .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(0)));
+            }
+            let remaining = spec.count;
+            scripts.push(StoreWriterFaultScript { spec, remaining });
+        }
+        let (generation, _) = tokio::sync::watch::channel(0);
+        Ok(Self {
+            state: std::sync::Mutex::new(StoreWriterTestState {
+                scripts,
+                hit_counts: std::collections::HashMap::new(),
+                pause_gates,
+            }),
+            generation,
+            dropped_wakes: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    pub fn hit_count(
+        &self,
+        point: StoreWriterFaultPoint,
+        operation: StoreWriterOperationKind,
+    ) -> u32 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hit_counts
+            .get(&(point, operation))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub async fn wait_until_reached(&self, point: StoreWriterFaultPoint, expected: u32) {
+        if expected == 0 {
+            return;
+        }
+        let mut generation = self.generation.subscribe();
+        loop {
+            let observed = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .hit_counts
+                .iter()
+                .filter_map(|((observed_point, _), count)| {
+                    (*observed_point == point).then_some(*count)
+                })
+                .sum::<u32>();
+            if observed >= expected {
+                return;
+            }
+            generation
+                .changed()
+                .await
+                .expect("StoreWriter test controller remains alive while waiting");
+        }
+    }
+
+    pub fn release(&self, point: StoreWriterFaultPoint) -> usize {
+        let gate = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pause_gates
+            .get(&point)
+            .cloned();
+        if let Some(gate) = gate {
+            gate.add_permits(1);
+            1
+        } else {
+            0
+        }
+    }
+
+    fn consume(
+        &self,
+        point: StoreWriterFaultPoint,
+        operation: StoreWriterOperationKind,
+    ) -> Option<ConsumedStoreWriterFault> {
+        let gate = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let script = state.scripts.iter_mut().find(|script| {
+                script.remaining > 0
+                    && script.spec.point == point
+                    && script
+                        .spec
+                        .operation
+                        .is_none_or(|expected| expected == operation)
+            })?;
+            script.remaining -= 1;
+            *state.hit_counts.entry((point, operation)).or_default() += 1;
+            state.pause_gates.get(&point).cloned()
+        };
+        self.generation.send_modify(|value| {
+            *value = value.wrapping_add(1);
+        });
+        Some(ConsumedStoreWriterFault { pause_gate: gate })
+    }
+
+    async fn pause_if_scripted(
+        &self,
+        point: StoreWriterFaultPoint,
+        operation: StoreWriterOperationKind,
+    ) {
+        let Some(consumed) = self.consume(point, operation) else {
+            return;
+        };
+        consumed
+            .pause_gate
+            .expect("pause fault points install a release gate")
+            .acquire_owned()
+            .await
+            .expect("StoreWriter test pause semaphore remains open")
+            .forget();
+    }
+
+    fn mark_dropped_wake(&self) {
+        self.dropped_wakes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn take_dropped_wake(&self) -> bool {
+        self.dropped_wakes
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct TestStoreWriterBackend {
+    inner: Store,
+    controller: Arc<StoreWriterTestController>,
+}
+
+#[cfg(feature = "test-support")]
+impl StoreWriterBackend for TestStoreWriterBackend {
+    fn execute(&self, operation: StoreWriterOperation) -> StoreWriterBackendFuture<'_> {
+        Box::pin(async move {
+            let kind = operation.test_kind();
+            self.controller
+                .pause_if_scripted(StoreWriterFaultPoint::PauseBeforeExecute, kind)
+                .await;
+            if self
+                .controller
+                .consume(StoreWriterFaultPoint::FailBeforeExecute, kind)
+                .is_some()
+            {
+                return Err(StoreWriterError::Store(StoreError::InvariantViolation(
+                    "injected test-support StoreWriter failure",
+                )));
+            }
+            if self
+                .controller
+                .consume(StoreWriterFaultPoint::BusyBeforeExecute, kind)
+                .is_some()
+            {
+                return Err(StoreWriterError::Busy);
+            }
+            let outcome = StoreWriterBackend::execute(&self.inner, operation).await?;
+            if outcome.has_durable_event() {
+                self.controller
+                    .pause_if_scripted(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, kind)
+                    .await;
+                if self
+                    .controller
+                    .consume(StoreWriterFaultPoint::DropWakeAfterCommit, kind)
+                    .is_some()
+                {
+                    self.controller.mark_dropped_wake();
+                }
+            }
+            Ok(outcome)
+        })
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct TestEventWake {
+    inner: Arc<dyn EventWake>,
+    controller: Arc<StoreWriterTestController>,
+}
+
+#[cfg(feature = "test-support")]
+impl EventWake for TestEventWake {
+    fn wake(&self) {
+        if !self.controller.take_dropped_wake() {
+            self.inner.wake();
+        }
+    }
 }
 
 impl StoreWriterBackend for Store {
@@ -127,6 +449,24 @@ pub struct StoreWriterHandle {
 impl StoreWriterHandle {
     pub fn spawn(store: Store, wake: Arc<dyn EventWake>, capacity: usize) -> Self {
         Self::spawn_with_backend(Arc::new(store), wake, capacity)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn spawn_with_test_controller(
+        store: Store,
+        wake: Arc<dyn EventWake>,
+        capacity: usize,
+        controller: Arc<StoreWriterTestController>,
+    ) -> Self {
+        let backend = Arc::new(TestStoreWriterBackend {
+            inner: store,
+            controller: controller.clone(),
+        });
+        let wake = Arc::new(TestEventWake {
+            inner: wake,
+            controller,
+        });
+        Self::spawn_with_backend(backend, wake, capacity)
     }
 
     fn spawn_with_backend(
@@ -865,6 +1205,522 @@ mod tests {
         .expect("actor completes an already-started transaction");
     }
 
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn scripted_failures_are_operation_scoped_and_counted_exactly() {
+        let fixture = unit_fixture().await;
+        let controller = Arc::new(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::FailBeforeExecute,
+                operation: Some(StoreWriterOperationKind::CreateTask),
+                count: 2,
+            }])
+            .expect("valid writer fault script"),
+        );
+        let writer = StoreWriterHandle::spawn_with_test_controller(
+            fixture.store.clone(),
+            Arc::new(CountingWake::default()),
+            4,
+            controller.clone(),
+        );
+
+        for prompt in ["first injected failure", "second injected failure"] {
+            assert!(matches!(
+                writer
+                    .create_task(new_task(&fixture.repository, prompt), deadline())
+                    .await,
+                Err(StoreWriterError::Store(StoreError::InvariantViolation(
+                    "injected test-support StoreWriter failure"
+                )))
+            ));
+        }
+        writer
+            .create_task(
+                new_task(&fixture.repository, "fault budget exhausted"),
+                deadline(),
+            )
+            .await
+            .expect("third matching operation commits");
+
+        assert_eq!(
+            controller.hit_count(
+                StoreWriterFaultPoint::FailBeforeExecute,
+                StoreWriterOperationKind::CreateTask,
+            ),
+            2
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn fault_specs_have_a_closed_schema_and_positive_counts() {
+        let parsed = serde_json::from_str::<StoreWriterFaultSpec>(
+            r#"{
+                "point": "pause_before_execute",
+                "operation": "finish_task",
+                "count": 3
+            }"#,
+        )
+        .expect("deserialize a closed fault spec");
+        assert_eq!(parsed.point, StoreWriterFaultPoint::PauseBeforeExecute);
+        assert_eq!(parsed.operation, Some(StoreWriterOperationKind::FinishTask));
+        assert_eq!(parsed.count, 3);
+
+        assert!(
+            serde_json::from_str::<StoreWriterFaultSpec>(
+                r#"{
+                    "point": "fail_before_execute",
+                    "count": 1,
+                    "prompt_contains": "magic"
+                }"#,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::FailBeforeExecute,
+                operation: None,
+                count: 0,
+            }])
+            .err(),
+            Some(StoreWriterTestConfigError::ZeroCount)
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn transition_fault_filters_distinguish_start_finish_cancel_and_interrupt() {
+        let task_id = TaskId::new();
+        let transition = |expected, transition| StoreWriterOperation::TransitionWithEvent {
+            task_id,
+            expected,
+            transition,
+        };
+        assert_eq!(
+            transition(TaskStatus::Queued, TaskTransition::Running).test_kind(),
+            StoreWriterOperationKind::StartTask
+        );
+        assert_eq!(
+            transition(TaskStatus::Running, TaskTransition::Completed).test_kind(),
+            StoreWriterOperationKind::FinishTask
+        );
+        assert_eq!(
+            transition(
+                TaskStatus::Running,
+                TaskTransition::Failed(failure("FAILED"))
+            )
+            .test_kind(),
+            StoreWriterOperationKind::FinishTask
+        );
+        assert_eq!(
+            transition(TaskStatus::Queued, TaskTransition::Cancelled).test_kind(),
+            StoreWriterOperationKind::CancelTask
+        );
+        assert_eq!(
+            transition(
+                TaskStatus::Running,
+                TaskTransition::Interrupted(failure("INTERRUPTED")),
+            )
+            .test_kind(),
+            StoreWriterOperationKind::InterruptTask
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn before_execute_pause_is_releasable_and_precedes_the_commit() {
+        let fixture = unit_fixture().await;
+        let controller = Arc::new(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::PauseBeforeExecute,
+                operation: Some(StoreWriterOperationKind::CreateTask),
+                count: 1,
+            }])
+            .expect("valid writer pause script"),
+        );
+        let wake = Arc::new(CountingWake::default());
+        let writer = StoreWriterHandle::spawn_with_test_controller(
+            fixture.store.clone(),
+            wake.clone(),
+            4,
+            controller.clone(),
+        );
+        let request = tokio::spawn({
+            let writer = writer.clone();
+            let input = new_task(&fixture.repository, "before execute");
+            async move { writer.create_task(input, deadline()).await }
+        });
+
+        controller
+            .wait_until_reached(StoreWriterFaultPoint::PauseBeforeExecute, 1)
+            .await;
+        assert!(
+            fixture
+                .store
+                .bootstrap_snapshot()
+                .await
+                .expect("read store before release")
+                .tasks
+                .is_empty()
+        );
+        assert_eq!(wake.count(), 0);
+        assert!(!request.is_finished());
+
+        assert_eq!(
+            controller.release(StoreWriterFaultPoint::PauseBeforeExecute),
+            1
+        );
+        request
+            .await
+            .expect("join paused request")
+            .expect("released request succeeds");
+        assert_eq!(wake.count(), 1);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn scripted_busy_attempts_use_the_normal_bounded_retry_path() {
+        let fixture = unit_fixture().await;
+        let controller = Arc::new(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::BusyBeforeExecute,
+                operation: Some(StoreWriterOperationKind::CreateTask),
+                count: 2,
+            }])
+            .expect("valid writer busy script"),
+        );
+        let writer = StoreWriterHandle::spawn_with_test_controller(
+            fixture.store.clone(),
+            Arc::new(CountingWake::default()),
+            4,
+            controller.clone(),
+        );
+
+        writer
+            .create_task(new_task(&fixture.repository, "busy retries"), deadline())
+            .await
+            .expect("third attempt commits");
+        assert_eq!(
+            controller.hit_count(
+                StoreWriterFaultPoint::BusyBeforeExecute,
+                StoreWriterOperationKind::CreateTask,
+            ),
+            2
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn commit_before_wake_pause_is_releasable_without_hiding_the_commit() {
+        let fixture = unit_fixture().await;
+        let controller = Arc::new(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+                operation: Some(StoreWriterOperationKind::CreateTask),
+                count: 1,
+            }])
+            .expect("valid writer pause script"),
+        );
+        let wake = Arc::new(CountingWake::default());
+        let writer = StoreWriterHandle::spawn_with_test_controller(
+            fixture.store.clone(),
+            wake.clone(),
+            4,
+            controller.clone(),
+        );
+        let request = tokio::spawn({
+            let writer = writer.clone();
+            let input = new_task(&fixture.repository, "commit before wake");
+            async move { writer.create_task(input, deadline()).await }
+        });
+
+        controller
+            .wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1)
+            .await;
+        assert_eq!(
+            fixture
+                .store
+                .bootstrap_snapshot()
+                .await
+                .expect("read committed task")
+                .tasks
+                .len(),
+            1
+        );
+        assert_eq!(wake.count(), 0);
+        assert!(!request.is_finished());
+
+        assert_eq!(
+            controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+            1
+        );
+        request
+            .await
+            .expect("join paused request")
+            .expect("released request succeeds");
+        assert_eq!(wake.count(), 1);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn commit_before_wake_pause_skips_existing_without_consuming_its_budget() {
+        let fixture = unit_fixture().await;
+        let input = new_task(&fixture.repository, "existing outcome");
+        fixture
+            .store
+            .create_task(input.clone())
+            .await
+            .expect("seed the existing task");
+        let controller = Arc::new(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+                operation: Some(StoreWriterOperationKind::CreateTask),
+                count: 1,
+            }])
+            .expect("valid writer pause script"),
+        );
+        let writer = StoreWriterHandle::spawn_with_test_controller(
+            fixture.store.clone(),
+            Arc::new(CountingWake::default()),
+            4,
+            controller.clone(),
+        );
+
+        let existing = tokio::time::timeout(
+            Duration::from_secs(1),
+            writer.create_task(input, deadline()),
+        )
+        .await
+        .expect("Existing does not pause")
+        .expect("Existing succeeds");
+        assert!(matches!(existing.value, CreateTaskOutcome::Existing { .. }));
+        assert_eq!(
+            controller.hit_count(
+                StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+                StoreWriterOperationKind::CreateTask,
+            ),
+            0
+        );
+
+        let request = tokio::spawn({
+            let writer = writer.clone();
+            let input = new_task(&fixture.repository, "durable after existing");
+            async move { writer.create_task(input, deadline()).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+        )
+        .await
+        .expect("the next durable create consumes the preserved pause budget");
+        assert_eq!(
+            controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+            1
+        );
+        request
+            .await
+            .expect("join durable create")
+            .expect("released durable create succeeds");
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn commit_before_wake_pause_skips_conflict_without_consuming_its_budget() {
+        let fixture = unit_fixture().await;
+        let conflict_task = fixture
+            .store
+            .create_task(new_task(&fixture.repository, "conflict outcome"))
+            .await
+            .expect("seed conflict task")
+            .task()
+            .clone();
+        fixture
+            .store
+            .transition_with_event(
+                conflict_task.id,
+                TaskStatus::Queued,
+                TaskTransition::Cancelled,
+            )
+            .await
+            .expect("move conflict task out of queued");
+        let durable_task = fixture
+            .store
+            .create_task(new_task(&fixture.repository, "durable after conflict"))
+            .await
+            .expect("seed durable transition task")
+            .task()
+            .clone();
+        let controller = Arc::new(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+                operation: Some(StoreWriterOperationKind::StartTask),
+                count: 1,
+            }])
+            .expect("valid writer pause script"),
+        );
+        let writer = StoreWriterHandle::spawn_with_test_controller(
+            fixture.store.clone(),
+            Arc::new(CountingWake::default()),
+            4,
+            controller.clone(),
+        );
+
+        let conflict = tokio::time::timeout(
+            Duration::from_secs(1),
+            writer.transition_with_event(
+                conflict_task.id,
+                TaskStatus::Queued,
+                TaskTransition::Running,
+                deadline(),
+            ),
+        )
+        .await
+        .expect("Conflict does not pause")
+        .expect("Conflict is a successful outcome");
+        assert!(matches!(conflict.value, TransitionOutcome::Conflict { .. }));
+        assert_eq!(
+            controller.hit_count(
+                StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+                StoreWriterOperationKind::StartTask,
+            ),
+            0
+        );
+
+        let request = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                writer
+                    .transition_with_event(
+                        durable_task.id,
+                        TaskStatus::Queued,
+                        TaskTransition::Running,
+                        deadline(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+        )
+        .await
+        .expect("the next durable transition consumes the preserved pause budget");
+        assert_eq!(
+            controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+            1
+        );
+        request
+            .await
+            .expect("join durable transition")
+            .expect("released durable transition succeeds");
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn commit_before_wake_pause_skips_not_running_without_consuming_its_budget() {
+        let fixture = unit_fixture().await;
+        let task = fixture
+            .store
+            .create_task(new_task(&fixture.repository, "not-running outcome"))
+            .await
+            .expect("seed not-running task")
+            .task()
+            .clone();
+        let controller = Arc::new(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+                operation: Some(StoreWriterOperationKind::AppendRunningEvent),
+                count: 1,
+            }])
+            .expect("valid writer pause script"),
+        );
+        let writer = StoreWriterHandle::spawn_with_test_controller(
+            fixture.store.clone(),
+            Arc::new(CountingWake::default()),
+            4,
+            controller.clone(),
+        );
+
+        let not_running = tokio::time::timeout(
+            Duration::from_secs(1),
+            writer.append_running_event(task.id, plan_payload(1), deadline()),
+        )
+        .await
+        .expect("NotRunning does not pause")
+        .expect("NotRunning is a successful outcome");
+        assert!(matches!(
+            not_running.value,
+            AppendEventOutcome::NotRunning { .. }
+        ));
+        assert_eq!(
+            controller.hit_count(
+                StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+                StoreWriterOperationKind::AppendRunningEvent,
+            ),
+            0
+        );
+        fixture
+            .store
+            .transition_with_event(task.id, TaskStatus::Queued, TaskTransition::Running)
+            .await
+            .expect("move task to running");
+
+        let request = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                writer
+                    .append_running_event(task.id, plan_payload(2), deadline())
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+        )
+        .await
+        .expect("the next durable append consumes the preserved pause budget");
+        assert_eq!(
+            controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+            1
+        );
+        request
+            .await
+            .expect("join durable append")
+            .expect("released durable append succeeds");
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn dropped_wake_budget_does_not_drop_the_next_notification() {
+        let fixture = unit_fixture().await;
+        let controller = Arc::new(
+            StoreWriterTestController::try_new([StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::DropWakeAfterCommit,
+                operation: Some(StoreWriterOperationKind::CreateTask),
+                count: 1,
+            }])
+            .expect("valid writer drop-wake script"),
+        );
+        let wake = Arc::new(CountingWake::default());
+        let writer = StoreWriterHandle::spawn_with_test_controller(
+            fixture.store.clone(),
+            wake.clone(),
+            4,
+            controller,
+        );
+
+        writer
+            .create_task(new_task(&fixture.repository, "dropped wake"), deadline())
+            .await
+            .expect("first commit succeeds");
+        assert_eq!(wake.count(), 0);
+        writer
+            .create_task(new_task(&fixture.repository, "delivered wake"), deadline())
+            .await
+            .expect("second commit succeeds");
+        assert_eq!(wake.count(), 1);
+    }
+
     async fn wait_for_attempts(backend: &FaultControlledBackend, expected: usize) {
         for _ in 0..100 {
             if backend.attempts() == expected {
@@ -876,5 +1732,24 @@ mod tests {
             "store attempts did not reach {expected}; observed {}",
             backend.attempts()
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    fn failure(code: &str) -> TaskFailure {
+        TaskFailure {
+            code: code.to_owned(),
+            message: "unit-test failure".to_owned(),
+            retryable: true,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn plan_payload(revision: u64) -> TaskEventPayload {
+        TaskEventPayload::PlanUpdated {
+            plan: coding_agent_domain::PlanSnapshot {
+                revision,
+                items: Vec::new(),
+            },
+        }
     }
 }

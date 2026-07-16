@@ -225,7 +225,7 @@ export function TaskWorkspace({
               <span className="status-glyph" aria-hidden="true">
                 {STATUS_GLYPH[task.status]}
               </span>{" "}
-              Status: {task.status}
+              <span className="task-status-label">Status: {task.status}</span>
             </p>
             {task.status === "completed" ? (
               <p className="completion-disclaimer">Execution completed — not reviewed</p>

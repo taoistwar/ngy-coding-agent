@@ -31,7 +31,8 @@ export function ActivityPane({ activity }: ActivityPaneProps) {
                   {ACTIVITY_GLYPH[entry.level]}
                 </span>
                 <span>
-                  <strong>{entry.level}</strong> {entry.message}
+                  <strong>{entry.level}</strong>{" "}
+                  <span className="activity-message">{entry.message}</span>
                   <time dateTime={entry.created_at}>{entry.created_at}</time>
                 </span>
               </li>

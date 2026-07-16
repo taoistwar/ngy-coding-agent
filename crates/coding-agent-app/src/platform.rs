@@ -201,7 +201,7 @@ impl BrowserLauncher {
     }
 }
 
-fn create_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) => {
             return Err(io::Error::new(

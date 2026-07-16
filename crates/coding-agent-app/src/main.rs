@@ -3,6 +3,8 @@ compile_error!("release builds require the `embedded-web` feature");
 
 use std::process::ExitCode;
 
+#[cfg(feature = "test-support")]
+use coding_agent_app::ProcessTestEnvironment;
 use coding_agent_app::{
     NativeDialogService, StartupDependencies, StartupOutcome, launch,
     run_degraded_shutdown_warning_if_requested,
@@ -45,9 +47,14 @@ fn main() -> ExitCode {
 
 #[cfg(not(target_os = "macos"))]
 fn run_on_platform_main_thread(runtime: &tokio::runtime::Runtime) -> i32 {
-    runtime.block_on(run_application(startup_dependencies(Some(
-        NativeDialogService::new(),
-    ))))
+    let dependencies = match startup_dependencies(Some(NativeDialogService::new())) {
+        Ok(dependencies) => dependencies,
+        Err(error) => {
+            show_early_error(&error);
+            return 1;
+        }
+    };
+    runtime.block_on(run_application(dependencies))
 }
 
 #[cfg(target_os = "macos")]
@@ -60,19 +67,32 @@ fn run_on_platform_main_thread(runtime: &tokio::runtime::Runtime) -> i32 {
         }
     };
     let dialog_host_keepalive = dialog.clone();
+    let dependencies = match startup_dependencies(Some(dialog)) {
+        Ok(dependencies) => dependencies,
+        Err(error) => {
+            show_early_error(&error);
+            return 1;
+        }
+    };
     runtime.block_on(select_application_and_dialog_host(
         dialog_host_keepalive,
-        run_application(startup_dependencies(Some(dialog))),
+        run_application(dependencies),
         host.run(),
         || show_early_error("The native dialog host stopped unexpectedly."),
     ))
 }
 
-fn startup_dependencies(dialog: Option<NativeDialogService>) -> StartupDependencies {
+fn startup_dependencies(
+    dialog: Option<NativeDialogService>,
+) -> Result<StartupDependencies, String> {
     let dependencies = StartupDependencies::production(dialog);
     #[cfg(all(debug_assertions, not(feature = "embedded-web")))]
     let dependencies = dependencies.with_development_public_origin(VITE_PUBLIC_ORIGIN);
-    dependencies
+    #[cfg(feature = "test-support")]
+    let dependencies = ProcessTestEnvironment::from_environment()
+        .and_then(|environment| environment.apply(dependencies))
+        .map_err(|error| format!("The isolated process-test configuration is invalid: {error}"))?;
+    Ok(dependencies)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -149,12 +169,18 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await
 }
 
+#[cfg(not(feature = "test-support"))]
 fn show_early_error(body: &str) {
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("Coding Agent could not start")
         .set_description(body)
         .show();
+}
+
+#[cfg(feature = "test-support")]
+fn show_early_error(body: &str) {
+    eprintln!("Coding Agent could not start: {body}");
 }
 
 #[cfg(test)]

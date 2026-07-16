@@ -29,6 +29,27 @@ trait PickerBackend: Send + Sync + 'static {
     async fn pick_repository(&self) -> Result<Option<PathBuf>, PickerError>;
 }
 
+#[cfg(feature = "test-support")]
+struct ProcessTestPickerProbe {
+    marker_path: PathBuf,
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+impl PickerBackend for ProcessTestPickerProbe {
+    async fn pick_repository(&self) -> Result<Option<PathBuf>, PickerError> {
+        match crate::platform::PrivateFile::create_new(&self.marker_path) {
+            Ok(marker) => marker
+                .as_file()
+                .sync_all()
+                .map_err(|_| PickerError::Unavailable)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(PickerError::Unavailable),
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 struct DialogRequest {
     response: tokio::sync::oneshot::Sender<Option<PathBuf>>,
@@ -153,6 +174,13 @@ impl NativeDialogService {
         selected.await.unwrap_or(Err(PickerError::Unavailable))
     }
 
+    #[cfg(feature = "test-support")]
+    pub(crate) fn process_test_probe(marker_path: PathBuf) -> Self {
+        Self {
+            backend: DialogBackend::Direct(Arc::new(ProcessTestPickerProbe { marker_path })),
+        }
+    }
+
     #[cfg(test)]
     fn with_backend(backend: Arc<dyn PickerBackend>) -> Self {
         Self {
@@ -262,6 +290,21 @@ mod tests {
         async fn pick_repository(&self) -> Result<Option<PathBuf>, PickerError> {
             Ok(Some(self.0.clone()))
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn process_test_picker_probe_records_a_real_dispatch() {
+        let _test_guard = TEST_LOCK.lock().await;
+        let fixture = tempfile::tempdir().expect("create picker-probe fixture");
+        let marker = fixture.path().join("picker-invoked.probe");
+        let service = NativeDialogService::process_test_probe(marker.clone());
+
+        assert_eq!(service.pick_repository().await.unwrap(), None);
+        assert!(
+            marker.is_file(),
+            "a dispatched picker must publish its marker"
+        );
     }
 
     #[tokio::test]

@@ -29,6 +29,8 @@ use uuid::Uuid;
 
 use crate::security::LAUNCH_TOKEN_LIFETIME;
 use crate::store_writer::sqlite_code_is_retryable;
+#[cfg(feature = "test-support")]
+use crate::test_support::{ActorPauseController, ActorPausePoint};
 use crate::{
     CancelOutcome, EventDispatcherHandle, NativeDialogService, PickerError, RepositoryDiscovery,
     RepositoryDiscoveryError, SecurityManager, ServiceState, ServiceStateController, StartupPhase,
@@ -409,6 +411,8 @@ pub struct ApplicationBackend {
     max_concurrent_tasks: u32,
     write_budget: Duration,
     quit_signal: Arc<dyn Fn() + Send + Sync + 'static>,
+    #[cfg(feature = "test-support")]
+    actor_pauses: Option<Arc<ActorPauseController>>,
 }
 
 impl ApplicationBackend {
@@ -447,7 +451,18 @@ impl ApplicationBackend {
             max_concurrent_tasks,
             write_budget,
             quit_signal,
+            #[cfg(feature = "test-support")]
+            actor_pauses: None,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_process_test_pauses(
+        mut self,
+        actor_pauses: Arc<ActorPauseController>,
+    ) -> Self {
+        self.actor_pauses = Some(actor_pauses);
+        self
     }
 
     pub fn mutation_gate(&self) -> &MutationGate {
@@ -456,6 +471,14 @@ impl ApplicationBackend {
 
     fn deadline(&self) -> Instant {
         Instant::now() + self.write_budget
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn pause_actor(&self, point: ActorPausePoint) -> bool {
+        if let Some(pauses) = &self.actor_pauses {
+            return pauses.pause(point).await;
+        }
+        false
     }
 
     async fn register_path(&self, path: &Path) -> ApiResult<CreateResult<RepositoryDto>> {
@@ -498,11 +521,24 @@ impl ApiBackend for ApplicationBackend {
             .await
             .map_err(map_store_error)?;
         let state = self.service_state.current();
+        #[cfg(feature = "test-support")]
+        self.pause_actor(ActorPausePoint::BootstrapBeforeSse).await;
+        #[cfg(feature = "test-support")]
+        let latest_event_id = if self
+            .pause_actor(ActorPausePoint::BootstrapCursorAhead)
+            .await
+        {
+            snapshot.latest_event_id.get().saturating_add(1)
+        } else {
+            snapshot.latest_event_id.get()
+        };
+        #[cfg(not(feature = "test-support"))]
+        let latest_event_id = snapshot.latest_event_id.get();
         Ok(BootstrapResponse {
             csrf_token: self.security.csrf_for_auth(auth)?,
             repositories: snapshot.repositories.into_iter().map(Into::into).collect(),
             tasks: snapshot.tasks.into_iter().map(Into::into).collect(),
-            latest_event_id: snapshot.latest_event_id.get(),
+            latest_event_id,
             server_started_at: self.server_started_at.into(),
             service_state: service_state(state.state),
             service_state_generation: state.generation,
@@ -577,6 +613,8 @@ impl ApiBackend for ApplicationBackend {
             request.prompt,
         )
         .map_err(map_domain_error)?;
+        #[cfg(feature = "test-support")]
+        self.pause_actor(ActorPausePoint::CreateBeforeWrite).await;
         let receipt = self
             .writer
             .create_task(input, self.deadline())
@@ -619,6 +657,9 @@ impl ApiBackend for ApplicationBackend {
             .await
             .map_err(map_store_error)?
             .ok_or_else(task_not_found)?;
+        #[cfg(feature = "test-support")]
+        self.pause_actor(ActorPausePoint::TaskDetailAfterSnapshot)
+            .await;
         Ok(TaskDetailDto {
             task: detail.task.into(),
             plan: detail.plan.map(Into::into),
@@ -645,6 +686,8 @@ impl ApiBackend for ApplicationBackend {
 
     async fn retry_task(&self, _: &AuthContext, id: TaskId) -> ApiResult<CreateResult<TaskDto>> {
         let _guard = self.mutation_gate.enter_data_mutation()?;
+        #[cfg(feature = "test-support")]
+        self.pause_actor(ActorPausePoint::RetryBeforeWrite).await;
         let receipt = self
             .writer
             .retry_task(id, self.deadline())

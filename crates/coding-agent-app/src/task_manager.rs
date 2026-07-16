@@ -14,6 +14,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "test-support")]
+use crate::test_support::{ActorPauseController, ActorPausePoint};
 use crate::{
     DegradedCoordinator, DegradedCoordinatorError, DegradedRecoveryResult, EventDispatcherHandle,
     PendingDurableResult, ServiceState, ServiceStateController, StoreWriterError,
@@ -150,6 +152,8 @@ pub struct TaskManagerHandle {
     sender: mpsc::Sender<TaskManagerMessage>,
     degraded_recoveries: broadcast::Sender<DegradedRecoveryResult>,
     shutdown: Arc<TaskManagerShutdownControl>,
+    #[cfg(feature = "test-support")]
+    actor_pauses: Option<Arc<ActorPauseController>>,
 }
 
 struct TaskManagerShutdownControl {
@@ -191,6 +195,68 @@ impl TaskManagerHandle {
         concurrency: usize,
         capacity: usize,
     ) -> Self {
+        #[cfg(feature = "test-support")]
+        {
+            Self::spawn_inner(
+                store,
+                writer,
+                dispatcher,
+                service_state,
+                runner,
+                concurrency,
+                capacity,
+                None,
+            )
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            Self::spawn_inner(
+                store,
+                writer,
+                dispatcher,
+                service_state,
+                runner,
+                concurrency,
+                capacity,
+            )
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_process_test_pauses(
+        store: Store,
+        writer: StoreWriterHandle,
+        dispatcher: EventDispatcherHandle,
+        service_state: ServiceStateController,
+        runner: Arc<dyn TaskRunner>,
+        concurrency: usize,
+        capacity: usize,
+        actor_pauses: Arc<ActorPauseController>,
+    ) -> Self {
+        Self::spawn_inner(
+            store,
+            writer,
+            dispatcher,
+            service_state,
+            runner,
+            concurrency,
+            capacity,
+            Some(actor_pauses),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        store: Store,
+        writer: StoreWriterHandle,
+        dispatcher: EventDispatcherHandle,
+        service_state: ServiceStateController,
+        runner: Arc<dyn TaskRunner>,
+        concurrency: usize,
+        capacity: usize,
+        #[cfg(feature = "test-support")] actor_pauses: Option<Arc<ActorPauseController>>,
+    ) -> Self {
         assert!(concurrency > 0, "task-manager concurrency must be positive");
         assert!(
             capacity > 0,
@@ -223,6 +289,8 @@ impl TaskManagerHandle {
             shutdown: shutdown.clone(),
             #[cfg(feature = "test-support")]
             next_launch_ordinal: 0,
+            #[cfg(feature = "test-support")]
+            actor_pauses: actor_pauses.clone(),
             #[cfg(test)]
             claim_hooks: None,
             #[cfg(test)]
@@ -233,6 +301,8 @@ impl TaskManagerHandle {
             sender,
             degraded_recoveries,
             shutdown,
+            #[cfg(feature = "test-support")]
+            actor_pauses,
         }
     }
 
@@ -284,6 +354,8 @@ impl TaskManagerHandle {
             shutdown: shutdown.clone(),
             #[cfg(feature = "test-support")]
             next_launch_ordinal: 0,
+            #[cfg(feature = "test-support")]
+            actor_pauses: None,
             claim_hooks: Some(claim_hooks),
             exit_probe: None,
         };
@@ -292,6 +364,8 @@ impl TaskManagerHandle {
             sender,
             degraded_recoveries,
             shutdown,
+            #[cfg(feature = "test-support")]
+            actor_pauses: None,
         }
     }
 
@@ -330,6 +404,10 @@ impl TaskManagerHandle {
         let (response, receiver) = oneshot::channel();
         self.send(TaskManagerMessage::Cancel { task_id, response })
             .await?;
+        #[cfg(feature = "test-support")]
+        if let Some(actor_pauses) = &self.actor_pauses {
+            actor_pauses.pause(ActorPausePoint::CancelEnqueued).await;
+        }
         receiver.await.map_err(|_| TaskManagerError::Closed)?
     }
 
@@ -409,6 +487,8 @@ struct TaskManager {
     shutdown: Arc<TaskManagerShutdownControl>,
     #[cfg(feature = "test-support")]
     next_launch_ordinal: u64,
+    #[cfg(feature = "test-support")]
+    actor_pauses: Option<Arc<ActorPauseController>>,
     #[cfg(test)]
     claim_hooks: Option<Arc<ClaimTestHooks>>,
     #[cfg(test)]
@@ -518,6 +598,8 @@ impl TaskManager {
             let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
                 break;
             };
+            #[cfg(feature = "test-support")]
+            self.pause_actor(ActorPausePoint::ClaimPermitAcquired).await;
             #[cfg(test)]
             self.pause_claim(ClaimPhase::PermitAcquired).await;
             if self.is_frozen() {
@@ -541,6 +623,9 @@ impl TaskManager {
                     done_receiver: Some(done_receiver),
                 },
             );
+            #[cfg(feature = "test-support")]
+            self.pause_actor(ActorPausePoint::ClaimHandleRegistered)
+                .await;
             #[cfg(test)]
             if let Some(hooks) = &self.claim_hooks {
                 hooks
@@ -579,6 +664,9 @@ impl TaskManager {
             match claim {
                 Ok(receipt) => match receipt.value {
                     TransitionOutcome::Applied { task, .. } => {
+                        #[cfg(feature = "test-support")]
+                        self.pause_actor(ActorPausePoint::ClaimRunningCommitted)
+                            .await;
                         #[cfg(test)]
                         self.pause_claim(ClaimPhase::RunningCommitted).await;
                         if self.is_frozen() {
@@ -770,6 +858,8 @@ impl TaskManager {
             RunnerOutcome::Cancelled => TaskTransition::Cancelled,
             RunnerOutcome::Failed(failure) => TaskTransition::Failed(failure),
         };
+        #[cfg(feature = "test-support")]
+        self.pause_actor(ActorPausePoint::ResultBeforeWrite).await;
         let result = self
             .writer
             .transition_with_event(
@@ -804,6 +894,9 @@ impl TaskManager {
         self.scan_requested = false;
         let _ = self.service_state.set(ServiceState::Quiescing);
         let now = current_timestamp().map_err(TaskManagerError::Invariant)?;
+        #[cfg(feature = "test-support")]
+        self.pause_actor(ActorPausePoint::QuiesceBeforeRecovery)
+            .await;
         let recovery = self
             .writer
             .recover_incomplete(now, shutdown_failure(), deadline)
@@ -852,6 +945,13 @@ impl TaskManager {
     async fn pause_claim(&self, phase: ClaimPhase) {
         if let Some(hooks) = &self.claim_hooks {
             hooks.pause(phase).await;
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn pause_actor(&self, point: ActorPausePoint) {
+        if let Some(pauses) = &self.actor_pauses {
+            pauses.pause(point).await;
         }
     }
 

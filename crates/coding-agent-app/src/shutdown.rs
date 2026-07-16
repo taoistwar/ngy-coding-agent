@@ -76,6 +76,7 @@ struct RuntimeShutdown {
 
 impl ShutdownCoordinator {
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "test-support", allow(dead_code))]
     pub(crate) fn new(
         mutation_gate: MutationGate,
         task_manager: TaskManagerHandle,
@@ -86,6 +87,66 @@ impl ShutdownCoordinator {
         instance_id: Uuid,
         wall_clock: Arc<dyn WallClock>,
         messages: Arc<dyn NativeMessageSink>,
+    ) -> Self {
+        Self::new_with_marker_writer(
+            mutation_gate,
+            task_manager,
+            dispatcher,
+            store,
+            cleanup,
+            paths,
+            instance_id,
+            wall_clock,
+            messages,
+            Arc::new(FilesystemShutdownMarkerWriter),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_process_test(
+        mutation_gate: MutationGate,
+        task_manager: TaskManagerHandle,
+        dispatcher: EventDispatcherHandle,
+        store: Store,
+        cleanup: Arc<dyn ShutdownCleanup>,
+        paths: &PlatformPaths,
+        instance_id: Uuid,
+        wall_clock: Arc<dyn WallClock>,
+        messages: Arc<dyn NativeMessageSink>,
+        marker_write_failure: bool,
+    ) -> Self {
+        let marker_writer: Arc<dyn ShutdownMarkerWriter> = if marker_write_failure {
+            Arc::new(ProcessTestFailingShutdownMarkerWriter)
+        } else {
+            Arc::new(FilesystemShutdownMarkerWriter)
+        };
+        Self::new_with_marker_writer(
+            mutation_gate,
+            task_manager,
+            dispatcher,
+            store,
+            cleanup,
+            paths,
+            instance_id,
+            wall_clock,
+            messages,
+            marker_writer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_marker_writer(
+        mutation_gate: MutationGate,
+        task_manager: TaskManagerHandle,
+        dispatcher: EventDispatcherHandle,
+        store: Store,
+        cleanup: Arc<dyn ShutdownCleanup>,
+        paths: &PlatformPaths,
+        instance_id: Uuid,
+        wall_clock: Arc<dyn WallClock>,
+        messages: Arc<dyn NativeMessageSink>,
+        marker_writer: Arc<dyn ShutdownMarkerWriter>,
     ) -> Self {
         let (outcome, _) = watch::channel(None);
         Self {
@@ -102,7 +163,7 @@ impl ShutdownCoordinator {
                     instance_id,
                     wall_clock,
                     messages,
-                    marker_writer: Arc::new(FilesystemShutdownMarkerWriter),
+                    marker_writer,
                 },
             }),
         }
@@ -414,6 +475,24 @@ impl ShutdownMarkerWriter for FilesystemShutdownMarkerWriter {
     ) -> io::Result<()> {
         let instance_path = shutdown_marker_instance_path(path, instance_id)?;
         write_shutdown_marker(&instance_path, instance_id, timestamp)
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct ProcessTestFailingShutdownMarkerWriter;
+
+#[cfg(feature = "test-support")]
+impl ShutdownMarkerWriter for ProcessTestFailingShutdownMarkerWriter {
+    fn write(
+        &self,
+        _path: &Path,
+        _instance_id: Uuid,
+        _timestamp: time::OffsetDateTime,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected process-test shutdown marker failure",
+        ))
     }
 }
 
@@ -811,6 +890,30 @@ mod tests {
         assert!(
             !canonical.exists(),
             "a shutdown worker must never publish or replace a shared canonical path"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn process_test_marker_failure_is_deterministic_and_creates_no_file() {
+        let directory = tempfile::tempdir().expect("create marker-failure directory");
+        let path = directory.path().join("unclean-shutdown.json");
+
+        let error = ProcessTestFailingShutdownMarkerWriter
+            .write(
+                &path,
+                Uuid::new_v4(),
+                time::macros::datetime!(2026-07-15 00:00 UTC),
+            )
+            .expect_err("the process-test writer always rejects marker creation");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            std::fs::read_dir(directory.path())
+                .expect("scan marker-failure directory")
+                .next()
+                .is_none(),
+            "marker failure must not leave a partial file"
         );
     }
 

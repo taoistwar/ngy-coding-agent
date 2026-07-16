@@ -6,6 +6,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
+#[cfg(feature = "test-support")]
+use coding_agent_app::{
+    ActorPausePoint, ProcessTestConfig, ProcessTestEnvironment, VirtualReleaseSignal,
+    VirtualReleaseTarget,
+};
 use coding_agent_app::{
     InstanceLock, RuntimeDescriptor, RuntimeDescriptorError, SecurityManager, SecuritySeed,
     StartupError, StartupOutcome, StartupPhase, StartupPhaseController, SystemSecurityClock,
@@ -606,6 +611,94 @@ async fn listener_binding_retries_are_finite_and_never_publish_a_descriptor() {
             .expect("startup error releases lock")
             .is_some()
     );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cancelling_launch_at_descriptor_pause_cleans_descriptor_lock_and_listener() {
+    let fixture = support::StartupFixture::new();
+    fixture.prepare();
+    let signals = fixture.paths.runtime_dir.join("signals");
+    std::fs::create_dir(&signals).expect("create actor signal directory");
+    let release = signals.join("descriptor-before-browser.release");
+    let mut reached_name = release
+        .file_name()
+        .expect("release has a file name")
+        .to_os_string();
+    reached_name.push(".reached");
+    let reached = release.with_file_name(reached_name);
+    let scenario = fixture.paths.data_dir.join("cancel-launch-scenario.json");
+    std::fs::write(
+        &scenario,
+        serde_json::to_vec(&ProcessTestConfig {
+            fake_scenarios: Vec::new(),
+            store_writer_faults: Vec::new(),
+            actor_pauses: vec![ActorPausePoint::DescriptorBeforeBrowser],
+            virtual_release_signals: vec![VirtualReleaseSignal {
+                name: "descriptor-before-browser".to_owned(),
+                path: release,
+                target: VirtualReleaseTarget::ActorDescriptorBeforeBrowser,
+            }],
+            marker_write_failure: false,
+        })
+        .expect("serialize process-test scenario"),
+    )
+    .expect("write process-test scenario");
+    let environment = ProcessTestEnvironment::load(
+        &fixture.paths.data_dir,
+        &fixture.paths.runtime_dir,
+        &scenario,
+    )
+    .expect("load process-test environment");
+    let dependencies = environment
+        .apply(fixture.dependencies(Default::default()))
+        .expect("apply descriptor pause");
+    let launch_task = tokio::spawn(launch(dependencies));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !reached.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("launch reaches descriptor-before-browser pause");
+    let descriptor = RuntimeDescriptor::read(&fixture.paths.instance_descriptor)
+        .expect("descriptor is published before the pause");
+    let port = descriptor.port().get();
+    tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("listener accepts connections while launch is paused");
+    assert!(!launch_task.is_finished());
+
+    launch_task.abort();
+    let cancellation = match launch_task.await {
+        Err(error) => error,
+        Ok(_) => panic!("aborted launch must not produce an outcome"),
+    };
+    assert!(cancellation.is_cancelled());
+
+    assert!(
+        !fixture.paths.instance_descriptor.exists(),
+        "cancelling the launch removes its published descriptor"
+    );
+    assert!(
+        InstanceLock::try_acquire(&fixture.paths.instance_lock)
+            .expect("probe instance lock after cancellation")
+            .is_some(),
+        "cancelling the launch releases its instance lock"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                Err(_) => return,
+                Ok(stream) => drop(stream),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelling the launch stops its listener");
 }
 
 async fn drive_until_finished<T>(task: &tokio::task::JoinHandle<T>) {

@@ -201,7 +201,8 @@ mod scripted {
     use super::{FakeRunnerConfig, run_success};
     use crate::{RunContext, RunnerEventSink, RunnerOutcome, TaskRunner};
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
     pub enum FakeScenario {
         Success,
         Blocking,
@@ -215,6 +216,7 @@ mod scripted {
         scenario_state: Mutex<ScenarioState>,
         next_ordinal: watch::Sender<u64>,
         started: Mutex<Vec<TaskId>>,
+        started_count: watch::Sender<usize>,
         releases: Mutex<HashMap<TaskId, Arc<Notify>>>,
     }
 
@@ -229,6 +231,7 @@ mod scripted {
             scenarios: impl IntoIterator<Item = FakeScenario>,
         ) -> Self {
             let (next_ordinal, _) = watch::channel(0);
+            let (started_count, _) = watch::channel(0);
             Self {
                 config,
                 scenario_state: Mutex::new(ScenarioState {
@@ -237,6 +240,7 @@ mod scripted {
                 }),
                 next_ordinal,
                 started: Mutex::new(Vec::new()),
+                started_count,
                 releases: Mutex::new(HashMap::new()),
             }
         }
@@ -260,6 +264,36 @@ mod scripted {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        pub fn release_next(&self) -> Option<TaskId> {
+            let started = self.started_task_ids();
+            let released = {
+                let mut releases = self
+                    .releases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                started
+                    .into_iter()
+                    .find_map(|task_id| releases.remove(&task_id).map(|release| (task_id, release)))
+            };
+            released.map(|(task_id, release)| {
+                release.notify_one();
+                task_id
+            })
+        }
+
+        pub async fn wait_and_release_next(&self) -> TaskId {
+            let mut started_count = self.started_count.subscribe();
+            loop {
+                if let Some(task_id) = self.release_next() {
+                    return task_id;
+                }
+                started_count
+                    .changed()
+                    .await
+                    .expect("scripted fake runner remains alive while waiting for a task");
+            }
         }
 
         async fn scenario_for(&self, launch_ordinal: u64) -> FakeScenario {
@@ -309,10 +343,15 @@ mod scripted {
         }
 
         fn record_start(&self, task_id: TaskId) {
-            self.started
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(task_id);
+            let started_count = {
+                let mut started = self
+                    .started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                started.push(task_id);
+                started.len()
+            };
+            self.started_count.send_replace(started_count);
         }
 
         fn remove_release(&self, task_id: TaskId) {
@@ -368,7 +407,52 @@ mod scripted {
             retryable: true,
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+
+        use coding_agent_domain::TaskId;
+
+        use super::ScriptedFakeRunner;
+        use crate::FakeRunnerConfig;
+
+        #[tokio::test]
+        async fn virtual_release_waits_for_and_releases_the_next_started_task() {
+            let runner = Arc::new(ScriptedFakeRunner::new(FakeRunnerConfig::default(), []));
+            let release = tokio::spawn({
+                let runner = runner.clone();
+                async move { runner.wait_and_release_next().await }
+            });
+            tokio::task::yield_now().await;
+            assert!(!release.is_finished());
+
+            let task_id = TaskId::new();
+            let task_release = runner.install_release(task_id);
+            runner.record_start(task_id);
+
+            assert_eq!(release.await.expect("join release waiter"), task_id);
+            tokio::time::timeout(std::time::Duration::from_secs(1), task_release.notified())
+                .await
+                .expect("release signal is delivered");
+        }
+    }
 }
 
 #[cfg(feature = "test-support")]
 pub use scripted::{FakeScenario, ScriptedFakeRunner};
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::FakeScenario;
+
+    #[test]
+    fn scripted_scenarios_use_a_closed_snake_case_schema() {
+        assert_eq!(
+            serde_json::from_str::<FakeScenario>(r#""ignores_cancellation""#)
+                .expect("deserialize scripted scenario"),
+            FakeScenario::IgnoresCancellation
+        );
+        assert!(serde_json::from_str::<FakeScenario>(r#""prompt_failure""#).is_err());
+    }
+}

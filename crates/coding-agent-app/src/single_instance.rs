@@ -26,6 +26,8 @@ use uuid::Uuid;
 use crate::platform::{PrivateFile, harden_private_file, validate_private_file};
 use crate::security::{LauncherSecret, SecurityClock, SecurityError, SystemSecurityClock};
 use crate::shutdown::ShutdownCleanup;
+#[cfg(feature = "test-support")]
+use crate::test_support::{ActorPausePoint, ProcessTestWatchers};
 use crate::{
     ApplicationBackend, BrowserLaunchError, BrowserLauncher, EventDispatcherError,
     EventDispatcherHandle, FakeTaskRunner, MutationGate, NativeDialogService, PlatformPaths,
@@ -566,6 +568,8 @@ pub struct StartupDependencies {
     pub security_clock: Arc<dyn SecurityClock>,
     pub runner: Arc<dyn TaskRunner>,
     pub dialog: Option<NativeDialogService>,
+    #[cfg(feature = "test-support")]
+    pub(crate) process_test_support: Option<Arc<crate::test_support::ProcessTestRuntime>>,
     public_origin: StartupPublicOrigin,
 }
 
@@ -597,6 +601,8 @@ impl StartupDependencies {
             security_clock: Arc::new(SystemSecurityClock),
             runner: Arc::new(FakeTaskRunner::default()),
             dialog,
+            #[cfg(feature = "test-support")]
+            process_test_support: None,
             public_origin: StartupPublicOrigin::Listener,
         }
     }
@@ -715,6 +721,8 @@ pub struct PrimaryRuntime {
     browser_opened: bool,
     #[cfg(feature = "test-support")]
     test_handles: PrimaryRuntimeTestHandles,
+    #[cfg(feature = "test-support")]
+    _test_signal_watchers: ProcessTestWatchers,
 }
 
 #[cfg(feature = "test-support")]
@@ -789,6 +797,13 @@ async fn start_primary(
     lock: InstanceLock,
     dependencies: StartupDependencies,
 ) -> Result<PrimaryRuntime, StartupError> {
+    #[cfg(feature = "test-support")]
+    let test_signal_watchers = dependencies
+        .process_test_support
+        .as_ref()
+        .map_or_else(ProcessTestWatchers::default, |support| {
+            support.spawn_virtual_release_watchers()
+        });
     remove_stale_descriptors(&paths)?;
 
     let store = dependencies.stores.open(&paths.database_path).await?;
@@ -805,6 +820,22 @@ async fn start_primary(
             },
         )
         .await?;
+    #[cfg(feature = "test-support")]
+    if let Some(support) = &dependencies.process_test_support {
+        if support
+            .publish_startup_recovery_probe(recovery.interrupted_count)
+            .is_err()
+        {
+            tracing::warn!(
+                error_code = "TEST_RECOVERY_PROBE_FAILED",
+                "process-test recovery probe could not be published"
+            );
+        }
+        support
+            .actor_pauses
+            .pause(ActorPausePoint::RecoveryBeforeDescriptor)
+            .await;
+    }
     remove_recovered_shutdown_marker(&paths);
 
     let seed = SecuritySeed::generate()?;
@@ -834,12 +865,28 @@ async fn start_primary(
 
     let dispatcher = EventDispatcherHandle::spawn(store.clone(), EVENT_BROADCAST_CAPACITY).await?;
     debug_assert_eq!(store.latest_event_id().await?, recovery.high_watermark);
+    #[cfg(not(feature = "test-support"))]
     let writer = StoreWriterHandle::spawn(
         store.clone(),
         Arc::new(dispatcher.clone()),
         ACTOR_QUEUE_CAPACITY,
     );
+    #[cfg(feature = "test-support")]
+    let writer = match &dependencies.process_test_support {
+        Some(support) => StoreWriterHandle::spawn_with_test_controller(
+            store.clone(),
+            Arc::new(dispatcher.clone()),
+            ACTOR_QUEUE_CAPACITY,
+            support.writer_controller.clone(),
+        ),
+        None => StoreWriterHandle::spawn(
+            store.clone(),
+            Arc::new(dispatcher.clone()),
+            ACTOR_QUEUE_CAPACITY,
+        ),
+    };
     let service_state = ServiceStateController::new(ServiceState::Ready);
+    #[cfg(not(feature = "test-support"))]
     let task_manager = TaskManagerHandle::spawn(
         store.clone(),
         writer.clone(),
@@ -849,6 +896,28 @@ async fn start_primary(
         MAX_CONCURRENT_TASKS,
         ACTOR_QUEUE_CAPACITY,
     );
+    #[cfg(feature = "test-support")]
+    let task_manager = match &dependencies.process_test_support {
+        Some(support) => TaskManagerHandle::spawn_with_process_test_pauses(
+            store.clone(),
+            writer.clone(),
+            dispatcher.clone(),
+            service_state.clone(),
+            dependencies.runner.clone(),
+            MAX_CONCURRENT_TASKS,
+            ACTOR_QUEUE_CAPACITY,
+            support.actor_pauses.clone(),
+        ),
+        None => TaskManagerHandle::spawn(
+            store.clone(),
+            writer.clone(),
+            dispatcher.clone(),
+            service_state.clone(),
+            dependencies.runner.clone(),
+            MAX_CONCURRENT_TASKS,
+            ACTOR_QUEUE_CAPACITY,
+        ),
+    };
 
     let quit_requested = Arc::new(Notify::new());
     let quit_signal = {
@@ -856,7 +925,7 @@ async fn start_primary(
         Arc::new(move || quit_requested.notify_one()) as Arc<dyn Fn() + Send + Sync + 'static>
     };
     let mutation_gate = MutationGate::new(service_state.clone());
-    let backend = Arc::new(ApplicationBackend::new(
+    let backend = ApplicationBackend::new(
         store.clone(),
         writer.clone(),
         dispatcher.clone(),
@@ -870,7 +939,13 @@ async fn start_primary(
         MAX_CONCURRENT_TASKS as u32,
         WRITE_BUDGET,
         quit_signal,
-    ));
+    );
+    #[cfg(feature = "test-support")]
+    let backend = match &dependencies.process_test_support {
+        Some(support) => backend.with_process_test_pauses(support.actor_pauses.clone()),
+        None => backend,
+    };
+    let backend = Arc::new(backend);
     let api_router = coding_agent_api::build_api_router(
         backend.clone(),
         Arc::new(security.clone()),
@@ -912,6 +987,18 @@ async fn start_primary(
         let _ = std::fs::remove_file(&paths.instance_descriptor);
         return Err(error.into());
     }
+    let cleanup = Arc::new(PrimaryRuntimeCleanup::new(
+        server,
+        lock,
+        paths.instance_descriptor.clone(),
+    ));
+    #[cfg(feature = "test-support")]
+    if let Some(support) = &dependencies.process_test_support {
+        support
+            .actor_pauses
+            .pause(ActorPausePoint::DescriptorBeforeBrowser)
+            .await;
+    }
 
     let browser_opened = open_browser_or_report(
         &*dependencies.browser,
@@ -927,11 +1014,7 @@ async fn start_primary(
         task_manager: task_manager.clone(),
         mutation_gate: mutation_gate.clone(),
     };
-    let cleanup = Arc::new(PrimaryRuntimeCleanup::new(
-        server,
-        lock,
-        paths.instance_descriptor.clone(),
-    ));
+    #[cfg(not(feature = "test-support"))]
     let shutdown = ShutdownCoordinator::new(
         mutation_gate,
         task_manager,
@@ -943,6 +1026,22 @@ async fn start_primary(
         dependencies.wall_clock.clone(),
         dependencies.messages.clone(),
     );
+    #[cfg(feature = "test-support")]
+    let shutdown = ShutdownCoordinator::new_for_process_test(
+        mutation_gate,
+        task_manager,
+        dispatcher,
+        store,
+        cleanup,
+        &paths,
+        instance_id,
+        dependencies.wall_clock.clone(),
+        dependencies.messages.clone(),
+        dependencies
+            .process_test_support
+            .as_ref()
+            .is_some_and(|support| support.config.marker_write_failure),
+    );
     Ok(PrimaryRuntime {
         descriptor,
         startup_phase,
@@ -951,6 +1050,8 @@ async fn start_primary(
         browser_opened,
         #[cfg(feature = "test-support")]
         test_handles,
+        #[cfg(feature = "test-support")]
+        _test_signal_watchers: test_signal_watchers,
     })
 }
 
@@ -1255,6 +1356,28 @@ impl PrimaryRuntimeCleanup {
             );
         }
     }
+
+    fn force_cleanup(&self) {
+        let mut resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(lock) = resources.lock.take() else {
+            return;
+        };
+        if let Some(mut server) = resources.server.take() {
+            server.stop();
+        }
+        self.remove_descriptor();
+        drop(resources);
+        drop(lock);
+    }
+}
+
+impl Drop for PrimaryRuntimeCleanup {
+    fn drop(&mut self) {
+        self.force_cleanup();
+    }
 }
 
 #[async_trait::async_trait]
@@ -1272,15 +1395,7 @@ impl ShutdownCleanup for PrimaryRuntimeCleanup {
     }
 
     fn remove_descriptor_and_release_lock(&self) {
-        let mut resources = self
-            .resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(mut server) = resources.server.take() {
-            server.stop();
-        }
-        self.remove_descriptor();
-        resources.lock.take();
+        self.force_cleanup();
     }
 }
 
@@ -1380,6 +1495,41 @@ impl NativeMessageSink for SystemNativeMessageSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_cleanup_drop_preserves_a_replacement_descriptor() {
+        let temp = tempfile::tempdir().expect("create cleanup fixture");
+        let lock_path = temp.path().join("instance.lock");
+        let descriptor_path = temp.path().join("runtime.json");
+        let lock = InstanceLock::try_acquire(&lock_path)
+            .expect("acquire cleanup fixture lock")
+            .expect("cleanup fixture lock is available");
+        std::fs::write(&descriptor_path, b"old descriptor")
+            .expect("write owned descriptor fixture");
+
+        let cleanup = Arc::new(PrimaryRuntimeCleanup {
+            descriptor_path: descriptor_path.clone(),
+            resources: Mutex::new(PrimaryRuntimeResources {
+                server: None,
+                lock: Some(lock),
+            }),
+        });
+        cleanup.force_cleanup();
+        assert!(
+            !descriptor_path.exists(),
+            "the first cleanup must remove the descriptor it owns"
+        );
+
+        std::fs::write(&descriptor_path, b"replacement descriptor")
+            .expect("publish replacement descriptor fixture");
+        drop(cleanup);
+
+        assert_eq!(
+            std::fs::read(&descriptor_path).expect("read replacement descriptor"),
+            b"replacement descriptor",
+            "dropping an already-cleaned owner must not remove a later primary's descriptor"
+        );
+    }
 
     #[test]
     fn degraded_warning_helper_requires_the_exact_private_switch() {

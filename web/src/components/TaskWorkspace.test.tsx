@@ -327,7 +327,9 @@ describe("TaskWorkspace", () => {
       "aria-live",
       "polite",
     );
-    expect(screen.getByText("Workspace prepared")).toBeVisible();
+    expect(
+      screen.getByText("Workspace prepared", { selector: ".activity-message" }),
+    ).toBeVisible();
     expect(screen.getByRole("heading", { name: "Synthetic diff" })).toBeVisible();
     expect(screen.getByText("src/lib.rs")).toBeVisible();
     expect(screen.getByRole("heading", { name: "Test results" })).toBeVisible();
@@ -350,6 +352,9 @@ describe("TaskWorkspace", () => {
 
     expect(screen.getByText("Execution completed — not reviewed")).toBeVisible();
     expect(container).not.toHaveTextContent(/review passed|deliverable|merge|edit code/i);
+    expect(
+      screen.getByText("Status: completed", { selector: ".task-status-label" }),
+    ).toBeVisible();
     expect(screen.getByText(/Status: completed/i)).toBeVisible();
   });
 
