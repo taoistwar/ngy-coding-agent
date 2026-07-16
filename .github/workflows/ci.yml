@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-e2e:
+    name: Linux quality and E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Install frontend dependencies
+        run: npm --prefix web ci
+
+      - name: Install Chromium
+        run: npm --prefix web exec -- playwright install --with-deps chromium
+
+      - name: Enable offline quality gates
+        shell: bash
+        run: |
+          echo "CARGO_NET_OFFLINE=true" >> "$GITHUB_ENV"
+          echo "npm_config_offline=true" >> "$GITHUB_ENV"
+
+      - name: Export OpenAPI schema
+        run: cargo run --locked --offline -p coding-agent-api --bin export_openapi -- web/openapi.json
+
+      - name: Check generated API client
+        run: npm --prefix web run api:check
+
+      - name: Check API artifacts are unchanged
+        run: git diff --exit-code -- web/openapi.json web/src/api/generated/schema.d.ts
+
+      - name: Type-check frontend
+        run: npm --prefix web run typecheck
+
+      - name: Test frontend
+        run: npm --prefix web run test:run
+
+      - name: Build frontend
+        run: npm --prefix web run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --all-features --locked --offline
+
+      - name: Build E2E application
+        run: cargo build --locked --offline -p coding-agent-app --features e2e
+
+      - name: Set E2E application path
+        shell: bash
+        run: echo "CODING_AGENT_E2E_BINARY=$PWD/target/debug/coding-agent-app" >> "$GITHUB_ENV"
+
+      - name: Run browser E2E tests
+        run: npm --prefix web run e2e
+
+      - name: Build embedded release application
+        run: cargo build --release --locked --offline -p coding-agent-app --features embedded-web
+
+      - name: Reject placeholder markers
+        run: node scripts/check-placeholders.mjs
+
+  release-smoke:
+    name: Release smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Install frontend dependencies
+        run: npm --prefix web ci
+
+      - name: Enable offline release gates
+        shell: bash
+        run: |
+          echo "CARGO_NET_OFFLINE=true" >> "$GITHUB_ENV"
+          echo "npm_config_offline=true" >> "$GITHUB_ENV"
+
+      - name: Export OpenAPI schema
+        run: cargo run --locked --offline -p coding-agent-api --bin export_openapi -- web/openapi.json
+
+      - name: Check generated API client
+        run: npm --prefix web run api:check
+
+      - name: Check API artifacts are unchanged
+        run: git diff --exit-code -- web/openapi.json web/src/api/generated/schema.d.ts
+
+      - name: Type-check frontend
+        run: npm --prefix web run typecheck
+
+      - name: Test frontend
+        run: npm --prefix web run test:run
+
+      - name: Build frontend
+        run: npm --prefix web run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --all-features --locked --offline
+
+      - name: Build embedded release application
+        run: cargo build --release --locked --offline -p coding-agent-app --features embedded-web
+
+      - name: Set release application path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = (Resolve-Path "target/release/coding-agent-app.exe").Path
+          Add-Content -Path $env:GITHUB_ENV -Value "CODING_AGENT_RELEASE_BINARY=$binary" -Encoding utf8
+
+      - name: Set release application path (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "CODING_AGENT_RELEASE_BINARY=$GITHUB_WORKSPACE/target/release/coding-agent-app" >> "$GITHUB_ENV"
+
+      - name: Smoke-test release application
+        run: cargo test --locked --offline -p coding-agent-app --test release_smoke --features embedded-web -- --ignored --exact release_binary_starts_without_node_or_dist
