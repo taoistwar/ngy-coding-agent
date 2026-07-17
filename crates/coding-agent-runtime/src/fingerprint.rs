@@ -187,7 +187,10 @@ impl WorkspaceFingerprinter {
         let mut hasher = Sha256::new();
         hasher.update(FINGERPRINT_DOMAIN);
         let mut total_bytes = 0u64;
+        #[cfg(windows)]
         let mut leases = Vec::new();
+        #[cfg(not(windows))]
+        let leases = Vec::new();
 
         for (raw_path, entry) in entries {
             check_cancelled(cancellation)?;

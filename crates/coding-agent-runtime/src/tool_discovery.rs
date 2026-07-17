@@ -293,7 +293,9 @@ fn resolve_bootstrap_executable(
 
     // Host PATH entries are bootstrap input only. Resolve a trusted shim once,
     // then pin and invoke the canonical object; child processes never search it.
-    let mut canonical = std::fs::canonicalize(&candidate).map_err(|_| role.invalid_error())?;
+    let canonical = std::fs::canonicalize(&candidate).map_err(|_| role.invalid_error())?;
+    #[cfg(windows)]
+    let mut canonical = canonical;
     #[cfg(windows)]
     if matches!(role, ToolRole::BootstrapRustc)
         && has_file_name(&candidate, "rustc.exe")

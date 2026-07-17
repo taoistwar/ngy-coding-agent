@@ -39,7 +39,12 @@ try {
     "utf8",
   );
   writeFileSync(temporary, generated);
-  const current = existsSync(destination) ? readFileSync(destination) : null;
+  const current = existsSync(destination)
+    ? Buffer.from(
+        readFileSync(destination, "utf8").replace(/\r\n?|\n/g, "\n"),
+        "utf8",
+      )
+    : null;
 
   if (current === null || !current.equals(generated)) {
     if (checkOnly) {
