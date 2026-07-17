@@ -508,7 +508,7 @@ impl TaskManager {
                     self.handle_message(message).await;
                 }
                 _ = reconcile.tick() => {
-                    if self.claims_allowed() {
+                    if self.claims_allowed() && self.periodic_reconciliation_enabled() {
                         self.scan_requested = true;
                     }
                 }
@@ -526,6 +526,18 @@ impl TaskManager {
         if let Some(exited) = self.exit_probe.take() {
             let _ = exited.send(());
         }
+    }
+
+    #[cfg(test)]
+    fn periodic_reconciliation_enabled(&self) -> bool {
+        // Claim-hook tests trigger reconciliation explicitly so the actor cannot
+        // enter a paused claim before the test receives its notification reply.
+        self.claim_hooks.is_none()
+    }
+
+    #[cfg(not(test))]
+    fn periodic_reconciliation_enabled(&self) -> bool {
+        true
     }
 
     async fn handle_message(&mut self, message: TaskManagerMessage) {
@@ -1072,7 +1084,9 @@ impl ClaimTestHooks {
     }
 
     async fn wait_until_reached(&self) {
-        self.reached.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), self.reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("claim pause was not reached for phase {:?}", self.phase));
     }
 
     fn resume(&self) {
