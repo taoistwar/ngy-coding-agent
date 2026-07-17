@@ -124,6 +124,62 @@ impl Seek for PrivateFile {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PrivateFileReadError {
+    #[error("private file could not be opened")]
+    Open(#[source] io::Error),
+    #[error("private file metadata could not be validated")]
+    Metadata(#[source] io::Error),
+    #[error("private file permissions are invalid")]
+    NotPrivate(#[source] io::Error),
+    #[error("private file exceeds its byte limit")]
+    TooLarge,
+    #[error("private file could not be read")]
+    Read(#[source] io::Error),
+}
+
+pub(crate) fn read_private_file_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, PrivateFileReadError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(PrivateFileReadError::Open)?;
+    validate_private_file(&file).map_err(PrivateFileReadError::NotPrivate)?;
+    let metadata = file.metadata().map_err(PrivateFileReadError::Metadata)?;
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if metadata.len() > max_bytes_u64 {
+        return Err(PrivateFileReadError::TooLarge);
+    }
+
+    let read_limit = max_bytes_u64.saturating_add(1);
+    let mut encoded = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(max_bytes)
+            .min(max_bytes),
+    );
+    file.take(read_limit)
+        .read_to_end(&mut encoded)
+        .map_err(PrivateFileReadError::Read)?;
+    if encoded.len() > max_bytes {
+        return Err(PrivateFileReadError::TooLarge);
+    }
+    Ok(encoded)
+}
+
 pub(crate) fn validate_private_file(file: &File) -> io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -194,7 +250,14 @@ impl BrowserLauncher {
         opener: impl FnOnce(&str) -> Result<(), E>,
     ) -> Result<(), BrowserLaunchError> {
         let url = Self::url(port, token);
-        if port == 0 || token.is_empty() || opener(&url).is_err() {
+        if port == 0 || token.is_empty() {
+            return Err(BrowserLaunchError { url });
+        }
+        let open_result = {
+            let _spawn_guard = coding_agent_runtime::acquire_process_spawn_lock();
+            opener(&url)
+        };
+        if open_result.is_err() {
             return Err(BrowserLaunchError { url });
         }
         Ok(())

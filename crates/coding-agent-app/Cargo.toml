@@ -18,6 +18,9 @@ axum.workspace = true
 axum-extra.workspace = true
 base64.workspace = true
 coding-agent-api = { path = "../coding-agent-api" }
+coding-agent-core = { path = "../coding-agent-core" }
+coding-agent-provider = { path = "../coding-agent-provider" }
+coding-agent-runtime = { path = "../coding-agent-runtime" }
 coding-agent-domain = { path = "../coding-agent-domain" }
 coding-agent-store = { path = "../coding-agent-store" }
 directories.workspace = true

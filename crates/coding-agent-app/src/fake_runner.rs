@@ -145,6 +145,7 @@ fn success_events(activity_time: UtcTimestamp) -> Vec<RunnerEvent> {
                 .to_owned(),
                 additions: 1,
                 deletions: 0,
+                truncated: false,
             }],
         }),
         RunnerEvent::TestUpdated(TestSnapshot {

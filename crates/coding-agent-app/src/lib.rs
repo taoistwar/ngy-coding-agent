@@ -9,6 +9,8 @@
 //! };
 //! ```
 
+mod artifact_reconciliation;
+mod coding_agent_runner;
 mod event_dispatcher;
 mod fake_runner;
 mod local_client;
@@ -16,7 +18,9 @@ mod local_client;
 mod macos_acl;
 mod native_dialog;
 mod platform;
+mod provider_config;
 mod repository_service;
+mod runner_factory;
 mod security;
 mod server;
 mod service_state;
@@ -28,6 +32,21 @@ mod task_manager;
 #[cfg(feature = "test-support")]
 mod test_support;
 
+pub use artifact_reconciliation::{
+    ArtifactReconciliationError, ArtifactReconciliationSummary, AttemptArtifactObserver,
+    RestartArtifactObservation, WorktreeArtifactObserver, reconcile_restart_artifacts,
+};
+pub use coding_agent_provider::{
+    ApiKey, MAX_PROVIDER_CONFIG_BYTES, PROVIDER_CONFIG_INVALID, ProviderConfig,
+    ProviderConfigError, ProviderConfigErrorReason, RedactedText, SecretRedactor,
+};
+pub use coding_agent_runner::{
+    AttemptArtifactObservation, AttemptReservation, CodingAgentAttempt, CodingAgentAttemptFactory,
+    CodingAgentRunner, CodingAgentRunnerConfig, CodingAgentRunnerConfigError, CodingAttemptError,
+    CodingAttemptProvisionError, Project2RuntimeSessionFactory, ProvisionedAgentRuntimeFactory,
+    RepositoryWorktreeProvisionerFactory, TaskAgentRuntime, TaskModelProviderFactory,
+    TaskModelSession, WorktreeCodingAgentAttemptFactory,
+};
 pub use event_dispatcher::{EventDispatcherError, EventDispatcherHandle};
 pub use fake_runner::{FakeRunnerConfig, FakeTaskRunner};
 #[cfg(feature = "test-support")]
@@ -38,8 +57,15 @@ pub use native_dialog::{NativeDialogService, PickerError};
 pub use platform::{
     BrowserLaunchError, BrowserLauncher, PlatformPaths, PrivateFile, SystemWallClock, WallClock,
 };
+pub use provider_config::{
+    ProviderConfigLoadError, ProviderConfigLoadErrorKind, load_provider_config,
+};
 pub use repository_service::{
     CommandRunner, DiscoveredRepository, RepositoryDiscovery, RepositoryDiscoveryError,
+};
+pub use runner_factory::{
+    FixedStartupRunnerFactory, ProductionStartupRunnerFactory, StartupRunnerContext,
+    StartupRunnerFactory, StartupRunnerFactoryError, StartupRunnerSelection,
 };
 pub use security::{
     LaunchToken, LauncherSecret, SecurityClock, SecurityError, SecurityManager, SecuritySeed,

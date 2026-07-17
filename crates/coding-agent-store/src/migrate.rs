@@ -4,7 +4,13 @@ use time::OffsetDateTime;
 
 use crate::StoreError;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_initial.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_initial.sql")),
+    (
+        2,
+        include_str!("../migrations/0002_task_attempt_artifacts.sql"),
+    ),
+];
 
 pub(crate) async fn run(pool: &SqlitePool) -> Result<(), StoreError> {
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;

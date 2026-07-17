@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,10 +12,10 @@ use std::sync::{Arc, Mutex};
 use coding_agent_app::{
     BrowserLaunchError, BrowserLauncher, BrowserOpener, CancelOutcome, CommandRunner,
     DegradedRecoveryResult, EventDispatcherHandle, EventWake, FakeRunnerConfig, FakeTaskRunner,
-    LaunchToken, ListenerFactory, NativeMessageSink, PlatformPaths, RunContext, RunnerEvent,
-    RunnerEventError, RunnerEventSink, RunnerOutcome, SecurityClock, SecurityManager, SecuritySeed,
-    ServiceState, ServiceStateController, StartupDependencies, StartupPaths, StoreFactory,
-    StoreWriterHandle, TaskManagerHandle, TaskRunner, WallClock,
+    FixedStartupRunnerFactory, LaunchToken, ListenerFactory, NativeMessageSink, PlatformPaths,
+    RunContext, RunnerEvent, RunnerEventError, RunnerEventSink, RunnerOutcome, SecurityClock,
+    SecurityManager, SecuritySeed, ServiceState, ServiceStateController, StartupDependencies,
+    StartupPaths, StoreFactory, StoreWriterHandle, TaskManagerHandle, TaskRunner, WallClock,
 };
 #[cfg(feature = "test-support")]
 use coding_agent_app::{
@@ -177,7 +178,10 @@ impl StartupFixture {
         });
         dependencies.wall_clock = Arc::new(FixedWallClock);
         dependencies.security_clock = Arc::new(FakeSecurityClock::new());
-        dependencies.runner = Arc::new(FakeTaskRunner::default());
+        dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new(
+            Arc::new(FakeTaskRunner::default()),
+            NonZeroU32::new(4).expect("test concurrency is nonzero"),
+        ));
         dependencies
     }
 }
@@ -864,7 +868,10 @@ pub async fn shutdown_fixture(
         scenarios,
     ));
     let mut dependencies = startup.dependencies(StartupBehavior::default());
-    dependencies.runner = runner.clone();
+    dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new(
+        runner.clone(),
+        NonZeroU32::new(4).expect("test concurrency is nonzero"),
+    ));
     let primary = match launch(dependencies).await.expect("launch shutdown fixture") {
         StartupOutcome::Primary(primary) => primary,
         StartupOutcome::Secondary(_) => panic!("shutdown fixture must own the primary lock"),
@@ -1653,6 +1660,12 @@ enum RunnerScenario {
         event: RunnerEvent,
         result: oneshot::Sender<EventAppendResult>,
     },
+    DurableThenLateEvent {
+        durable: RunnerEvent,
+        release: Arc<Notify>,
+        late: RunnerEvent,
+        result: oneshot::Sender<EventAppendResult>,
+    },
 }
 
 pub struct LateEventGate {
@@ -1721,6 +1734,25 @@ impl ControlledRunner {
         self.push(RunnerScenario::EventGate {
             release: release.clone(),
             event,
+            result,
+        });
+        EventGate {
+            release,
+            result: receiver,
+        }
+    }
+
+    pub fn push_durable_then_late_event(
+        &self,
+        durable: RunnerEvent,
+        late: RunnerEvent,
+    ) -> EventGate {
+        let release = Arc::new(Notify::new());
+        let (result, receiver) = oneshot::channel();
+        self.push(RunnerScenario::DurableThenLateEvent {
+            durable,
+            release: release.clone(),
+            late,
             result,
         });
         EventGate {
@@ -1816,6 +1848,19 @@ impl TaskRunner for ControlledRunner {
             } => {
                 release.notified().await;
                 let _ = result.send(sink.append(event).await);
+                RunnerOutcome::Succeeded
+            }
+            RunnerScenario::DurableThenLateEvent {
+                durable,
+                release,
+                late,
+                result,
+            } => {
+                sink.append(durable)
+                    .await
+                    .expect("append durable runner event before the gate");
+                release.notified().await;
+                let _ = result.send(sink.append(late).await);
                 RunnerOutcome::Succeeded
             }
         }

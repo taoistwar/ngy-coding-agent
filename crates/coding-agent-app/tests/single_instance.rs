@@ -12,9 +12,10 @@ use coding_agent_app::{
     VirtualReleaseTarget,
 };
 use coding_agent_app::{
-    InstanceLock, RuntimeDescriptor, RuntimeDescriptorError, SecurityManager, SecuritySeed,
-    StartupError, StartupOutcome, StartupPhase, StartupPhaseController, SystemSecurityClock,
-    build_runtime_router, launch,
+    InstanceLock, ProductionStartupRunnerFactory, RuntimeDescriptor, RuntimeDescriptorError,
+    SecurityManager, SecuritySeed, StartupError, StartupOutcome, StartupPhase,
+    StartupPhaseController, StartupRunnerContext, StartupRunnerFactory, StartupRunnerFactoryError,
+    StartupRunnerSelection, SystemSecurityClock, build_runtime_router, launch,
 };
 use coding_agent_domain::{
     CanonicalPath, ClientRequestId, NewRepository, NewTask, TaskEventKind, TaskStatus, UtcTimestamp,
@@ -24,6 +25,18 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 
 const DEVELOPMENT_PUBLIC_ORIGIN: &str = "http://127.0.0.1:5173";
+
+struct PanicStartupRunnerFactory;
+
+#[async_trait::async_trait]
+impl StartupRunnerFactory for PanicStartupRunnerFactory {
+    async fn create(
+        &self,
+        _context: StartupRunnerContext,
+    ) -> Result<StartupRunnerSelection, StartupRunnerFactoryError> {
+        panic!("a secondary instance must never initialize the task runner")
+    }
+}
 
 #[test]
 fn permanent_lock_selects_exactly_one_primary_without_replacing_the_lock_file() {
@@ -474,10 +487,12 @@ async fn secondary_waits_for_descriptor_and_ready_without_opening_store_or_liste
     let fixture = support::StartupFixture::new();
     fixture.prepare();
     let primary = FakePrimary::start(&fixture).await;
-    let secondary = tokio::spawn(launch(fixture.dependencies(support::StartupBehavior {
+    let mut dependencies = fixture.dependencies(support::StartupBehavior {
         panic_on_store_open: true,
         ..support::StartupBehavior::default()
-    })));
+    });
+    dependencies.runner_factory = Arc::new(PanicStartupRunnerFactory);
+    let secondary = tokio::spawn(launch(dependencies));
 
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -503,6 +518,29 @@ async fn secondary_waits_for_descriptor_and_ready_without_opening_store_or_liste
     assert_eq!(fixture.calls.store_opens(), 0);
     assert_eq!(fixture.calls.listener_binds(), 0);
     assert_eq!(fixture.calls.browser_urls().len(), 1);
+}
+
+#[tokio::test]
+async fn locked_primary_requires_private_valid_provider_config_before_binding_listener() {
+    let fixture = support::StartupFixture::new();
+    let mut dependencies = fixture.dependencies(support::StartupBehavior::default());
+    dependencies.runner_factory = Arc::new(ProductionStartupRunnerFactory);
+
+    let result = launch(dependencies).await;
+
+    match result {
+        Err(StartupError::Runner(error)) => {
+            assert_eq!(error.code(), "PROVIDER_CONFIG_INVALID");
+        }
+        Err(error) => panic!("unexpected primary startup error: {error:?}"),
+        Ok(_) => panic!("a primary without provider configuration must fail"),
+    }
+    assert_eq!(fixture.calls.store_opens(), 1);
+    assert_eq!(fixture.calls.listener_binds(), 0);
+    assert!(!fixture.paths.instance_descriptor.exists());
+    let messages = fixture.calls.messages();
+    assert_eq!(messages.len(), 1);
+    assert!(!messages[0].1.contains("provider.json"));
 }
 
 #[tokio::test(start_paused = true)]

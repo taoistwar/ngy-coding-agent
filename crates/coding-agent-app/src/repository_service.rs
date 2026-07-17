@@ -23,11 +23,18 @@ impl CommandRunner for ProcessCommandRunner {
         args: &[OsString],
         current_dir: &Path,
     ) -> io::Result<Vec<u8>> {
-        let output = tokio::process::Command::new(program)
+        let mut command = tokio::process::Command::new(program);
+        command
             .args(args)
             .current_dir(current_dir)
-            .output()
-            .await?;
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = {
+            let _spawn_guard = coding_agent_runtime::acquire_process_spawn_lock();
+            command.spawn()?
+        };
+        let output = child.wait_with_output().await?;
         if !output.status.success() {
             return Err(io::Error::other("repository command failed"));
         }

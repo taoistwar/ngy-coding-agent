@@ -3,9 +3,11 @@ mod support;
 use std::sync::Arc;
 
 use coding_agent_app::{ServiceState, ServiceStateController, StoreWriterError, StoreWriterHandle};
-use coding_agent_domain::{PlanSnapshot, TaskEventPayload, TaskStatus};
+use coding_agent_domain::{CanonicalPath, PlanSnapshot, TaskEventPayload, TaskStatus};
 use coding_agent_store::{
-    AppendEventOutcome, RegisterRepositoryOutcome, TaskTransition, TransitionOutcome,
+    AppendEventOutcome, AttemptArtifactIdentity, AttemptArtifactState, RegisterRepositoryOutcome,
+    ReserveAttemptArtifact, ReserveAttemptArtifactOutcome, TaskTransition, TransitionOutcome,
+    UpdateAttemptArtifactOutcome,
 };
 use tokio::time::{Duration, Instant};
 
@@ -119,6 +121,77 @@ async fn repository_only_write_does_not_wake_dispatcher() {
     ));
     assert_eq!(receipt.event_id, None);
     assert_eq!(fixture.wake.count(), 0);
+}
+
+#[tokio::test]
+async fn artifact_lifecycle_is_serialized_through_writer_without_event_wakes() {
+    let fixture = support::writer_fixture().await;
+    let created_task = fixture
+        .writer
+        .create_task(
+            support::new_task(fixture.repository.id, "artifact lifecycle"),
+            support::deadline(),
+        )
+        .await
+        .unwrap();
+    let task = created_task.value.task().clone();
+    assert_eq!(fixture.wake.count(), 1);
+    let identity = AttemptArtifactIdentity {
+        task_id: task.id,
+        repository_id: task.repository_id,
+        attempt: task.attempt,
+    };
+    let input = ReserveAttemptArtifact {
+        identity,
+        base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        branch_name: format!("codex/task-{}-attempt-{}", task.id, task.attempt),
+        worktree_path: CanonicalPath::try_from_canonical(
+            fixture
+                .repository
+                .git_root
+                .as_path()
+                .join("attempt-artifacts")
+                .join(task.id.to_string()),
+        )
+        .unwrap(),
+    };
+
+    let reserved = fixture
+        .writer
+        .reserve_attempt_artifact(input.clone(), support::deadline())
+        .await
+        .unwrap();
+    assert!(matches!(
+        reserved.value,
+        ReserveAttemptArtifactOutcome::Created(ref artifact)
+            if artifact.state == AttemptArtifactState::Reserved
+    ));
+    assert_eq!(reserved.event_id, None);
+    assert_eq!(fixture.wake.count(), 1);
+
+    let repeated = fixture
+        .writer
+        .reserve_attempt_artifact(input, support::deadline())
+        .await
+        .unwrap();
+    assert!(matches!(
+        repeated.value,
+        ReserveAttemptArtifactOutcome::Existing(_)
+    ));
+    assert_eq!(fixture.wake.count(), 1);
+
+    let ready = fixture
+        .writer
+        .mark_attempt_artifact_ready(identity, support::deadline())
+        .await
+        .unwrap();
+    assert!(matches!(
+        ready.value,
+        UpdateAttemptArtifactOutcome::Applied(ref artifact)
+            if artifact.state == AttemptArtifactState::Ready
+    ));
+    assert_eq!(ready.event_id, None);
+    assert_eq!(fixture.wake.count(), 1);
 }
 
 #[tokio::test]

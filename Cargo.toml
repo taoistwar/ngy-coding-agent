@@ -1,5 +1,8 @@
 [workspace]
 members = [
+  "crates/coding-agent-core",
+  "crates/coding-agent-provider",
+  "crates/coding-agent-runtime",
   "crates/coding-agent-domain",
   "crates/coding-agent-store",
   "crates/coding-agent-api",
@@ -20,6 +23,7 @@ axum-extra = { version = "0.12.6", default-features = false, features = ["cookie
 base64 = "0.22.1"
 directories = "6.0.0"
 futures-util = "0.3.32"
+fs_at = "0.2.1"
 getrandom = "0.4.3"
 http = "1.4.2"
 http-body-util = "0.1.4"
@@ -27,16 +31,19 @@ hyper = { version = "1.10.1", default-features = false, features = ["client", "h
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 libc = "0.2.186"
 mime_guess = "2.0.5"
+regex = "1.13.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 rfd = "0.17.2"
 rust-embed = "8.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = "0.10.9"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "json", "uuid", "time"] }
 subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 time = { version = "0.3.53", features = ["serde", "formatting", "parsing", "macros"] }
-tokio = { version = "1.52.3", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 tower = { version = "0.5.3", features = ["util"] }
@@ -46,5 +53,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 utoipa = { version = "5.5.0", features = ["axum_extras", "time", "uuid"] }
 utoipa-axum = "0.2.0"
 uuid = { version = "1.23.5", features = ["serde", "v4"] }
+url = "2.5.8"
 webbrowser = { version = "1.2.1", features = ["hardened"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_SystemServices", "Win32_System_Threading"] }

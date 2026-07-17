@@ -216,6 +216,26 @@ fn task_and_detail_components_have_exact_required_and_nullable_shapes() {
 }
 
 #[test]
+fn diff_file_exposes_a_required_truncation_marker() {
+    let value = openapi_value();
+    let diff_file = &value["components"]["schemas"]["DiffFileDto"];
+
+    assert_eq!(
+        property_set(diff_file),
+        set(&[
+            "path",
+            "status",
+            "patch",
+            "additions",
+            "deletions",
+            "truncated",
+        ])
+    );
+    assert_eq!(string_set(&diff_file["required"]), property_set(diff_file));
+    assert_eq!(diff_file["properties"]["truncated"]["type"], "boolean");
+}
+
+#[test]
 fn control_components_are_exact_required_shapes_without_persisted_ids() {
     let value = openapi_value();
     let schemas = &value["components"]["schemas"];

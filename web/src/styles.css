@@ -438,6 +438,15 @@ ol {
   background: rgb(21 24 33 / 0.82);
 }
 
+.execution-boundary-note {
+  margin: 0.55rem 0 0.8rem;
+  border-left: 3px solid var(--warning);
+  padding-left: 0.7rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
 .task-composer button[type="submit"] {
   justify-self: start;
   border-color: rgb(152 168 255 / 0.58);

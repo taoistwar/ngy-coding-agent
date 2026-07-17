@@ -152,6 +152,7 @@ describe("agentReducer", () => {
           patch: "+done",
           additions: 1,
           deletions: 0,
+          truncated: false,
         },
       ],
     };

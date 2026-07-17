@@ -273,6 +273,7 @@ pub struct DiffFileDto {
     pub patch: String,
     pub additions: u64,
     pub deletions: u64,
+    pub truncated: bool,
 }
 
 impl From<DiffFile> for DiffFileDto {
@@ -283,6 +284,7 @@ impl From<DiffFile> for DiffFileDto {
             patch: value.patch,
             additions: value.additions,
             deletions: value.deletions,
+            truncated: value.truncated,
         }
     }
 }

@@ -9,6 +9,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,9 +18,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::platform::{create_private_directory, harden_private_file};
 use crate::{
-    BrowserLaunchError, BrowserOpener, FakeRunnerConfig, FakeScenario, NativeMessageSink,
-    PlatformPaths, PrivateFile, ScriptedFakeRunner, StartupDependencies, StartupPaths,
-    StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterTestController,
+    BrowserLaunchError, BrowserOpener, FakeRunnerConfig, FakeScenario, FixedStartupRunnerFactory,
+    NativeMessageSink, PlatformPaths, PrivateFile, ScriptedFakeRunner, StartupDependencies,
+    StartupPaths, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterTestController,
 };
 
 pub const TEST_APP_DATA_ENV: &str = "CODING_AGENT_TEST_APP_DATA_DIR";
@@ -391,7 +392,10 @@ impl ProcessTestEnvironment {
         });
         dependencies.messages = Arc::new(ProcessNativeMessageSink);
         dependencies.dialog = Some(crate::NativeDialogService::process_test_probe(picker_probe));
-        dependencies.runner = runner.clone();
+        dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new(
+            runner.clone(),
+            NonZeroU32::new(1).expect("process-test concurrency is nonzero"),
+        ));
         dependencies.process_test_support = Some(Arc::new(ProcessTestRuntime {
             config: self.config,
             writer_controller,

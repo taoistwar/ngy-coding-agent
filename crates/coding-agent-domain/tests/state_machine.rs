@@ -322,6 +322,21 @@ fn task_event_serialization_is_tagged_and_schema_versioned() {
     assert_eq!(serde_json::from_value::<TaskEvent>(value).unwrap(), event);
 }
 
+#[test]
+fn legacy_diff_files_default_the_truncation_marker_to_false() {
+    let file = serde_json::from_value::<coding_agent_domain::DiffFile>(serde_json::json!({
+        "path": "src/lib.rs",
+        "status": "modified",
+        "patch": "+changed",
+        "additions": 1,
+        "deletions": 0
+    }))
+    .unwrap();
+
+    assert!(!file.truncated);
+    assert_eq!(serde_json::to_value(file).unwrap()["truncated"], false);
+}
+
 fn task_with_status(status: TaskStatus) -> Task {
     use TaskStatus::*;
 

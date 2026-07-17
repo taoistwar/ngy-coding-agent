@@ -1066,6 +1066,7 @@ function isDiffSnapshot(value: unknown): boolean {
         typeof file.patch === "string" &&
         isNonNegativeSafeInteger(file.additions) &&
         isNonNegativeSafeInteger(file.deletions) &&
+        typeof file.truncated === "boolean" &&
         (file.status === "added" ||
           file.status === "modified" ||
           file.status === "deleted"),

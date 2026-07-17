@@ -257,6 +257,7 @@ export interface components {
             patch: string;
             path: string;
             status: components["schemas"]["DiffFileStatusDto"];
+            truncated: boolean;
         };
         /** @enum {string} */
         DiffFileStatusDto: "added" | "modified" | "deleted";

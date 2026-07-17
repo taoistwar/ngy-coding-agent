@@ -1,5 +1,6 @@
 //! Persistence responsibilities for coding-agent domain data.
 
+mod artifacts;
 mod migrate;
 mod projection;
 mod repositories;
@@ -37,6 +38,8 @@ pub enum StoreError {
     InvalidEventKind(String),
     #[error("stored task event schema version is invalid: {0}")]
     InvalidEventSchemaVersion(i64),
+    #[error("stored attempt artifact state is invalid: {0}")]
+    InvalidArtifactState(String),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("illegal task transition from {from:?} to {to:?}")]
@@ -45,6 +48,14 @@ pub enum StoreError {
     IdempotencyConflict,
     #[error("task was not found")]
     TaskNotFound,
+    #[error("attempt artifact input is invalid")]
+    InvalidArtifactInput,
+    #[error("attempt artifact identity conflicts with durable state")]
+    ArtifactIdentityConflict,
+    #[error("attempt artifact was not found")]
+    ArtifactNotFound,
+    #[error("attempt artifact state transition conflicts with durable state")]
+    ArtifactStateConflict,
     #[error("task is not terminal and cannot be retried")]
     TaskNotRetryable,
     #[error("only non-lifecycle panel events may be appended to a running task")]
@@ -135,3 +146,7 @@ fn validate_wal_checkpoint(
         })
     }
 }
+pub use artifacts::{
+    AttemptArtifactIdentity, AttemptArtifactState, ReserveAttemptArtifact,
+    ReserveAttemptArtifactOutcome, TaskAttemptArtifact, UpdateAttemptArtifactOutcome,
+};

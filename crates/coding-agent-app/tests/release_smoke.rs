@@ -9,7 +9,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use coding_agent_app::{RuntimeDescriptor, StartupPhase};
+use coding_agent_app::{PlatformPaths, PrivateFile, RuntimeDescriptor, StartupPhase};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
@@ -135,8 +135,8 @@ fn release_binary_starts_without_node_or_dist() {
         "a fresh release must bootstrap in the ready state"
     );
     assert_eq!(
-        bootstrap.max_concurrent_tasks, 4,
-        "the production bootstrap must advertise the four-runner limit"
+        bootstrap.max_concurrent_tasks, 1,
+        "the production bootstrap must advertise the isolated single-runner limit"
     );
     assert_secret_shape(&bootstrap.csrf_token, "bootstrap CSRF token");
     assert!(bootstrap.repositories.is_empty());
@@ -429,6 +429,8 @@ fn try_remove_temporary_tree(path: &Path) -> io::Result<()> {
 
 struct IsolatedChildEnvironment {
     path: OsString,
+    cargo_home: PathBuf,
+    rustup_home: Option<PathBuf>,
     home: PathBuf,
     local_app_data: PathBuf,
     roaming_app_data: PathBuf,
@@ -453,6 +455,41 @@ impl IsolatedChildEnvironment {
             "filtering Node entries must preserve operating-system PATH entries"
         );
         let path = env::join_paths(&retained_paths).expect("join the Node-free child PATH");
+
+        // The release application now composes the real offline coding runner
+        // before publishing its listener. Isolating HOME must not accidentally
+        // hide the already-installed Rust toolchain that production requires;
+        // the smoke contract removes Node and external Web assets, not Cargo or
+        // rustup. Resolve these trusted host directories before overriding the
+        // child's platform home variables.
+        let host_home = directories::BaseDirs::new()
+            .expect("the release smoke requires a host home directory")
+            .home_dir()
+            .to_owned();
+        let cargo_home = env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| host_home.join(".cargo"))
+            .canonicalize()
+            .expect("canonicalize the installed Cargo home");
+        assert!(
+            cargo_home.is_dir(),
+            "the release smoke requires an installed Cargo home"
+        );
+        let rustup_home = match env::var_os("RUSTUP_HOME") {
+            Some(path) => Some(
+                PathBuf::from(path)
+                    .canonicalize()
+                    .expect("canonicalize the configured rustup home"),
+            ),
+            None => {
+                let default = host_home.join(".rustup");
+                default.is_dir().then(|| {
+                    default
+                        .canonicalize()
+                        .expect("canonicalize the installed rustup home")
+                })
+            }
+        };
 
         #[cfg(all(unix, not(target_os = "macos")))]
         assert!(
@@ -514,8 +551,26 @@ impl IsolatedChildEnvironment {
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         let runtime_dir = data_dir.join("run");
 
+        let application_paths = PlatformPaths::new(data_dir.clone(), runtime_dir.clone());
+        application_paths
+            .prepare()
+            .expect("prepare private release-smoke application paths");
+        let mut provider = PrivateFile::create_new(data_dir.join("provider.json"))
+            .expect("create private non-contacted provider configuration");
+        provider
+            .write_all(
+                br#"{"base_url":"https://127.0.0.1:9/","model":"offline-smoke","api_key":"offline-smoke-secret"}"#,
+            )
+            .expect("write release-smoke provider configuration");
+        provider
+            .as_file()
+            .sync_all()
+            .expect("flush release-smoke provider configuration");
+
         Self {
             path,
+            cargo_home,
+            rustup_home,
             home,
             local_app_data,
             roaming_app_data,
@@ -533,6 +588,7 @@ impl IsolatedChildEnvironment {
     fn apply(&self, command: &mut Command) {
         command
             .env("PATH", &self.path)
+            .env("CARGO_HOME", &self.cargo_home)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("LOCALAPPDATA", &self.local_app_data)
@@ -550,6 +606,11 @@ impl IsolatedChildEnvironment {
             .env_remove("CODING_AGENT_TEST_APP_DATA_DIR")
             .env_remove("CODING_AGENT_TEST_RUNTIME_DIR")
             .env_remove("CODING_AGENT_TEST_SCENARIO");
+        if let Some(rustup_home) = &self.rustup_home {
+            command.env("RUSTUP_HOME", rustup_home);
+        } else {
+            command.env_remove("RUSTUP_HOME");
+        }
 
         // Linux browser discovery normally depends on commands such as
         // `xdg-open` that may share a PATH entry with Node. Use a controlled,

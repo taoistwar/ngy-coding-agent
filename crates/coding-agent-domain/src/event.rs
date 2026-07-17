@@ -50,6 +50,8 @@ pub struct DiffFile {
     pub patch: String,
     pub additions: u64,
     pub deletions: u64,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

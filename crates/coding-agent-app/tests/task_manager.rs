@@ -344,6 +344,72 @@ async fn durable_quiesce_interrupts_incomplete_tasks_and_returns_live_handles() 
 }
 
 #[tokio::test]
+async fn forced_quiesce_retains_the_latest_durable_diff_and_rejects_late_updates() {
+    let fixture = support::task_manager_fixture(1).await;
+    let durable = DiffSnapshot {
+        revision: 7,
+        files: vec![DiffFile {
+            path: "src/lib.rs".to_owned(),
+            status: DiffFileStatus::Modified,
+            patch: "+durable\n".to_owned(),
+            additions: 1,
+            deletions: 0,
+            truncated: false,
+        }],
+    };
+    let late = DiffSnapshot {
+        revision: 8,
+        files: vec![DiffFile {
+            path: "src/lib.rs".to_owned(),
+            status: DiffFileStatus::Modified,
+            patch: "+late\n".to_owned(),
+            additions: 1,
+            deletions: 0,
+            truncated: false,
+        }],
+    };
+    let gate = fixture.runner.push_durable_then_late_event(
+        RunnerEvent::DiffUpdated(durable.clone()),
+        RunnerEvent::DiffUpdated(late),
+    );
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture.load_detail(task.id).await.diff == Some(durable.clone()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the pre-quiesce diff becomes durable");
+
+    let active = match fixture
+        .manager
+        .quiesce_and_interrupt(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap()
+    {
+        QuiesceResult::Durable { active, .. } => active,
+        QuiesceResult::Frozen { .. } => panic!("quiesce should commit"),
+    };
+    assert_eq!(fixture.load(task.id).await.status, TaskStatus::Interrupted);
+    assert_eq!(
+        fixture.load_detail(task.id).await.diff,
+        Some(durable.clone())
+    );
+
+    gate.release.notify_one();
+    assert!(matches!(
+        gate.result.await.unwrap(),
+        Err(RunnerEventError::TaskNotRunning | RunnerEventError::StoreDegraded)
+    ));
+    active.into_iter().next().unwrap().done.await.unwrap();
+    assert_eq!(fixture.load_detail(task.id).await.diff, Some(durable));
+}
+
+#[tokio::test]
 async fn durable_quiesce_does_not_cancel_runners_before_the_shutdown_owner_decides() {
     let fixture = support::task_manager_fixture(1).await;
     fixture.runner.push_blocking(1);
@@ -525,6 +591,7 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
                 patch: "diff --git a/synthetic/example.rs b/synthetic/example.rs\nnew file mode 100644\n--- /dev/null\n+++ b/synthetic/example.rs\n@@ -0,0 +1 @@\n+// deterministic fake change\n".to_owned(),
                 additions: 1,
                 deletions: 0,
+                truncated: false,
             }],
         })
     );

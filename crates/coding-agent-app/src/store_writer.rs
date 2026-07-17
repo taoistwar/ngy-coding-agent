@@ -9,8 +9,10 @@ use coding_agent_domain::{
     UtcTimestamp,
 };
 use coding_agent_store::{
-    AppendEventOutcome, CreateTaskOutcome, RecoveryOutcome, RegisterRepositoryOutcome,
+    AppendEventOutcome, AttemptArtifactIdentity, CreateTaskOutcome, RecoveryOutcome,
+    RegisterRepositoryOutcome, ReserveAttemptArtifact, ReserveAttemptArtifactOutcome,
     RetryTaskOutcome, Store, StoreError, TaskTransition, TransitionOutcome,
+    UpdateAttemptArtifactOutcome,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
@@ -57,6 +59,12 @@ enum StoreWriterOperation {
         task_id: TaskId,
         payload: TaskEventPayload,
     },
+    ReserveAttemptArtifact(ReserveAttemptArtifact),
+    MarkAttemptArtifactReady(AttemptArtifactIdentity),
+    MarkAttemptArtifactInconsistent {
+        identity: AttemptArtifactIdentity,
+        failure_code: String,
+    },
     RecoverIncomplete {
         now: UtcTimestamp,
         failure: TaskFailure,
@@ -70,6 +78,8 @@ enum StoreWriterOperationOutcome {
     RetryTask(RetryTaskOutcome),
     TransitionWithEvent(TransitionOutcome),
     AppendRunningEvent(AppendEventOutcome),
+    ReserveAttemptArtifact(ReserveAttemptArtifactOutcome),
+    UpdateAttemptArtifact(UpdateAttemptArtifactOutcome),
     RecoverIncomplete(RecoveryOutcome),
 }
 
@@ -89,6 +99,11 @@ impl StoreWriterOperation {
                 TaskTransition::Interrupted(_) => StoreWriterOperationKind::InterruptTask,
             },
             Self::AppendRunningEvent { .. } => StoreWriterOperationKind::AppendRunningEvent,
+            Self::ReserveAttemptArtifact(_) => StoreWriterOperationKind::ReserveAttemptArtifact,
+            Self::MarkAttemptArtifactReady(_) => StoreWriterOperationKind::MarkAttemptArtifactReady,
+            Self::MarkAttemptArtifactInconsistent { .. } => {
+                StoreWriterOperationKind::MarkAttemptArtifactInconsistent
+            }
             Self::RecoverIncomplete { .. } => StoreWriterOperationKind::RecoverIncomplete,
         }
     }
@@ -99,6 +114,7 @@ impl StoreWriterOperationOutcome {
     fn has_durable_event(&self) -> bool {
         match self {
             Self::RegisterRepository(_) => false,
+            Self::ReserveAttemptArtifact(_) | Self::UpdateAttemptArtifact(_) => false,
             Self::CreateTask(CreateTaskOutcome::Created { .. })
             | Self::RetryTask(RetryTaskOutcome::Created { .. })
             | Self::TransitionWithEvent(TransitionOutcome::Applied { .. })
@@ -143,6 +159,9 @@ pub enum StoreWriterOperationKind {
     CancelTask,
     InterruptTask,
     AppendRunningEvent,
+    ReserveAttemptArtifact,
+    MarkAttemptArtifactReady,
+    MarkAttemptArtifactInconsistent,
     RecoverIncomplete,
 }
 
@@ -431,6 +450,21 @@ impl StoreWriterBackend for Store {
                     .append_running_event(task_id, payload)
                     .await
                     .map(StoreWriterOperationOutcome::AppendRunningEvent),
+                StoreWriterOperation::ReserveAttemptArtifact(input) => self
+                    .reserve_attempt_artifact(input)
+                    .await
+                    .map(StoreWriterOperationOutcome::ReserveAttemptArtifact),
+                StoreWriterOperation::MarkAttemptArtifactReady(identity) => self
+                    .mark_attempt_artifact_ready(identity)
+                    .await
+                    .map(StoreWriterOperationOutcome::UpdateAttemptArtifact),
+                StoreWriterOperation::MarkAttemptArtifactInconsistent {
+                    identity,
+                    failure_code,
+                } => self
+                    .mark_attempt_artifact_inconsistent(identity, failure_code)
+                    .await
+                    .map(StoreWriterOperationOutcome::UpdateAttemptArtifact),
                 StoreWriterOperation::RecoverIncomplete { now, failure } => self
                     .recover_incomplete(now, failure)
                     .await
@@ -581,6 +615,53 @@ impl StoreWriterHandle {
         receive(receiver).await
     }
 
+    pub async fn reserve_attempt_artifact(
+        &self,
+        input: ReserveAttemptArtifact,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<ReserveAttemptArtifactOutcome>, StoreWriterError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(WriteCommand::ReserveAttemptArtifact {
+            input,
+            deadline,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn mark_attempt_artifact_ready(
+        &self,
+        identity: AttemptArtifactIdentity,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<UpdateAttemptArtifactOutcome>, StoreWriterError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(WriteCommand::MarkAttemptArtifactReady {
+            identity,
+            deadline,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn mark_attempt_artifact_inconsistent(
+        &self,
+        identity: AttemptArtifactIdentity,
+        failure_code: impl Into<String>,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<UpdateAttemptArtifactOutcome>, StoreWriterError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(WriteCommand::MarkAttemptArtifactInconsistent {
+            identity,
+            failure_code: failure_code.into(),
+            deadline,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
     async fn send(&self, command: WriteCommand) -> Result<(), StoreWriterError> {
         self.sender
             .send(command)
@@ -618,6 +699,25 @@ enum WriteCommand {
         payload: TaskEventPayload,
         deadline: Instant,
         response: oneshot::Sender<Result<WriteReceipt<AppendEventOutcome>, StoreWriterError>>,
+    },
+    ReserveAttemptArtifact {
+        input: ReserveAttemptArtifact,
+        deadline: Instant,
+        response:
+            oneshot::Sender<Result<WriteReceipt<ReserveAttemptArtifactOutcome>, StoreWriterError>>,
+    },
+    MarkAttemptArtifactReady {
+        identity: AttemptArtifactIdentity,
+        deadline: Instant,
+        response:
+            oneshot::Sender<Result<WriteReceipt<UpdateAttemptArtifactOutcome>, StoreWriterError>>,
+    },
+    MarkAttemptArtifactInconsistent {
+        identity: AttemptArtifactIdentity,
+        failure_code: String,
+        deadline: Instant,
+        response:
+            oneshot::Sender<Result<WriteReceipt<UpdateAttemptArtifactOutcome>, StoreWriterError>>,
     },
     RecoverIncomplete {
         now: UtcTimestamp,
@@ -749,6 +849,64 @@ async fn run_writer(
                     });
                 let _ = response.send(result);
             }
+            WriteCommand::ReserveAttemptArtifact {
+                input,
+                deadline,
+                response,
+            } => {
+                let result = execute(
+                    &*backend,
+                    StoreWriterOperation::ReserveAttemptArtifact(input),
+                    deadline,
+                )
+                .await
+                .and_then(expect_reserve_artifact)
+                .map(|value| WriteReceipt {
+                    value,
+                    event_id: None,
+                });
+                let _ = response.send(result);
+            }
+            WriteCommand::MarkAttemptArtifactReady {
+                identity,
+                deadline,
+                response,
+            } => {
+                let result = execute(
+                    &*backend,
+                    StoreWriterOperation::MarkAttemptArtifactReady(identity),
+                    deadline,
+                )
+                .await
+                .and_then(expect_update_artifact)
+                .map(|value| WriteReceipt {
+                    value,
+                    event_id: None,
+                });
+                let _ = response.send(result);
+            }
+            WriteCommand::MarkAttemptArtifactInconsistent {
+                identity,
+                failure_code,
+                deadline,
+                response,
+            } => {
+                let result = execute(
+                    &*backend,
+                    StoreWriterOperation::MarkAttemptArtifactInconsistent {
+                        identity,
+                        failure_code,
+                    },
+                    deadline,
+                )
+                .await
+                .and_then(expect_update_artifact)
+                .map(|value| WriteReceipt {
+                    value,
+                    event_id: None,
+                });
+                let _ = response.send(result);
+            }
         }
     }
 }
@@ -874,6 +1032,24 @@ fn expect_recovery(
 ) -> Result<RecoveryOutcome, StoreWriterError> {
     match outcome {
         StoreWriterOperationOutcome::RecoverIncomplete(value) => Ok(value),
+        _ => Err(unexpected_outcome()),
+    }
+}
+
+fn expect_reserve_artifact(
+    outcome: StoreWriterOperationOutcome,
+) -> Result<ReserveAttemptArtifactOutcome, StoreWriterError> {
+    match outcome {
+        StoreWriterOperationOutcome::ReserveAttemptArtifact(value) => Ok(value),
+        _ => Err(unexpected_outcome()),
+    }
+}
+
+fn expect_update_artifact(
+    outcome: StoreWriterOperationOutcome,
+) -> Result<UpdateAttemptArtifactOutcome, StoreWriterError> {
+    match outcome {
+        StoreWriterOperationOutcome::UpdateAttemptArtifact(value) => Ok(value),
         _ => Err(unexpected_outcome()),
     }
 }

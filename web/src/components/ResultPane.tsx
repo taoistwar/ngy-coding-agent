@@ -27,11 +27,11 @@ function DiffPanel({ diff }: { diff: DiffSnapshot | null }) {
   return (
     <section className="evidence-panel diff-panel" aria-labelledby="diff-heading">
       <div className="panel-heading-row">
-        <h3 id="diff-heading">Synthetic diff</h3>
+        <h3 id="diff-heading">Worktree diff</h3>
         {diff !== null ? <span>Revision {diff.revision}</span> : null}
       </div>
       {diff === null || diff.files.length === 0 ? (
-        <p className="empty-state">No synthetic diff is available yet.</p>
+        <p className="empty-state">No worktree diff is available yet.</p>
       ) : (
         <ul className="diff-files">
           {diff.files.map((file) => (
@@ -44,8 +44,11 @@ function DiffPanel({ diff }: { diff: DiffSnapshot | null }) {
                 <span>
                   {file.status}; +{file.additions} −{file.deletions}
                 </span>
+                {file.truncated ? (
+                  <span className="readonly-badge">Patch truncated at safety limit</span>
+                ) : null}
               </div>
-              <pre aria-label={`Synthetic patch for ${file.path}`}>{file.patch}</pre>
+              <pre aria-label={`Worktree patch for ${file.path}`}>{file.patch}</pre>
             </li>
           ))}
         </ul>

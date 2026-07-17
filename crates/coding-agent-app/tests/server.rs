@@ -11,11 +11,14 @@ use coding_agent_api::{
     ApiBackend, AuthContext, CreateResult, CreateTaskRequest, LiveEventItem, RequestSecurity,
     SessionExchange, SseBackend, build_api_router,
 };
-use coding_agent_app::{ApplicationBackend, MutationGate, RepositoryDiscovery, ServiceState};
-use coding_agent_domain::{ClientRequestId, NewTask, TaskStatus};
+use coding_agent_app::{
+    ApplicationBackend, EventDispatcherHandle, MutationGate, RepositoryDiscovery, ServiceState,
+    ServiceStateController, StoreWriterHandle, TaskManagerHandle,
+};
+use coding_agent_domain::{ClientRequestId, EventCursor, NewTask, TaskStatus};
 use coding_agent_store::{CreateTaskOutcome, TaskTransition, TransitionOutcome};
 use futures_util::StreamExt as _;
-use http::header::{COOKIE, HOST, ORIGIN};
+use http::header::{CONTENT_TYPE, COOKIE, HOST, ORIGIN};
 use http::{Method, Request, StatusCode};
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
@@ -124,6 +127,135 @@ async fn both_sse_sources_close_after_publishing_quiescing() {
     );
     assert!(late_service.next().await.is_none());
     assert!(late_live.next().await.is_none());
+}
+
+#[tokio::test]
+async fn production_sse_router_recovers_dispatcher_lag_from_sqlite_with_exact_frames() {
+    let fixture = support::store_fixture().await;
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 2)
+        .await
+        .expect("spawn deliberately small SSE dispatcher");
+    let writer = StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(dispatcher.clone()), 16);
+    let state = ServiceStateController::new(ServiceState::Ready);
+    let manager = TaskManagerHandle::spawn(
+        fixture.store.clone(),
+        writer.clone(),
+        dispatcher.clone(),
+        state.clone(),
+        Arc::new(support::ControlledRunner::default()),
+        1,
+        16,
+    );
+    let security = support::SecurityFixture::production();
+    let session = establish_session(&security).await;
+    let backend = Arc::new(ApplicationBackend::new(
+        fixture.store.clone(),
+        writer.clone(),
+        dispatcher.clone(),
+        manager,
+        RepositoryDiscovery::new(std::env::temp_dir()),
+        None,
+        security.manager.clone(),
+        state.clone(),
+        MutationGate::new(state.clone()),
+        support::timestamp(),
+        1,
+        Duration::from_secs(2),
+        Arc::new(|| {}),
+    ));
+    let router = build_api_router(backend.clone(), Arc::new(security.manager.clone()), backend);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/events?after=0")
+                .header(HOST, &security.expected_host)
+                .header(COOKIE, &session.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+
+    let mut stream = response.into_body().into_data_stream();
+    let service = stream
+        .next()
+        .await
+        .expect("initial service frame")
+        .expect("read initial service frame");
+    assert!(String::from_utf8_lossy(&service).contains("event: service.state\n"));
+
+    // Drive the connection through its empty initial snapshot and leave it
+    // waiting on the production dispatcher. Four durable commits then overflow
+    // the two-event live buffer, forcing the real SSE path to refill the gap
+    // from SQLite rather than serializing or dropping a lag marker.
+    let waiting = stream.next();
+    futures_util::pin_mut!(waiting);
+    assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+
+    let mut expected_ids = Vec::new();
+    for prompt in ["lag one", "lag two", "lag three", "lag four"] {
+        let receipt = writer
+            .create_task(
+                support::new_task(fixture.repository.id, prompt),
+                support::deadline(),
+            )
+            .await
+            .expect("persist lag-recovery event");
+        expected_ids.push(receipt.event_id.expect("create emits a queued event").get());
+    }
+    dispatcher
+        .flush_to(EventCursor::new(*expected_ids.last().unwrap()).unwrap())
+        .await
+        .expect("publish every lag-recovery event");
+
+    let first = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("lag recovery produced its first persisted frame")
+        .expect("SSE stream remains open")
+        .expect("read first recovered frame");
+    let mut wire = String::from_utf8(first.to_vec()).expect("SSE frame is UTF-8");
+    while persisted_sse_ids(&wire).len() < expected_ids.len() {
+        let frame = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("lag recovery produced the complete persisted range")
+            .expect("SSE stream remains open during recovery")
+            .expect("read recovered frame");
+        wire.push_str(std::str::from_utf8(&frame).expect("SSE frame is UTF-8"));
+    }
+
+    state.set(ServiceState::Quiescing).unwrap();
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("quiescing closes the production SSE stream")
+    {
+        let frame = frame.expect("read quiescing frame");
+        wire.push_str(std::str::from_utf8(&frame).expect("SSE frame is UTF-8"));
+    }
+
+    assert_eq!(persisted_sse_ids(&wire), expected_ids);
+    assert!(!wire.contains("lagged"));
+    for id in expected_ids {
+        let frame = wire
+            .split("\n\n")
+            .find(|frame| frame.lines().any(|line| line == format!("id: {id}")))
+            .expect("recovered event has an SSE frame");
+        assert!(frame.contains("event: task.queued\n"));
+        assert!(frame.contains(&format!("\"id\":{id}")));
+    }
+}
+
+fn persisted_sse_ids(wire: &str) -> Vec<i64> {
+    wire.split("\n\n")
+        .filter_map(|frame| {
+            frame
+                .lines()
+                .find_map(|line| line.strip_prefix("id: "))
+                .and_then(|id| id.parse().ok())
+        })
+        .collect()
 }
 
 async fn occupied_fixture() -> support::TaskManagerFixture {

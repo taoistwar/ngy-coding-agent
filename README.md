@@ -1,28 +1,37 @@
 # ngy Coding Agent
 
-This repository contains Project 1 of a local, browser-based Coding Agent. The
-application is a Rust process that owns Axum, SQLite, task orchestration, and
-native dialogs, with a React UI served on a random `127.0.0.1` port.
+This repository contains Project 2 of a local, browser-based Coding Agent. The
+application is a Rust process that owns Axum, SQLite, task orchestration, native
+dialogs, an isolated Git-worktree runtime, and an OpenAI-compatible provider
+client, with a React UI served on a random `127.0.0.1` port.
 
-## Project 1 scope
+## Project 2 scope
 
-Project 1 is a deterministic fake platform used to prove the local application
-architecture and lifecycle. It can register real Git/Cargo repositories and
-exercise realistic task, activity, diff, test, retry, recovery, and shutdown UI
-states. Its task runner does **not** read or modify repository source, call a
-model, create worktrees, execute repository tests, review changes, merge work,
-or imply that a task is deliverable.
+Project 2 runs one real coding task at a time. Every attempt receives a unique
+branch and private Git worktree based on the registered repository's committed
+`HEAD`. The agent can inspect and safely replace files inside that worktree,
+run bounded Cargo commands, and publish plan, activity, diff, and test evidence
+through the durable Project 1 event stream. The user's original staged,
+unstaged, and untracked bytes are not copied into the worktree and are not used
+as model context.
+
+`Completed` means that the execution loop ended normally with a passing Cargo
+test bound to the final workspace fingerprint. It does **not** mean reviewed,
+deliverable, mergeable, or automatically merged. Project 3 adds the separate
+review-quality loop.
 
 Installers, a macOS application bundle, Linux desktop entries, code signing and
 notarization, auto-update, and polished launcher packaging belong to Project 4.
-They are not Project 1 CI gates.
+They are not Project 2 CI gates.
 
 ## Prerequisites
 
 - Rust `1.97.0` with `rustfmt` and `clippy` (pinned by
   `rust-toolchain.toml`).
 - Node.js 24 or newer and npm.
-- Git and Cargo available on `PATH` for repository discovery.
+- Git 2.45 or newer and Cargo available on `PATH` for repository discovery.
+- A private `provider.json` as described below. Production startup does not
+  fall back to the fake test runner when this file is absent or invalid.
 - The native build prerequisites for the host OS and a graphical desktop when
   using the browser or repository picker.
 
@@ -110,6 +119,36 @@ Launch it directly with `./target/release/coding-agent-app` on Linux/macOS or
 
 Starting a second copy does not create another database writer. It verifies the
 existing primary, requests a fresh one-time URL, opens the browser, and exits.
+The secondary does not read or validate `provider.json`.
+
+## Provider configuration
+
+Create `provider.json` in the data directory from the table below. It has one
+strict schema; unknown fields are rejected:
+
+```json
+{
+  "base_url": "https://provider.example/",
+  "model": "provider-model-name",
+  "api_key": "replace-with-the-provider-key"
+}
+```
+
+The production base URL must use HTTPS and must not contain user information, a
+query, or a fragment. The client sends Chat Completions requests to
+`v1/chat/completions`, rejects redirects, uses a rustls TLS backend, and applies
+bounded connect, request, response, and cumulative task limits. The API key is
+8-4096 printable non-space ASCII bytes. The application uses the configured key
+for provider authorization and boundary redaction; it does not copy the key
+from `provider.json` into SQLite, model messages, child-process environments,
+activity events, or ordinary logs. This is not general content scanning: task
+prompts and retained repository artifacts are durable user data and may contain
+credentials supplied by the user, so do not paste secrets into either one.
+
+The file must be a regular, non-link private file. On Unix use mode `0600`, for
+example `chmod 600 provider.json`. On Windows, ensure only the current user has
+access; the application validates the opened file handle and rejects reparse
+points or broad ACLs. Keep the data directory private as well.
 
 ## Data and runtime files
 
@@ -126,6 +165,15 @@ The application uses the host's per-user project directories:
 launcher capability and must not be shared. `unclean-shutdown.json` records a
 shutdown whose final task states could not be persisted and is recovered on the
 next start.
+
+Attempt artifacts are retained for inspection. Branches use
+`codex/task-<task-id>-attempt-<attempt>` and worktrees are stored under the
+private data directory at
+`worktrees/<repository-id>/<task-id>/<attempt>`. SQLite records the immutable
+repository/task/attempt identity, base commit, branch, worktree path, and
+`reserved`, `ready`, or `inconsistent` lifecycle state. A retry always receives
+a new branch and worktree; the application never overwrites or deletes an
+unknown conflicting artifact.
 
 For a main-file-only backup, quit through the Web UI and confirm a clean
 shutdown: the process and `instance.json` are gone, no degraded-shutdown warning
@@ -158,13 +206,36 @@ browser-open failure.
 
 The server listens only on a random IPv4 loopback port. Exact Host checks,
 one-time launch exchange, process-scoped session cookies, exact Origin checks,
-and CSRF tokens protect ordinary cross-site browser access. Secrets are kept
-out of URLs after exchange, SQLite, and normal logs.
+and CSRF tokens protect ordinary cross-site browser access. Launcher and
+provider-configuration secrets are kept out of URLs after exchange and ordinary
+logs, and the application does not copy the configured provider key into
+SQLite. Task prompts and retained artifacts remain durable user data and can
+contain secrets supplied as task or repository content.
 
-This is not a sandbox against a malicious process already running as the same
-OS user. Such a process can inspect that user's memory, files, browser traffic,
-or local endpoints. Repository paths and the runtime descriptor should be
-treated as private user data.
+Git worktrees and capability-based file tools isolate an attempt from the
+user's original working directory, but Project 2 is **not** an OS sandbox for
+untrusted code. Cargo may execute an existing or generated `build.rs`, proc
+macro, dependency, test binary, and other repository code with the current OS
+user's permissions. That code can attempt to read or write outside the
+worktree, access the network, or start processes. Run tasks only for repositories
+and generated changes you are willing to execute as the current user; use a
+separately hardened VM/container for genuinely untrusted code.
+
+Final test evidence is bound to the actual terminal workspace fingerprint.
+Diff collection also checks the workspace before and after collection, but it
+does not provide a filesystem snapshot or linearizability against a malicious
+same-user process deliberately changing bytes and restoring them during that
+window. The retained worktree remains the authoritative artifact in that
+out-of-boundary scenario.
+
+The built-in tools reject path escape, `.git` access, links/reparse points,
+unbounded output, inherited secrets, arbitrary commands, and executable Git
+configuration. Cargo runs offline by default and child process trees are
+terminated on timeout or cancellation. These controls reduce accidental tool
+escape; they do not change the trusted-code boundary above. A malicious process
+already running as the same OS user can also inspect that user's memory, files,
+browser traffic, or local endpoints. Repository paths and the runtime descriptor
+should be treated as private user data.
 
 ## Troubleshooting codes
 
@@ -180,7 +251,23 @@ matching an error to local logs.
 | `APP_RESTARTED` | An incomplete task was interrupted during crash/restart recovery. Retry it explicitly if desired. |
 | `APP_SHUTDOWN` | An incomplete task was interrupted by an orderly application quit. |
 | `STORE_WRITE_FAILED` | A task had an ambiguous background write and was durably interrupted during recovery. |
-| `RUNNER_PANICKED` / `FAKE_RUNNER_FAILURE` | The deterministic Project 1 runner reached an injected panic or failure scenario; other tasks remain isolated. |
+| `PROVIDER_CONFIG_INVALID` | Create a strict, private `provider.json`; verify HTTPS, field names, file permissions, model, and API key. Production never falls back to a fake runner. |
+| `PROVIDER_UNAUTHORIZED` | Verify the configured API key and provider account without placing the key in logs or issue reports. |
+| `PROVIDER_RATE_LIMITED` / `PROVIDER_UNAVAILABLE` / `PROVIDER_TRANSPORT_FAILED` | The provider throttled, failed, disconnected, or timed out. Retry after the provider is healthy. |
+| `PROVIDER_REQUEST_BYTE_LIMIT_REACHED` / `PROVIDER_TASK_BYTE_LIMIT_REACHED` | The provider exchange exceeded its per-request or cumulative task budget. Narrow the task and retry. |
+| `PROVIDER_RESPONSE_INVALID` / `PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS` / `PROVIDER_REDIRECT_REJECTED` | The endpoint did not honor the supported single-tool-call Chat Completions contract. Check provider compatibility and base URL. |
+| `GIT_HEAD_UNBORN` | Commit an initial repository revision before creating a task. Dirty working-directory bytes are intentionally not used. |
+| `WORKTREE_CREATE_FAILED` / `WORKTREE_STATE_INCONSISTENT` | Inspect the retained attempt artifact. Resolve branch/path identity conflicts manually; the application does not delete unknown objects. |
+| `WORKTREE_PATH_ESCAPE` | A reserved attempt path or Cargo workspace escaped its trusted repository/artifact roots. Inspect the registered repository and retained artifact instead of weakening the boundary. |
+| `FILE_NOT_TEXT` / `FILE_TOO_LARGE` / `FILE_CHANGED_SINCE_READ` / `ATOMIC_REPLACE_FAILED` | The requested file cannot be safely read or atomically replaced. Retry only after checking the retained worktree state. |
+| `COMMAND_NOT_ALLOWED` / `COMMAND_TIMED_OUT` / `PROCESS_TREE_CLEANUP_FAILED` | A command or `.git` path violated the fixed tool contract, timed out, or could not be safely quiesced. Bounded output is returned as explicitly truncated tool evidence. Inspect the worktree and terminate any suspect repository process before retrying. |
+| `CARGO_METADATA_FAILED` / `CARGO_DEPENDENCY_UNAVAILABLE_OFFLINE` | Fix the Cargo workspace or prefetch its dependencies explicitly; task Cargo commands do not fetch from the network. |
+| `AGENT_STEP_LIMIT_REACHED` / `AGENT_CONTEXT_LIMIT_REACHED` | The bounded agent loop exhausted its step or context budget before a valid final result. Narrow the task and retry. |
+| `CURRENT_TEST_REQUIRED` | The final worktree fingerprint has no passing Cargo test evidence. Run the relevant test after the last source change. |
+| `TERMINAL_DIFF_TRUNCATED` | The retained final diff exceeded a safety bound, so the task was not marked Completed. Inspect the worktree and split the change into a smaller task. |
+| `TERMINAL_FINALIZATION_TIMEOUT` | Final test/diff evidence did not settle within the bounded terminal window. Inspect the retained worktree and retry only after any repository process has stopped. |
+| `TOOLCHAIN_DISCOVERY_FAILED` | Startup could not pin the required Git/Rust tools. Verify Git 2.45+ and the active Rust toolchain, then relaunch. |
+| `RUNNER_PANICKED` | The runner failed unexpectedly; the task is isolated and other work remains available. Preserve the request ID and retained artifact for diagnosis. |
 | `REPOSITORY_PATH_NOT_FOUND` / `REPOSITORY_PATH_NOT_DIRECTORY` | Select an existing directory. |
 | `CARGO_WORKSPACE_NOT_FOUND` / `CARGO_WORKSPACE_OUTSIDE_GIT_ROOT` | Select a Cargo workspace contained by its Git repository. |
 | `REPOSITORY_COMMAND_FAILED` | Verify that Git and Cargo are installed and the repository can be inspected. |

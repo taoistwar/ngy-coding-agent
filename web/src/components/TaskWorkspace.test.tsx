@@ -53,6 +53,7 @@ function detail(value: Task): TaskDetail {
           patch: "@@ -1 +1 @@\n-old\n+new",
           additions: 1,
           deletions: 1,
+          truncated: false,
         },
       ],
     },
@@ -330,7 +331,7 @@ describe("TaskWorkspace", () => {
     expect(
       screen.getByText("Workspace prepared", { selector: ".activity-message" }),
     ).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Synthetic diff" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Worktree diff" })).toBeVisible();
     expect(screen.getByText("src/lib.rs")).toBeVisible();
     expect(screen.getByRole("heading", { name: "Test results" })).toBeVisible();
     expect(screen.getByText("workspace renders")).toBeVisible();
@@ -356,6 +357,20 @@ describe("TaskWorkspace", () => {
       screen.getByText("Status: completed", { selector: ".task-status-label" }),
     ).toBeVisible();
     expect(screen.getByText(/Status: completed/i)).toBeVisible();
+  });
+
+  it("marks a bounded worktree patch when its true prefix was truncated", () => {
+    const running = task("task-truncated-diff", "running");
+    const bounded = detail(running);
+    bounded.diff!.files[0]!.truncated = true;
+
+    render(<TaskWorkspace {...props(running, { detail: bounded })} />);
+
+    expect(screen.getByRole("heading", { name: "Worktree diff" })).toBeVisible();
+    expect(screen.getByText("Patch truncated at safety limit")).toBeVisible();
+    expect(screen.getByLabelText("Worktree patch for src/lib.rs")).toHaveTextContent(
+      "@@ -1 +1 @@",
+    );
   });
 
   it("isolates a broken plan projection so activity and task actions remain usable", () => {
@@ -437,7 +452,7 @@ describe("TaskWorkspace", () => {
     {
       panel: "tests",
       fallback: "Test results unavailable",
-      unaffectedHeading: "Synthetic diff",
+      unaffectedHeading: "Worktree diff",
       breakDetail(value: TaskDetail) {
         if (value.tests === null || value.tests === undefined) throw new Error("fixture");
         Object.defineProperty(value.tests, "cases", {
@@ -450,7 +465,7 @@ describe("TaskWorkspace", () => {
     {
       panel: "timeline",
       fallback: "Timeline unavailable",
-      unaffectedHeading: "Synthetic diff",
+      unaffectedHeading: "Worktree diff",
       breakDetail(value: TaskDetail) {
         value.timeline = new Proxy(value.timeline, {
           get(target, property, receiver) {
@@ -492,7 +507,7 @@ describe("TaskWorkspace", () => {
 
     expect(screen.getByText("No plan has been published yet.")).toBeVisible();
     expect(screen.getByText("No activity yet.")).toBeVisible();
-    expect(screen.getByText("No synthetic diff is available yet.")).toBeVisible();
+    expect(screen.getByText("No worktree diff is available yet.")).toBeVisible();
     expect(screen.getByText("No test results are available yet.")).toBeVisible();
     expect(screen.getByText("No lifecycle events are available yet.")).toBeVisible();
   });

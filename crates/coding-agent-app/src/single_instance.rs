@@ -30,10 +30,11 @@ use crate::shutdown::ShutdownCleanup;
 use crate::test_support::{ActorPausePoint, ProcessTestWatchers};
 use crate::{
     ApplicationBackend, BrowserLaunchError, BrowserLauncher, EventDispatcherError,
-    EventDispatcherHandle, FakeTaskRunner, MutationGate, NativeDialogService, PlatformPaths,
-    RepositoryDiscovery, SecurityManager, SecuritySeed, ServiceState, ServiceStateController,
-    ShutdownCoordinator, ShutdownOutcome, StoreWriterHandle, SystemWallClock, TaskManagerHandle,
-    TaskRunner, WallClock, build_runtime_router,
+    EventDispatcherHandle, MutationGate, NativeDialogService, PlatformPaths,
+    ProductionStartupRunnerFactory, RepositoryDiscovery, SecurityManager, SecuritySeed,
+    ServiceState, ServiceStateController, ShutdownCoordinator, ShutdownOutcome,
+    StartupRunnerContext, StartupRunnerFactory, StoreWriterHandle, SystemWallClock,
+    TaskManagerHandle, WallClock, build_runtime_router,
 };
 
 const MAX_DESCRIPTOR_BYTES: u64 = 4 * 1024;
@@ -44,7 +45,6 @@ const SECONDARY_MAX_DELAY: Duration = Duration::from_secs(1);
 const LISTENER_BIND_ATTEMPTS: usize = 3;
 const EVENT_BROADCAST_CAPACITY: usize = 1_024;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
-const MAX_CONCURRENT_TASKS: usize = 4;
 const WRITE_BUDGET: Duration = Duration::from_secs(5);
 const DEGRADED_SHUTDOWN_WARNING_ARGUMENT: &str =
     "--coding-agent-internal-degraded-shutdown-warning";
@@ -566,7 +566,7 @@ pub struct StartupDependencies {
     pub messages: Arc<dyn NativeMessageSink>,
     pub wall_clock: Arc<dyn WallClock>,
     pub security_clock: Arc<dyn SecurityClock>,
-    pub runner: Arc<dyn TaskRunner>,
+    pub runner_factory: Arc<dyn StartupRunnerFactory>,
     pub dialog: Option<NativeDialogService>,
     #[cfg(feature = "test-support")]
     pub(crate) process_test_support: Option<Arc<crate::test_support::ProcessTestRuntime>>,
@@ -599,7 +599,7 @@ impl StartupDependencies {
             messages: Arc::new(SystemNativeMessageSink),
             wall_clock: Arc::new(SystemWallClock),
             security_clock: Arc::new(SystemSecurityClock),
-            runner: Arc::new(FakeTaskRunner::default()),
+            runner_factory: Arc::new(ProductionStartupRunnerFactory),
             dialog,
             #[cfg(feature = "test-support")]
             process_test_support: None,
@@ -642,6 +642,8 @@ pub enum StartupError {
     Security(#[from] SecurityError),
     #[error("the event dispatcher could not be started: {0}")]
     Dispatcher(#[from] EventDispatcherError),
+    #[error("the coding task runner could not be started: {0}")]
+    Runner(#[from] crate::StartupRunnerFactoryError),
     #[error("the loopback listener could not be bound: {0}")]
     Listener(#[source] io::Error),
     #[error("the listener factory returned a non-loopback or zero-port listener")]
@@ -838,6 +840,41 @@ async fn start_primary(
     }
     remove_recovered_shutdown_marker(&paths);
 
+    let dispatcher = EventDispatcherHandle::spawn(store.clone(), EVENT_BROADCAST_CAPACITY).await?;
+    debug_assert_eq!(store.latest_event_id().await?, recovery.high_watermark);
+    #[cfg(not(feature = "test-support"))]
+    let writer = StoreWriterHandle::spawn(
+        store.clone(),
+        Arc::new(dispatcher.clone()),
+        ACTOR_QUEUE_CAPACITY,
+    );
+    #[cfg(feature = "test-support")]
+    let writer = match &dependencies.process_test_support {
+        Some(support) => StoreWriterHandle::spawn_with_test_controller(
+            store.clone(),
+            Arc::new(dispatcher.clone()),
+            ACTOR_QUEUE_CAPACITY,
+            support.writer_controller.clone(),
+        ),
+        None => StoreWriterHandle::spawn(
+            store.clone(),
+            Arc::new(dispatcher.clone()),
+            ACTOR_QUEUE_CAPACITY,
+        ),
+    };
+    let runner_selection = dependencies
+        .runner_factory
+        .create(StartupRunnerContext::new(
+            paths.clone(),
+            store.clone(),
+            writer.clone(),
+            dependencies.wall_clock.clone(),
+        ))
+        .await?;
+    let runner = runner_selection.runner();
+    let concurrency = usize::try_from(runner_selection.concurrency().get())
+        .expect("u32 task concurrency fits usize on supported platforms");
+
     let seed = SecuritySeed::generate()?;
     let initial_launch_token = seed.initial_launch_token().clone();
     let launcher_secret = seed.launcher_secret().clone();
@@ -863,28 +900,6 @@ async fn start_primary(
     let browser_port = canonical_loopback_origin_port(security.public_origin())
         .expect("SecurityManager guarantees a canonical nonzero loopback public origin");
 
-    let dispatcher = EventDispatcherHandle::spawn(store.clone(), EVENT_BROADCAST_CAPACITY).await?;
-    debug_assert_eq!(store.latest_event_id().await?, recovery.high_watermark);
-    #[cfg(not(feature = "test-support"))]
-    let writer = StoreWriterHandle::spawn(
-        store.clone(),
-        Arc::new(dispatcher.clone()),
-        ACTOR_QUEUE_CAPACITY,
-    );
-    #[cfg(feature = "test-support")]
-    let writer = match &dependencies.process_test_support {
-        Some(support) => StoreWriterHandle::spawn_with_test_controller(
-            store.clone(),
-            Arc::new(dispatcher.clone()),
-            ACTOR_QUEUE_CAPACITY,
-            support.writer_controller.clone(),
-        ),
-        None => StoreWriterHandle::spawn(
-            store.clone(),
-            Arc::new(dispatcher.clone()),
-            ACTOR_QUEUE_CAPACITY,
-        ),
-    };
     let service_state = ServiceStateController::new(ServiceState::Ready);
     #[cfg(not(feature = "test-support"))]
     let task_manager = TaskManagerHandle::spawn(
@@ -892,8 +907,8 @@ async fn start_primary(
         writer.clone(),
         dispatcher.clone(),
         service_state.clone(),
-        dependencies.runner.clone(),
-        MAX_CONCURRENT_TASKS,
+        runner.clone(),
+        concurrency,
         ACTOR_QUEUE_CAPACITY,
     );
     #[cfg(feature = "test-support")]
@@ -903,8 +918,8 @@ async fn start_primary(
             writer.clone(),
             dispatcher.clone(),
             service_state.clone(),
-            dependencies.runner.clone(),
-            MAX_CONCURRENT_TASKS,
+            runner.clone(),
+            concurrency,
             ACTOR_QUEUE_CAPACITY,
             support.actor_pauses.clone(),
         ),
@@ -913,8 +928,8 @@ async fn start_primary(
             writer.clone(),
             dispatcher.clone(),
             service_state.clone(),
-            dependencies.runner.clone(),
-            MAX_CONCURRENT_TASKS,
+            runner.clone(),
+            concurrency,
             ACTOR_QUEUE_CAPACITY,
         ),
     };
@@ -936,7 +951,7 @@ async fn start_primary(
         service_state.clone(),
         mutation_gate.clone(),
         started_at,
-        MAX_CONCURRENT_TASKS as u32,
+        runner_selection.concurrency().get(),
         WRITE_BUDGET,
         quit_signal,
     );
@@ -1474,7 +1489,10 @@ impl NativeMessageSink for SystemNativeMessageSink {
             command.process_group(0);
         }
 
-        let mut child = command.spawn()?;
+        let mut child = {
+            let _spawn_guard = coding_agent_runtime::acquire_process_spawn_lock();
+            command.spawn()?
+        };
         let mut ready = [0_u8; 1];
         child
             .stdout

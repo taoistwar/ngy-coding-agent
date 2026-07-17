@@ -290,6 +290,20 @@ describe("Sidebar", () => {
 });
 
 describe("TaskComposer", () => {
+  it("states the isolated-worktree and trusted-code execution boundary", () => {
+    render(
+      <TaskComposer
+        repositoryId="repo"
+        onCreateTask={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/isolated Git worktree/)).toBeVisible();
+    expect(screen.getByText(/current user permissions/)).toBeVisible();
+    expect(screen.getByText(/not a malicious-code sandbox/)).toBeVisible();
+  });
+
   it("trims input, counts Unicode scalar values, and enforces the 50,000 limit", async () => {
     const user = userEvent.setup();
     const onCreateTask = vi.fn((): CreateTaskCommand => ({

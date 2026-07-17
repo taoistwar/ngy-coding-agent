@@ -143,6 +143,11 @@ export function TaskComposer({
   return (
     <section className="task-composer" aria-labelledby="new-task-heading">
       <h2 id="new-task-heading">New task</h2>
+      <p className="execution-boundary-note">
+        Tasks run in an isolated Git worktree. Cargo executes repository and
+        generated code with your current user permissions; this is not a
+        malicious-code sandbox.
+      </p>
       <form onSubmit={(event) => void submit(event)} noValidate>
         <label htmlFor={descriptionId}>Task description</label>
         <textarea

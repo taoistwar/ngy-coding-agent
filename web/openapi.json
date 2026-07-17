@@ -1388,7 +1388,8 @@
           "status",
           "patch",
           "additions",
-          "deletions"
+          "deletions",
+          "truncated"
         ],
         "properties": {
           "additions": {
@@ -1409,6 +1410,9 @@
           },
           "status": {
             "$ref": "#/components/schemas/DiffFileStatusDto"
+          },
+          "truncated": {
+            "type": "boolean"
           }
         }
       },

@@ -532,6 +532,7 @@ fn diff(revision: u64) -> DiffSnapshot {
             patch: format!("revision {revision}"),
             additions: revision,
             deletions: 0,
+            truncated: false,
         }],
     }
 }
