@@ -16,11 +16,13 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
+use crate::PrivateFile;
 use crate::platform::{create_private_directory, harden_private_file};
 use crate::{
     BrowserLaunchError, BrowserOpener, FakeRunnerConfig, FakeScenario, FixedStartupRunnerFactory,
-    NativeMessageSink, PlatformPaths, PrivateFile, ScriptedFakeRunner, StartupDependencies,
-    StartupPaths, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterTestController,
+    NativeMessageSink, PlatformPaths, ScriptedFakeRunner, StartupDependencies, StartupPaths,
+    StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterTestController,
 };
 
 pub const TEST_APP_DATA_ENV: &str = "CODING_AGENT_TEST_APP_DATA_DIR";
