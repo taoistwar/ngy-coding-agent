@@ -209,7 +209,11 @@ impl StartupRunnerFactory for ProductionStartupRunnerFactory {
         let toolchain = Arc::new(
             discover_toolchain(context.paths().runtime_dir.as_path(), None, None)
                 .await
-                .map_err(|error| StartupRunnerFactoryError::new(error.code()))?,
+                .map_err(|error| {
+                    #[cfg(test)]
+                    eprintln!("secret-safe toolchain discovery failure: {error:?}");
+                    StartupRunnerFactoryError::new(error.code())
+                })?,
         );
         let process_limits = production_process_limits();
         let worktree_limits = WorktreeLimits::try_new(Duration::from_secs(60))

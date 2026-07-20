@@ -118,12 +118,29 @@ fn assert_private_path(path: &std::path::Path) {
     } else {
         windows_sys::Win32::Security::NO_INHERITANCE
     };
-    assert_windows_owner_only_acl(path, true, Some(expected_inheritance));
+    assert_windows_owner_only_acl(
+        path,
+        true,
+        Some(expected_inheritance),
+        WindowsOwnerExpectation::ExplicitTokenUser,
+    );
 }
 
 #[cfg(windows)]
 fn assert_inherited_private_file(path: &std::path::Path) {
-    assert_windows_owner_only_acl(path, false, None);
+    assert_windows_owner_only_acl(
+        path,
+        false,
+        None,
+        WindowsOwnerExpectation::NewObjectTokenOwner,
+    );
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum WindowsOwnerExpectation {
+    ExplicitTokenUser,
+    NewObjectTokenOwner,
 }
 
 #[cfg(windows)]
@@ -131,6 +148,7 @@ fn assert_windows_owner_only_acl(
     path: &std::path::Path,
     protected: bool,
     expected_inheritance: Option<u32>,
+    owner_expectation: WindowsOwnerExpectation,
 ) {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
@@ -146,8 +164,8 @@ fn assert_windows_owner_only_acl(
         ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
         GetSecurityDescriptorControl, GetTokenInformation, INHERITED_ACE,
-        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, TOKEN_QUERY,
-        TOKEN_USER, TokenUser,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, TOKEN_OWNER,
+        TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
@@ -178,8 +196,39 @@ fn assert_windows_owner_only_acl(
         0,
         "read TokenUser"
     );
+    let mut owner_required = 0u32;
+    unsafe {
+        GetTokenInformation(token, TokenOwner, null_mut(), 0, &mut owner_required);
+    }
+    assert_ne!(owner_required, 0, "measure TokenOwner buffer");
+    let mut token_owner_buffer =
+        vec![0usize; (owner_required as usize).div_ceil(size_of::<usize>())];
+    assert_ne!(
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenOwner,
+                token_owner_buffer.as_mut_ptr().cast(),
+                owner_required,
+                &mut owner_required,
+            )
+        },
+        0,
+        "read TokenOwner"
+    );
     unsafe { CloseHandle(token) };
     let current_user = unsafe { (&*token_buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let token_owner = unsafe { (&*token_owner_buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+    assert!(!current_user.is_null());
+    assert!(!token_owner.is_null());
+    let expected_owner = match owner_expectation {
+        WindowsOwnerExpectation::ExplicitTokenUser => current_user,
+        // Windows assigns an ordinary new object's owner from TokenOwner. An
+        // elevated token may name Administrators here even though TokenUser is
+        // the account SID. The inherited DACL below must still contain only
+        // the explicit current-user ACE installed on the parent directory.
+        WindowsOwnerExpectation::NewObjectTokenOwner => token_owner,
+    };
 
     let wide = path
         .as_os_str()
@@ -205,9 +254,10 @@ fn assert_windows_owner_only_acl(
     assert!(!owner.is_null());
     assert!(!dacl.is_null());
     assert_ne!(
-        unsafe { EqualSid(owner, current_user) },
+        unsafe { EqualSid(owner, expected_owner) },
         0,
-        "the path owner must be the current TokenUser"
+        "the path owner must match its Windows creation semantics for {}",
+        path.display()
     );
 
     let mut control = 0u16;

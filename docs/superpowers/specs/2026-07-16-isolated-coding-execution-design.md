@@ -152,7 +152,7 @@ Project 2 对 Completed、Failed、Cancelled、Interrupted 的 worktree 和分�
 
 内部命令由不可由模型构造的 `ValidatedCommand` 表示，不调用 `sh -c`、`cmd /C` 或 PowerShell。应用启动时解析、验证并固定 Git/Cargo/Rust 工具的绝对可执行文件身份，不按模型输入或 child cwd 搜索 PATH。发现阶段通过同一个有界 supervisor 执行固定的 `git --version` 探针，并要求 Git 2.45 或更新版本；这是固定 `--no-lazy-fetch` 防护参数的明确能力下限，旧版本在启动时以稳定错误 fail closed。模型只看到第 6.1 节 typed 工具；runtime 为 Git status/diff 和 Cargo metadata/check/test 生成固定 argv，不提供任意 program/args/cwd 接口。
 
-固定身份在 spawn 边界继续保持：Unix 从已打开的 executable fd 经 `/proc/self/fd` 或 `/dev/fd` 执行，并在 `pre_exec` 中对已打开的 worktree fd 执行 `fchdir`；Windows 对 executable 持有 deny-write/deny-delete lease，并在 suspended `CreateProcess` 消费 cwd 路径期间持有已重验身份的目录 lease。Cargo 的 `RUSTC`、`RUSTDOC` 与可离线调用的 Git 都来自同一组 pinned tool handles，且在每次 Cargo spawn 前一并重验。bootstrap `rustc --print sysroot` 也通过同一个 supervisor，而不是另走只终止 leader 的临时进程路径。
+固定身份在 spawn 边界继续保持：Unix 从已打开的 executable fd 经 `/proc/self/fd` 或 `/dev/fd` 执行，并在 `pre_exec` 中对已打开的 worktree fd 执行 `fchdir`；Windows 对 executable 持有 deny-write/deny-delete lease，并在 suspended `CreateProcess` 消费 cwd 路径期间持有已重验身份的目录 lease。Cargo 的 `RUSTC`、`RUSTDOC` 与可离线调用的 Git 都来自同一组 pinned tool handles，且在每次 Cargo spawn 前一并重验。直接或未知来源的 bootstrap `rustc --print sysroot` 也通过同一个 supervisor，而不是另走只终止 leader 的临时进程路径；对于严格 canonical、逐级 containment 校验且与 rustup 默认 concrete compiler 完全匹配的 `<RUSTUP_HOME>/toolchains/<default>`，直接采用该受管根作为 sysroot，避免 macOS `/dev/fd` 执行破坏 compiler 自定位。
 
 Cargo metadata 只有在完整未截断时才解析；workspace root、固定的 worktree 内 `target` 目录、每个 workspace member manifest 与 target source 都必须再次通过 worktree handle no-follow 打开验证。package 与 integration-test selector 只接受这次 metadata 的精确发现值，check/test 的总 timeout 同时覆盖前置 metadata 与最终命令。
 

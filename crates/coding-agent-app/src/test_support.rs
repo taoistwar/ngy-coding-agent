@@ -31,6 +31,7 @@ pub const TEST_SCENARIO_ENV: &str = "CODING_AGENT_TEST_SCENARIO";
 
 const MAX_SCENARIO_BYTES: u64 = 1024 * 1024;
 const MAX_SIGNAL_NAME_BYTES: usize = 64;
+const PROCESS_TEST_CONCURRENCY: NonZeroU32 = NonZeroU32::new(4).unwrap();
 const SIGNAL_DIRECTORY_NAME: &str = "signals";
 pub const TEST_PICKER_PROBE_FILE: &str = "native-picker-invoked.probe";
 pub const TEST_BROWSER_PROBE_FILE: &str = "browser-invoked.probe";
@@ -396,7 +397,7 @@ impl ProcessTestEnvironment {
         dependencies.dialog = Some(crate::NativeDialogService::process_test_probe(picker_probe));
         dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new(
             runner.clone(),
-            NonZeroU32::new(1).expect("process-test concurrency is nonzero"),
+            PROCESS_TEST_CONCURRENCY,
         ));
         dependencies.process_test_support = Some(Arc::new(ProcessTestRuntime {
             config: self.config,

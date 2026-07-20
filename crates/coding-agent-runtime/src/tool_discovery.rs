@@ -192,9 +192,14 @@ pub async fn discover(
     .await?;
     require_supported_git_version(&git_version_output)?;
 
-    let sysroot_output =
-        query_sysroot(bootstrap_rustc, runtime_safe_cwd, bootstrap_environment).await?;
-    let sysroot = parse_sysroot_line(&sysroot_output)?;
+    let known_sysroot = bootstrap_rustc.known_sysroot.clone();
+    let sysroot = if let Some(known_sysroot) = known_sysroot {
+        known_sysroot
+    } else {
+        let sysroot_output =
+            query_sysroot(bootstrap_rustc, runtime_safe_cwd, bootstrap_environment).await?;
+        parse_sysroot_line(&sysroot_output)?
+    };
     let sysroot = canonical_existing_directory(&sysroot, ToolDiscoveryError::SysrootInvalid)?;
     let bin =
         canonical_existing_directory(&sysroot.join("bin"), ToolDiscoveryError::SysrootInvalid)?;
@@ -271,6 +276,13 @@ impl ToolRole {
 
 struct BootstrapExecutable {
     pinned: PinnedExecutable,
+    known_sysroot: Option<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConcreteRustupRustc {
+    executable: PathBuf,
+    sysroot: PathBuf,
 }
 
 fn resolve_bootstrap_executable(
@@ -279,8 +291,6 @@ fn resolve_bootstrap_executable(
     host_path: &[PathBuf],
     rustup_home: Option<&Path>,
 ) -> Result<BootstrapExecutable, ToolDiscoveryError> {
-    #[cfg(not(windows))]
-    let _ = rustup_home;
     let candidate = if let Some(path) = explicit_path {
         validate_unambiguous_absolute_path(path).map_err(|_| role.invalid_error())?;
         path.to_owned()
@@ -292,6 +302,7 @@ fn resolve_bootstrap_executable(
     // Host PATH entries are bootstrap input only. Resolve a trusted shim once,
     // then pin and invoke the canonical object; child processes never search it.
     let mut canonical = std::fs::canonicalize(&candidate).map_err(|_| role.invalid_error())?;
+    let mut known_sysroot = None;
     if is_rustup_rustc_proxy(role, &candidate, &canonical) {
         // A retained executable descriptor has a kernel-visible `/proc/self/fd`
         // or `/dev/fd` path on Unix, while canonicalization exposes `rustup.exe`
@@ -299,8 +310,12 @@ fn resolve_bootstrap_executable(
         // only rustup's bounded, host-owned default setting and pin that already-
         // installed toolchain's concrete compiler. No repository override,
         // inherited working directory, or network lookup participates.
-        canonical =
+        let concrete =
             concrete_rustup_rustc(rustup_home.ok_or(ToolDiscoveryError::BootstrapRustcInvalid)?)?;
+        canonical = concrete.executable;
+        known_sysroot = Some(concrete.sysroot);
+    } else if matches!(role, ToolRole::BootstrapRustc) {
+        known_sysroot = matching_managed_rustup_sysroot(rustup_home, &canonical);
     }
     #[cfg(windows)]
     if matches!(role, ToolRole::Git) {
@@ -309,7 +324,10 @@ fn resolve_bootstrap_executable(
     validate_unambiguous_absolute_path(&canonical).map_err(|_| role.invalid_error())?;
     let pinned = PinnedExecutable::open(&canonical).map_err(|_| role.invalid_error())?;
 
-    Ok(BootstrapExecutable { pinned })
+    Ok(BootstrapExecutable {
+        pinned,
+        known_sysroot,
+    })
 }
 
 fn has_file_name(path: &Path, expected: &str) -> bool {
@@ -332,9 +350,36 @@ fn is_rustup_rustc_proxy(role: ToolRole, candidate: &Path, canonical: &Path) -> 
     #[cfg(not(windows))]
     let (rustc_name, rustup_name) = ("rustc", "rustup");
 
-    matches!(role, ToolRole::BootstrapRustc)
-        && has_file_name(candidate, rustc_name)
-        && has_file_name(canonical, rustup_name)
+    if !matches!(role, ToolRole::BootstrapRustc) || !has_file_name(candidate, rustc_name) {
+        return false;
+    }
+    if has_file_name(canonical, rustup_name) {
+        return true;
+    }
+
+    // rustup historically preferred hard-linked proxies and still permits
+    // them as a fallback. Canonicalization cannot distinguish those names, so
+    // compare the candidate with the fixed sibling `rustup` object on Unix.
+    #[cfg(unix)]
+    {
+        candidate
+            .parent()
+            .is_some_and(|parent| same_unix_file(candidate, &parent.join(rustup_name)))
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn same_unix_file(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (Ok(left), Ok(right)) = (std::fs::metadata(left), std::fs::metadata(right)) else {
+        return false;
+    };
+    left.is_file() && right.is_file() && left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(windows)]
@@ -391,7 +436,7 @@ fn windows_git_for_windows_layout_candidates(candidate: &Path) -> Option<[PathBu
     Some(architectures.map(|architecture| root.join(architecture).join("bin").join("git.exe")))
 }
 
-fn concrete_rustup_rustc(rustup_home: &Path) -> Result<PathBuf, ToolDiscoveryError> {
+fn concrete_rustup_rustc(rustup_home: &Path) -> Result<ConcreteRustupRustc, ToolDiscoveryError> {
     const SETTINGS_LIMIT: u64 = 64 * 1024;
 
     let root = crate::RootCapability::open(rustup_home)
@@ -425,7 +470,7 @@ fn concrete_rustup_rustc(rustup_home: &Path) -> Result<PathBuf, ToolDiscoveryErr
 fn concrete_rustup_rustc_path(
     rustup_home: &Path,
     toolchain: &str,
-) -> Result<PathBuf, ToolDiscoveryError> {
+) -> Result<ConcreteRustupRustc, ToolDiscoveryError> {
     if !is_safe_rustup_toolchain_name(toolchain) {
         return Err(ToolDiscoveryError::BootstrapRustcInvalid);
     }
@@ -467,7 +512,18 @@ fn concrete_rustup_rustc_path(
     {
         return Err(ToolDiscoveryError::BootstrapRustcInvalid);
     }
-    Ok(canonical)
+    Ok(ConcreteRustupRustc {
+        executable: canonical,
+        sysroot: toolchain_root,
+    })
+}
+
+fn matching_managed_rustup_sysroot(
+    rustup_home: Option<&Path>,
+    canonical_rustc: &Path,
+) -> Option<PathBuf> {
+    let concrete = concrete_rustup_rustc(rustup_home?).ok()?;
+    (concrete.executable == canonical_rustc).then_some(concrete.sysroot)
 }
 
 fn parse_default_rustup_toolchain(settings: &str) -> Option<&str> {
@@ -1072,6 +1128,32 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rustup_proxy_detection_recognizes_hardlinked_unix_proxies() {
+        let temporary = tempfile::tempdir().unwrap();
+        let rustup = temporary.path().join("rustup");
+        let rustc = temporary.path().join("rustc");
+        std::fs::write(&rustup, b"rustup proxy image").unwrap();
+        std::fs::hard_link(&rustup, &rustc).unwrap();
+
+        let canonical_rustc = std::fs::canonicalize(&rustc).unwrap();
+        assert!(has_file_name(&canonical_rustc, "rustc"));
+        assert!(is_rustup_rustc_proxy(
+            ToolRole::BootstrapRustc,
+            &rustc,
+            &canonical_rustc
+        ));
+
+        std::fs::remove_file(&rustc).unwrap();
+        std::fs::write(&rustc, b"independent compiler image").unwrap();
+        assert!(!is_rustup_rustc_proxy(
+            ToolRole::BootstrapRustc,
+            &rustc,
+            &std::fs::canonicalize(&rustc).unwrap()
+        ));
+    }
+
     #[test]
     fn concrete_rustup_rustc_path_uses_only_the_configured_installed_layout() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1081,9 +1163,11 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let rustc = bin.join(ToolRole::Rustc.executable_name());
         std::fs::write(&rustc, b"test compiler").unwrap();
+        let concrete = concrete_rustup_rustc_path(rustup_home, toolchain).unwrap();
+        assert_eq!(concrete.executable, std::fs::canonicalize(rustc).unwrap());
         assert_eq!(
-            concrete_rustup_rustc_path(rustup_home, toolchain).unwrap(),
-            std::fs::canonicalize(rustc).unwrap()
+            concrete.sysroot,
+            std::fs::canonicalize(rustup_home.join("toolchains").join(toolchain)).unwrap()
         );
         assert_eq!(
             concrete_rustup_rustc_path(rustup_home, ".."),
@@ -1132,6 +1216,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn concrete_rustup_rustc_reads_the_bounded_default_setting() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let temporary = tempfile::tempdir().unwrap();
         let rustup_home = temporary.path();
         let toolchain = "1.97.0-test-host";
@@ -1139,16 +1225,38 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let rustc = bin.join(ToolRole::Rustc.executable_name());
         std::fs::write(&rustc, b"test compiler").unwrap();
+        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(
             rustup_home.join("settings.toml"),
             format!("version = \"12\"\ndefault_toolchain = \"{toolchain}\"\n"),
         )
         .unwrap();
 
+        let concrete = concrete_rustup_rustc(rustup_home).unwrap();
+        assert_eq!(concrete.executable, std::fs::canonicalize(&rustc).unwrap());
         assert_eq!(
-            concrete_rustup_rustc(rustup_home).unwrap(),
-            std::fs::canonicalize(rustc).unwrap()
+            concrete.sysroot,
+            std::fs::canonicalize(rustup_home.join("toolchains").join(toolchain)).unwrap()
         );
+        assert_eq!(
+            matching_managed_rustup_sysroot(Some(rustup_home), &concrete.executable),
+            Some(concrete.sysroot.clone())
+        );
+        assert_eq!(
+            matching_managed_rustup_sysroot(
+                Some(rustup_home),
+                &temporary.path().join("other-rustc")
+            ),
+            None
+        );
+        let resolved = resolve_bootstrap_executable(
+            ToolRole::BootstrapRustc,
+            Some(&rustc),
+            &[],
+            Some(rustup_home),
+        )
+        .unwrap();
+        assert_eq!(resolved.known_sysroot, Some(concrete.sysroot));
     }
 
     #[cfg(windows)]
