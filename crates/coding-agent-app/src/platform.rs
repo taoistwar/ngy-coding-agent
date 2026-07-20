@@ -181,6 +181,24 @@ pub(crate) fn read_private_file_bounded(
 }
 
 pub(crate) fn validate_private_file(file: &File) -> io::Result<()> {
+    validate_private_file_with(file, validate_private_file_permissions)
+}
+
+pub(crate) fn validate_private_file_snapshot(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        validate_private_file_with(file, validate_private_file_snapshot_permissions)
+    }
+    #[cfg(windows)]
+    {
+        validate_private_file(file)
+    }
+}
+
+fn validate_private_file_with(
+    file: &File,
+    validate_permissions: fn(&File) -> io::Result<()>,
+) -> io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -199,7 +217,7 @@ pub(crate) fn validate_private_file(file: &File) -> io::Result<()> {
             ));
         }
     }
-    validate_private_file_permissions(file)
+    validate_permissions(file)
 }
 
 pub(crate) fn harden_private_file(file: &File) -> io::Result<()> {
@@ -384,31 +402,37 @@ fn make_private_file(file: &File) -> io::Result<()> {
     crate::macos_acl::clear_extended_acl(file)
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn validate_private_file_permissions(file: &File) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let metadata = file.metadata()?;
-    if metadata.permissions().mode() & 0o7777 == 0o600
-        && metadata.nlink() == 1
-        && metadata.uid() == unsafe { libc::geteuid() }
-    {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "private file permissions are not owner-only read/write",
-        ))
-    }
+    validate_private_unix_file_permissions(file, PrivateFileLinkPolicy::ExactlyOne)
 }
 
-#[cfg(target_os = "macos")]
-fn validate_private_file_permissions(file: &File) -> io::Result<()> {
+#[cfg(unix)]
+fn validate_private_file_snapshot_permissions(file: &File) -> io::Result<()> {
+    validate_private_unix_file_permissions(file, PrivateFileLinkPolicy::Snapshot)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum PrivateFileLinkPolicy {
+    ExactlyOne,
+    Snapshot,
+}
+
+#[cfg(unix)]
+fn validate_private_unix_file_permissions(
+    file: &File,
+    link_policy: PrivateFileLinkPolicy,
+) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = file.metadata()?;
+    let link_count_is_valid = match link_policy {
+        PrivateFileLinkPolicy::ExactlyOne => metadata.nlink() == 1,
+        PrivateFileLinkPolicy::Snapshot => metadata.nlink() <= 1,
+    };
     if metadata.permissions().mode() & 0o7777 != 0o600
-        || metadata.nlink() != 1
+        || !link_count_is_valid
         || metadata.uid() != unsafe { libc::geteuid() }
     {
         return Err(io::Error::new(
@@ -416,7 +440,12 @@ fn validate_private_file_permissions(file: &File) -> io::Result<()> {
             "private file permissions are not owner-only read/write",
         ));
     }
-    crate::macos_acl::validate_no_extended_acl(file)
+
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_acl::validate_no_extended_acl(file)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -750,6 +779,71 @@ mod tests {
             b"opened file contents"
         );
         assert_eq!(std::fs::read(&victim).unwrap(), b"victim contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_validation_accepts_an_open_inode_unlinked_by_atomic_replacement() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().expect("create descriptor replacement fixture");
+        let path = temp.path().join("instance.json");
+        let replacement_path = temp.path().join("instance.json.next");
+        let old_contents = b"complete old descriptor";
+        let new_contents = b"complete new descriptor";
+
+        let mut opened = PrivateFile::create_new(&path).expect("create old descriptor");
+        opened
+            .write_all(old_contents)
+            .expect("write old descriptor");
+        opened.flush().expect("flush old descriptor");
+
+        let mut replacement =
+            PrivateFile::create_new(&replacement_path).expect("create replacement descriptor");
+        replacement
+            .write_all(new_contents)
+            .expect("write replacement descriptor");
+        replacement.flush().expect("flush replacement descriptor");
+        drop(replacement);
+
+        std::fs::rename(&replacement_path, &path).expect("atomically replace descriptor");
+        assert_eq!(
+            opened.as_file().metadata().unwrap().nlink(),
+            0,
+            "the still-open old descriptor no longer has a directory entry"
+        );
+        assert!(
+            validate_private_file(opened.as_file()).is_err(),
+            "permanent private files must remain linked exactly once"
+        );
+        validate_private_file_snapshot(opened.as_file())
+            .expect("an already-open unlinked descriptor snapshot remains private");
+
+        opened
+            .seek(io::SeekFrom::Start(0))
+            .expect("rewind old descriptor");
+        let mut observed = Vec::new();
+        opened
+            .read_to_end(&mut observed)
+            .expect("read old descriptor snapshot");
+        assert_eq!(observed, old_contents);
+        assert_eq!(std::fs::read(&path).unwrap(), new_contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_validation_rejects_a_file_with_multiple_hard_links() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().expect("create hard-link fixture");
+        let path = temp.path().join("instance.json");
+        let alias = temp.path().join("instance-alias.json");
+        let opened = PrivateFile::create_new(&path).expect("create private descriptor");
+        std::fs::hard_link(&path, &alias).expect("create descriptor hard link");
+
+        assert_eq!(opened.as_file().metadata().unwrap().nlink(), 2);
+        assert!(validate_private_file(opened.as_file()).is_err());
+        assert!(validate_private_file_snapshot(opened.as_file()).is_err());
     }
 
     #[cfg(windows)]

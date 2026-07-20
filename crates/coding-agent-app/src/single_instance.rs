@@ -23,7 +23,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::platform::{PrivateFile, harden_private_file, validate_private_file};
+use crate::platform::{
+    PrivateFile, harden_private_file, validate_private_file, validate_private_file_snapshot,
+};
 use crate::security::{LauncherSecret, SecurityClock, SecurityError, SystemSecurityClock};
 use crate::shutdown::ShutdownCleanup;
 #[cfg(feature = "test-support")]
@@ -266,7 +268,7 @@ impl RuntimeDescriptor {
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
         let file = options.open(path)?;
-        validate_private_file(&file)?;
+        validate_private_file_snapshot(&file)?;
         if file.metadata()?.len() > MAX_DESCRIPTOR_BYTES {
             return Err(RuntimeDescriptorError::Invalid("document is too large"));
         }

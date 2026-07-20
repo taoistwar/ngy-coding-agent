@@ -179,7 +179,7 @@ async fn provider_request(
                 }),
             ),
             1 => {
-                assert!(latest_tool_content(&body).starts_with("[tool_status=failed;"));
+                assert_latest_tool_status(&body, "failed");
                 final_response("path escape was rejected")
             }
             _ => panic!("unexpected path-escape provider request {call}"),
@@ -251,7 +251,7 @@ fn scripted_coding_response(
             )
         }
         3 if state.scenario == Scenario::ReplaceAfterPass => {
-            assert!(latest_tool_content(request).starts_with("[tool_status=succeeded;"));
+            assert_latest_tool_status(request, "succeeded");
             let digest = state
                 .replacement_sha256
                 .lock()
@@ -269,16 +269,15 @@ fn scripted_coding_response(
             )
         }
         3 => {
-            let content = latest_tool_content(request);
             if state.scenario == Scenario::TestFailure {
-                assert!(content.starts_with("[tool_status=failed;"));
+                assert_latest_tool_status(request, "failed");
             } else {
-                assert!(content.starts_with("[tool_status=succeeded;"));
+                assert_latest_tool_status(request, "succeeded");
             }
             final_response("offline task finished")
         }
         4 if state.scenario == Scenario::ReplaceAfterPass => {
-            assert!(latest_tool_content(request).starts_with("[tool_status=succeeded;"));
+            assert_latest_tool_status(request, "succeeded");
             final_response("stale test must not prove completion")
         }
         _ => panic!("unexpected scripted provider request {call}"),
@@ -294,6 +293,14 @@ fn latest_tool_content(request: &serde_json::Value) -> &str {
         .find(|message| message["role"] == "tool")
         .and_then(|message| message["content"].as_str())
         .expect("latest tool result")
+}
+
+fn assert_latest_tool_status(request: &serde_json::Value, expected: &str) {
+    let content = latest_tool_content(request);
+    assert!(
+        content.starts_with(&format!("[tool_status={expected};")),
+        "expected a {expected} tool result, got: {content}"
+    );
 }
 
 fn latest_tool_payload(request: &serde_json::Value) -> serde_json::Value {
