@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -1233,20 +1235,21 @@ fn git_line(repository: &Path, arguments: &[&str]) -> String {
 }
 
 fn git_output(repository: &Path, arguments: &[&str]) -> Output {
-    Command::new("git")
-        .arg("--no-pager")
-        .arg("-c")
-        .arg(git_hooks_path_configuration())
-        .arg("-c")
-        .arg("commit.gpgSign=false")
-        .arg("-C")
-        .arg(repository)
-        .args(arguments)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", null_device())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .unwrap()
+    support::command_output(
+        Command::new("git")
+            .arg("--no-pager")
+            .arg("-c")
+            .arg(git_hooks_path_configuration())
+            .arg("-c")
+            .arg("commit.gpgSign=false")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device())
+            .env("GIT_TERMINAL_PROMPT", "0"),
+    )
+    .unwrap()
 }
 
 fn raw_worktree_add(repository: &Path, reservation: &WorktreeReservation) -> PathBuf {
@@ -1419,10 +1422,8 @@ fn assert_contains(haystack: &[u8], needle: &[u8]) {
 }
 
 fn concrete_rustc() -> PathBuf {
-    let output = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .unwrap();
+    let output =
+        support::command_output(Command::new("rustc").args(["--print", "sysroot"])).unwrap();
     assert!(output.status.success());
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
         .join("bin")

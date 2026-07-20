@@ -895,14 +895,25 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_hardening_removes_an_inherited_extended_acl() {
-        use std::process::Command;
+        use std::process::{Command, Stdio};
 
         let temp = tempfile::tempdir().expect("create inherited ACL fixture");
         let parent = temp.path().join("parent");
         std::fs::create_dir(&parent).expect("create ACL parent");
-        let username = Command::new("id")
+        let mut username_command = Command::new("id");
+        username_command
             .arg("-un")
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let username_child = {
+            let _spawn_guard = coding_agent_runtime::acquire_process_spawn_lock();
+            username_command
+                .spawn()
+                .expect("spawn current macOS username query")
+        };
+        let username = username_child
+            .wait_with_output()
             .expect("read current macOS username");
         assert!(username.status.success());
         let username = String::from_utf8(username.stdout)
@@ -910,11 +921,17 @@ mod tests {
             .trim()
             .to_owned();
         let inherited_ace = format!("{username} allow read,file_inherit");
-        let status = Command::new("chmod")
+        let mut chmod_command = Command::new("chmod");
+        chmod_command
             .args(["+a", inherited_ace.as_str()])
-            .arg(&parent)
-            .status()
-            .expect("install inheritable macOS ACL");
+            .arg(&parent);
+        let mut chmod_child = {
+            let _spawn_guard = coding_agent_runtime::acquire_process_spawn_lock();
+            chmod_command
+                .spawn()
+                .expect("spawn inheritable macOS ACL installer")
+        };
+        let status = chmod_child.wait().expect("install inheritable macOS ACL");
         assert!(status.success());
 
         let path = parent.join("instance.json");

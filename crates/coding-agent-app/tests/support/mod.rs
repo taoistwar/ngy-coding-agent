@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -658,10 +658,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let status = Command::new(program)
-        .args(args)
-        .current_dir(current_dir)
-        .status()
+    let status = command_status(Command::new(program).args(args).current_dir(current_dir))
         .expect("run fixture command");
     assert!(status.success(), "fixture command failed: {program}");
 }
@@ -671,13 +668,30 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(current_dir)
-        .output()
+    let output = command_output(Command::new(program).args(args).current_dir(current_dir))
         .expect("run fixture command");
     assert!(output.status.success(), "fixture command failed: {program}");
     output.stdout
+}
+
+pub fn command_output(command: &mut Command) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = {
+        let _spawn_guard = coding_agent_runtime::acquire_process_spawn_lock();
+        command.spawn()?
+    };
+    child.wait_with_output()
+}
+
+pub fn command_status(command: &mut Command) -> io::Result<ExitStatus> {
+    let mut child = {
+        let _spawn_guard = coding_agent_runtime::acquire_process_spawn_lock();
+        command.spawn()?
+    };
+    child.wait()
 }
 
 pub struct FakeRunnerFixture {

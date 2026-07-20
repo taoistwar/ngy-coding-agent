@@ -1147,22 +1147,21 @@ fn git_line(repository: &Path, arguments: &[&str]) -> String {
 }
 
 fn git_output(repository: &Path, arguments: &[&str]) -> Output {
-    Command::new(path_executable(if cfg!(windows) {
-        "git.exe"
-    } else {
-        "git"
-    }))
-    .arg("-C")
-    .arg(repository)
-    .args(arguments)
-    .output()
+    support::command_output(
+        Command::new(path_executable(if cfg!(windows) {
+            "git.exe"
+        } else {
+            "git"
+        }))
+        .arg("-C")
+        .arg(repository)
+        .args(arguments),
+    )
     .expect("run fixture Git")
 }
 
 fn concrete_rustc() -> PathBuf {
-    let output = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
+    let output = support::command_output(Command::new("rustc").args(["--print", "sysroot"]))
         .expect("query Rust sysroot");
     assert!(output.status.success());
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())

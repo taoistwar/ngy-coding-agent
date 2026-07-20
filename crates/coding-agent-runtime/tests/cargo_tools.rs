@@ -1,3 +1,5 @@
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -129,10 +131,8 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
 }
 
 fn concrete_rustc() -> PathBuf {
-    let output = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .unwrap();
+    let output =
+        support::command_output(Command::new("rustc").args(["--print", "sysroot"])).unwrap();
     assert!(output.status.success());
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
         .join("bin")

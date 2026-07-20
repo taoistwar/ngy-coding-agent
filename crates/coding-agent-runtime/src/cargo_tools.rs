@@ -1634,11 +1634,18 @@ mod tests {
         .unwrap();
 
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = std::process::Command::new(cargo)
+        let mut command = std::process::Command::new(cargo);
+        command
             .current_dir(root.path())
             .args(["metadata", "--format-version=1", "--no-deps", "--offline"])
-            .output()
-            .unwrap();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = {
+            let _spawn_guard = crate::acquire_process_spawn_lock();
+            command.spawn().unwrap()
+        };
+        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "cargo metadata failed: {}",

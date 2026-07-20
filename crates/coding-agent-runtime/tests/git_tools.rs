@@ -1,3 +1,5 @@
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -119,23 +121,22 @@ async fn typed_status_and_diff_observe_a_real_repository_without_call_arguments(
 }
 
 fn git(repository: &Path, arguments: &[&str]) {
-    let status = Command::new("git")
-        .arg("--no-pager")
-        .arg("-c")
-        .arg(git_hooks_path_configuration())
-        .arg("-C")
-        .arg(repository)
-        .args(arguments)
-        .status()
-        .unwrap();
+    let status = support::command_status(
+        Command::new("git")
+            .arg("--no-pager")
+            .arg("-c")
+            .arg(git_hooks_path_configuration())
+            .arg("-C")
+            .arg(repository)
+            .args(arguments),
+    )
+    .unwrap();
     assert!(status.success(), "git fixture command failed");
 }
 
 fn concrete_rustc() -> PathBuf {
-    let output = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .unwrap();
+    let output =
+        support::command_output(Command::new("rustc").args(["--print", "sysroot"])).unwrap();
     assert!(output.status.success());
     let sysroot = String::from_utf8(output.stdout).unwrap();
     PathBuf::from(sysroot.trim())

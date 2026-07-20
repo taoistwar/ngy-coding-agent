@@ -442,15 +442,16 @@ fn process_limits() -> ProcessLimits {
 }
 
 fn git(repository: &Path, arguments: &[&str]) {
-    let output = Command::new(path_executable(if cfg!(windows) {
-        "git.exe"
-    } else {
-        "git"
-    }))
-    .arg("-C")
-    .arg(repository)
-    .args(arguments)
-    .output()
+    let output = support::command_output(
+        Command::new(path_executable(if cfg!(windows) {
+            "git.exe"
+        } else {
+            "git"
+        }))
+        .arg("-C")
+        .arg(repository)
+        .args(arguments),
+    )
     .unwrap();
     assert!(
         output.status.success(),
@@ -461,10 +462,8 @@ fn git(repository: &Path, arguments: &[&str]) {
 }
 
 fn concrete_rustc() -> PathBuf {
-    let output = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .unwrap();
+    let output =
+        support::command_output(Command::new("rustc").args(["--print", "sysroot"])).unwrap();
     assert!(output.status.success());
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
         .join("bin")

@@ -1,3 +1,5 @@
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -265,27 +267,29 @@ impl RepositoryFixture {
     }
 
     fn git_output(&self, arguments: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("--no-pager")
-            .arg("-C")
-            .arg(&self.repository)
-            .args(arguments)
-            .output()
-            .unwrap();
+        let output = support::command_output(
+            Command::new("git")
+                .arg("--no-pager")
+                .arg("-C")
+                .arg(&self.repository)
+                .args(arguments),
+        )
+        .unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     fn git_expect_failure(&self, arguments: &[&str]) {
-        let status = Command::new("git")
-            .arg("--no-pager")
-            .arg("-c")
-            .arg(git_hooks_path_configuration())
-            .arg("-C")
-            .arg(&self.repository)
-            .args(arguments)
-            .status()
-            .unwrap();
+        let status = support::command_status(
+            Command::new("git")
+                .arg("--no-pager")
+                .arg("-c")
+                .arg(git_hooks_path_configuration())
+                .arg("-C")
+                .arg(&self.repository)
+                .args(arguments),
+        )
+        .unwrap();
         assert!(
             !status.success(),
             "Git command unexpectedly passed: {arguments:?}"
@@ -336,23 +340,22 @@ impl RepositoryFixture {
 }
 
 fn run_git(repository: &Path, arguments: &[&str]) {
-    let status = Command::new("git")
-        .arg("--no-pager")
-        .arg("-c")
-        .arg(git_hooks_path_configuration())
-        .arg("-C")
-        .arg(repository)
-        .args(arguments)
-        .status()
-        .unwrap();
+    let status = support::command_status(
+        Command::new("git")
+            .arg("--no-pager")
+            .arg("-c")
+            .arg(git_hooks_path_configuration())
+            .arg("-C")
+            .arg(repository)
+            .args(arguments),
+    )
+    .unwrap();
     assert!(status.success(), "Git command failed: {arguments:?}");
 }
 
 fn concrete_rustc() -> PathBuf {
-    let output = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .unwrap();
+    let output =
+        support::command_output(Command::new("rustc").args(["--print", "sysroot"])).unwrap();
     assert!(output.status.success());
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
         .join("bin")
