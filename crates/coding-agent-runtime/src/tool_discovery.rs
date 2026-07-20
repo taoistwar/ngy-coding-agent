@@ -778,7 +778,11 @@ async fn query_sysroot(
     let result = ProcessSupervisor::new(limits)
         .run(command, CancellationToken::new())
         .await
-        .map_err(map_bootstrap_process_error)?;
+        .map_err(|error| {
+            #[cfg(test)]
+            log_process_failure("bootstrap rustc", &error);
+            map_bootstrap_process_error(error)
+        })?;
 
     if result.timed_out {
         return Err(ToolDiscoveryError::BootstrapTimedOut);
@@ -827,7 +831,11 @@ async fn query_git_version(
     let result = ProcessSupervisor::new(limits)
         .run(command, CancellationToken::new())
         .await
-        .map_err(map_git_process_error)?;
+        .map_err(|error| {
+            #[cfg(test)]
+            log_process_failure("bootstrap Git", &error);
+            map_git_process_error(error)
+        })?;
 
     if result.timed_out {
         return Err(ToolDiscoveryError::BootstrapGitTimedOut);
@@ -865,6 +873,32 @@ fn map_git_process_error(error: ProcessError) -> ToolDiscoveryError {
         | ProcessError::TreeCleanupFailed(_)
         | ProcessError::CleanupTimedOut
         | ProcessError::WorkerFailed => ToolDiscoveryError::BootstrapGitWaitFailed,
+    }
+}
+
+#[cfg(test)]
+fn log_process_failure(context: &str, error: &ProcessError) {
+    let (variant, source) = match error {
+        ProcessError::InvalidCommand => ("InvalidCommand", None),
+        ProcessError::CommandPolicy(_) => ("CommandPolicy", None),
+        ProcessError::TimeoutOutsideLimit => ("TimeoutOutsideLimit", None),
+        ProcessError::SpawnFailed(source) => ("SpawnFailed", Some(source)),
+        ProcessError::TreeSetupFailed(source) => ("TreeSetupFailed", Some(source)),
+        ProcessError::MissingOutputPipe => ("MissingOutputPipe", None),
+        ProcessError::WaitFailed(source) => ("WaitFailed", Some(source)),
+        ProcessError::TreeCleanupFailed(source) => ("TreeCleanupFailed", Some(source)),
+        ProcessError::CleanupTimedOut => ("CleanupTimedOut", None),
+        ProcessError::OutputDrainFailed(source) => ("OutputDrainFailed", Some(source)),
+        ProcessError::WorkerFailed => ("WorkerFailed", None),
+    };
+    if let Some(source) = source {
+        eprintln!(
+            "secret-safe {context} process failure: variant={variant} io_kind={:?} raw_os_error={:?}",
+            source.kind(),
+            source.raw_os_error()
+        );
+    } else {
+        eprintln!("secret-safe {context} process failure: variant={variant}");
     }
 }
 
