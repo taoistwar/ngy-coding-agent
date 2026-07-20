@@ -2392,7 +2392,7 @@ mod tests {
                 .into_iter()
                 .map(OsString::from)
                 .collect(),
-            temp.path().to_path_buf(),
+            temp.path().canonicalize().unwrap(),
             environment,
             timeout,
         )

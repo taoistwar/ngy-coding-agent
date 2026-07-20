@@ -312,7 +312,7 @@ mod tests {
         std::fs::write(safe.join("value.txt"), b"inside").unwrap();
         std::fs::write(outside.path().join("value.txt"), b"outside").unwrap();
 
-        let root = RootCapability::open(root_directory.path()).unwrap();
+        let root = RootCapability::open(root_directory.path().canonicalize().unwrap()).unwrap();
         let path = RelativePath::parse("safe/value.txt").unwrap();
         let mut file = root
             .open_file_for_read_with_hook(&path, |depth| {
@@ -338,7 +338,7 @@ mod tests {
             return;
         }
 
-        let root = RootCapability::open(root_directory.path()).unwrap();
+        let root = RootCapability::open(root_directory.path().canonicalize().unwrap()).unwrap();
         let path = RelativePath::parse("linked/escaped".to_owned()).unwrap();
         assert!(root.ensure_directory_path(&path).is_err());
         assert!(!outside.path().join("escaped").exists());
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn directory_creation_returns_a_guard_for_the_exact_parent() {
         let root_directory = tempfile::tempdir().unwrap();
-        let root = RootCapability::open(root_directory.path()).unwrap();
+        let root = RootCapability::open(root_directory.path().canonicalize().unwrap()).unwrap();
         let path = RelativePath::parse("one/two".to_owned()).unwrap();
 
         let guard = root.ensure_directory_path(&path).unwrap();

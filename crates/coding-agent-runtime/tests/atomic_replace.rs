@@ -314,7 +314,7 @@ struct Fixture {
 
 fn fixture(max_content_bytes: usize) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
-    let root_path = temp.path().to_path_buf();
+    let root_path = temp.path().canonicalize().unwrap();
     let root = RootCapability::open(&root_path).unwrap();
     let limits = AtomicReplaceLimits::try_new(max_content_bytes).unwrap();
     Fixture {

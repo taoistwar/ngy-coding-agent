@@ -486,7 +486,7 @@ struct Fixture {
 
 fn fixture(limits: FileToolLimits) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
-    let root_path = temp.path().to_path_buf();
+    let root_path = temp.path().canonicalize().unwrap();
     let root = RootCapability::open(&root_path).unwrap();
     Fixture {
         _temp: temp,

@@ -69,7 +69,7 @@ fn root_capability_reads_regular_files_one_component_at_a_time() {
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(nested.join("lib.rs"), b"pub fn answer() -> u8 { 42 }").unwrap();
 
-    let root = RootCapability::open(temp.path()).unwrap();
+    let root = RootCapability::open(temp.path().canonicalize().unwrap()).unwrap();
     let relative = RelativePath::parse("src/nested/lib.rs").unwrap();
     let mut file = root.open_file_for_read(&relative).unwrap();
     let mut content = String::new();
@@ -85,7 +85,7 @@ fn root_capability_rejects_final_and_ancestor_links() {
     std::fs::write(outside.path().join("secret.txt"), b"outside").unwrap();
     std::fs::create_dir(temp.path().join("safe")).unwrap();
     std::fs::write(temp.path().join("safe").join("inside.txt"), b"inside").unwrap();
-    let root = RootCapability::open(temp.path()).unwrap();
+    let root = RootCapability::open(temp.path().canonicalize().unwrap()).unwrap();
 
     create_file_link(
         &outside.path().join("secret.txt"),
@@ -105,7 +105,7 @@ fn root_capability_rejects_final_and_ancestor_links() {
 fn root_capability_rejects_a_link_as_the_root() {
     let parent = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
-    let link = parent.path().join("root-link");
+    let link = parent.path().canonicalize().unwrap().join("root-link");
     create_dir_link(target.path(), &link)
         .expect("path-security tests require directory-link creation");
     assert!(RootCapability::open(&link).is_err());
@@ -116,7 +116,7 @@ fn root_capability_rejects_a_link_in_the_root_ancestors() {
     let parent = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::create_dir(outside.path().join("worktree")).unwrap();
-    let link = parent.path().join("ancestor-link");
+    let link = parent.path().canonicalize().unwrap().join("ancestor-link");
     create_dir_link(outside.path(), &link)
         .expect("path-security tests require directory-link creation");
 
@@ -173,7 +173,7 @@ fn opening_a_fifo_fails_without_blocking() {
     let fifo = temp.path().join("pipe");
     let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
-    let root = RootCapability::open(temp.path()).unwrap();
+    let root = RootCapability::open(temp.path().canonicalize().unwrap()).unwrap();
     let started = Instant::now();
 
     assert!(

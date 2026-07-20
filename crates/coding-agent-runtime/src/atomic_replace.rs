@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn cancellation_after_sync_removes_the_exclusive_same_directory_temporary_file() {
         let temp = tempfile::tempdir().unwrap();
-        let root = RootCapability::open(temp.path()).unwrap();
+        let root = RootCapability::open(temp.path().canonicalize().unwrap()).unwrap();
         let replacer = AtomicFileReplacer::new(root, AtomicReplaceLimits::try_new(1_024).unwrap());
         let cancellation = CancellationToken::new();
         let mut observed_temporary = false;
@@ -476,7 +476,7 @@ mod tests {
         let safe = temp.path().join("safe");
         let held = temp.path().join("held");
         std::fs::create_dir(&safe).unwrap();
-        let root = RootCapability::open(temp.path()).unwrap();
+        let root = RootCapability::open(temp.path().canonicalize().unwrap()).unwrap();
         let replacer = AtomicFileReplacer::new(root, AtomicReplaceLimits::try_new(1_024).unwrap());
 
         replacer
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn cancellation_observed_after_publication_does_not_change_the_committed_result() {
         let temp = tempfile::tempdir().unwrap();
-        let root = RootCapability::open(temp.path()).unwrap();
+        let root = RootCapability::open(temp.path().canonicalize().unwrap()).unwrap();
         let replacer = AtomicFileReplacer::new(root, AtomicReplaceLimits::try_new(1_024).unwrap());
         let cancellation = CancellationToken::new();
 
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn a_swapped_temporary_leaf_is_never_published_or_deleted_as_if_it_were_ours() {
         let temp = tempfile::tempdir().unwrap();
-        let root = RootCapability::open(temp.path()).unwrap();
+        let root = RootCapability::open(temp.path().canonicalize().unwrap()).unwrap();
         let replacer = AtomicFileReplacer::new(root, AtomicReplaceLimits::try_new(1_024).unwrap());
         let held = temp.path().join("held-original.tmp");
         let mut decoy = None;

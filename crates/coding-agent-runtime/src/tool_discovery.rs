@@ -1253,7 +1253,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temporary = tempfile::tempdir().unwrap();
-        let rustup_home = temporary.path();
+        let rustup_home = temporary.path().canonicalize().unwrap();
         let toolchain = "1.97.0-test-host";
         let bin = rustup_home.join("toolchains").join(toolchain).join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -1266,19 +1266,19 @@ mod tests {
         )
         .unwrap();
 
-        let concrete = concrete_rustup_rustc(rustup_home).unwrap();
+        let concrete = concrete_rustup_rustc(&rustup_home).unwrap();
         assert_eq!(concrete.executable, std::fs::canonicalize(&rustc).unwrap());
         assert_eq!(
             concrete.sysroot,
             std::fs::canonicalize(rustup_home.join("toolchains").join(toolchain)).unwrap()
         );
         assert_eq!(
-            matching_managed_rustup_sysroot(Some(rustup_home), &concrete.executable),
+            matching_managed_rustup_sysroot(Some(&rustup_home), &concrete.executable),
             Some(concrete.sysroot.clone())
         );
         assert_eq!(
             matching_managed_rustup_sysroot(
-                Some(rustup_home),
+                Some(&rustup_home),
                 &temporary.path().join("other-rustc")
             ),
             None
@@ -1287,7 +1287,7 @@ mod tests {
             ToolRole::BootstrapRustc,
             Some(&rustc),
             &[],
-            Some(rustup_home),
+            Some(&rustup_home),
         )
         .unwrap();
         assert_eq!(resolved.known_sysroot, Some(concrete.sysroot));

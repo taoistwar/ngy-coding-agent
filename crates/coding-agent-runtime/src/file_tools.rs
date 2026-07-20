@@ -1024,7 +1024,7 @@ mod tests {
         std::fs::create_dir(&safe).unwrap();
         std::fs::write(safe.join("inside.txt"), b"inside").unwrap();
         std::fs::write(outside.path().join("outside.txt"), b"outside").unwrap();
-        let root = RootCapability::open(root_path.path()).unwrap();
+        let root = RootCapability::open(root_path.path().canonicalize().unwrap()).unwrap();
         let limits =
             FileToolLimits::try_new(1_024, 100 * 1_024, 1_024, 1_024, 3, 100, 100, 100).unwrap();
         let tools = FileTools::new(root, limits);
@@ -1064,7 +1064,7 @@ mod tests {
         std::fs::create_dir(&safe).unwrap();
         std::fs::write(safe.join("inside.txt"), b"needle inside").unwrap();
         std::fs::write(outside.path().join("outside.txt"), b"needle outside").unwrap();
-        let root = RootCapability::open(root_path.path()).unwrap();
+        let root = RootCapability::open(root_path.path().canonicalize().unwrap()).unwrap();
         let limits =
             FileToolLimits::try_new(1_024, 100 * 1_024, 1_024, 1_024, 3, 100, 100, 100).unwrap();
         let tools = FileTools::new(root, limits);
@@ -1099,7 +1099,7 @@ mod tests {
         let nested = root_path.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
         std::fs::write(nested.join("large.txt"), vec![b'x'; 512 * 1_024]).unwrap();
-        let root = RootCapability::open(root_path.path()).unwrap();
+        let root = RootCapability::open(root_path.path().canonicalize().unwrap()).unwrap();
         let limits =
             FileToolLimits::try_new(1024 * 1024, 1024 * 1024, 1024, 1024, 3, 100, 100, 100)
                 .unwrap();
