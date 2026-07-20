@@ -38,7 +38,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
     .unwrap();
     std::fs::write(
         tests.join("slow.rs"),
-        b"#[test]\nfn waits() { std::thread::sleep(std::time::Duration::from_secs(5)); }\n",
+        b"#[test]\nfn waits() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n",
     )
     .unwrap();
 
@@ -112,7 +112,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
         .test(
             Some("typed_fixture"),
             Some("slow"),
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             CancellationToken::new(),
         )
         .await

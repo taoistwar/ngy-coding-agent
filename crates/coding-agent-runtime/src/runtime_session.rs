@@ -129,8 +129,6 @@ impl RuntimeSession {
             .cloned_root_capability()
             .map_err(RuntimeSessionError::CommandPolicy)?;
         let temporary_directory = temporary_directory.as_ref();
-        let output_redactor =
-            KnownPathRedactor::for_session(worktree, toolchain, temporary_directory);
         let cargo = CargoTools::from_trusted_capabilities(
             toolchain,
             worktree.cargo_workspace(),
@@ -140,6 +138,12 @@ impl RuntimeSession {
             limits.cargo,
         )
         .map_err(RuntimeSessionError::Cargo)?;
+        let output_redactor = KnownPathRedactor::for_session(
+            worktree,
+            toolchain,
+            temporary_directory,
+            cargo.redaction_paths(),
+        );
         let git = GitTools::from_trusted_capabilities(
             toolchain,
             worktree.git_directory(),
@@ -534,6 +538,7 @@ impl KnownPathRedactor {
         worktree: &ProvisionedWorktree,
         toolchain: &ToolchainPaths,
         temporary_directory: &Path,
+        additional_paths: &[PathBuf],
     ) -> Self {
         let mut paths = vec![
             worktree.worktree_path().to_owned(),
@@ -550,6 +555,7 @@ impl KnownPathRedactor {
             toolchain.git().path().to_owned(),
         ];
         paths.extend(toolchain.search_directories().iter().cloned());
+        paths.extend(additional_paths.iter().cloned());
 
         // The linked Git directory is nested below `<repository>/.git/worktrees`.
         // Include its trusted ancestors so diagnostics that print the common
@@ -583,17 +589,24 @@ impl KnownPathRedactor {
                 continue;
             }
             let native = path.to_string_lossy().into_owned();
-            Self::push_pattern(&mut patterns, native.clone());
-            Self::push_pattern(&mut patterns, native.replace('\\', "/"));
             #[cfg(windows)]
-            if let Some(unprefixed) = native.strip_prefix(r"\\?\") {
-                Self::push_pattern(&mut patterns, unprefixed.to_owned());
-                Self::push_pattern(&mut patterns, unprefixed.replace('\\', "/"));
+            let unprefixed = native.strip_prefix(r"\\?\").map(str::to_owned);
+            Self::push_native_path_patterns(&mut patterns, native);
+            #[cfg(windows)]
+            if let Some(unprefixed) = unprefixed {
+                Self::push_native_path_patterns(&mut patterns, unprefixed);
             }
         }
         patterns.sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
         patterns.dedup();
         Self { patterns }
+    }
+
+    fn push_native_path_patterns(patterns: &mut Vec<String>, native: String) {
+        Self::push_pattern(patterns, native.clone());
+        Self::push_pattern(patterns, native.replace('\\', "/"));
+        #[cfg(windows)]
+        Self::push_pattern(patterns, native.replace('\\', r"\\"));
     }
 
     fn push_pattern(patterns: &mut Vec<String>, pattern: String) {
@@ -878,5 +891,41 @@ mod tests {
         );
         let similar_source_text = format!("{native}-example");
         assert_eq!(redactor.redact(&similar_source_text), similar_source_text);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cargo_json_escaped_windows_paths_are_redacted_with_token_boundaries() {
+        let unprefixed = r"C:\Users\runneradmin\AppData\Local\Temp\coding-agent";
+        let prefixed = format!(r"\\?\{unprefixed}");
+        let redactor = KnownPathRedactor::from_paths([PathBuf::from(&prefixed)]);
+        let escaped_prefixed = prefixed.replace('\\', r"\\");
+        let escaped_unprefixed = unprefixed.replace('\\', r"\\");
+        let encoded = format!(
+            r#"{{"descendant":"{escaped_prefixed}\\workspace","root":"{escaped_unprefixed}"}}"#
+        );
+        let observed_bytes = encoded.len() as u64;
+        let stream = crate::CapturedStream {
+            head: encoded.into_bytes(),
+            tail: Vec::new(),
+            observed_bytes,
+            omitted_observed_bytes: 0,
+            truncated: false,
+            complete: true,
+        };
+
+        let captured = captured_stream(&stream, &redactor);
+        let text = captured["text"].as_str().unwrap();
+        assert!(!text.contains(&escaped_prefixed));
+        assert!(!text.contains(&escaped_unprefixed));
+        let inner: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            inner["descendant"],
+            Value::String(format!(r"{REDACTED_PATH}\workspace"))
+        );
+        assert_eq!(inner["root"], Value::String(REDACTED_PATH.to_owned()));
+
+        let similar = format!(r#""{escaped_unprefixed}-example""#);
+        assert_eq!(redactor.redact(&similar), similar);
     }
 }

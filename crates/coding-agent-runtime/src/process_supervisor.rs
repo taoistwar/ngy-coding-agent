@@ -125,6 +125,9 @@ pub(crate) enum ToolchainEnvironmentError {
     Directory,
     #[error("the pinned Rust compiler must be an existing absolute file")]
     Compiler,
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[error("the pinned MSVC linker must be an existing absolute file")]
+    Linker,
     #[error("the explicit tool search path is invalid")]
     SearchPath,
 }
@@ -230,6 +233,40 @@ pub(crate) struct RustToolchainEnvironment {
     rustup_home: Option<PathBuf>,
     rustc: PathBuf,
     rustdoc: PathBuf,
+    #[cfg(all(windows, target_env = "msvc"))]
+    windows_msvc: Option<WindowsMsvcEnvironment>,
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+#[derive(Debug, Clone)]
+pub(crate) struct WindowsMsvcEnvironment {
+    linker_environment_key: &'static str,
+    linker: PathBuf,
+    library_path: OsString,
+    include_path: OsString,
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+impl WindowsMsvcEnvironment {
+    pub(crate) fn try_new(
+        linker: PathBuf,
+        library_directories: Vec<PathBuf>,
+        include_directories: Vec<PathBuf>,
+    ) -> Result<Self, ToolchainEnvironmentError> {
+        if !linker.is_absolute() || !linker.is_file() {
+            return Err(ToolchainEnvironmentError::Linker);
+        }
+        let library_path = join_toolchain_directories(library_directories)?;
+        let include_path = join_toolchain_directories(include_directories)?;
+        let linker_environment_key =
+            cargo_linker_environment_key().ok_or(ToolchainEnvironmentError::Linker)?;
+        Ok(Self {
+            linker_environment_key,
+            linker,
+            library_path,
+            include_path,
+        })
+    }
 }
 
 impl RustToolchainEnvironment {
@@ -269,7 +306,45 @@ impl RustToolchainEnvironment {
             rustup_home,
             rustc,
             rustdoc,
+            #[cfg(all(windows, target_env = "msvc"))]
+            windows_msvc: None,
         })
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    pub(crate) fn with_windows_msvc(mut self, windows_msvc: WindowsMsvcEnvironment) -> Self {
+        self.windows_msvc = Some(windows_msvc);
+        self
+    }
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn join_toolchain_directories(
+    directories: Vec<PathBuf>,
+) -> Result<OsString, ToolchainEnvironmentError> {
+    if directories.is_empty()
+        || directories
+            .iter()
+            .any(|directory| !is_existing_absolute_directory(directory))
+        || directories
+            .iter()
+            .any(|directory| contains_path_list_separator(directory.as_os_str()))
+    {
+        return Err(ToolchainEnvironmentError::Directory);
+    }
+    std::env::join_paths(directories).map_err(|_| ToolchainEnvironmentError::SearchPath)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn cargo_linker_environment_key() -> Option<&'static str> {
+    if cfg!(target_arch = "x86_64") {
+        Some("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER")
+    } else if cfg!(target_arch = "aarch64") {
+        Some("CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER")
+    } else if cfg!(target_arch = "x86") {
+        Some("CARGO_TARGET_I686_PC_WINDOWS_MSVC_LINKER")
+    } else {
+        None
     }
 }
 
@@ -367,6 +442,19 @@ impl ChildEnvironment {
                 OsString::from("RUSTUP_HOME"),
                 rustup_home.as_os_str().to_owned(),
             );
+        }
+        #[cfg(all(windows, target_env = "msvc"))]
+        if let Some(msvc) = &toolchain.windows_msvc {
+            environment.entries.insert(
+                OsString::from(msvc.linker_environment_key),
+                msvc.linker.as_os_str().to_owned(),
+            );
+            environment
+                .entries
+                .insert(OsString::from("LIB"), msvc.library_path.to_owned());
+            environment
+                .entries
+                .insert(OsString::from("INCLUDE"), msvc.include_path.to_owned());
         }
         environment
     }
@@ -1892,6 +1980,141 @@ mod tests {
                 std::env::current_exe().unwrap(),
             ),
             Err(ToolchainEnvironmentError::SearchPath)
+        ));
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn windows_msvc_environment_adds_only_pinned_toolchain_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let linker_directory = temp.path().join("msvc-bin");
+        let library_directory = temp.path().join("msvc-lib");
+        let include_directory = temp.path().join("msvc-include");
+        for directory in [&linker_directory, &library_directory, &include_directory] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let linker = linker_directory.join("link.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &linker).unwrap();
+        let compiler = std::env::current_exe().unwrap();
+        let toolchain = RustToolchainEnvironment::try_new(
+            vec![linker_directory.clone(), temp.path().to_path_buf()],
+            temp.path().to_path_buf(),
+            None,
+            compiler.clone(),
+            compiler,
+        )
+        .unwrap()
+        .with_windows_msvc(
+            WindowsMsvcEnvironment::try_new(
+                linker.clone(),
+                vec![library_directory.clone()],
+                vec![include_directory.clone()],
+            )
+            .unwrap(),
+        );
+
+        let environment =
+            ChildEnvironment::for_rust_toolchain(&platform_environment(&temp), &toolchain);
+        let linker_key = OsString::from(cargo_linker_environment_key().unwrap());
+        assert_eq!(environment.entries[&linker_key], linker);
+        assert_eq!(
+            std::env::split_paths(&environment.entries[&OsString::from("LIB")]).collect::<Vec<_>>(),
+            vec![library_directory]
+        );
+        assert_eq!(
+            std::env::split_paths(&environment.entries[&OsString::from("INCLUDE")])
+                .collect::<Vec<_>>(),
+            vec![include_directory]
+        );
+        assert_eq!(
+            std::env::split_paths(&environment.entries[&OsString::from("PATH")])
+                .collect::<Vec<_>>(),
+            vec![linker_directory, temp.path().to_path_buf()]
+        );
+
+        let mut actual = environment
+            .entries
+            .keys()
+            .map(|key| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let mut expected = vec![
+            "CARGO_HOME",
+            "CARGO_NET_OFFLINE",
+            "CARGO_TERM_COLOR",
+            cargo_linker_environment_key().unwrap(),
+            "INCLUDE",
+            "LANG",
+            "LC_ALL",
+            "LIB",
+            "PATH",
+            "RUSTC",
+            "RUSTDOC",
+            "RUST_BACKTRACE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        ];
+        actual.sort();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(
+            !environment
+                .entries
+                .contains_key(&OsString::from("CODING_AGENT_SENTINEL_SECRET"))
+        );
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn windows_msvc_environment_fails_closed_for_untrusted_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let library_directory = temp.path().join("lib");
+        let include_directory = temp.path().join("include");
+        std::fs::create_dir(&library_directory).unwrap();
+        std::fs::create_dir(&include_directory).unwrap();
+        let missing_linker = temp.path().join("missing-link.exe");
+
+        assert!(matches!(
+            WindowsMsvcEnvironment::try_new(
+                PathBuf::from("relative-link.exe"),
+                vec![library_directory.clone()],
+                vec![include_directory.clone()],
+            ),
+            Err(ToolchainEnvironmentError::Linker)
+        ));
+        assert!(matches!(
+            WindowsMsvcEnvironment::try_new(
+                missing_linker,
+                vec![library_directory.clone()],
+                vec![include_directory.clone()],
+            ),
+            Err(ToolchainEnvironmentError::Linker)
+        ));
+
+        let linker = temp.path().join("link.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &linker).unwrap();
+        for library_directories in [
+            Vec::new(),
+            vec![PathBuf::from("relative-lib")],
+            vec![temp.path().join("missing-lib")],
+        ] {
+            assert!(matches!(
+                WindowsMsvcEnvironment::try_new(
+                    linker.clone(),
+                    library_directories,
+                    vec![include_directory.clone()],
+                ),
+                Err(ToolchainEnvironmentError::Directory)
+            ));
+        }
+        assert!(matches!(
+            WindowsMsvcEnvironment::try_new(
+                linker,
+                vec![library_directory],
+                vec![PathBuf::from("relative-include")],
+            ),
+            Err(ToolchainEnvironmentError::Directory)
         ));
     }
 

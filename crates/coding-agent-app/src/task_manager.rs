@@ -1610,8 +1610,10 @@ mod tests {
                 CancelOutcome::Accepted { .. }
             ));
             wait_for_status(&store, task.id, TaskStatus::Cancelled).await;
+            wait_for_claim_resources_released(&hooks).await;
             assert_eq!(runner.starts.load(Ordering::SeqCst), 1);
             assert_eq!(hooks.active_count(), 0);
+            assert_eq!(hooks.available_permits(), 1);
         }
     }
 
@@ -1722,5 +1724,18 @@ mod tests {
         })
         .await
         .expect("claim-pause task reaches expected status");
+    }
+
+    async fn wait_for_claim_resources_released(hooks: &ClaimTestHooks) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if hooks.active_count() == 0 && hooks.available_permits() == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("claim-pause active handle and permit are released");
     }
 }

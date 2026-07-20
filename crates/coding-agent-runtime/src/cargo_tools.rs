@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(all(windows, target_env = "msvc"))]
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -7,11 +9,16 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(all(windows, target_env = "msvc"))]
+use find_msvc_tools::{Env, EnvGetter, find_tool_with_env};
+
 use crate::command_policy::{
     ExecutionDirectory, PinnedExecutable, ValidatedCommand, child_visible_path,
     is_safe_cargo_selector,
 };
 use crate::native_fs::{open_child_directory, open_child_file};
+#[cfg(all(windows, target_env = "msvc"))]
+use crate::process_supervisor::WindowsMsvcEnvironment;
 use crate::process_supervisor::{
     ChildEnvironment, CommandResult, PlatformEnvironment, ProcessError, ProcessLimits,
     ProcessSupervisor, RustToolchainEnvironment,
@@ -124,9 +131,12 @@ pub struct CargoTools {
     rustc: Arc<PinnedExecutable>,
     rustdoc: Arc<PinnedExecutable>,
     git: Arc<PinnedExecutable>,
+    #[cfg(all(windows, target_env = "msvc"))]
+    windows_linker: Arc<PinnedExecutable>,
     execution_directory: Arc<ExecutionDirectory>,
     target_directory: Arc<ExecutionDirectory>,
     environment: ChildEnvironment,
+    redaction_paths: Vec<PathBuf>,
     limits: CargoToolLimits,
 }
 
@@ -163,14 +173,36 @@ impl CargoTools {
         let platform = platform_environment(temporary_directory.as_ref())?;
         let rustc = toolchain.rustc();
         let rustdoc = toolchain.rustdoc();
+        #[cfg(all(windows, target_env = "msvc"))]
+        let windows_msvc = discover_windows_msvc()?;
+        let search_directories = toolchain.search_directories().to_vec();
+        #[cfg(all(windows, target_env = "msvc"))]
+        let search_directories = {
+            let mut combined = windows_msvc.search_directories.clone();
+            combined.extend(search_directories);
+            combined
+        };
         let toolchain_environment = RustToolchainEnvironment::try_new(
-            toolchain.search_directories().to_vec(),
+            search_directories,
             toolchain.cargo_home().to_owned(),
             None,
             rustc.path().to_owned(),
             rustdoc.path().to_owned(),
         )
         .map_err(|_| CargoToolError::InvalidEnvironment)?;
+        #[cfg(all(windows, target_env = "msvc"))]
+        let toolchain_environment = toolchain_environment.with_windows_msvc(
+            WindowsMsvcEnvironment::try_new(
+                windows_msvc.linker.path().to_owned(),
+                windows_msvc.library_directories.clone(),
+                windows_msvc.include_directories.clone(),
+            )
+            .map_err(|_| CargoToolError::InvalidEnvironment)?,
+        );
+        #[cfg(all(windows, target_env = "msvc"))]
+        let redaction_paths = windows_msvc.redaction_paths();
+        #[cfg(not(all(windows, target_env = "msvc")))]
+        let redaction_paths = Vec::new();
         let mut environment =
             ChildEnvironment::for_rust_toolchain(&platform, &toolchain_environment);
         environment.set_cargo_target_directory(&child_visible_path(target_directory.path()));
@@ -181,9 +213,12 @@ impl CargoTools {
             rustc,
             rustdoc,
             git: toolchain.git(),
+            #[cfg(all(windows, target_env = "msvc"))]
+            windows_linker: windows_msvc.linker,
             execution_directory,
             target_directory,
             environment,
+            redaction_paths,
             limits,
         })
     }
@@ -237,13 +272,7 @@ impl CargoTools {
                 timeout,
             ),
         }
-        .and_then(|command| {
-            command.with_dependent_executables(vec![
-                self.rustc.clone(),
-                self.rustdoc.clone(),
-                self.git.clone(),
-            ])
-        })
+        .and_then(|command| command.with_dependent_executables(self.dependent_executables()))
         .map_err(CargoToolError::CommandPolicy)?;
         let result = self
             .supervisor
@@ -291,13 +320,7 @@ impl CargoTools {
             package,
             remaining,
         )
-        .and_then(|command| {
-            command.with_dependent_executables(vec![
-                self.rustc.clone(),
-                self.rustdoc.clone(),
-                self.git.clone(),
-            ])
-        })
+        .and_then(|command| command.with_dependent_executables(self.dependent_executables()))
         .map_err(CargoToolError::CommandPolicy)?;
         self.run(command, cancellation).await
     }
@@ -336,13 +359,7 @@ impl CargoTools {
             test,
             remaining,
         )
-        .and_then(|command| {
-            command.with_dependent_executables(vec![
-                self.rustc.clone(),
-                self.rustdoc.clone(),
-                self.git.clone(),
-            ])
-        })
+        .and_then(|command| command.with_dependent_executables(self.dependent_executables()))
         .map_err(CargoToolError::CommandPolicy)?;
         self.run(command, cancellation).await
     }
@@ -358,6 +375,18 @@ impl CargoTools {
             .await
             .map_err(CargoToolError::Process)?;
         cargo_run_result(command)
+    }
+
+    fn dependent_executables(&self) -> Vec<Arc<PinnedExecutable>> {
+        let mut executables = Vec::with_capacity(4);
+        executables.extend([self.rustc.clone(), self.rustdoc.clone(), self.git.clone()]);
+        #[cfg(all(windows, target_env = "msvc"))]
+        executables.push(self.windows_linker.clone());
+        executables
+    }
+
+    pub(crate) fn redaction_paths(&self) -> &[PathBuf] {
+        &self.redaction_paths
     }
 }
 
@@ -378,6 +407,155 @@ fn platform_environment(path: &std::path::Path) -> Result<PlatformEnvironment, C
 
     PlatformEnvironment::try_new(path.to_owned(), system_root)
         .map_err(|_| CargoToolError::InvalidEnvironment)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+struct NoHostMsvcEnvironment;
+
+#[cfg(all(windows, target_env = "msvc"))]
+impl EnvGetter for NoHostMsvcEnvironment {
+    fn get_env(&self, _: &'static str) -> Option<Env> {
+        None
+    }
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+struct DiscoveredWindowsMsvc {
+    linker: Arc<PinnedExecutable>,
+    search_directories: Vec<PathBuf>,
+    library_directories: Vec<PathBuf>,
+    include_directories: Vec<PathBuf>,
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+impl DiscoveredWindowsMsvc {
+    fn redaction_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.linker.path().to_owned()];
+        for path in self
+            .search_directories
+            .iter()
+            .chain(&self.library_directories)
+            .chain(&self.include_directories)
+        {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+        paths
+    }
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn discover_windows_msvc() -> Result<DiscoveredWindowsMsvc, CargoToolError> {
+    // Deliberately deny find-msvc-tools access to the process environment. The
+    // result therefore comes from Windows Setup Configuration and machine SDK
+    // registry state, never caller-controlled PATH/LIB/INCLUDE overrides.
+    let tool = find_tool_with_env(std::env::consts::ARCH, "link.exe", &NoHostMsvcEnvironment)
+        .ok_or(CargoToolError::InvalidEnvironment)?;
+    let environment = tool
+        .env()
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect::<Vec<_>>();
+    validate_windows_msvc(tool.path(), &environment)
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn validate_windows_msvc(
+    linker: &Path,
+    environment: &[(OsString, OsString)],
+) -> Result<DiscoveredWindowsMsvc, CargoToolError> {
+    let mut variables = BTreeMap::new();
+    for (key, value) in environment {
+        if !matches!(key.to_str(), Some("PATH" | "LIB" | "INCLUDE"))
+            || variables.insert(key.to_owned(), value.to_owned()).is_some()
+        {
+            return Err(CargoToolError::InvalidEnvironment);
+        }
+    }
+    if variables.len() != 3 {
+        return Err(CargoToolError::InvalidEnvironment);
+    }
+
+    let search_directories = canonical_msvc_path_list(
+        variables
+            .get(OsStr::new("PATH"))
+            .ok_or(CargoToolError::InvalidEnvironment)?,
+    )?;
+    let library_directories = canonical_msvc_path_list(
+        variables
+            .get(OsStr::new("LIB"))
+            .ok_or(CargoToolError::InvalidEnvironment)?,
+    )?;
+    let include_directories = canonical_msvc_path_list(
+        variables
+            .get(OsStr::new("INCLUDE"))
+            .ok_or(CargoToolError::InvalidEnvironment)?,
+    )?;
+
+    if !linker.is_absolute()
+        || linker
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(CargoToolError::InvalidEnvironment);
+    }
+    let linker = std::fs::canonicalize(linker).map_err(|_| CargoToolError::InvalidEnvironment)?;
+    if !linker.is_file()
+        || !linker
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("link.exe"))
+        || !linker.parent().is_some_and(|parent| {
+            search_directories
+                .iter()
+                .any(|directory| directory == parent)
+        })
+    {
+        return Err(CargoToolError::InvalidEnvironment);
+    }
+    let linker =
+        Arc::new(PinnedExecutable::open(linker).map_err(|_| CargoToolError::InvalidEnvironment)?);
+
+    Ok(DiscoveredWindowsMsvc {
+        linker,
+        search_directories,
+        library_directories,
+        include_directories,
+    })
+}
+
+#[cfg(all(windows, target_env = "msvc"))]
+fn canonical_msvc_path_list(value: &OsStr) -> Result<Vec<PathBuf>, CargoToolError> {
+    let mut canonical_directories = Vec::new();
+    for directory in std::env::split_paths(value) {
+        // find-msvc-tools emits a trailing separator. Never preserve the
+        // resulting empty component because Windows interprets it as the
+        // child process's current directory.
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        if !directory.is_absolute()
+            || directory
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(CargoToolError::InvalidEnvironment);
+        }
+        let canonical =
+            std::fs::canonicalize(directory).map_err(|_| CargoToolError::InvalidEnvironment)?;
+        if !canonical.is_dir() {
+            return Err(CargoToolError::InvalidEnvironment);
+        }
+        if !canonical_directories.contains(&canonical) {
+            canonical_directories.push(canonical);
+        }
+    }
+    if canonical_directories.is_empty() {
+        Err(CargoToolError::InvalidEnvironment)
+    } else {
+        Ok(canonical_directories)
+    }
 }
 
 fn cargo_run_result(command: CommandResult) -> Result<CargoRunResult, CargoToolError> {
@@ -800,6 +978,33 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(all(windows, target_env = "msvc"))]
+    fn msvc_fixture() -> (tempfile::TempDir, PathBuf, Vec<(OsString, OsString)>) {
+        let root = tempdir();
+        let binary_directory = root.path().join("bin");
+        let library_directory = root.path().join("lib");
+        let include_directory = root.path().join("include");
+        for directory in [&binary_directory, &library_directory, &include_directory] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let linker = binary_directory.join("link.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &linker).unwrap();
+        let mut search_path = std::env::join_paths([&binary_directory, &binary_directory]).unwrap();
+        search_path.push(";");
+        let environment = vec![
+            (OsString::from("PATH"), search_path),
+            (
+                OsString::from("LIB"),
+                std::env::join_paths([&library_directory]).unwrap(),
+            ),
+            (
+                OsString::from("INCLUDE"),
+                std::env::join_paths([&include_directory]).unwrap(),
+            ),
+        ];
+        (root, linker, environment)
+    }
+
     fn execution_directory(path: &Path) -> ExecutionDirectory {
         ExecutionDirectory::open(path).unwrap()
     }
@@ -922,6 +1127,139 @@ mod tests {
             CargoToolLimits::try_new(Duration::from_secs(1), 1, 1, 0),
             Err(CargoToolError::InvalidLimits)
         ));
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn msvc_discovery_never_reads_host_environment() {
+        for key in [
+            "PATH",
+            "LIB",
+            "INCLUDE",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "VCToolsInstallDir",
+            "VCToolsVersion",
+            "WindowsSdkDir",
+        ] {
+            assert!(NoHostMsvcEnvironment.get_env(key).is_none());
+        }
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn msvc_environment_accepts_only_canonical_fixed_keys() {
+        let (_root, linker, environment) = msvc_fixture();
+        let discovered = validate_windows_msvc(&linker, &environment).unwrap();
+        assert_eq!(
+            discovered.linker.path(),
+            std::fs::canonicalize(&linker).unwrap()
+        );
+        assert_eq!(discovered.search_directories.len(), 1);
+        assert!(
+            discovered
+                .search_directories
+                .iter()
+                .chain(&discovered.library_directories)
+                .chain(&discovered.include_directories)
+                .all(|directory| directory.is_absolute() && directory.is_dir())
+        );
+
+        let mut unexpected = environment.clone();
+        unexpected.push((OsString::from("CL"), OsString::from("/DUNTRUSTED")));
+        assert!(matches!(
+            validate_windows_msvc(&linker, &unexpected),
+            Err(CargoToolError::InvalidEnvironment)
+        ));
+
+        let mut duplicate = environment.clone();
+        duplicate.push(environment[0].clone());
+        assert!(matches!(
+            validate_windows_msvc(&linker, &duplicate),
+            Err(CargoToolError::InvalidEnvironment)
+        ));
+
+        let missing_key = environment
+            .iter()
+            .filter(|(key, _)| key != "INCLUDE")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            validate_windows_msvc(&linker, &missing_key),
+            Err(CargoToolError::InvalidEnvironment)
+        ));
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn msvc_environment_fails_closed_for_relative_missing_or_mismatched_paths() {
+        let (root, linker, environment) = msvc_fixture();
+
+        let mut relative = environment.clone();
+        relative[1].1 = OsString::from("relative-lib");
+        assert!(matches!(
+            validate_windows_msvc(&linker, &relative),
+            Err(CargoToolError::InvalidEnvironment)
+        ));
+
+        let mut missing = environment.clone();
+        missing[2].1 = root.path().join("missing-include").into_os_string();
+        assert!(matches!(
+            validate_windows_msvc(&linker, &missing),
+            Err(CargoToolError::InvalidEnvironment)
+        ));
+
+        let other_binary_directory = root.path().join("other-bin");
+        std::fs::create_dir(&other_binary_directory).unwrap();
+        let mut mismatched = environment.clone();
+        mismatched[0].1 = other_binary_directory.into_os_string();
+        assert!(matches!(
+            validate_windows_msvc(&linker, &mismatched),
+            Err(CargoToolError::InvalidEnvironment)
+        ));
+
+        assert!(matches!(
+            validate_windows_msvc(&root.path().join("missing-link.exe"), &environment),
+            Err(CargoToolError::InvalidEnvironment)
+        ));
+    }
+
+    #[cfg(all(windows, target_env = "msvc"))]
+    #[test]
+    fn msvc_linker_is_discovered_from_machine_configuration() {
+        let tool = find_tool_with_env(std::env::consts::ARCH, "link.exe", &NoHostMsvcEnvironment)
+            .expect("MSVC linker should be discoverable without host environment variables");
+        let environment = tool
+            .env()
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<Vec<_>>();
+        let discovered = validate_windows_msvc(tool.path(), &environment).unwrap_or_else(|error| {
+            panic!(
+                "discovered MSVC linker environment should validate: path={:?}, environment={environment:?}, error={error}",
+                tool.path()
+            )
+        });
+        assert!(discovered.linker.path().is_absolute());
+        assert_eq!(
+            discovered.linker.path().file_name().and_then(OsStr::to_str),
+            Some("link.exe")
+        );
+        assert!(
+            discovered.search_directories.iter().any(|directory| {
+                discovered.linker.path().parent() == Some(directory.as_path())
+            })
+        );
+        let redaction_paths = discovered.redaction_paths();
+        assert!(redaction_paths.contains(&discovered.linker.path().to_owned()));
+        assert!(
+            discovered
+                .search_directories
+                .iter()
+                .chain(&discovered.library_directories)
+                .chain(&discovered.include_directories)
+                .all(|path| redaction_paths.contains(path))
+        );
     }
 
     #[test]
