@@ -21,7 +21,7 @@ async fn fifth_task_stays_queued_until_a_permit_is_released() {
     fixture.wait_for_running(4).await;
     assert_eq!(fixture.load(tasks[4].id).await.status, TaskStatus::Queued);
 
-    fixture.runner.release(tasks[0].id);
+    fixture.runner.release(tasks[0].id).await;
     fixture
         .wait_for_status(tasks[4].id, TaskStatus::Running)
         .await;
@@ -136,7 +136,7 @@ async fn a_failed_fifo_head_claim_cannot_be_overtaken() {
         .wait_for_status(tasks[0].id, TaskStatus::Running)
         .await;
     assert_eq!(fixture.load(tasks[1].id).await.status, TaskStatus::Queued);
-    fixture.runner.release(tasks[0].id);
+    fixture.runner.release(tasks[0].id).await;
     fixture
         .wait_for_status(tasks[1].id, TaskStatus::Running)
         .await;
@@ -176,21 +176,32 @@ async fn queued_tasks_are_claimed_fifo_by_created_at_then_id() {
         fixture.manager.notify_queued(task.id).await.unwrap();
     }
 
-    let mut expected = queued.iter().map(|task| task.id).collect::<Vec<_>>();
-    expected.sort_by_key(|id| {
-        let created = if *id == queued[0].id { 2 } else { 1 };
-        (created, id.to_string())
-    });
-    let mut actual = Vec::new();
-    fixture.runner.release(blocker.id);
-    for expected_id in &expected {
-        fixture
-            .wait_for_status(*expected_id, TaskStatus::Running)
-            .await;
-        actual.push(*expected_id);
-        fixture.runner.release(*expected_id);
+    let mut persisted = Vec::with_capacity(queued.len());
+    for task in &queued {
+        persisted.push(fixture.load(task.id).await);
     }
-    assert_eq!(actual, expected);
+    persisted.sort_by_key(|task| (task.created_at, task.id.to_string()));
+    let expected = persisted.iter().map(|task| task.id).collect::<Vec<_>>();
+    let mut actual = vec![fixture.runner.wait_for_started_task(0).await];
+    assert_eq!(actual, [blocker.id]);
+    fixture.runner.release(blocker.id).await;
+    for (index, expected_id) in expected.iter().enumerate() {
+        let actual_id = fixture.runner.wait_for_started_task(index + 1).await;
+        actual.push(actual_id);
+        assert_eq!(actual_id, *expected_id, "FIFO start {index}");
+        assert_eq!(fixture.load(actual_id).await.status, TaskStatus::Running);
+        assert_eq!(fixture.runner.started_count(actual_id), 1);
+        for pending_id in &expected[index + 1..] {
+            assert_eq!(fixture.load(*pending_id).await.status, TaskStatus::Queued);
+            assert_eq!(fixture.runner.started_count(*pending_id), 0);
+        }
+        fixture.runner.release(actual_id).await;
+    }
+    let expected_with_blocker = std::iter::once(blocker.id)
+        .chain(expected)
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected_with_blocker);
+    assert_eq!(fixture.runner.started_task_ids(), expected_with_blocker);
 }
 
 #[tokio::test]

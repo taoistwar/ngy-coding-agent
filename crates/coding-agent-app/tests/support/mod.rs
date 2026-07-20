@@ -1619,6 +1619,7 @@ impl DegradedFixture {
 pub struct ControlledRunner {
     scenarios: Mutex<VecDeque<RunnerScenario>>,
     started: Mutex<HashMap<TaskId, usize>>,
+    started_order: Mutex<Vec<TaskId>>,
     releases: Mutex<HashMap<TaskId, Arc<Notify>>>,
 }
 
@@ -1743,14 +1744,23 @@ impl ControlledRunner {
         }
     }
 
-    pub fn release(&self, task_id: TaskId) {
-        let release = self
-            .releases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&task_id)
-            .cloned()
-            .expect("blocking runner has started");
+    pub async fn release(&self, task_id: TaskId) {
+        let release = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let release = self
+                    .releases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&task_id)
+                    .cloned();
+                if let Some(release) = release {
+                    return release;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("blocking runner did not start task {task_id}"));
         release.notify_one();
     }
 
@@ -1761,6 +1771,32 @@ impl ControlledRunner {
             .get(&task_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    pub async fn wait_for_started_task(&self, index: usize) -> TaskId {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let task_id = self
+                    .started_order
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(index)
+                    .copied();
+                if let Some(task_id) = task_id {
+                    return task_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("runner did not publish start at index {index}"))
+    }
+
+    pub fn started_task_ids(&self) -> Vec<TaskId> {
+        self.started_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn push(&self, scenario: RunnerScenario) {
@@ -1774,29 +1810,33 @@ impl ControlledRunner {
 #[async_trait::async_trait]
 impl TaskRunner for ControlledRunner {
     async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
-        *self
-            .started
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(context.task.id)
-            .or_insert(0) += 1;
         let scenario = self
             .scenarios
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
             .expect("a runner scenario is queued for every started task");
+        if let RunnerScenario::Blocking(release) = &scenario {
+            self.releases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(context.task.id, release.clone());
+        }
+        *self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(context.task.id)
+            .or_insert(0) += 1;
+        self.started_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(context.task.id);
         match scenario {
-            RunnerScenario::Blocking(release) => {
-                self.releases
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(context.task.id, release.clone());
-                tokio::select! {
-                    () = context.cancellation.cancelled() => RunnerOutcome::Cancelled,
-                    () = release.notified() => RunnerOutcome::Succeeded,
-                }
-            }
+            RunnerScenario::Blocking(release) => tokio::select! {
+                () = context.cancellation.cancelled() => RunnerOutcome::Cancelled,
+                () = release.notified() => RunnerOutcome::Succeeded,
+            },
             RunnerScenario::Panic => panic!("injected runner panic"),
             RunnerScenario::LateEvent { release, result } => {
                 tokio::spawn(async move {
