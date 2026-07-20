@@ -19,7 +19,8 @@ async fn collects_added_modified_deleted_binary_untracked_and_non_utf8_paths_det
     fixture.write("renamed-old.txt", b"renamed\n");
     fixture.write("copied-source.txt", b"copied\n");
     fixture.write("external-attribute.txt", b"before\n");
-    #[cfg(unix)]
+    // Apple VFS rejects malformed UTF-8 names with EILSEQ; Linux CI covers byte paths.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
@@ -87,7 +88,7 @@ async fn collects_added_modified_deleted_binary_untracked_and_non_utf8_paths_det
         "vanilla Git demonstrates that the external attributes file is active"
     );
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
@@ -132,7 +133,7 @@ async fn collects_added_modified_deleted_binary_untracked_and_non_utf8_paths_det
     assert!(paths.contains(&"staged.txt"));
     assert!(paths.contains(&"untracked.bin"));
     assert!(!paths.contains(&"copied-source.txt"));
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     {
         assert!(paths.contains(&"nonutf8-%FF.txt"));
         assert!(paths.contains(&"tracked-nonutf8-%FF.txt"));

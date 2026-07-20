@@ -50,7 +50,8 @@ async fn tracked_untracked_index_state_and_ignored_outputs_are_deterministic() {
     let creation_order_two = collector.collect(CancellationToken::new()).await.unwrap();
     assert_eq!(creation_order_one, creation_order_two);
 
-    #[cfg(unix)]
+    // Apple VFS rejects malformed UTF-8 names with EILSEQ; Linux CI covers byte paths.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
