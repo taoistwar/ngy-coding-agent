@@ -175,21 +175,26 @@ Checkpoint: no new crate depends on `coding-agent-app`.
 
 - [x] Independent review focuses on path races, `.git`/Git config execution, Windows pre-execution Job assignment, StoreWriter ordering, redaction and revision-bound tests.
 - [x] Resolve every blocker/high finding and rerun impacted tests.
-- [ ] Capture fresh three-platform CI evidence.
+- [x] Capture fresh three-platform CI evidence.
 - [x] Demonstrate success plus timeout, cancellation, path escape, malicious Git config and replace-after-pass failures.
 - [x] Record exact commands/results and verify no secrets, generated drift or placeholders.
 
-Fresh three-platform execution remains an external gate: the existing GitHub Actions
-matrix covers Ubuntu, Windows and macOS, but this uncommitted local worktree has not
-been pushed and therefore has no honest remote run to cite.
+Fresh three-platform evidence is GitHub Actions run
+[`29738805404`](https://github.com/taoistwar/ngy-coding-agent/actions/runs/29738805404)
+for commit `f0abaa24e50e9583a27227a6457f7f180b323c00`:
 
-### Local acceptance evidence — Windows, 2026-07-17
+- Linux quality and E2E job `88340446147` — success, including browser E2E and the embedded release build.
+- Ubuntu release-smoke job `88340446186` — success.
+- Windows release-smoke job `88340446187` — success.
+- macOS release-smoke job `88340446212` — success, including the full workspace tests that exercise Darwin process-tree cleanup and concurrent worktree fixtures.
 
-- `cargo fmt --all -- --check` — passed.
-- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` — passed; the final release-smoke-only edit also passed focused Clippy with warnings denied.
-- `cargo test --workspace --all-features --locked` — passed under the real Windows user ACL and system temporary directory in 294.1 seconds, including the offline E2E (4/4), production SSE (12/12), worktree, malicious Git configuration, process-tree and atomic-replace suites.
-- `pnpm --dir web run api:check`, `config:check`, `typecheck`, `test:run`, and `build` — passed; Vitest reported 130/130.
-- `cargo build --release --locked -p coding-agent-app --features embedded-web` with Cargo offline — passed.
-- `cargo test --release --locked -p coding-agent-app --test release_smoke --features embedded-web -- --ignored --exact release_binary_starts_without_node_or_dist` — passed against the copied release executable with Node and external `dist` unavailable; bootstrap reported production concurrency 1.
-- `node scripts/check-placeholders.mjs`, `git diff --check`, generated API drift, zero-byte and temporary-artifact checks — passed; 186 text files contained no forbidden placeholder.
-- Independent audit findings were fixed and their focused regressions rerun: restart recovery uses `APP_RESTARTED`, command output hides known absolute paths, artifact reconciliation starts its write deadline after observation, and real production SSE lag recovery refills from SQLite without gaps or duplicates.
+### Fresh acceptance evidence — Windows and GitHub CI, 2026-07-20
+
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings` — passed.
+- `cargo test --workspace --all-features --locked` — passed locally in 514.7 seconds after the final production fixes; the fresh CI run repeated the full workspace on Linux, Ubuntu, Windows and macOS.
+- `cargo test -p coding-agent-app --test task_manager --all-features --locked --offline` — 27/27 passed; the FIFO claim-order regression then passed 50/50 consecutive runs while observing the runner's actual start sequence.
+- Focused runtime integration tests for worktree, diff, fingerprint, typed Git and typed Cargo — 23/23 passed; app artifact reconciliation and real offline E2E — 8/8 passed.
+- `cargo test -p coding-agent-runtime -p coding-agent-app --lib --all-features --locked --offline` — 151/151 passed, including the production runner factory with concurrency one and process-supervisor cleanup tests.
+- The CI jobs also passed generated API drift checks, frontend type-check/tests/build, placeholder rejection, embedded release builds and release application startup smoke tests without contacting a real provider.
+- Independent audits approved the Darwin/XNU quiescent-group handling, actual FIFO start-order synchronization and process-global spawn-lock coverage; no blocker or high finding remains.
