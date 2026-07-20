@@ -779,7 +779,7 @@ async fn query_sysroot(
         .run(command, CancellationToken::new())
         .await
         .map_err(|error| {
-            #[cfg(test)]
+            #[cfg(debug_assertions)]
             log_process_failure("bootstrap rustc", &error);
             map_bootstrap_process_error(error)
         })?;
@@ -832,7 +832,7 @@ async fn query_git_version(
         .run(command, CancellationToken::new())
         .await
         .map_err(|error| {
-            #[cfg(test)]
+            #[cfg(debug_assertions)]
             log_process_failure("bootstrap Git", &error);
             map_git_process_error(error)
         })?;
@@ -876,7 +876,7 @@ fn map_git_process_error(error: ProcessError) -> ToolDiscoveryError {
     }
 }
 
-#[cfg(test)]
+#[cfg(debug_assertions)]
 fn log_process_failure(context: &str, error: &ProcessError) {
     let (variant, source) = match error {
         ProcessError::InvalidCommand => ("InvalidCommand", None),
