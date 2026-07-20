@@ -688,6 +688,28 @@ enum ObservedTermination {
     WaitFailed(io::Error),
 }
 
+#[cfg(target_os = "macos")]
+fn should_use_exited_tree_kill(observed: &ObservedTermination) -> bool {
+    matches!(observed, ObservedTermination::Exited(_))
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_exited_tree_kill(
+    kill_result: io::Result<()>,
+    liveness_probe: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<()> {
+    match kill_result {
+        Err(kill_error) if kill_error.raw_os_error() == Some(libc::EPERM) => {
+            match liveness_probe() {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(kill_error),
+                Err(probe_error) => Err(probe_error),
+            }
+        }
+        result => result,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn supervise_child(
     mut child: Child,
@@ -734,7 +756,17 @@ async fn supervise_child(
     };
 
     // Unix observes exit with waitid(WNOWAIT), so the group leader remains a
-    // non-reusable PID anchor until this process-group kill has completed.
+    // non-reusable PID anchor until this process-group kill has completed. XNU
+    // filters SZOMB members while resolving a negative-PID kill, so a group with
+    // only the waitable leader left can report EPERM. In that exact macOS case,
+    // an EOF sentinel proves that every protocol-participating process exited.
+    #[cfg(target_os = "macos")]
+    let kill_error = if should_use_exited_tree_kill(&observed) {
+        tree.kill_now_after_observed_exit(&leader_exit).err()
+    } else {
+        tree.kill_now().err()
+    };
+    #[cfg(not(target_os = "macos"))]
     let kill_error = tree.kill_now().err();
     if kill_error.is_some() {
         let _ = child.start_kill();
@@ -996,6 +1028,20 @@ impl TreeKillHandle {
             .map_err(KillFailure::into_io_error)
     }
 
+    #[cfg(target_os = "macos")]
+    fn kill_now_after_observed_exit(&self, leader_exit: &platform::LeaderExit) -> io::Result<()> {
+        self.inner
+            .outcome
+            .get_or_init(|| {
+                reconcile_exited_tree_kill(self.inner.platform.kill(), || {
+                    leader_exit.liveness_pipe_has_no_writers_now()
+                })
+                .map_err(KillFailure::from)
+            })
+            .clone()
+            .map_err(KillFailure::into_io_error)
+    }
+
     fn disarm_without_kill(&self) {
         let _ = self.inner.outcome.set(Ok(()));
     }
@@ -1198,12 +1244,17 @@ mod platform {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        pub(super) fn liveness_pipe_has_no_writers_now(&self) -> io::Result<bool> {
+            liveness_pipe_has_no_writers(&self.liveness_read)
+        }
+
         pub(super) async fn wait_tree_after_reap(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    fn create_liveness_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    pub(super) fn create_liveness_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         let mut descriptors = [-1; 2];
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let result =
@@ -1292,7 +1343,7 @@ mod platform {
         }
     }
 
-    fn liveness_pipe_has_no_writers(read: &OwnedFd) -> io::Result<bool> {
+    pub(super) fn liveness_pipe_has_no_writers(read: &OwnedFd) -> io::Result<bool> {
         let mut byte = 0u8;
         loop {
             let read_count = unsafe {
@@ -1717,6 +1768,66 @@ mod tests {
 
         assert_eq!(executable.program(), path);
         assert!(!executable.program().starts_with("/dev/fd"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_only_uses_the_exited_tree_kill_path_after_observed_leader_exit() {
+        assert!(should_use_exited_tree_kill(&ObservedTermination::Exited(
+            None
+        )));
+        assert!(!should_use_exited_tree_kill(
+            &ObservedTermination::Cancelled
+        ));
+        assert!(!should_use_exited_tree_kill(&ObservedTermination::TimedOut));
+        assert!(!should_use_exited_tree_kill(
+            &ObservedTermination::WaitFailed(io::Error::other("wait failed"))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_only_accepts_eof_after_an_exited_tree_kill_returns_eperm() {
+        assert!(
+            reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(libc::EPERM)), || Ok(true))
+                .is_ok()
+        );
+
+        let writers_remain =
+            reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(libc::EPERM)), || {
+                Ok(false)
+            })
+            .unwrap_err();
+        assert_eq!(writers_remain.raw_os_error(), Some(libc::EPERM));
+
+        let probe_failed =
+            reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(libc::EPERM)), || {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            })
+            .unwrap_err();
+        assert_eq!(probe_failed.raw_os_error(), Some(libc::EIO));
+
+        let non_eperm =
+            reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(libc::EINVAL)), || {
+                panic!("non-EPERM failures must not probe liveness")
+            })
+            .unwrap_err();
+        assert_eq!(non_eperm.raw_os_error(), Some(libc::EINVAL));
+
+        reconcile_exited_tree_kill(Ok(()), || {
+            panic!("successful kills must not probe liveness")
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_liveness_probe_distinguishes_live_writers_from_eof() {
+        let (read, write) = platform::create_liveness_pipe().unwrap();
+
+        assert!(!platform::liveness_pipe_has_no_writers(&read).unwrap());
+        drop(write);
+        assert!(platform::liveness_pipe_has_no_writers(&read).unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

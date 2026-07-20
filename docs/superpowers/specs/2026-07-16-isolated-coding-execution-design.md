@@ -167,7 +167,7 @@ Cargo metadata 只有在完整未截断时才解析；workspace root、固定的
 
 Windows 实现不能采用普通 spawn 后再 `AssignProcessToJobObject` 的可逃逸窗口；应使用 `STARTUPINFOEX` 的 job-list attribute，或 suspended create → assign → resume，并测试孙进程。Unix process group 无法约束主动 `setsid()` 的恶意代码，这属于 2.3 中明确排除的强沙箱边界。
 
-Unix supervisor 以 `waitid(..., WNOWAIT)` 保留 leader PID/PGID 锚，并让正常子孙继承一个只用于终态确认的 liveness writer；group kill 后先等待 reader EOF，再 reap leader。Darwin 的可移植 `pipe()` + `fcntl(FD_CLOEXEC)` 回退由应用级共享 spawn lock 覆盖，所有已知生产 spawn 都通过同一协调点。主动 `setsid`、`close_range`/`closefrom` 或显式关闭/改写该内部 fd 都属于 2.3 中已排除的恶意或主动逃逸代码边界，Project 2 不把这一机制表述为 OS 沙箱或对任意进程的内核级成员证明。
+Unix supervisor 以 `waitid(..., WNOWAIT)` 保留 leader PID/PGID 锚，并让正常子孙继承一个只用于终态确认的 liveness writer；group kill 后先等待 reader EOF，再 reap leader。macOS 有一个严格限定的正常退出例外：XNU 在解析 negative-PID kill 时会过滤 `SZOMB` 成员，因此只剩 waitable zombie leader 的 process group 可能返回 `EPERM`。仅当 supervisor 已观测到 leader 退出、group kill 在同一个一次性结果闭包中返回 `EPERM`，且随后对 nonblocking liveness reader 的检查返回 EOF（即所有协议内进程都已关闭 writer）时，才将 tree 视为已清理，随后仍正常 reap leader。`WouldBlock` 仍表示存在 writer，保留原 `EPERM` 失败；liveness 检查错误也失败；取消和超时路径始终使用通用 kill，不吞掉 `EPERM`。Darwin 的可移植 `pipe()` + `fcntl(FD_CLOEXEC)` 回退由应用级共享 spawn lock 覆盖，所有已知生产 spawn 都通过同一协调点。主动 `setsid`、`close_range`/`closefrom` 或显式关闭/改写该内部 fd 都属于 2.3 中已排除的恶意或主动逃逸代码边界，Project 2 不把这一机制表述为 OS 沙箱或对任意进程的内核级成员证明。
 
 即使 leader 正常退出，只要其孙进程仍存活或仍持有 stdout/stderr pipe，supervisor 也先清理进程树，再完成有界 pipe drain；supervisor future 被 abort/drop 时由 RAII guard 触发同样的 kill。`cancelled` 优先于同时可观察到的 timeout，测试锁定该竞态规则。
 
