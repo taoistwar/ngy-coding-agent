@@ -1355,37 +1355,19 @@ impl TaskManagerFixture {
             .expect("toggle task-start failure trigger");
     }
 
-    pub async fn fail_started_event_for(&self, task_id: Option<TaskId>) {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS test_claim_failures (task_id TEXT PRIMARY KEY NOT NULL)",
-        )
-        .execute(self.store.pool())
-        .await
-        .expect("create FIFO-head failure selector");
-        sqlx::query("DELETE FROM test_claim_failures")
+    pub async fn fail_fifo_head_started_event_inserts(&self, enabled: bool) {
+        let statement = if enabled {
+            "CREATE TRIGGER fail_fifo_head_started BEFORE INSERT ON task_events \
+             WHEN NEW.kind = 'task.started' AND NEW.task_id = (\
+                 SELECT id FROM tasks ORDER BY created_at, id LIMIT 1\
+             ) BEGIN SELECT RAISE(ABORT, 'injected'); END"
+        } else {
+            "DROP TRIGGER IF EXISTS fail_fifo_head_started"
+        };
+        sqlx::query(statement)
             .execute(self.store.pool())
             .await
-            .expect("clear FIFO-head failure selector");
-        sqlx::query("DROP TRIGGER IF EXISTS fail_fifo_head_started")
-            .execute(self.store.pool())
-            .await
-            .expect("remove prior FIFO-head failure trigger");
-        if let Some(task_id) = task_id {
-            sqlx::query("INSERT INTO test_claim_failures (task_id) VALUES (?)")
-                .bind(task_id.to_string())
-                .execute(self.store.pool())
-                .await
-                .expect("select FIFO-head task for injected failure");
-            sqlx::query(
-                "CREATE TRIGGER fail_fifo_head_started BEFORE INSERT ON task_events \
-                 WHEN NEW.kind = 'task.started' AND EXISTS (\
-                     SELECT 1 FROM test_claim_failures WHERE task_id = NEW.task_id\
-                 ) BEGIN SELECT RAISE(ABORT, 'injected'); END",
-            )
-            .execute(self.store.pool())
-            .await
-            .expect("install FIFO-head failure trigger");
-        }
+            .expect("toggle FIFO-head task-start failure trigger");
     }
 
     pub async fn force_claim_busy(&self, enabled: bool) {

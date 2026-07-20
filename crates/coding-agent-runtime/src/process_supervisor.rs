@@ -1061,19 +1061,25 @@ mod platform {
     }
 
     impl Executable {
-        pub(super) fn new(_: &std::path::Path, file: File) -> io::Result<Self> {
+        pub(super) fn new(path: &std::path::Path, file: File) -> io::Result<Self> {
             let file = normalize_inherited_file(file)?;
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let descriptor_root = std::path::Path::new("/proc/self/fd");
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let descriptor_root = std::path::Path::new("/dev/fd");
-            if !descriptor_root.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "descriptor-backed executable namespace is unavailable",
-                ));
-            }
-            let program = descriptor_root.join(file.as_raw_fd().to_string());
+            #[cfg(target_os = "macos")]
+            let program = path.to_owned();
+            #[cfg(not(target_os = "macos"))]
+            let program = {
+                let _ = path;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let descriptor_root = std::path::Path::new("/proc/self/fd");
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let descriptor_root = std::path::Path::new("/dev/fd");
+                if !descriptor_root.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "descriptor-backed executable namespace is unavailable",
+                    ));
+                }
+                descriptor_root.join(file.as_raw_fd().to_string())
+            };
             Ok(Self { file, program })
         }
 
@@ -1107,6 +1113,7 @@ mod platform {
         let sigchld = tokio::signal::unix::signal(SignalKind::child())?;
         let (liveness_read, liveness_write) = create_liveness_pipe()?;
         let inherited_write = liveness_write.as_raw_fd();
+        #[cfg(not(target_os = "macos"))]
         let executable_descriptor = executable.file.as_raw_fd();
         let working_directory = normalize_inherited_file(working_directory)?;
         let working_directory_descriptor = working_directory.as_raw_fd();
@@ -1114,14 +1121,18 @@ mod platform {
             command.pre_exec(move || {
                 // Keep both owned descriptors captured until this closure has
                 // run in the child. The executable descriptor must survive the
-                // following exec long enough for /proc/self/fd or /dev/fd to
-                // resolve it; the cwd is selected from its retained capability.
+                // following exec long enough for descriptor-backed Unix paths
+                // to resolve it. macOS retains the same revalidated handle until
+                // path-based exec and leaves it CLOEXEC so it is not exposed to
+                // the launched tool. The cwd is selected from its retained
+                // capability.
                 let _executable = &executable.file;
                 let _working_directory = &working_directory;
                 let _dependent_directories = &dependent_directories;
                 if libc::fchdir(working_directory_descriptor) != 0 {
                     return Err(io::Error::last_os_error());
                 }
+                #[cfg(not(target_os = "macos"))]
                 clear_close_on_exec(executable_descriptor)?;
                 clear_close_on_exec(inherited_write)
             });
@@ -1691,6 +1702,21 @@ mod tests {
             }
             unexpected => panic!("unknown helper mode {unexpected}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_the_validated_executable_path_instead_of_dev_fd() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("pinned-tool");
+        std::fs::write(&path, b"deterministic test image").unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let file = File::open(&path).unwrap();
+
+        let executable = platform::Executable::new(&path, file).unwrap();
+
+        assert_eq!(executable.program(), path);
+        assert!(!executable.program().starts_with("/dev/fd"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

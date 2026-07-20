@@ -358,10 +358,13 @@ impl ValidatedCommand {
 
     /// The only command admitted during trusted Rust toolchain bootstrap.
     ///
-    /// Unix launches through a retained executable descriptor, so the kernel-
-    /// visible program path is `/proc/self/fd/*` or `/dev/fd/*`. Fixing argv0
-    /// to the Rust compiler role also preserves rustup proxy dispatch without
-    /// admitting a caller-selected program identity.
+    /// Unix normally launches through a retained executable descriptor, so the
+    /// kernel-visible program path is `/proc/self/fd/*` or `/dev/fd/*`. macOS is
+    /// the compatibility exception: it consumes the validated pinned path after
+    /// revalidation under the global spawn lock while retaining the same open
+    /// executable handle through spawn. Fixing argv0 to the Rust compiler role
+    /// preserves bootstrap role dispatch without admitting a caller-selected
+    /// program identity.
     pub(crate) fn rustc_sysroot(
         executable: Arc<PinnedExecutable>,
         working_directory: Arc<ExecutionDirectory>,

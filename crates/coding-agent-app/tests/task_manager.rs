@@ -115,8 +115,8 @@ async fn terminal_claim_failure_cleans_provisional_state_and_reconciliation_clai
 async fn a_failed_fifo_head_claim_cannot_be_overtaken() {
     let fixture = support::task_manager_fixture(1).await;
     fixture.runner.push_blocking(2);
+    fixture.fail_fifo_head_started_event_inserts(true).await;
     let tasks = fixture.enqueue_tasks(2, false).await;
-    fixture.fail_started_event_for(Some(tasks[0].id)).await;
 
     fixture.manager.notify_queued(tasks[0].id).await.unwrap();
     assert!(matches!(
@@ -130,7 +130,7 @@ async fn a_failed_fifo_head_claim_cannot_be_overtaken() {
     assert_eq!(fixture.load(tasks[1].id).await.status, TaskStatus::Queued);
     assert_eq!(fixture.runner.started_count(tasks[1].id), 0);
 
-    fixture.fail_started_event_for(None).await;
+    fixture.fail_fifo_head_started_event_inserts(false).await;
     fixture.manager.notify_queued(tasks[0].id).await.unwrap();
     fixture
         .wait_for_status(tasks[0].id, TaskStatus::Running)
