@@ -1,96 +1,96 @@
-# Local Web Platform Implementation Plan
+# 本地 Web 平台实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **面向智能体执行者：** 必需子技能：使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`，按任务实施本计划。步骤使用复选框（`- [ ]`）语法跟踪进度。
 
-**Goal:** Build Project 1 as a directly launchable local Rust application with a protected React three-pane UI, deterministic fake tasks, SQLite persistence, REST commands, replayable SSE, restart recovery, and cross-platform smoke coverage.
+**目标：** 将 Project 1 构建为可直接启动的本地 Rust 应用程序，具备受保护的 React 三窗格界面、确定性假任务、SQLite 持久化、REST 命令、可重放 SSE、重启恢复及跨平台冒烟测试覆盖。
 
-**Architecture:** Four Rust crates preserve the approved dependency direction: `domain` owns pure rules, `store` owns SQLite, `api` owns REST/SSE contracts, and `app` composes actors and native platform services. React consumes OpenAPI-generated TypeScript types, treats REST snapshots as authoritative, and applies persisted SSE events as idempotent deltas. Project 1 uses only `FakeTaskRunner`; real model, code tools, worktrees, roles, and merge behavior remain outside this plan.
+**架构：** 四个 Rust 软件包保持已批准的依赖方向：`domain` 负责纯规则，`store` 负责 SQLite，`api` 负责 REST/SSE 契约，`app` 组合执行体与原生平台服务。React 使用由 OpenAPI 生成的 TypeScript 类型，将 REST 快照视为权威数据，并将持久化的 SSE 事件作为幂等增量应用。Project 1 仅使用 `FakeTaskRunner`；真实模型、代码工具、Git 工作树、角色和合并行为不在本计划范围内。
 
-**Tech Stack:** Rust 1.97.0, edition 2024, Axum 0.8.9, Tokio 1.52.3, SQLx 0.9.0 with SQLite, Utoipa 5.5.0, React 19.2.7, TypeScript 5.9.3, Vite 8.1.4, Vitest 4.1.10, Playwright 1.61.1.
+**技术栈：** Rust 1.97.0、edition 2024、Axum 0.8.9、Tokio 1.52.3、采用 SQLite 的 SQLx 0.9.0、Utoipa 5.5.0、React 19.2.7、TypeScript 5.9.3、Vite 8.1.4、Vitest 4.1.10、Playwright 1.61.1。
 
-## Global Constraints
+## 全局约束
 
-- Execute this plan in an isolated worktree created with `superpowers:using-git-worktrees`; do not implement directly on `main`.
-- Project 1 may inspect only Git/Cargo registration metadata. It must not read source files, call a model, create a worktree, modify a repository, or run repository tests.
-- The production fake runner concurrency is exactly 4. The future real runner defaults to 1 until Project 4; do not encode fake concurrency into API types.
-- `TaskStatus::Completed` means runner success only. It never means reviewed, deliverable, or mergeable.
-- SQLite is authoritative. Every observable task state change and its event commit in one transaction; memory channels are acceleration only.
-- Task claim/cancel, runner event/result, reconciliation, and quiesce are serialized by `TaskManager`; after runtime actors start, create/retry and every SQLite mutation are serialized by `StoreWriter`; migration/startup recovery run earlier under sole primary ownership. Every persisted live event is published in ID order by `EventDispatcher`.
-- Bind only `127.0.0.1` on a random port. Production has no CORS and no remote/CDN assets.
-- All `/api/*` reads require the process session. Every mutation additionally requires exact Origin and `X-CSRF-Token`.
-- Browser refresh or close never cancels work. Startup converts persisted `Queued`/`Running` tasks to `Interrupted`; it never auto-resumes them.
-- Rust OpenAPI is the only API DTO source. Frontend aliases may reference generated types but may not duplicate DTO shapes.
-- All persisted and API timestamps pass through `UtcTimestamp` and serialize as UTC RFC 3339; repository paths pass through `CanonicalPath` before persistence or response mapping.
-- Release order is OpenAPI export → `npm ci` → TypeScript generation check → typecheck/tests/build → Rust checks/tests → release build.
-- Dependency installation may use registries; test execution and normal application runtime must make no external network request.
-- Use TDD for every behavior: observe the focused test fail for the intended reason, implement the minimum behavior, observe it pass, run impacted suites, then commit.
-- Do not add compatibility layers for Project 2. Only keep the approved `TaskRunner` and versioned event seams.
+- 在使用 `superpowers:using-git-worktrees` 创建的隔离 Git 工作树中执行本计划；不得直接在 `main` 上实施。
+- Project 1 只能检查 Git/Cargo 注册元数据。不得读取源文件、调用模型、创建 Git 工作树、修改仓库或运行仓库测试。
+- 生产环境假运行器的并发数严格为 4。在 Project 4 之前，未来真实运行器的默认并发数为 1；不得将假任务并发数编码进 API 类型。
+- `TaskStatus::Completed` 只表示运行器成功。绝不表示已审查、可交付或可合并。
+- SQLite 是权威数据源。每个可观察的任务状态变更及其事件必须在同一事务中提交；内存通道仅用于加速。
+- 任务领取/取消、运行器事件/结果、状态协调和静默化由 `TaskManager` 串行化；运行时执行体启动后，创建/重试以及每次 SQLite 变更由 `StoreWriter` 串行化；迁移/启动恢复更早在唯一主实例的独占控制下运行。每个持久化实时事件由 `EventDispatcher` 按 ID 顺序发布。
+- 仅在随机端口上绑定 `127.0.0.1`。生产环境不启用 CORS，也不使用远程/CDN 资源。
+- 所有 `/api/*` 读取都需要进程会话。每个变更操作还需要完全匹配的 `Origin` 和 `X-CSRF-Token`。
+- 刷新或关闭浏览器绝不取消工作。启动时将持久化的 `Queued`/`Running` 任务转换为 `Interrupted`；绝不自动恢复它们。
+- Rust OpenAPI 是 API DTO 的唯一来源。前端别名可以引用生成的类型，但不得重复定义 DTO 结构。
+- 所有持久化及 API 时间戳均经过 `UtcTimestamp`，并序列化为 UTC RFC 3339；仓库路径必须先经过 `CanonicalPath`，再持久化或映射到响应。
+- 发布顺序为：导出 OpenAPI → `npm ci` → 检查 TypeScript 生成结果 → 类型检查/测试/构建 → Rust 检查/测试 → 发布构建。
+- 安装依赖时可以使用注册表；执行测试和应用程序正常运行时不得发起任何外部网络请求。
+- 每项行为都采用 TDD：先观察聚焦测试因预期原因失败，再实施最小行为，观察其通过，运行受影响的测试套件，随后提交。
+- 不要为 Project 2 添加兼容层。仅保留已批准的 `TaskRunner` 和带版本的事件接缝。
 
-## Source Specifications
+## 来源规范
 
 - `docs/superpowers/specs/2026-07-14-coding-agent-product-roadmap-design.md`
 - `docs/superpowers/specs/2026-07-14-local-web-platform-design.md`
 
-## Locked File Map
+## 锁定文件映射
 
 ```text
-Cargo.toml                                  Rust workspace and locked shared dependencies
-Cargo.lock                                  committed Rust dependency lock
-rust-toolchain.toml                         Rust 1.97.0 toolchain pin
+Cargo.toml                                  Rust 工作区和锁定的共享依赖
+Cargo.lock                                  已提交的 Rust 依赖锁文件
+rust-toolchain.toml                         Rust 1.97.0 工具链版本固定
 crates/coding-agent-domain/
   Cargo.toml
-  src/lib.rs                                public domain exports
-  src/ids.rs                                UUID newtypes
-  src/value.rs                              validated path/time/event cursor values
-  src/repository.rs                         Repository and registration inputs
-  src/task.rs                               Task state machine and failure
-  src/event.rs                              event kinds and panel snapshots
-  tests/state_machine.rs                    legal transition and retry tests
+  src/lib.rs                                公开的领域层导出
+  src/ids.rs                                UUID 新类型
+  src/value.rs                              经验证的路径/时间/事件游标值
+  src/repository.rs                         仓库及注册输入
+  src/task.rs                               任务状态机和失败信息
+  src/event.rs                              事件种类和面板快照
+  tests/state_machine.rs                    合法转换和重试测试
 crates/coding-agent-store/
   Cargo.toml
   migrations/0001_initial.sql               repositories/tasks/events/schema_migrations
-  src/lib.rs                                Store entrypoint and read pool
-  src/migrate.rs                            embedded monotonic migration runner
-  src/repositories.rs                       repository identity and upsert
-  src/tasks.rs                              task/event transactions and recovery
-  src/projection.rs                         BootstrapSnapshot and TaskDetail replay
+  src/lib.rs                                Store 入口点和读取池
+  src/migrate.rs                            内嵌单调迁移执行器
+  src/repositories.rs                       仓库身份和更新或插入
+  src/tasks.rs                              任务/事件事务和恢复
+  src/projection.rs                         BootstrapSnapshot 和 TaskDetail 重放
   tests/migrations.rs
   tests/repositories.rs
   tests/tasks.rs
   tests/projection.rs
-  tests/support/mod.rs                    shared SQLite fixtures imported by each test target
+  tests/support/mod.rs                    各测试目标导入的共享 SQLite 测试夹具
 crates/coding-agent-api/
   Cargo.toml
   src/lib.rs
   src/contract.rs                           REST/SSE/OpenAPI DTOs
-  src/backend.rs                            ApiBackend and RequestSecurity ports
-  src/error.rs                              ApiErrorResponse mapping
-  src/router.rs                             protected REST route handlers
-  src/sse.rs                                SSE join and wire frames
-  src/bin/export_openapi.rs                 deterministic OpenAPI exporter
+  src/backend.rs                            ApiBackend 和 RequestSecurity 端口
+  src/error.rs                              ApiErrorResponse 映射
+  src/router.rs                             受保护的 REST 路由处理器
+  src/sse.rs                                SSE 汇合和传输帧
+  src/bin/export_openapi.rs                 确定性 OpenAPI 导出器
   tests/openapi.rs
   tests/router.rs
   tests/sse.rs
-  tests/support/mod.rs                    fake API/security/SSE ports
+  tests/support/mod.rs                    假 API/安全/SSE 端口
 crates/coding-agent-app/
   Cargo.toml
-  build.rs                                  frontend embed rebuild trigger
+  build.rs                                  前端内嵌重建触发器
   src/lib.rs
-  src/main.rs                               primary/secondary composition root
-  src/service_state.rs                      ready/degraded/quiescing generation
-  src/store_writer.rs                       single SQLite mutation actor
-  src/event_dispatcher.rs                   ordered DB-backed live publisher
-  src/task_manager.rs                       single task-control actor
-  src/fake_runner.rs                        deterministic runner and test scripts
-  src/repository_service.rs                 read-only Git/Cargo discovery
-  src/native_dialog.rs                      serialized picker/message dialog port
-  src/security.rs                           session, token, Host, Origin, CSRF
-  src/platform.rs                           app paths, private permissions, browser
-  src/single_instance.rs                    file lock and runtime descriptor
-  src/server.rs                             outer Axum router and readiness
-  src/static_assets.rs                      dev fallback and release embedding
-  src/shutdown.rs                           normal and degraded shutdown
-  src/test_support.rs                       feature-gated process test injection
+  src/main.rs                               主/辅助实例组合根
+  src/service_state.rs                      就绪/降级/静默化状态世代号
+  src/store_writer.rs                       单一 SQLite 变更执行体
+  src/event_dispatcher.rs                   由数据库支持的有序实时发布器
+  src/task_manager.rs                       单一任务控制执行体
+  src/fake_runner.rs                        确定性运行器和测试脚本
+  src/repository_service.rs                 只读 Git/Cargo 发现
+  src/native_dialog.rs                      串行化的选择器/消息对话框端口
+  src/security.rs                           会话、令牌、Host、Origin、CSRF
+  src/platform.rs                           应用路径、私有权限、浏览器
+  src/single_instance.rs                    文件锁和运行时描述符
+  src/server.rs                             外层 Axum 路由器和就绪状态
+  src/static_assets.rs                      开发环境后备和发布内嵌
+  src/shutdown.rs                           正常和降级关闭
+  src/test_support.rs                       受功能特性限制的进程测试注入
   tests/store_writer.rs
   tests/event_dispatcher.rs
   tests/task_manager.rs
@@ -104,7 +104,7 @@ crates/coding-agent-app/
   tests/shutdown.rs
   tests/process_support.rs
   tests/release_smoke.rs
-  tests/support/mod.rs                    shared actor/platform fixtures imported by each test target
+  tests/support/mod.rs                    各测试目标导入的共享执行体/平台测试夹具
 web/
   package.json
   package-lock.json
@@ -140,41 +140,41 @@ web/
   src/**/*.test.ts(x)
   e2e/local-app.spec.ts
   e2e/support/localApp.ts
-.github/workflows/ci.yml                  Rust, frontend, E2E, three-OS smoke gates
-scripts/check-placeholders.mjs             tracked-source forbidden-marker gate
-README.md                                 direct-launch and development workflow
+.github/workflows/ci.yml                  Rust、前端、E2E 和三个操作系统的冒烟门禁
+scripts/check-placeholders.mjs             已跟踪源文件的禁用标记门禁
+README.md                                 直接启动和开发工作流
 ```
 
 ---
 
-### Task 1: Establish the Workspace and Pure Domain Model
+### 任务 1：建立工作区和纯领域模型
 
-**Files:**
-- Create: `Cargo.toml`
-- Create: `rust-toolchain.toml`
-- Create: `crates/coding-agent-domain/Cargo.toml`
-- Create: `crates/coding-agent-domain/src/lib.rs`
-- Create: `crates/coding-agent-domain/src/ids.rs`
-- Create: `crates/coding-agent-domain/src/value.rs`
-- Create: `crates/coding-agent-domain/src/repository.rs`
-- Create: `crates/coding-agent-domain/src/task.rs`
-- Create: `crates/coding-agent-domain/src/event.rs`
-- Create: `crates/coding-agent-domain/tests/state_machine.rs`
-- Create: `crates/coding-agent-store/Cargo.toml`
-- Create: `crates/coding-agent-store/src/lib.rs`
-- Create: `crates/coding-agent-api/Cargo.toml`
-- Create: `crates/coding-agent-api/src/lib.rs`
-- Create: `crates/coding-agent-app/Cargo.toml`
-- Create: `crates/coding-agent-app/src/lib.rs`
-- Modify: `.gitignore`
+**文件：**
+- 创建：`Cargo.toml`
+- 创建：`rust-toolchain.toml`
+- 创建：`crates/coding-agent-domain/Cargo.toml`
+- 创建：`crates/coding-agent-domain/src/lib.rs`
+- 创建：`crates/coding-agent-domain/src/ids.rs`
+- 创建：`crates/coding-agent-domain/src/value.rs`
+- 创建：`crates/coding-agent-domain/src/repository.rs`
+- 创建：`crates/coding-agent-domain/src/task.rs`
+- 创建：`crates/coding-agent-domain/src/event.rs`
+- 创建：`crates/coding-agent-domain/tests/state_machine.rs`
+- 创建：`crates/coding-agent-store/Cargo.toml`
+- 创建：`crates/coding-agent-store/src/lib.rs`
+- 创建：`crates/coding-agent-api/Cargo.toml`
+- 创建：`crates/coding-agent-api/src/lib.rs`
+- 创建：`crates/coding-agent-app/Cargo.toml`
+- 创建：`crates/coding-agent-app/src/lib.rs`
+- 修改：`.gitignore`
 
-**Interfaces:**
-- Produces: `RepositoryId`, `TaskId`, `ClientRequestId`, `CanonicalPath`, `UtcTimestamp`, `EventId`, `EventCursor`, `DomainError`, `Repository`, `NewRepository`, `Task`, `NewTask`, `TaskStatus`, `TaskFailure`, `TaskEvent`, `TaskEventKind`, `TaskEventPayload`, `PlanSnapshot`, `ActivityEntry`, `DiffSnapshot`, `TestSnapshot`, and `TimelineEntry`.
-- Invariant: `TaskStatus::can_transition_to` is the only legal-transition table; store code may not duplicate it.
+**接口：**
+- 产出：`RepositoryId`、`TaskId`、`ClientRequestId`、`CanonicalPath`、`UtcTimestamp`、`EventId`、`EventCursor`、`DomainError`、`Repository`、`NewRepository`、`Task`、`NewTask`、`TaskStatus`、`TaskFailure`、`TaskEvent`、`TaskEventKind`、`TaskEventPayload`、`PlanSnapshot`、`ActivityEntry`、`DiffSnapshot`、`TestSnapshot` 和 `TimelineEntry`。
+- 不变量：`TaskStatus::can_transition_to` 是唯一的合法转换表；存储层代码不得复制该表。
 
-- [ ] **Step 1: Create the workspace manifests and a failing state-machine test**
+- [ ] **步骤 1：创建工作区清单和一个失败的状态机测试**
 
-Use this workspace dependency set and commit `Cargo.lock` when Cargo generates it; the independent npm lockfile is created in Task 16:
+使用以下工作区依赖集，并在 Cargo 生成 `Cargo.lock` 时将其提交；独立的 npm 锁文件将在任务 16 中创建：
 
 ```toml
 [workspace]
@@ -234,9 +234,9 @@ profile = "minimal"
 components = ["clippy", "rustfmt"]
 ```
 
-Create all four member manifests now so Cargo reaches the intended domain compile failure. The three not-yet-implemented `src/lib.rs` files contain only a crate-level responsibility comment. Later tasks add runtime dependencies when code first uses them.
+现在创建全部四个成员清单，使 Cargo 能触发预期的领域层编译失败。三个尚未实施的 `src/lib.rs` 文件只包含一条软件包级职责注释。后续任务会在代码首次使用运行时依赖时再添加它们。
 
-Add `/target`, `/web/node_modules`, `/web/dist`, and Playwright output directories to `.gitignore`; keep `Cargo.lock`, `web/package-lock.json`, `web/openapi.json`, and generated TypeScript declarations tracked.
+将 `/target`、`/web/node_modules`、`/web/dist` 和 Playwright 输出目录添加到 `.gitignore`；继续跟踪 `Cargo.lock`、`web/package-lock.json`、`web/openapi.json` 以及生成的 TypeScript 声明。
 
 ```toml
 # crates/coding-agent-domain/Cargo.toml
@@ -329,15 +329,15 @@ fn only_terminal_tasks_are_retryable() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and confirm the intended failure**
+- [ ] **步骤 2：运行聚焦测试并确认预期失败**
 
-Run: `cargo test -p coding-agent-domain --test state_machine`
+运行：`cargo test -p coding-agent-domain --test state_machine`
 
-Expected: compilation fails because `coding_agent_domain::TaskStatus` does not yet exist. A toolchain or dependency-download failure is not the expected red result; fix the environment and rerun until the missing type is the failure.
+预期：由于 `coding_agent_domain::TaskStatus` 尚不存在，编译失败。工具链或依赖下载失败并不是预期的红灯结果；修复环境并重新运行，直到缺失类型成为失败原因。
 
-- [ ] **Step 3: Implement the domain types and the single transition table**
+- [ ] **步骤 3：实施领域类型和唯一转换表**
 
-Use transparent UUID newtypes and keep HTTP/OpenAPI names out of this crate:
+使用透明的 UUID 新类型（newtype），并确保该软件包中不出现 HTTP/OpenAPI 名称：
 
 ```rust
 // crates/coding-agent-domain/src/task.rs
@@ -379,7 +379,7 @@ pub struct TaskFailure {
 }
 ```
 
-The remaining domain shapes are fixed here and reused unchanged by store/API mapping:
+其余领域结构在此固定，并由存储层/API 映射原样复用：
 
 ```rust
 pub struct NewRepository {
@@ -465,9 +465,9 @@ pub struct TimelineEntry {
 }
 ```
 
-All structs/enums derive the appropriate Debug/Clone/Eq/serde traits; status enums use `snake_case`. `RepositoryId`, `TaskId`, and `ClientRequestId` are distinct transparent `uuid::Uuid` newtypes with `new()` and `Display`/`FromStr`. `NewTask::try_new` trims the prompt, rejects empty or more than 50,000 Unicode scalar values through `DomainError::InvalidPrompt`, and stores the trimmed value. Store constructors enforce `attempt >= 1` and `last_event_id > 0`. Queued has no timestamps/failure; Running has start only; Completed has start/finish and no failure; Failed has start/finish plus failure; Cancelled and Interrupted have finish with optional start, and only Interrupted requires failure.
+所有结构体/枚举均派生适当的 `Debug`/`Clone`/`Eq`/`serde` 特征；状态枚举使用 `snake_case`。`RepositoryId`、`TaskId` 和 `ClientRequestId` 是彼此不同的透明 `uuid::Uuid` 新类型，带有 `new()` 以及 `Display`/`FromStr`。`NewTask::try_new` 会去除提示词两端空白，通过 `DomainError::InvalidPrompt` 拒绝空提示词或超过 50,000 个 Unicode 标量值的提示词，并存储去除空白后的值。`Store` 构造函数强制要求 `attempt >= 1` 且 `last_event_id > 0`。`Queued` 没有时间戳/失败信息；`Running` 只有开始时间；`Completed` 有开始/结束时间且无失败信息；`Failed` 有开始/结束时间和失败信息；`Cancelled` 与 `Interrupted` 有结束时间以及可选的开始时间，且只有 `Interrupted` 必须提供失败信息。
 
-Define IDs in `ids.rs`, repository types in `repository.rs`, and these exact event variants in `event.rs`:
+在 `ids.rs` 中定义 ID，在 `repository.rs` 中定义仓库类型，并在 `event.rs` 中定义以下严格一致的事件变体：
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -505,49 +505,49 @@ pub struct TaskEvent {
 }
 ```
 
-`CanonicalPath::try_from_canonical` accepts only absolute, normalized paths without current/parent components; platform discovery performs filesystem canonicalization before calling it. `UtcTimestamp` normalizes to `UtcOffset::UTC`, parses RFC 3339, and always serializes the fixed-width UTC form `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ` so SQLite text order equals chronological order. It never exposes a non-UTC value. `EventId::new` accepts only positive values; `EventCursor::new` accepts nonnegative values and provides `ZERO`. All four are private-field serde newtypes with checked constructors/accessors; event ID/cursor values derive Copy/Ord and convert explicitly at SQL/API boundaries.
+`CanonicalPath::try_from_canonical` 只接受绝对、规范化且不含当前/父级组件的路径；平台发现功能在调用它之前执行文件系统规范化。`UtcTimestamp` 会规范为 `UtcOffset::UTC`，解析 RFC 3339，并始终序列化为固定宽度的 UTC 形式 `YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`，从而使 SQLite 文本顺序等同于时间顺序。它绝不暴露非 UTC 值。`EventId::new` 只接受正值；`EventCursor::new` 接受非负值并提供 `ZERO`。这四种类型均为字段私有的 serde 新类型，带有受检查的构造函数/访问器；事件 ID/游标值派生 `Copy`/`Ord`，并在 SQL/API 边界进行显式转换。
 
-`TaskEventKind` exhaustively mirrors those ten variants and `TaskEventPayload::kind()` is the only mapping. `TaskEvent::new` fixes schema version to 1. Extend `state_machine.rs` with prompt tests at empty, 50,000, and 50,001 scalars; UUID and event ID/cursor round trips; canonical-path rejection; non-UTC timestamp normalization/RFC3339 output; Task invariants; and tagged event serialization. No type contains a review/delivery field.
+`TaskEventKind` 穷举映射这十个变体，`TaskEventPayload::kind()` 是唯一映射。`TaskEvent::new` 将模式版本固定为 1。扩展 `state_machine.rs`，加入空值、50,000 和 50,001 个标量值的提示词测试；UUID 和事件 ID/游标往返测试；规范路径拒绝测试；非 UTC 时间戳规范化/RFC3339 输出测试；`Task` 不变量测试；以及带标签事件序列化测试。任何类型都不得包含审查/交付字段。
 
-- [ ] **Step 4: Run domain tests and confirm green**
+- [ ] **步骤 4：运行领域测试并确认通过**
 
-Run: `cargo test -p coding-agent-domain`
+运行：`cargo test -p coding-agent-domain`
 
-Expected: state-machine, prompt boundary, ID, invariant, and tagged-event tests pass with zero failures.
+预期：状态机、提示词边界、ID、不变量和带标签事件测试全部通过，零失败。
 
-- [ ] **Step 5: Run formatting and lint for the new crate**
+- [ ] **步骤 5：对新软件包运行格式和代码检查**
 
-Run: `cargo fmt --all --check`
+运行：`cargo fmt --all --check`
 
-Run: `cargo clippy -p coding-agent-domain --all-targets -- -D warnings`
+运行：`cargo clippy -p coding-agent-domain --all-targets -- -D warnings`
 
-Expected: both commands exit 0 with no diagnostics.
+预期：两个命令均以 0 退出，且无诊断信息。
 
-- [ ] **Step 6: Commit the independently testable domain foundation**
+- [ ] **步骤 6：提交可独立测试的领域基础**
 
 ```bash
 git add Cargo.toml Cargo.lock rust-toolchain.toml .gitignore crates/coding-agent-domain crates/coding-agent-store/Cargo.toml crates/coding-agent-store/src/lib.rs crates/coding-agent-api/Cargo.toml crates/coding-agent-api/src/lib.rs crates/coding-agent-app/Cargo.toml crates/coding-agent-app/src/lib.rs
 git commit -m "feat: add project domain model"
 ```
 
-### Task 2: Add SQLite Migrations and Repository Registration
+### 任务 2：添加 SQLite 迁移和仓库注册
 
-**Files:**
-- Modify: `crates/coding-agent-store/Cargo.toml`
-- Create: `crates/coding-agent-store/migrations/0001_initial.sql`
-- Modify: `crates/coding-agent-store/src/lib.rs`
-- Create: `crates/coding-agent-store/src/migrate.rs`
-- Create: `crates/coding-agent-store/src/repositories.rs`
-- Create: `crates/coding-agent-store/tests/migrations.rs`
-- Create: `crates/coding-agent-store/tests/repositories.rs`
-- Create: `crates/coding-agent-store/tests/support/mod.rs`
+**文件：**
+- 修改：`crates/coding-agent-store/Cargo.toml`
+- 创建：`crates/coding-agent-store/migrations/0001_initial.sql`
+- 修改：`crates/coding-agent-store/src/lib.rs`
+- 创建：`crates/coding-agent-store/src/migrate.rs`
+- 创建：`crates/coding-agent-store/src/repositories.rs`
+- 创建：`crates/coding-agent-store/tests/migrations.rs`
+- 创建：`crates/coding-agent-store/tests/repositories.rs`
+- 创建：`crates/coding-agent-store/tests/support/mod.rs`
 
-**Interfaces:**
-- Consumes: domain `Repository`, `RepositoryId`, and `NewRepository`.
-- Produces: `Store::open`, `Store::migrate`, `Store::register_repository`, `RegisterRepositoryOutcome::{Created, Existing}`, and read-only `Store::list_repositories` ordered by `(last_opened_at DESC,id)` without pagination.
-- Invariant: the display path never defines identity; `(git_identity_key, cargo_identity_key)` is unique.
+**接口：**
+- 使用：领域层（domain）中的 `Repository`、`RepositoryId` 和 `NewRepository`。
+- 产出：`Store::open`、`Store::migrate`、`Store::register_repository`、`RegisterRepositoryOutcome::{Created, Existing}`，以及按 `(last_opened_at DESC,id)` 排序、不分页的只读 `Store::list_repositories`。
+- 不变量：显示路径绝不用于定义身份；`(git_identity_key, cargo_identity_key)` 是唯一的。
 
-The store manifest delta for this task is exact:
+本任务的存储层清单增量必须严格如下：
 
 ```toml
 [dependencies]
@@ -563,7 +563,7 @@ tempfile.workspace = true
 tokio.workspace = true
 ```
 
-- [ ] **Step 1: Write failing migration and repository idempotency tests**
+- [ ] **步骤 1：编写失败的迁移和仓库幂等性测试**
 
 ```rust
 // crates/coding-agent-store/tests/repositories.rs
@@ -579,17 +579,17 @@ async fn registering_the_same_workspace_reuses_the_row() {
 }
 ```
 
-`tests/support/mod.rs` owns `memory_store`, file-backed temporary Store, repository builders, and database fault helpers; every store integration test begins with `mod support;`. `migrations.rs` must assert `PRAGMA journal_mode`, `PRAGMA foreign_keys`, a non-zero busy timeout, idempotent second migration, and existence of `schema_migrations`, `repositories`, `tasks`, and `task_events`.
+`tests/support/mod.rs` 负责 `memory_store`、基于文件的临时 `Store`、仓库构建器和数据库故障辅助函数；每个存储层集成测试都以 `mod support;` 开头。`migrations.rs` 必须断言 `PRAGMA journal_mode`、`PRAGMA foreign_keys`、非零忙等待超时、第二次迁移的幂等性，以及 `schema_migrations`、`repositories`、`tasks` 和 `task_events` 的存在。
 
-- [ ] **Step 2: Run store tests and verify the red result**
+- [ ] **步骤 2：运行存储层测试并验证红灯结果**
 
-Run: `cargo test -p coding-agent-store --test migrations --test repositories`
+运行：`cargo test -p coding-agent-store --test migrations --test repositories`
 
-Expected: compilation fails because `Store` and the migration do not exist.
+预期：由于 `Store` 和迁移尚不存在，编译失败。
 
-- [ ] **Step 3: Implement the schema and embedded monotonic migration runner**
+- [ ] **步骤 3：实施数据库结构和内嵌的单调迁移执行器**
 
-The initial SQL must contain these constraints, with timestamps stored as RFC 3339 text and UUIDs as lowercase text:
+初始 SQL 必须包含以下约束，时间戳以 RFC 3339 文本存储，UUID 以小写文本存储：
 
 ```sql
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -637,42 +637,42 @@ CREATE TABLE task_events (
 CREATE INDEX task_events_task_id_id ON task_events(task_id, id);
 ```
 
-`Store::open` uses `SqliteConnectOptions` with create-if-missing, WAL, foreign keys, and a five-second busy timeout. `migrate` runs `BEGIN IMMEDIATE`, applies the ordered table beginning with `(1, include_str!("../migrations/0001_initial.sql"))` when absent from `schema_migrations`, inserts the version, and commits. Never auto-delete or recreate a failing database.
+`Store::open` 使用 `SqliteConnectOptions`，启用缺失时创建、WAL、外键以及五秒忙等待超时。`migrate` 运行 `BEGIN IMMEDIATE`，若 `schema_migrations` 中不存在相应记录，则应用以 `(1, include_str!("../migrations/0001_initial.sql"))` 开头的有序表，插入版本号并提交。绝不自动删除或重建故障数据库。
 
-- [ ] **Step 4: Implement repository identity upsert**
+- [ ] **步骤 4：实施仓库身份更新或插入（upsert）**
 
-`register_repository` starts an immediate transaction, looks up the identity pair, updates `selected_path` and `last_opened_at` for an existing row, otherwise inserts a UUID v4 row. On Windows, canonical paths pass through one `windows_identity_key` function that normalizes separators and uses Unicode lowercase; tests must cover a case-variant input. Unix identity keys preserve case.
+`register_repository` 启动立即事务并查找身份对；对于已有行，更新 `selected_path` 和 `last_opened_at`，否则插入一个 UUID v4 行。在 Windows 上，规范路径经过唯一的 `windows_identity_key` 函数，该函数统一分隔符并使用 Unicode 小写形式；测试必须覆盖大小写变体输入。Unix 身份键保留大小写。
 
-- [ ] **Step 5: Run focused and impacted tests**
+- [ ] **步骤 5：运行聚焦测试和受影响的测试**
 
-Run: `cargo test -p coding-agent-store --test migrations --test repositories`
+运行：`cargo test -p coding-agent-store --test migrations --test repositories`
 
-Run: `cargo test -p coding-agent-domain -p coding-agent-store`
+运行：`cargo test -p coding-agent-domain -p coding-agent-store`
 
-Expected: all tests pass. The second migration call leaves one version row, and duplicate registration leaves one repository row.
+预期：所有测试通过。第二次迁移调用只留下一个版本行，重复注册只留下一个仓库行。
 
-- [ ] **Step 6: Commit the repository persistence slice**
+- [ ] **步骤 6：提交仓库持久化切片**
 
 ```bash
 git add crates/coding-agent-store Cargo.lock
 git commit -m "feat: persist registered repositories"
 ```
 
-### Task 3: Add Atomic Task/Event Transactions and Projections
+### 任务 3：添加原子任务/事件事务和投影
 
-**Files:**
-- Create: `crates/coding-agent-store/src/tasks.rs`
-- Create: `crates/coding-agent-store/src/projection.rs`
-- Create: `crates/coding-agent-store/tests/tasks.rs`
-- Create: `crates/coding-agent-store/tests/projection.rs`
-- Modify: `crates/coding-agent-store/tests/support/mod.rs`
-- Modify: `crates/coding-agent-store/src/lib.rs`
+**文件：**
+- 创建：`crates/coding-agent-store/src/tasks.rs`
+- 创建：`crates/coding-agent-store/src/projection.rs`
+- 创建：`crates/coding-agent-store/tests/tasks.rs`
+- 创建：`crates/coding-agent-store/tests/projection.rs`
+- 修改：`crates/coding-agent-store/tests/support/mod.rs`
+- 修改：`crates/coding-agent-store/src/lib.rs`
 
-**Interfaces:**
-- Produces: `TaskTransition`, `CreateTaskOutcome`, `RetryTaskOutcome`, `TransitionOutcome`, `AppendEventOutcome`, `RecoveryOutcome`, `BootstrapSnapshot`, `TaskDetail`, `EventPage`, and store methods `create_task`, `retry_task`, `transition_with_event`, `append_running_event`, `recover_incomplete`, `bootstrap_snapshot`, `task_detail`, `events_after`, `task_events_after`, and `latest_event_id`.
-- Invariant: each method that changes visible task state also inserts its event and updates `last_event_id` in the same transaction.
+**接口：**
+- 产出：`TaskTransition`、`CreateTaskOutcome`、`RetryTaskOutcome`、`TransitionOutcome`、`AppendEventOutcome`、`RecoveryOutcome`、`BootstrapSnapshot`、`TaskDetail`、`EventPage`，以及存储层方法 `create_task`、`retry_task`、`transition_with_event`、`append_running_event`、`recover_incomplete`、`bootstrap_snapshot`、`task_detail`、`events_after`、`task_events_after` 和 `latest_event_id`。
+- 不变量：每个改变可见任务状态的方法，都必须在同一事务中插入对应事件并更新 `last_event_id`。
 
-- [ ] **Step 1: Write failing transaction, retry, recovery, and projection tests**
+- [ ] **步骤 1：编写失败的事务、重试、恢复和投影测试**
 
 ```rust
 #[tokio::test]
@@ -709,21 +709,21 @@ async fn retry_is_a_linear_idempotent_chain() {
 }
 ```
 
-Add tests that initial create sets `attempt = 1` and `retry_of = None`, a mismatched repeated `client_request_id` returns `IDEMPOTENCY_CONFLICT`, an illegal transition changes neither task nor event count, startup recovery atomically interrupts all queued/running tasks, and `TaskDetail` reads events plus the global watermark from one SQLite read transaction.
+添加测试以验证：初次创建设置 `attempt = 1` 和 `retry_of = None`；不匹配的重复 `client_request_id` 返回 `IDEMPOTENCY_CONFLICT`；非法转换既不改变任务也不改变事件数量；启动恢复以原子方式中断所有 `Queued`/`Running` 任务；`TaskDetail` 在一个 SQLite 读事务中读取事件及全局水位线。
 
-Add a concurrent retry test that releases at least eight calls against one terminal source and observes one direct child ID/event. For every lifecycle event, assert `payload.task.last_event_id == event.id`. Inject a failure after task-state update, placeholder event insert, last-event update, and final payload update; every fault must roll the entire transaction back and leave no publishable event or placeholder payload.
+添加并发重试测试：针对一个终态来源同时释放至少八个调用，并只观察到一个直接子任务 ID/事件。对于每个生命周期事件，断言 `payload.task.last_event_id == event.id`。分别在任务状态更新、占位事件插入、末尾事件更新和最终载荷更新之后注入失败；每个故障都必须回滚整个事务，不得留下可发布事件或占位载荷。
 
-- [ ] **Step 2: Run the focused tests and verify failure**
+- [ ] **步骤 2：运行聚焦测试并验证失败**
 
-Run: `cargo test -p coding-agent-store --test tasks --test projection`
+运行：`cargo test -p coding-agent-store --test tasks --test projection`
 
-Expected: compilation fails on the missing task methods and projection types.
+预期：因缺少任务方法和投影类型而编译失败。
 
-- [ ] **Step 3: Implement task creation, transitions, event append, and retry**
+- [ ] **步骤 3：实施任务创建、转换、事件追加和重试**
 
-Use `BEGIN IMMEDIATE` for every mutation. Lifecycle payloads embed the final Task, so all create/retry/transition/recovery paths use one invisible transaction-local sequence: write the raw task row/state (creation may temporarily store integer zero without constructing a domain Task), insert the lifecycle event row with valid-JSON internal placeholder `{}`, obtain its AUTOINCREMENT EventId, update `tasks.last_event_id`, reload and validate the final domain Task, replace that event's placeholder with the typed payload containing the reloaded Task, verify exactly one payload row changed, and commit. No public/committed Task has ID zero, no committed event has a placeholder, and every lifecycle payload Task points back to its own event ID.
+每次变更都使用 `BEGIN IMMEDIATE`。生命周期载荷内嵌最终 `Task`，因此所有创建/重试/转换/恢复路径都使用一个外部不可见的事务内序列：写入原始任务行/状态（创建时可以临时存储整数零而不构造领域 `Task`），插入带有有效 JSON 内部占位符 `{}` 的生命周期事件行，获取其 AUTOINCREMENT `EventId`，更新 `tasks.last_event_id`，重新加载并验证最终领域 `Task`，将该事件的占位符替换为包含重新加载 `Task` 的类型化载荷，验证恰好有一个载荷行发生变化，然后提交。任何公开/已提交 `Task` 的 ID 都不能为零，任何已提交事件都不能含占位符，并且每个生命周期载荷中的 `Task` 都必须回指自身事件 ID。
 
-Repeated create request IDs compare repository and trimmed prompt. `transition_with_event(task_id, expected, transition)` validates the state table and conditionally updates by both id and expected status before the shared sequence. Non-lifecycle running events can insert their final typed payload immediately, then update Task.last_event_id before commit. Callers never supply lifecycle payloads or stale Task snapshots.
+重复的创建请求 ID 要比较仓库和去除空白后的提示词。`transition_with_event(task_id, expected, transition)` 验证状态表，并在共享序列之前同时按 ID 和预期状态进行条件更新。非生命周期的运行中事件可立即插入其最终类型化载荷，然后在提交前更新 `Task.last_event_id`。调用者绝不提供生命周期载荷或过期的 `Task` 快照。
 
 ```rust
 pub enum TaskTransition {
@@ -786,15 +786,15 @@ pub struct EventPage {
 }
 ```
 
-The closed enum makes invalid failure combinations unrepresentable. `Running` sets `started_at = now`, clears finish/failure, and is valid only from Queued. Every terminal transition sets `finished_at = now` and preserves the existing `started_at`; `Failed` and `Interrupted` store their structured failure, while Completed/Cancelled clear it. Reject a table-invalid edge as `StoreError::IllegalTransition { from, to }` before SQL; a CAS miss returns `Conflict { current }`; a missing ID is `StoreError::TaskNotFound`. Create mismatch is `StoreError::IdempotencyConflict`; retry of a nonterminal task is `StoreError::TaskNotRetryable`.
+该封闭枚举使无效的失败组合无法表示。`Running` 设置 `started_at = now`，清除结束时间/失败信息，且只允许从 `Queued` 转入。每个终态转换都设置 `finished_at = now` 并保留现有 `started_at`；`Failed` 和 `Interrupted` 存储其结构化失败信息，而 `Completed`/`Cancelled` 将其清除。执行 SQL 之前，将状态表中的非法边拒绝为 `StoreError::IllegalTransition { from, to }`；CAS 未命中返回 `Conflict { current }`；ID 缺失返回 `StoreError::TaskNotFound`。创建不匹配返回 `StoreError::IdempotencyConflict`；重试非终态任务返回 `StoreError::TaskNotRetryable`。
 
-`append_running_event` accepts only PlanUpdated, ActivityAppended, DiffUpdated, or TestUpdated payloads and returns `StoreError::InvalidRunningEvent` for lifecycle variants; it returns NotRunning unless the task is still Running. Initial create always sets `attempt = 1` and `retry_of = None`. `retry_task` accepts only terminal tasks, returns an existing direct child before inserting, and creates exactly one new queued child plus event. The child copies the source `repository_id` and prompt, sets `attempt = source.attempt + 1` and `retry_of = Some(source.id)`, and receives a fresh server-generated `ClientRequestId`; it never reuses the source request ID. Both create/retry outcome enums implement `task(&self) -> &Task`.
+`append_running_event` 只接受 `PlanUpdated`、`ActivityAppended`、`DiffUpdated` 或 `TestUpdated` 载荷；对于生命周期变体返回 `StoreError::InvalidRunningEvent`；除非任务仍为 `Running`，否则返回 `NotRunning`。初次创建始终设置 `attempt = 1` 和 `retry_of = None`。`retry_task` 只接受终态任务，插入前先返回已有的直接子任务，并且只创建一个新的 `Queued` 子任务及事件。子任务复制来源的 `repository_id` 和提示词，设置 `attempt = source.attempt + 1` 与 `retry_of = Some(source.id)`，并获得服务器新生成的 `ClientRequestId`；绝不复用来源请求 ID。创建/重试两个结果枚举均实施 `task(&self) -> &Task`。
 
-`recover_incomplete(now, failure)` updates all Queued/Running tasks and inserts one `task.interrupted` event per task in deterministic `(created_at,id)` order in a single transaction, then returns the database high watermark even when count is zero. Callers use failure codes `APP_RESTARTED`, `STORE_DEGRADED_RECOVERY`, or `APP_SHUTDOWN`, each with a stable user-safe message and `retryable = true`.
+`recover_incomplete(now, failure)` 在单一事务中更新所有 `Queued`/`Running` 任务，并按确定性的 `(created_at,id)` 顺序为每个任务插入一个 `task.interrupted` 事件，随后即使数量为零也返回数据库高水位线。调用者使用失败代码 `APP_RESTARTED`、`STORE_DEGRADED_RECOVERY` 或 `APP_SHUTDOWN`；每种代码都配有稳定且对用户安全的消息，并设置 `retryable = true`。
 
-- [ ] **Step 4: Implement coherent bootstrap and TaskDetail replay**
+- [ ] **步骤 4：实施一致的引导快照和 TaskDetail 重放**
 
-`bootstrap_snapshot` reads all repositories ordered by `(last_opened_at DESC,id)`, all task summaries ordered by `(created_at DESC,id)`, and `MAX(task_events.id)` in one read transaction; Project 1 does not paginate or prune either list. `task_detail` starts one read transaction, loads all task events in ID order, projects the panel state, reads the same snapshot's global maximum into `event_cursor`, and commits.
+`bootstrap_snapshot` 在一个读事务中读取按 `(last_opened_at DESC,id)` 排序的所有仓库、按 `(created_at DESC,id)` 排序的所有任务摘要以及 `MAX(task_events.id)`；Project 1 不对任一列表分页或裁剪。`task_detail` 启动一个读事务，按 ID 顺序加载所有任务事件，投影面板状态，将同一快照的全局最大值读入 `event_cursor`，然后提交。
 
 ```rust
 pub struct TaskDetail {
@@ -808,38 +808,38 @@ pub struct TaskDetail {
 }
 ```
 
-Projection rules replace plan/diff/tests snapshots, append activity by stable entry ID, and derive timeline only from task lifecycle variants.
+投影规则替换计划/差异/测试快照，按稳定条目 ID 追加活动，并且只从任务生命周期变体派生时间线。
 
-- [ ] **Step 5: Run store suites and verify atomic behavior**
+- [ ] **步骤 5：运行存储层测试套件并验证原子行为**
 
-Run: `cargo test -p coding-agent-store`
+运行：`cargo test -p coding-agent-store`
 
-Expected: all migration, repository, task, recovery, and projection tests pass with zero failures.
+预期：所有迁移、仓库、任务、恢复和投影测试全部通过，零失败。
 
-- [ ] **Step 6: Commit the authoritative task/event store**
+- [ ] **步骤 6：提交权威任务/事件存储层**
 
 ```bash
 git add crates/coding-agent-store
 git commit -m "feat: add atomic task event store"
 ```
 
-### Task 4: Define the API Contract and Deterministic OpenAPI Export
+### 任务 4：定义 API 契约和确定性 OpenAPI 导出
 
-**Files:**
-- Modify: `crates/coding-agent-api/Cargo.toml`
-- Modify: `crates/coding-agent-api/src/lib.rs`
-- Create: `crates/coding-agent-api/src/contract.rs`
-- Create: `crates/coding-agent-api/src/backend.rs`
-- Create: `crates/coding-agent-api/src/error.rs`
-- Create: `crates/coding-agent-api/src/bin/export_openapi.rs`
-- Create: `crates/coding-agent-api/tests/openapi.rs`
+**文件：**
+- 修改：`crates/coding-agent-api/Cargo.toml`
+- 修改：`crates/coding-agent-api/src/lib.rs`
+- 创建：`crates/coding-agent-api/src/contract.rs`
+- 创建：`crates/coding-agent-api/src/backend.rs`
+- 创建：`crates/coding-agent-api/src/error.rs`
+- 创建：`crates/coding-agent-api/src/bin/export_openapi.rs`
+- 创建：`crates/coding-agent-api/tests/openapi.rs`
 
-**Interfaces:**
-- Consumes: domain models only; store projection/error mapping belongs to the app crate and this crate does not depend on `coding-agent-store` or `coding-agent-app`.
-- Produces: `UtcTimestampDto`, `CanonicalPathDto`, all REST DTOs, the discriminator-based `TaskEventDto`, `StreamResetControl`, `ServiceStateControl`, `SseMessage`, `ApiError`, `ApiErrorResponse`, `CreateResult`, `CancelResult`, `QuitAcceptance`, `ApiBackend`, `SseBackend`, `RequestSecurity`, and `ApiDoc`.
-- Invariant: Task event payloads are typed OpenAPI `oneOf`; only the explicitly open-ended API error `details` map may use `serde_json::Value`.
+**接口：**
+- 使用：仅使用领域层模型；存储层投影/错误映射属于应用软件包，且本软件包不依赖 `coding-agent-store` 或 `coding-agent-app`。
+- 产出：`UtcTimestampDto`、`CanonicalPathDto`、所有 REST DTO、基于判别器的 `TaskEventDto`、`StreamResetControl`、`ServiceStateControl`、`SseMessage`、`ApiError`、`ApiErrorResponse`、`CreateResult`、`CancelResult`、`QuitAcceptance`、`ApiBackend`、`SseBackend`、`RequestSecurity` 和 `ApiDoc`。
+- 不变量：`Task` 事件载荷使用类型化的 OpenAPI `oneOf`；只有明确保持开放的 API 错误 `details` 映射可以使用 `serde_json::Value`。
 
-The API manifest delta is exact:
+API 清单增量必须严格如下：
 
 ```toml
 [dependencies]
@@ -863,7 +863,7 @@ tempfile.workspace = true
 windows-sys.workspace = true
 ```
 
-- [ ] **Step 1: Write failing OpenAPI contract tests**
+- [ ] **步骤 1：编写失败的 OpenAPI 契约测试**
 
 ```rust
 #[test]
@@ -891,19 +891,19 @@ fn openapi_contains_every_approved_component() {
 }
 ```
 
-Add schema assertions that `TaskDto.last_event_id` is required and non-null; TaskDetail has nullable plan/diff/tests plus array activity/timeline; StreamResetControl is exactly schema version/kind/latest ID; and ServiceStateControl is exactly schema version/kind/state/generation. Add an exporter integration test that pre-creates the output with sentinel bytes, invokes `export_openapi` twice on that same path, and verifies each successful replacement is complete valid JSON with the canonical bytes. Endpoint path/response assertions begin in Task 12, when the real `utoipa-axum` router is the single path source.
+添加模式断言：`TaskDto.last_event_id` 必填且非空；`TaskDetail` 包含可为空的计划/差异/测试以及活动/时间线数组；`StreamResetControl` 严格由模式版本/种类/最新 ID 构成；`ServiceStateControl` 严格由模式版本/种类/状态/世代号构成。添加导出器集成测试：预先以哨兵字节创建输出，在同一路径上调用两次 `export_openapi`，并验证每次成功替换后，内容都是带规范字节的完整有效 JSON。端点路径/响应断言从任务 12 开始；届时真实的 `utoipa-axum` 路由器是唯一路径来源。
 
-- [ ] **Step 2: Run the contract test and verify the red result**
+- [ ] **步骤 2：运行契约测试并验证红灯结果**
 
-Run: `cargo test -p coding-agent-api --test openapi`
+运行：`cargo test -p coding-agent-api --test openapi`
 
-Expected: compilation fails because `ApiDoc` and contract DTOs do not exist.
+预期：由于 `ApiDoc` 和契约 DTO 尚不存在，编译失败。
 
-- [ ] **Step 3: Implement exact transport DTOs and port traits**
+- [ ] **步骤 3：实施精确的传输 DTO 和端口特征**
 
-Define private-field `UtcTimestampDto(String)` and `CanonicalPathDto(String)` transport scalars. Their only constructors consume domain UtcTimestamp/CanonicalPath; timestamp serialization is UTC RFC 3339 and its OpenAPI schema is string/date-time, while path is a platform string. DTO mapping never accepts arbitrary unvalidated strings for these fields.
+定义字段私有的 `UtcTimestampDto(String)` 和 `CanonicalPathDto(String)` 传输标量。它们唯一的构造函数使用领域层的 `UtcTimestamp`/`CanonicalPath`；时间戳序列化为 UTC RFC 3339，其 OpenAPI 模式为字符串/日期时间，而路径是平台字符串。DTO 映射绝不接受这些字段未经验证的任意字符串。
 
-Define `TaskEventDto` as a `#[serde(untagged)]` enum over ten concrete envelope structs. Every envelope has top-level `id`, `schema_version`, `task_id`, a single-value `kind` enum, its typed `payload`, and `created_at`; this preserves the approved flat wire frame instead of nesting envelope fields inside payload. Implement its Utoipa schema as `oneOf` those ten envelopes with `Discriminator::new("kind")`, and test both JSON shape and schema. Define `SseMessage` as `TaskEvent | StreamReset | ServiceState`, with control events carrying no persisted ID. `BootstrapResponse` includes `csrf_token`, repositories, tasks, `latest_event_id`, `server_started_at`, `service_state`, `service_state_generation`, and `max_concurrent_tasks`.
+将 `TaskEventDto` 定义为覆盖十个具体事件封装结构体的 `#[serde(untagged)]` 枚举。每个事件封装都包含顶层 `id`、`schema_version`、`task_id`、单值 `kind` 枚举、类型化 `payload` 和 `created_at`；这会保留已批准的扁平传输帧，而不是将封装字段嵌套进载荷。将其 Utoipa 模式实施为带 `Discriminator::new("kind")` 的十个事件封装的 `oneOf`，并同时测试 JSON 结构和模式。将 `SseMessage` 定义为 `TaskEvent | StreamReset | ServiceState`，控制事件不携带持久化 ID。`BootstrapResponse` 包含 `csrf_token`、`repositories`、`tasks`、`latest_event_id`、`server_started_at`、`service_state`、`service_state_generation` 和 `max_concurrent_tasks`。
 
 ```rust
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -937,9 +937,9 @@ pub enum ServiceStateKind { #[serde(rename = "service.state")] ServiceState }
 pub enum ServiceStateDto { Ready, StoreDegraded, Quiescing }
 ```
 
-Control constructors fix schema version to `1`; their kind fields are single-value enums, and `ServiceStateDto` serializes as snake_case. None has an `id` field.
+控制消息构造函数将模式版本固定为 `1`；其 `kind` 字段是单值枚举，`ServiceStateDto` 序列化为 `snake_case`。它们都没有 `id` 字段。
 
-Use these transport-neutral result types so handlers can choose `200` versus `201` without inspecting domain internals:
+使用以下与传输无关的结果类型，使处理器无需检查领域层内部结构即可选择 `200` 或 `201`：
 
 ```rust
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -959,9 +959,9 @@ pub struct QuitAcceptance {
 }
 ```
 
-`QuitAcceptance::take_trigger(&mut self) -> Option<Box<dyn FnOnce() + Send + 'static>>` moves the callback out exactly once.
+`QuitAcceptance::take_trigger(&mut self) -> Option<Box<dyn FnOnce() + Send + 'static>>` 只将回调移出一次。
 
-The backend port must expose these exact operations:
+后端端口必须公开以下严格一致的操作：
 
 ```rust
 #[async_trait::async_trait]
@@ -980,7 +980,7 @@ pub trait ApiBackend: Send + Sync + 'static {
 }
 ```
 
-Keep the replay/live seam in the API crate without depending on app actors:
+将重放/实时接缝保留在 API 软件包中，且不依赖应用执行体：
 
 ```rust
 pub enum LiveEventItem {
@@ -1010,9 +1010,9 @@ pub trait SseBackend: Send + Sync + 'static {
 }
 ```
 
-`events_between` returns only persisted IDs in `(after, through]`, ordered ascending. `LiveEventItem::Lagged` is a signal to refill from SQLite and is never serialized to the browser.
+`events_between` 仅返回 `(after, through]` 范围内的持久化 ID，并按升序排列。`LiveEventItem::Lagged` 是从 SQLite 补充数据的信号，绝不序列化到浏览器。
 
-The request-security port is exact and HTTP-aware so it can reject duplicated raw headers before handler extraction:
+请求安全端口必须严格一致且感知 HTTP，以便在处理器提取前拒绝重复的原始请求头：
 
 ```rust
 pub struct AuthContext {
@@ -1036,7 +1036,7 @@ pub trait RequestSecurity: Send + Sync + 'static {
 }
 ```
 
-Define internal and wire errors separately:
+分别定义内部错误和传输格式错误：
 
 ```rust
 pub struct ApiError {
@@ -1056,49 +1056,49 @@ pub struct ApiErrorResponse {
 }
 ```
 
-Only Task 12's router injects request ID and serializes `ApiErrorResponse`. `CreateResult` and `CancelResult` are internal control results, never wrapper JSON: Created/Existing returns the inner DTO with `201`/`200`; Finished returns Task DTO with `200`; Accepted returns `{task,cancellation_requested:true}` with `202`. Store/domain failures are mapped to `ApiError` by app `ApplicationBackend`, without exposing secrets.
+只有任务 12 的路由器注入请求 ID 并序列化 `ApiErrorResponse`。`CreateResult` 和 `CancelResult` 是内部控制结果，绝不是包装 JSON：`Created`/`Existing` 以 `201`/`200` 返回内部 DTO；`Finished` 以 `200` 返回 `Task` DTO；`Accepted` 以 `202` 返回 `{task,cancellation_requested:true}`。存储层/领域层失败由应用层 `ApplicationBackend` 映射到 `ApiError`，不得暴露秘密。
 
-- [ ] **Step 4: Implement deterministic OpenAPI export**
+- [ ] **步骤 4：实施确定性 OpenAPI 导出**
 
-`export_openapi` accepts exactly one output path argument, serializes `ApiDoc::openapi()` with pretty JSON plus one trailing newline, creates the parent directory, and writes through a uniquely named same-directory temporary file. Flush and `sync_all` the temporary file before publishing; never delete the destination first. A shared `atomic_replace` uses rename-over-existing on Unix and `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` through target-gated `windows-sys` on Windows, checks the OS result, and best-effort syncs the parent where supported. Clean up the temporary file on every failed publish. Task 12 switches the exporter to the real router-produced OpenAPI after paths exist.
+`export_openapi` 只接受一个输出路径参数，将 `ApiDoc::openapi()` 序列化为格式化 JSON 并附加一个末尾换行，创建父目录，然后通过同目录下唯一命名的临时文件写入。发布前对临时文件执行刷新和 `sync_all`；绝不先删除目标文件。共享的 `atomic_replace` 在 Unix 上使用覆盖现有文件的 `rename`，在 Windows 上通过受目标平台条件限制的 `windows-sys` 使用 `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`，检查操作系统结果，并在平台支持时尽力同步父目录。每次发布失败时都清理临时文件。任务 12 在路径存在后将导出器切换到由真实路由器生成的 OpenAPI。
 
-- [ ] **Step 5: Run contract and workspace checks**
+- [ ] **步骤 5：运行契约和工作区检查**
 
-Run: `cargo test -p coding-agent-api --test openapi`
+运行：`cargo test -p coding-agent-api --test openapi`
 
-Run: `cargo run -p coding-agent-api --bin export_openapi -- web/openapi.json`
+运行：`cargo run -p coding-agent-api --bin export_openapi -- web/openapi.json`
 
-Run: `cargo run -p coding-agent-api --bin export_openapi -- target/openapi-check.json`
+运行：`cargo run -p coding-agent-api --bin export_openapi -- target/openapi-check.json`
 
-Run: `git diff --no-index --exit-code -- web/openapi.json target/openapi-check.json`
+运行：`git diff --no-index --exit-code -- web/openapi.json target/openapi-check.json`
 
-Run: `cargo test -p coding-agent-domain -p coding-agent-store -p coding-agent-api`
+运行：`cargo test -p coding-agent-domain -p coding-agent-store -p coding-agent-api`
 
-Expected: OpenAPI tests pass; `web/openapi.json` exists and the independent second export is byte-identical.
+预期：OpenAPI 测试通过；`web/openapi.json` 存在，并且独立的第二次导出在字节层面完全一致。
 
-- [ ] **Step 6: Commit the API contract**
+- [ ] **步骤 6：提交 API 契约**
 
 ```bash
 git add crates/coding-agent-api web/openapi.json Cargo.lock
 git commit -m "feat: define local web api contract"
 ```
 
-### Task 5: Serialize Writes and Own Service State
+### 任务 5：串行化写入并管理服务状态
 
-**Files:**
-- Modify: `crates/coding-agent-app/Cargo.toml`
-- Modify: `crates/coding-agent-app/src/lib.rs`
-- Create: `crates/coding-agent-app/src/service_state.rs`
-- Create: `crates/coding-agent-app/src/store_writer.rs`
-- Create: `crates/coding-agent-app/tests/store_writer.rs`
-- Create: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 修改：`crates/coding-agent-app/Cargo.toml`
+- 修改：`crates/coding-agent-app/src/lib.rs`
+- 创建：`crates/coding-agent-app/src/service_state.rs`
+- 创建：`crates/coding-agent-app/src/store_writer.rs`
+- 创建：`crates/coding-agent-app/tests/store_writer.rs`
+- 创建：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Consumes: all store mutation methods from Tasks 2–3.
-- Produces: `EventWake`, `StoreWriterHandle`, `StoreWriterError`, `WriteReceipt<T>`, `ServiceState::{Ready,StoreDegraded,Quiescing}`, `ServiceStateSnapshot { state, generation }`, and `ServiceStateController`.
-- Invariant: application code outside `store_writer.rs` receives only a read-only `Store`; every mutation goes through `StoreWriterHandle`.
+**接口：**
+- 使用：任务 2–3 中的所有存储层变更方法。
+- 产出：`EventWake`、`StoreWriterHandle`、`StoreWriterError`、`WriteReceipt<T>`、`ServiceState::{Ready,StoreDegraded,Quiescing}`、`ServiceStateSnapshot { state, generation }` 和 `ServiceStateController`。
+- 不变量：`store_writer.rs` 之外的应用程序代码只能获得只读 `Store`；每次变更都必须经过 `StoreWriterHandle`。
 
-The app manifest delta for this task is exact:
+本任务的应用清单增量必须严格如下：
 
 ```toml
 [dependencies]
@@ -1114,7 +1114,7 @@ tracing.workspace = true
 tempfile.workspace = true
 ```
 
-- [ ] **Step 1: Write failing FIFO, transient retry, and generation tests**
+- [ ] **步骤 1：编写失败的 FIFO、瞬态重试和世代号测试**
 
 ```rust
 #[tokio::test]
@@ -1136,19 +1136,19 @@ async fn service_state_generation_never_moves_backwards() {
 }
 ```
 
-Every app integration test starts with `mod support;`; `tests/support/mod.rs` owns fake clocks, actor fixtures, fault-controlled Store adapters, and builders shared by later tasks. Add a fault-injection test where two `SQLITE_BUSY` attempts precede a success, plus a test where a command deadline expires before a transaction attempt and the task remains uncommitted.
+每个应用集成测试都以 `mod support;` 开头；`tests/support/mod.rs` 负责假时钟、执行体测试夹具、受故障控制的 `Store` 适配器，以及供后续任务共享的构建器。添加故障注入测试：两次 `SQLITE_BUSY` 尝试之后成功；另添加一个测试，验证命令截止时间在事务尝试前到期时任务仍未提交。
 
-Use counting and panicking fake `EventWake` implementations to assert each committed task/event mutation notifies once, repository-only or rolled-back writes do not notify, and a wake panic cannot turn a durable commit into an API failure.
+使用可计数及会触发 panic 的假 `EventWake` 实现，断言每次已提交的任务/事件变更只通知一次，仅仓库写入或已回滚写入不通知，并且唤醒过程中的 panic 不能把持久提交变成 API 失败。
 
-- [ ] **Step 2: Run the focused test and confirm red**
+- [ ] **步骤 2：运行聚焦测试并确认红灯**
 
-Run: `cargo test -p coding-agent-app --test store_writer`
+运行：`cargo test -p coding-agent-app --test store_writer`
 
-Expected: compilation fails because the actor and service-state types do not exist.
+预期：由于执行体和服务状态类型尚不存在，编译失败。
 
-- [ ] **Step 3: Implement the single writer actor**
+- [ ] **步骤 3：实施单一写入执行体**
 
-`StoreWriterHandle` sends a closed `WriteCommand` enum over a bounded Tokio mpsc channel and awaits a oneshot. Include commands for repository registration, task create/retry, transition, running-event append, and incomplete recovery. The actor processes one command to completion before receiving another. Its constructor receives `std::sync::Arc<dyn EventWake>` through this Task-owned port:
+`StoreWriterHandle` 通过有界 Tokio mpsc 通道发送封闭的 `WriteCommand` 枚举，并等待一次性通道。命令包括仓库注册、任务创建/重试、转换、运行中事件追加和未完成任务恢复。该执行体完成一个命令后才接收下一个。其构造函数通过本任务负责的以下端口接收 `std::sync::Arc<dyn EventWake>`：
 
 ```rust
 pub trait EventWake: Send + Sync + 'static {
@@ -1169,43 +1169,43 @@ pub enum StoreWriterError {
 }
 ```
 
-Repository-only writes return `event_id = None`; a single task/event mutation returns its committed EventId, and bulk recovery returns `value.last_event_id`. The writer passes the full store RecoveryOutcome through unchanged so startup, degraded recovery, shutdown, and EventDispatcher use one high-watermark definition.
+仅仓库写入返回 `event_id = None`；单个任务/事件变更返回其已提交 `EventId`，批量恢复返回 `value.last_event_id`。写入器原样传递完整的存储层 `RecoveryOutcome`，使启动、降级恢复、关闭和 `EventDispatcher` 使用同一个高水位线定义。
 
-Retry only `SQLITE_BUSY` and `SQLITE_LOCKED` with delays of 25, 50, 100, 200, and 400 milliseconds. Each foreground command carries a deadline. Check it before the first transaction and before each retry; if it has expired after a failed/rolled-back attempt, return Busy as known-uncommitted. Once an attempt begins, never abandon its oneshot via an outer timeout: return its success or rolled-back failure, and rely on the original request ID/CAS if the HTTP client disconnected. A command uses that same request ID or CAS condition on every retry. After the store returns a committed task/event outcome, call the content-free `EventWake`; never send a TaskEvent object from the producer. Catch/log a wake implementation panic and still return the durable receipt because wakes are acceleration only; Task 6's periodic database poll is the loss-recovery path.
+只重试 `SQLITE_BUSY` 和 `SQLITE_LOCKED`，延迟依次为 25、50、100、200 和 400 毫秒。每个前台命令都带有截止时间。在首次事务之前及每次重试之前检查该时间；若它在一次失败/回滚的尝试后到期，则返回 `Busy`，且明确知道尚未提交。一次尝试开始后，绝不通过外部超时放弃其一次性通道：返回成功结果或已回滚失败；若 HTTP 客户端断开，则依靠原始请求 ID/CAS。命令在每次重试时使用同一请求 ID 或 CAS 条件。`Store` 返回已提交的任务/事件结果后，调用不含内容的 `EventWake`；生产者绝不发送 `TaskEvent` 对象。捕获并记录唤醒实现中的 panic，但仍返回持久回执，因为唤醒仅用于加速；任务 6 的定期数据库轮询是唤醒丢失后的恢复路径。
 
-- [ ] **Step 4: Implement the single service-state publisher**
+- [ ] **步骤 4：实施单一服务状态发布器**
 
-`ServiceStateController` owns one Tokio watch sender and a current snapshot protected by a mutex. `set(&self, next) -> Result<ServiceStateSnapshot, InvalidServiceTransition>` increments generation only when state changes. Legal edges are Ready ↔ StoreDegraded and either of those → Quiescing; same-state sets return the unchanged snapshot. Quiescing is terminal, so attempts to leave it return InvalidServiceTransition.
+`ServiceStateController` 负责一个 Tokio 监视发送端，以及一个受互斥锁保护的当前快照。`set(&self, next) -> Result<ServiceStateSnapshot, InvalidServiceTransition>` 仅在状态变化时递增世代号。合法边为 `Ready` ↔ `StoreDegraded`，以及两者之一 → `Quiescing`；设置为相同状态时返回未变的快照。`Quiescing` 是终态，因此尝试离开该状态会返回 `InvalidServiceTransition`。
 
-- [ ] **Step 5: Run focused and impacted suites**
+- [ ] **步骤 5：运行聚焦测试和受影响的测试套件**
 
-Run: `cargo test -p coding-agent-app --test store_writer`
+运行：`cargo test -p coding-agent-app --test store_writer`
 
-Run: `cargo test -p coding-agent-domain -p coding-agent-store -p coding-agent-app`
+运行：`cargo test -p coding-agent-domain -p coding-agent-store -p coding-agent-app`
 
-Expected: FIFO, retry, no-ambiguous-commit, and monotonic-generation tests pass.
+预期：FIFO、重试、无歧义提交和世代号单调性测试通过。
 
-- [ ] **Step 6: Commit the write and service-state actors**
+- [ ] **步骤 6：提交写入和服务状态执行体**
 
 ```bash
 git add crates/coding-agent-app Cargo.lock
 git commit -m "feat: serialize application state writes"
 ```
 
-### Task 6: Publish Persisted Events in Database Order
+### 任务 6：按数据库顺序发布持久化事件
 
-**Files:**
-- Create: `crates/coding-agent-app/src/event_dispatcher.rs`
-- Create: `crates/coding-agent-app/tests/event_dispatcher.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
-- Modify: `crates/coding-agent-app/src/lib.rs`
+**文件：**
+- 创建：`crates/coding-agent-app/src/event_dispatcher.rs`
+- 创建：`crates/coding-agent-app/tests/event_dispatcher.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
+- 修改：`crates/coding-agent-app/src/lib.rs`
 
-**Interfaces:**
-- Consumes: `Store::events_after`, `Store::latest_event_id`, and Task 5's `EventWake` port.
-- Produces: `EventDispatcherHandle::subscribe() -> broadcast::Receiver<TaskEvent>`, `EventDispatcherHandle::wake()`, `EventDispatcherHandle::flush_to(EventCursor)`, and `impl EventWake for EventDispatcherHandle`.
-- Invariant: only this actor sends persisted TaskEvent values to the live broadcast channel.
+**接口：**
+- 使用：`Store::events_after`、`Store::latest_event_id` 以及任务 5 的 `EventWake` 端口。
+- 产出：`EventDispatcherHandle::subscribe() -> broadcast::Receiver<TaskEvent>`、`EventDispatcherHandle::wake()`、`EventDispatcherHandle::flush_to(EventCursor)` 和 `impl EventWake for EventDispatcherHandle`。
+- 不变量：只有此执行体能向实时广播通道发送持久化的 `TaskEvent` 值。
 
-- [ ] **Step 1: Write failing ordering and lost-wakeup tests**
+- [ ] **步骤 1：编写失败的排序和唤醒丢失测试**
 
 ```rust
 #[tokio::test(start_paused = true)]
@@ -1229,47 +1229,47 @@ async fn periodic_poll_recovers_a_lost_wakeup() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and confirm red**
+- [ ] **步骤 2：运行聚焦测试并确认红灯**
 
-Run: `cargo test -p coding-agent-app --test event_dispatcher`
+运行：`cargo test -p coding-agent-app --test event_dispatcher`
 
-Expected: compilation fails on `EventDispatcherHandle`.
+预期：在 `EventDispatcherHandle` 处编译失败。
 
-- [ ] **Step 3: Implement cursor-owned database polling**
+- [ ] **步骤 3：实施由游标管理的数据库轮询**
 
-Initialize the cursor from the startup-recovery high watermark. On wake or one-second interval, repeatedly query `events_after(cursor, 256)`, sort defensively by ID, skip IDs not greater than the cursor, broadcast each event, and update the cursor only after send. A send with zero receivers still advances because SQLite remains the replay source. `flush_to(target)` acknowledges only after the cursor reaches target or returns a store error.
+以启动恢复高水位线初始化游标。收到唤醒或每隔一秒时，反复查询 `events_after(cursor, 256)`，防御性地按 ID 排序，跳过不大于游标的 ID，广播每个事件，并且只在发送后更新游标。即使接收端数量为零，发送仍会推进游标，因为 SQLite 始终是重放来源。`flush_to(target)` 只在游标到达目标后才确认，否则返回存储层错误。
 
-- [ ] **Step 4: Run event and store suites**
+- [ ] **步骤 4：运行事件和存储层测试套件**
 
-Run: `cargo test -p coding-agent-app --test event_dispatcher`
+运行：`cargo test -p coding-agent-app --test event_dispatcher`
 
-Run: `cargo test -p coding-agent-store -p coding-agent-app`
+运行：`cargo test -p coding-agent-store -p coding-agent-app`
 
-Expected: ordered, duplicate-wakeup, lost-wakeup, and flush tests all pass.
+预期：排序、重复唤醒、唤醒丢失和刷新测试全部通过。
 
-- [ ] **Step 5: Commit the database-backed dispatcher**
+- [ ] **步骤 5：提交以数据库为后端的分发器**
 
 ```bash
 git add crates/coding-agent-app
 git commit -m "feat: publish durable events in order"
 ```
 
-### Task 7: Implement TaskManager Claim, Cancel, and Quiesce Ownership
+### 任务 7：实施 TaskManager 的领取、取消和静默化管理
 
-**Files:**
-- Create: `crates/coding-agent-app/src/task_manager.rs`
-- Create: `crates/coding-agent-app/tests/task_manager.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
-- Modify: `crates/coding-agent-app/src/lib.rs`
+**文件：**
+- 创建：`crates/coding-agent-app/src/task_manager.rs`
+- 创建：`crates/coding-agent-app/tests/task_manager.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
+- 修改：`crates/coding-agent-app/src/lib.rs`
 
-**Interfaces:**
-- Consumes: `StoreWriterHandle`, read-only `Store`, `ServiceStateController`, and an injected `Arc<dyn TaskRunner>`.
-- Produces: `TaskManagerHandle::{notify_queued,cancel,quiesce_and_interrupt}`, `CancelOutcome`, `TaskRunner`, `RunContext`, `RunnerEvent`, `RunnerEventSink`, `RunnerEventError`, `RunnerOutcome`, `RunnerShutdownHandle`, and `QuiesceResult`.
-- Invariant: claim, cancel, runner event/result, reconciliation, and shutdown barrier are messages handled by one actor; create/retry stay serialized through StoreWriter and only notify this actor after commit.
+**接口：**
+- 使用：`StoreWriterHandle`、只读 `Store`、`ServiceStateController` 以及注入的 `Arc<dyn TaskRunner>`。
+- 产出：`TaskManagerHandle::{notify_queued,cancel,quiesce_and_interrupt}`、`CancelOutcome`、`TaskRunner`、`RunContext`、`RunnerEvent`、`RunnerEventSink`、`RunnerEventError`、`RunnerOutcome`、`RunnerShutdownHandle` 和 `QuiesceResult`。
+- 不变量：领取、取消、运行器事件/结果、状态协调和关闭屏障都是由同一执行体处理的消息；创建/重试继续通过 `StoreWriter` 串行化，且只在提交后通知此执行体。
 
-Add `async-trait.workspace = true` to app dependencies in this task. Every test file imports the shared fixture with `mod support;`.
+在本任务中将 `async-trait.workspace = true` 添加到应用依赖。每个测试文件都通过 `mod support;` 导入共享测试夹具。
 
-- [ ] **Step 1: Write failing permit and claim/cancel race tests**
+- [ ] **步骤 1：编写失败的许可和领取/取消竞态测试**
 
 ```rust
 #[tokio::test]
@@ -1298,15 +1298,15 @@ async fn running_is_never_visible_without_an_active_handle() {
 }
 ```
 
-Add an explicit cancel matrix paused (a) after permit acquisition but before provisional handle registration, (b) after handle registration but before Running commit, and (c) after Running commit but before runner spawn. No row may expose Running without a token: if queued cancel commits first no runner starts; if claim commits first, the registered token is triggered and the runner exits through the normal cancel result. Inject BUSY and terminal StoreWriter failure into the claim CAS and assert no runner spawns, the provisional handle is removed, the permit is released, Task remains Queued, and reconciliation later claims it exactly once. Also test queued cancel winning before claim, completed-vs-cancel first-commit wins, reconciliation after lost queue notification, FIFO `(created_at,id)`, late event rejection, and runner panic becoming `RUNNER_PANICKED` without affecting another task.
+添加显式取消矩阵，分别暂停在：(a) 获取许可后但注册临时句柄前；(b) 注册句柄后但提交 `Running` 前；(c) 提交 `Running` 后但生成运行器前。任何一行都不得暴露没有令牌的 `Running`：若排队取消先提交，则运行器不会启动；若领取先提交，则触发已注册令牌，运行器通过正常取消结果退出。在领取 CAS 中注入 `BUSY` 和终态 `StoreWriter` 失败，并断言运行器未生成、临时句柄被移除、许可被释放、`Task` 保持 `Queued`，且状态协调随后恰好领取它一次。还要测试排队取消在领取前获胜、完成与取消之间首次提交获胜、队列通知丢失后的状态协调、FIFO `(created_at,id)`、拒绝迟到事件，以及运行器 panic 转换为 `RUNNER_PANICKED` 且不影响另一任务。
 
-- [ ] **Step 2: Run focused tests and verify red**
+- [ ] **步骤 2：运行聚焦测试并验证红灯**
 
-Run: `cargo test -p coding-agent-app --test task_manager`
+运行：`cargo test -p coding-agent-app --test task_manager`
 
-Expected: compilation fails because TaskManager and TaskRunner do not exist.
+预期：由于 TaskManager 和 TaskRunner 尚不存在，编译失败。
 
-- [ ] **Step 3: Define the runner port and bounded event sink**
+- [ ] **步骤 3：定义运行器端口和有界事件接收器**
 
 ```rust
 #[async_trait::async_trait]
@@ -1367,45 +1367,45 @@ pub struct RunContext {
 }
 ```
 
-`RunnerEventSink` implements `pub async fn append(&self, event: RunnerEvent) -> Result<EventId, RunnerEventError>`: it sends only the four non-lifecycle variants through a bounded message back to the actor and awaits the oneshot persistence result without blocking a runtime thread. The actor persists it only through `append_running_event` and returns the committed event ID; a terminal task returns TaskNotRunning, degraded mode returns StoreDegraded, and a closed mailbox returns ManagerClosed. Runner lifecycle/terminal events are unrepresentable through this sink.
+`RunnerEventSink` 实现 `pub async fn append(&self, event: RunnerEvent) -> Result<EventId, RunnerEventError>`：它只通过有界消息将四种非生命周期变体发回执行体，并等待一次性通道的持久化结果，且不阻塞运行时线程。执行体仅通过 `append_running_event` 将其持久化，并返回已提交的事件 ID；终态任务返回 `TaskNotRunning`，降级模式返回 `StoreDegraded`，已关闭邮箱返回 `ManagerClosed`。通过此接收器无法表示运行器生命周期/终态事件。
 
-- [ ] **Step 4: Implement the actor ordering**
+- [ ] **步骤 4：实施执行体排序**
 
-Scan queued tasks in `(created_at,id)` order. Use `Semaphore::try_acquire_owned`; if none is available, keep the task Queued and return to the mailbox. After acquiring: register provisional token/permit, perform the queued-to-running CAS through StoreWriter, spawn the runner only after commit, and clean up on CAS failure.
+按 `(created_at,id)` 顺序扫描排队任务。使用 `Semaphore::try_acquire_owned`；若无可用许可，则让任务保持 `Queued` 并回到邮箱处理循环。获取后：注册临时令牌/许可，通过 `StoreWriter` 执行从 `Queued` 到 `Running` 的 CAS，仅在提交后生成运行器，并在 CAS 失败时清理。
 
-Cancel messages are decided by the same actor. Running cancel triggers the registered token, rereads the latest Task, and returns `Accepted`; queued cancel commits and returns `Cancelled`; already Cancelled returns the same `Cancelled`; Completed/Failed/Interrupted return `TaskManagerError::TaskNotCancellable`. Catch spawned runner panics through `JoinError`, persist one terminal result with `status = Running` CAS, then remove handle and release permit.
+取消消息由同一执行体决定。`Running` 取消会触发已注册令牌，重新读取最新 `Task`，并返回 `Accepted`；`Queued` 取消会提交并返回 `Cancelled`；已经是 `Cancelled` 时返回同一 `Cancelled`；`Completed`/`Failed`/`Interrupted` 返回 `TaskManagerError::TaskNotCancellable`。通过 `JoinError` 捕获已生成运行器的 panic，以 `status = Running` CAS 持久化一个终态结果，然后移除句柄并释放许可。
 
-`quiesce_and_interrupt(deadline)` stops scans/claims, processes earlier mailbox messages, and performs one bulk incomplete-to-interrupted write through StoreWriter. It always freezes the actor: on commit it returns Durable with the Store recovery high watermark and active handles; on a rolled-back/deadline write error it returns Frozen with those same active handles for degraded shutdown. Each runner wrapper resolves its `done` receiver on success, failure, cancel, or panic.
+`quiesce_and_interrupt(deadline)` 停止扫描/领取，处理更早的邮箱消息，并通过 `StoreWriter` 执行一次从未完成到已中断的批量写入。它总是冻结执行体：提交时返回 `Durable`，携带 `Store` 恢复高水位线和活动句柄；发生已回滚/截止时间写入错误时返回 `Frozen`，携带相同活动句柄供降级关闭使用。每个运行器包装器都会在成功、失败、取消或 panic 时完成其 `done` 接收端。
 
-- [ ] **Step 5: Run task manager and persistence regression suites**
+- [ ] **步骤 5：运行任务管理器和持久化回归测试套件**
 
-Run: `cargo test -p coding-agent-app --test task_manager`
+运行：`cargo test -p coding-agent-app --test task_manager`
 
-Run: `cargo test -p coding-agent-store -p coding-agent-app`
+运行：`cargo test -p coding-agent-store -p coding-agent-app`
 
-Expected: all race tests pass repeatedly; run the focused race test 25 times with `cargo test -p coding-agent-app --test task_manager running_is_never_visible_without_an_active_handle -- --test-threads=1` and observe zero failures.
+预期：所有竞态测试均重复通过；使用 `cargo test -p coding-agent-app --test task_manager running_is_never_visible_without_an_active_handle -- --test-threads=1` 运行聚焦竞态测试 25 次，观察到零失败。
 
-- [ ] **Step 6: Commit the task-control actor**
+- [ ] **步骤 6：提交任务控制执行体**
 
 ```bash
 git add crates/coding-agent-app Cargo.lock
 git commit -m "feat: coordinate task lifecycle actor"
 ```
 
-### Task 8: Add the Deterministic FakeTaskRunner
+### 任务 8：添加确定性 FakeTaskRunner
 
-**Files:**
-- Create: `crates/coding-agent-app/src/fake_runner.rs`
-- Modify: `crates/coding-agent-app/src/lib.rs`
-- Modify: `crates/coding-agent-app/tests/task_manager.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 创建：`crates/coding-agent-app/src/fake_runner.rs`
+- 修改：`crates/coding-agent-app/src/lib.rs`
+- 修改：`crates/coding-agent-app/tests/task_manager.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Consumes: Task 7 `TaskRunner`, `RunContext`, and `RunnerEventSink`.
-- Produces: `FakeTaskRunner`, `FakeRunnerConfig`, and feature-gated `ScriptedFakeRunner` with `FakeScenario::{Success,Blocking,IgnoresCancellation,Failure,Panic}`.
-- Invariant: production behavior is deterministic and never reads repository contents or opens the network.
+**接口：**
+- 使用：任务 7 的 `TaskRunner`、`RunContext` 和 `RunnerEventSink`。
+- 产出：`FakeTaskRunner`、`FakeRunnerConfig`，以及受功能特性限制、带有 `FakeScenario::{Success,Blocking,IgnoresCancellation,Failure,Panic}` 的 `ScriptedFakeRunner`。
+- 不变量：生产环境行为是确定性的，绝不读取仓库内容或访问网络。
 
-Add the app Cargo feature now, before any test references scripted behavior:
+现在添加应用的 Cargo 功能特性，且必须早于任何测试引用脚本化行为：
 
 ```toml
 [features]
@@ -1413,7 +1413,7 @@ default = []
 test-support = []
 ```
 
-- [ ] **Step 1: Write a failing deterministic-sequence test with paused time**
+- [ ] **步骤 1：使用暂停时间编写失败的确定性序列测试**
 
 ```rust
 #[tokio::test(start_paused = true)]
@@ -1440,47 +1440,47 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify red**
+- [ ] **步骤 2：运行聚焦测试并验证红灯**
 
-Run: `cargo test -p coding-agent-app --features test-support fake_runner_emits_the_approved_panel_sequence`
+运行：`cargo test -p coding-agent-app --features test-support fake_runner_emits_the_approved_panel_sequence`
 
-Expected: compilation fails because `FakeTaskRunner` does not exist.
+预期：由于 `FakeTaskRunner` 尚不存在，编译失败。
 
-- [ ] **Step 3: Implement success, cancellation, failure, and panic scripts**
+- [ ] **步骤 3：实施成功、取消、失败和 panic 场景脚本**
 
-The success runner emits one complete three-item plan, three stable activity entries, one complete synthetic diff snapshot, tests Running, then tests Passed, with a configurable 200-millisecond interval between emissions. Check the cancellation token before and after every interval. The production constructor always selects Success.
+成功运行器依次发出一个完整的三项计划、三个稳定的活动条目、一个完整的合成差异快照、测试 `Running`，然后是测试 `Passed`；每次发出之间的间隔可配置，默认为 200 毫秒。在每个间隔之前和之后检查取消令牌。生产构造函数始终选择 `Success`。
 
-Under Cargo feature `test-support`, `ScriptedFakeRunner` consumes a process-loaded queue of explicit scenarios by task creation order. It does not inspect prompt text and exposes no HTTP control route. Blocking waits on cancellation or a test release channel; IgnoresCancellation waits only on its test release channel so shutdown budgets can be proved; Failure returns a fixed `FAKE_RUNNER_FAILURE`; Panic deliberately panics for isolation tests.
+在 Cargo 功能特性 `test-support` 下，`ScriptedFakeRunner` 按任务创建顺序使用进程加载的显式场景队列。它不检查提示词文本，也不公开 HTTP 控制路由。`Blocking` 等待取消或测试释放通道；`IgnoresCancellation` 只等待其测试释放通道，以便证明关闭预算；`Failure` 返回固定的 `FAKE_RUNNER_FAILURE`；`Panic` 为隔离测试而故意触发 panic。
 
-- [ ] **Step 4: Run fake-runner and task-manager tests**
+- [ ] **步骤 4：运行假运行器和任务管理器测试**
 
-Run: `cargo test -p coding-agent-app --features test-support fake_runner`
+运行：`cargo test -p coding-agent-app --features test-support fake_runner`
 
-Run: `cargo test -p coding-agent-app --features test-support --test task_manager`
+运行：`cargo test -p coding-agent-app --features test-support --test task_manager`
 
-Expected: deterministic sequence, cancel, failure, and panic isolation tests pass without wall-clock sleeps.
+预期：确定性序列、取消、失败和 panic 隔离测试均通过，且无需按真实时钟休眠。
 
-- [ ] **Step 5: Commit the fake execution slice**
+- [ ] **步骤 5：提交假执行切片**
 
 ```bash
 git add crates/coding-agent-app
 git commit -m "feat: add deterministic fake task runner"
 ```
 
-### Task 9: Coordinate StoreDegraded Recovery
+### 任务 9：协调 StoreDegraded 恢复
 
-**Files:**
-- Create: `crates/coding-agent-app/src/shutdown.rs`
-- Create: `crates/coding-agent-app/tests/degraded_recovery.rs`
-- Modify: `crates/coding-agent-app/src/store_writer.rs`
-- Modify: `crates/coding-agent-app/src/task_manager.rs`
-- Modify: `crates/coding-agent-app/src/lib.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 创建：`crates/coding-agent-app/src/shutdown.rs`
+- 创建：`crates/coding-agent-app/tests/degraded_recovery.rs`
+- 修改：`crates/coding-agent-app/src/store_writer.rs`
+- 修改：`crates/coding-agent-app/src/task_manager.rs`
+- 修改：`crates/coding-agent-app/src/lib.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Consumes: store `RecoveryOutcome` and its durable `high_watermark`.
-- Produces: `DegradedCoordinator::run`, `PendingDurableResult`, and app-level `DegradedRecoveryResult`.
-- Invariant: after a background write exhausts retry, no new runner starts until all ambiguous queued/running tasks are durably Interrupted and service state returns to Ready.
+**接口：**
+- 使用：存储层的 `RecoveryOutcome` 及其持久 `high_watermark`。
+- 产出：`DegradedCoordinator::run`、`PendingDurableResult` 和应用层 `DegradedRecoveryResult`。
+- 不变量：后台写入耗尽重试次数后，在所有状态不明确的 `Queued`/`Running` 任务被持久转换为 `Interrupted` 且服务状态回到 `Ready` 之前，不得启动新运行器。
 
 ```rust
 pub enum PendingDurableResult {
@@ -1495,9 +1495,9 @@ pub struct DegradedRecoveryResult {
 }
 ```
 
-Pending values are diagnostics/ownership markers, not a second durable queue. Once bulk recovery commits Interrupted for every ambiguous task and dispatcher flushes through `recovery.high_watermark`, the coordinator discards them and returns the generation produced by setting Ready.
+待处理值是诊断/所有权标记，不是第二个持久队列。一旦批量恢复为每个状态不明确的任务提交 `Interrupted`，且分发器刷新到 `recovery.high_watermark`，协调器就会丢弃它们，并返回设置 `Ready` 时产生的世代号。
 
-- [ ] **Step 1: Write a failing background terminal-write test**
+- [ ] **步骤 1：编写失败的后台终态写入测试**
 
 ```rust
 #[tokio::test(start_paused = true)]
@@ -1516,48 +1516,48 @@ async fn terminal_write_failure_stops_claims_until_recovery() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify red**
+- [ ] **步骤 2：运行聚焦测试并验证红灯**
 
-Run: `cargo test -p coding-agent-app --test degraded_recovery`
+运行：`cargo test -p coding-agent-app --test degraded_recovery`
 
-Expected: the test fails because a background StoreWriter error is not coordinated.
+预期：由于后台 StoreWriter 错误未得到协调，测试失败。
 
-- [ ] **Step 3: Implement degraded entry and recovery ordering**
+- [ ] **步骤 3：实施降级进入和恢复顺序**
 
-When runner-event or terminal persistence exhausts bounded retries, retain the pending result in memory, set StoreDegraded, stop reconciliation/claim, and cancel all active tokens. Retry a single bulk `recover_incomplete` transaction every second through StoreWriter. Only after it commits and EventDispatcher flushes its high watermark may the coordinator clear pending results, restart reconciliation, and set Ready with a larger generation.
+当运行器事件或终态持久化耗尽有界重试次数时，在内存中保留待处理结果，设置 `StoreDegraded`，停止状态协调/领取，并取消所有活动令牌。每秒通过 `StoreWriter` 重试一次批量 `recover_incomplete` 事务。只有在事务提交且 `EventDispatcher` 刷新到其高水位线后，协调器才能清除待处理结果、重启状态协调，并以更大的世代号设置 `Ready`。
 
-Foreground mutation timeout returns `503 STORE_BUSY` without entering this coordinator when the command is known uncommitted. Non-transient corruption remains StoreDegraded and never deletes/recreates the database.
+当前台变更超时且已知命令未提交时，返回 `503 STORE_BUSY`，不进入此协调器。非瞬态损坏保持 `StoreDegraded`，绝不删除/重建数据库。
 
-- [ ] **Step 4: Run degraded, manager, writer, and dispatcher suites**
+- [ ] **步骤 4：运行降级、管理器、写入器和分发器测试套件**
 
-Run: `cargo test -p coding-agent-app --test degraded_recovery --test store_writer --test event_dispatcher --test task_manager`
+运行：`cargo test -p coding-agent-app --test degraded_recovery --test store_writer --test event_dispatcher --test task_manager`
 
-Expected: recovery order is Interrupted event committed → dispatcher flushed → Ready generation published; no queued task starts while degraded.
+预期：恢复顺序为提交 `Interrupted` 事件 → 分发器完成刷新 → 发布 `Ready` 世代号；处于降级状态时不启动任何 `Queued` 任务。
 
-- [ ] **Step 5: Commit the degraded-mode coordinator**
+- [ ] **步骤 5：提交降级模式协调器**
 
 ```bash
 git add crates/coding-agent-app
 git commit -m "feat: recover from task store outages"
 ```
 
-### Task 10: Add Cross-Platform Paths, Repository Discovery, and Native Adapters
+### 任务 10：添加跨平台路径、仓库发现和原生适配器
 
-**Files:**
-- Modify: `crates/coding-agent-app/Cargo.toml`
-- Modify: `crates/coding-agent-app/src/lib.rs`
-- Create: `crates/coding-agent-app/src/platform.rs`
-- Create: `crates/coding-agent-app/src/repository_service.rs`
-- Create: `crates/coding-agent-app/src/native_dialog.rs`
-- Create: `crates/coding-agent-app/tests/platform.rs`
-- Create: `crates/coding-agent-app/tests/repository_service.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 修改：`crates/coding-agent-app/Cargo.toml`
+- 修改：`crates/coding-agent-app/src/lib.rs`
+- 创建：`crates/coding-agent-app/src/platform.rs`
+- 创建：`crates/coding-agent-app/src/repository_service.rs`
+- 创建：`crates/coding-agent-app/src/native_dialog.rs`
+- 创建：`crates/coding-agent-app/tests/platform.rs`
+- 创建：`crates/coding-agent-app/tests/repository_service.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Produces: `PlatformPaths`, `PrivateFile`, `BrowserLauncher`, `CommandRunner`, `RepositoryDiscovery`, `DiscoveredRepository`, `NativeDialogService`, and `PickerError`.
-- Invariant: discovery may run only `git rev-parse` and `cargo locate-project`; it never reads source contents, resolves dependencies, builds code, or changes a repository.
+**接口：**
+- 产出：`PlatformPaths`、`PrivateFile`、`BrowserLauncher`、`CommandRunner`、`RepositoryDiscovery`、`DiscoveredRepository`、`NativeDialogService` 和 `PickerError`。
+- 不变量：发现功能只能运行 `git rev-parse` 和 `cargo locate-project`；绝不读取源代码内容、解析依赖、构建代码或更改仓库。
 
-Add this app manifest delta:
+添加以下应用清单增量：
 
 ```toml
 [dependencies]
@@ -1569,9 +1569,9 @@ webbrowser.workspace = true
 windows-sys.workspace = true
 ```
 
-- [ ] **Step 1: Write failing path, permission, discovery, and picker tests**
+- [ ] **步骤 1：编写失败的路径、权限、发现和选择器测试**
 
-Create temporary repositories covering a nested selected directory, a manifest between selected and Git root, a Cargo workspace outside Git root, a missing manifest, missing/stale/dirty `Cargo.lock` states, a repository `rust-toolchain.toml` naming an intentionally unavailable channel, a symlinked selection, a nonexistent selected path, and an ordinary file selected as though it were a directory. Assert the last two fail before either command is invoked, with `REPOSITORY_PATH_NOT_FOUND` and `REPOSITORY_PATH_NOT_DIRECTORY` respectively. Record the recursive relative file list, every existing lockfile byte sequence, and `git status --porcelain=v1` before discovery and assert byte-for-byte equality afterward. The unavailable-toolchain fixture must still locate successfully, proving Cargo ran from the neutral runtime cwd rather than activating the repository override.
+创建临时仓库，覆盖以下情形：嵌套的选定目录、位于选定目录与 Git 根目录之间的清单、Git 根目录之外的 Cargo 工作区、缺失清单、`Cargo.lock` 缺失/过期/脏状态、仓库 `rust-toolchain.toml` 指定一个故意不可用的通道、通过符号链接选择、不存在的选定路径，以及将普通文件当作目录选择。断言最后两种情形在调用任一命令前就失败，分别返回 `REPOSITORY_PATH_NOT_FOUND` 和 `REPOSITORY_PATH_NOT_DIRECTORY`。发现前记录递归相对文件列表、每个现有锁文件的字节序列以及 `git status --porcelain=v1`，并断言发现后在字节层面完全一致。不可用工具链测试夹具仍必须成功定位，以证明 Cargo 从中立运行时当前工作目录执行，而非激活仓库覆盖配置。
 
 ```rust
 #[tokio::test]
@@ -1596,61 +1596,61 @@ async fn a_second_picker_is_rejected_while_the_first_is_open() {
 }
 ```
 
-`platform.rs` tests must assert data/runtime directories and sensitive files are private: Unix modes `0700`/`0600`; Windows owner DACL grants the current user and rejects inherited broad access. Browser-launch failure must be observable without becoming a process-fatal error.
+`platform.rs` 测试必须断言数据/运行时目录和敏感文件均为私有：Unix 模式为 `0700`/`0600`；Windows 所有者 DACL 授权当前用户并拒绝继承的宽泛访问权限。浏览器启动失败必须可观察，但不得成为进程致命错误。
 
-- [ ] **Step 2: Run focused tests and verify red**
+- [ ] **步骤 2：运行聚焦测试并验证红灯**
 
-Run: `cargo test -p coding-agent-app --test platform --test repository_service`
+运行：`cargo test -p coding-agent-app --test platform --test repository_service`
 
-Expected: compilation fails because the platform and discovery ports do not exist.
+预期：由于平台和发现端口尚不存在，编译失败。
 
-- [ ] **Step 3: Implement application paths and private-file helpers**
+- [ ] **步骤 3：实施应用程序路径和私有文件辅助函数**
 
-`PlatformPaths::discover()` uses `directories::ProjectDirs::from("com", "ngy", "coding-agent")` for user-local data. Prefer the OS runtime directory when available; otherwise use `<data_local>/run`. It exposes `database_path`, permanent `instance.lock`, replaceable `instance.json`, and `unclean-shutdown.json`. Directory creation is idempotent. Sensitive file creation uses `create_new`, applies owner-only permissions before publishing content, and never follows a symlink at the final path. Windows permission code is isolated behind `cfg(windows)` and uses `windows-sys`; Unix uses `OpenOptionsExt` and `PermissionsExt`.
+`PlatformPaths::discover()` 使用 `directories::ProjectDirs::from("com", "ngy", "coding-agent")` 获取用户本地数据路径。操作系统运行时目录可用时优先使用，否则使用 `<data_local>/run`。它公开 `database_path`、永久的 `instance.lock`、可替换的 `instance.json` 和 `unclean-shutdown.json`。目录创建是幂等的。敏感文件使用 `create_new` 创建，在发布内容前应用仅所有者权限，并且绝不跟随最终路径处的符号链接。Windows 权限代码隔离在 `cfg(windows)` 后并使用 `windows-sys`；Unix 使用 `OpenOptionsExt` 和 `PermissionsExt`。
 
-- [ ] **Step 4: Implement read-only repository discovery**
+- [ ] **步骤 4：实施只读仓库发现**
 
-Before launching any child process, inspect the selected path with `symlink_metadata`/`metadata`: map absence to `REPOSITORY_PATH_NOT_FOUND`, reject a non-directory as `REPOSITORY_PATH_NOT_DIRECTORY`, then canonicalize and normalize the directory. Run exactly this flow through an injectable `CommandRunner`:
+启动任何子进程前，使用 `symlink_metadata`/`metadata` 检查选定路径：将路径不存在映射为 `REPOSITORY_PATH_NOT_FOUND`，将非目录拒绝为 `REPOSITORY_PATH_NOT_DIRECTORY`，随后规范化并标准化该目录。通过可注入的 `CommandRunner` 严格运行以下流程：
 
-1. `git -C <selected> rev-parse --show-toplevel`.
-2. Walk ancestors from selected through the normalized Git root and choose the first existing `Cargo.toml`.
-3. From `PlatformPaths::runtime_dir` as the neutral child-process working directory, run `cargo locate-project --workspace --manifest-path <manifest> --message-format plain`.
-4. Normalize the returned manifest parent and reject it unless path-component containment proves it is inside the Git root.
+1. `git -C <selected> rev-parse --show-toplevel`。
+2. 从选定目录沿祖先目录遍历至规范化 Git 根目录，并选择第一个存在的 `Cargo.toml`。
+3. 将 `PlatformPaths::runtime_dir` 作为中立的子进程工作目录，运行 `cargo locate-project --workspace --manifest-path <manifest> --message-format plain`。
+4. 规范化返回的清单父目录；除非路径组件包含关系证明它位于 Git 根目录内，否则拒绝。
 
-Do not use string-prefix containment. Convert command spawn failures, non-zero exits, invalid UTF-8, missing roots, and out-of-root workspaces into stable codes without returning raw stderr to API callers. Unit tests prove invalid selected paths invoke neither Git nor Cargo. The integration test uses real Git/Cargo and confirms no file changes.
+不要使用字符串前缀判断包含关系。将命令生成失败、非零退出、无效 UTF-8、根目录缺失和根目录外工作区转换为稳定代码，不向 API 调用者返回原始标准错误输出。单元测试证明无效选定路径既不调用 Git 也不调用 Cargo。集成测试使用真实 Git/Cargo，并确认文件未发生变化。
 
-- [ ] **Step 5: Implement browser and serialized native-dialog adapters**
+- [ ] **步骤 5：实施浏览器和串行化的原生对话框适配器**
 
-`BrowserLauncher::open` delegates only complete `http://127.0.0.1:<port>/#token=<token>` URLs to hardened `webbrowser`. A failure returns the URL for the caller's native error dialog and does not stop the server. `NativeDialogService` owns one atomic/mutex gate and calls `rfd` through its platform-supported async adapter, including the required main-thread/event-loop handoff on macOS. Cancellation is `Ok(None)`, concurrent entry is `PickerError::AlreadyOpen`, and handlers never call `rfd` directly. Fix and test the stable discovery/dialog codes `REPOSITORY_PATH_NOT_FOUND`, `REPOSITORY_PATH_NOT_DIRECTORY`, `CARGO_WORKSPACE_NOT_FOUND`, `CARGO_WORKSPACE_OUTSIDE_GIT_ROOT`, `REPOSITORY_COMMAND_FAILED`, and `PICKER_ALREADY_OPEN`.
+`BrowserLauncher::open` 只将完整的 `http://127.0.0.1:<port>/#token=<token>` URL 委托给强化安全的 `webbrowser`。失败时返回 URL 供调用者的原生错误对话框使用，且不停止服务器。`NativeDialogService` 负责一个原子操作/互斥锁关卡，并通过平台支持的异步适配器调用 `rfd`，包括 macOS 所需的主线程/事件循环交接。取消返回 `Ok(None)`，并发进入返回 `PickerError::AlreadyOpen`，处理器绝不直接调用 `rfd`。固定并测试稳定的发现/对话框代码 `REPOSITORY_PATH_NOT_FOUND`、`REPOSITORY_PATH_NOT_DIRECTORY`、`CARGO_WORKSPACE_NOT_FOUND`、`CARGO_WORKSPACE_OUTSIDE_GIT_ROOT`、`REPOSITORY_COMMAND_FAILED` 和 `PICKER_ALREADY_OPEN`。
 
-- [ ] **Step 6: Run platform regressions and commit**
+- [ ] **步骤 6：运行平台回归测试并提交**
 
-Run: `cargo test -p coding-agent-app --test platform --test repository_service`
+运行：`cargo test -p coding-agent-app --test platform --test repository_service`
 
-Run: `cargo test -p coding-agent-store -p coding-agent-app`
+运行：`cargo test -p coding-agent-store -p coding-agent-app`
 
-Expected: all platform and discovery tests pass, and the real fixture fingerprint remains unchanged.
+预期：所有平台和发现测试通过，且真实测试夹具指纹保持不变。
 
 ```bash
 git add crates/coding-agent-app Cargo.lock
 git commit -m "feat: add local platform and repository discovery"
 ```
 
-### Task 11: Implement Process-Scoped Session, Host, Origin, and CSRF Security
+### 任务 11：实现进程范围的会话、Host、Origin 和 CSRF 安全机制
 
-**Files:**
-- Create: `crates/coding-agent-app/src/security.rs`
-- Create: `crates/coding-agent-app/tests/security.rs`
-- Modify: `crates/coding-agent-app/src/lib.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 创建：`crates/coding-agent-app/src/security.rs`
+- 创建：`crates/coding-agent-app/tests/security.rs`
+- 修改：`crates/coding-agent-app/src/lib.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Produces: `SecuritySeed`, `SecurityManager`, `LaunchToken`, `LauncherSecret`, `SessionRecord`, and the app implementation of API `RequestSecurity`.
-- Invariant: all secrets live only in memory except the launcher secret in the owner-only runtime descriptor; none enter SQLite, request targets, or ordinary logs.
+**接口：**
+- 产出：`SecuritySeed`、`SecurityManager`、`LaunchToken`、`LauncherSecret`、`SessionRecord`，以及 API `RequestSecurity` 的应用层实现。
+- 不变量：除仅所有者可读的运行时描述符中的启动器密钥外，所有密钥都只存在于内存中；任何密钥都不得进入 SQLite、请求目标或常规日志。
 
-Add `axum-extra.workspace = true`, `base64.workspace = true`, `getrandom.workspace = true`, `http.workspace = true`, and `subtle.workspace = true` to app dependencies, plus `tracing-subscriber.workspace = true` to app dev-dependencies for the redaction capture.
+向应用依赖添加 `axum-extra.workspace = true`、`base64.workspace = true`、`getrandom.workspace = true`、`http.workspace = true` 和 `subtle.workspace = true`，并向应用开发依赖添加 `tracing-subscriber.workspace = true`，用于捕获日志并验证敏感信息已被脱敏。
 
-- [ ] **Step 1: Write failing one-time token and request-boundary tests**
+- [ ] **步骤 1：编写失败的一次性令牌和请求边界测试**
 
 ```rust
 #[tokio::test]
@@ -1665,143 +1665,143 @@ async fn concurrent_exchange_consumes_a_launch_token_once() {
 }
 ```
 
-Add table tests for exact Host, missing/foreign Origin, missing/wrong CSRF, forged/old cookie, two-minute expiry using a fake clock, process restart invalidation, public read authorization, mutation authorization, and launcher-secret constant-time comparison. Capture tracing output seeded with known token, launcher secret, cookie, and CSRF and assert ordinary info logs contain none of their bytes. Assert responses contain no `Access-Control-Allow-Origin` header.
+添加表格驱动测试，覆盖精确 Host、Origin 缺失或来自外部、CSRF 缺失或错误、伪造或旧的 Cookie、通过伪时钟验证两分钟过期、进程重启后失效、公开读取授权、变更授权，以及启动器密钥的常量时间比较。捕获预先植入已知令牌、启动器密钥、Cookie 和 CSRF 值的跟踪输出，断言常规信息级日志不包含其中任何字节。断言响应不含 `Access-Control-Allow-Origin` 标头。
 
-- [ ] **Step 2: Run the focused suite and verify red**
+- [ ] **步骤 2：运行聚焦测试并验证红灯**
 
-Run: `cargo test -p coding-agent-app --test security`
+运行：`cargo test -p coding-agent-app --test security`
 
-Expected: compilation fails because `SecurityManager` and the `RequestSecurity` implementation do not exist.
+预期：由于 `SecurityManager` 和 `RequestSecurity` 实现尚不存在，编译失败。
 
-- [ ] **Step 3: Implement secret issuance and atomic exchange**
+- [ ] **步骤 3：实现密钥签发和原子交换**
 
-Generate every launch token, launcher secret, session ID, and CSRF token from 32 bytes filled by `getrandom`, then encode with URL-safe base64 without padding. `SecuritySeed::generate` creates process secrets before port binding; `SecurityManager::from_seed(seed, public_origin, clock)` consumes it exactly once after the loopback port is known. Store launch tokens in one mutex-protected map with issued and expiry instants. Exchange validates exact Host and configured public Origin, removes a valid token while holding the map lock, then creates an independent session. Use `subtle::ConstantTimeEq` for presented secret/token comparison.
+每个启动令牌、启动器密钥、会话 ID 和 CSRF 令牌都由 `getrandom` 填充的 32 字节生成，再以 URL 安全且无填充的 base64 编码。`SecuritySeed::generate` 在绑定端口前创建进程密钥；确定环回端口后，`SecurityManager::from_seed(seed, public_origin, clock)` 只消费该种子一次。启动令牌存放在一个由互斥锁保护的映射中，并记录签发和过期时刻。交换流程验证精确 Host 和已配置的公共 Origin，在持有映射锁时移除有效令牌，然后创建独立会话。使用 `subtle::ConstantTimeEq` 比较提交的密钥和令牌。
 
-Return a host-only `coding_agent_session` cookie with `HttpOnly`, `SameSite=Strict`, and `Path=/`; omit `Domain`, `Expires`, and `Secure` because production uses loopback HTTP. JavaScript receives the CSRF token only from authenticated bootstrap. A fresh `SecurityManager` has no knowledge of any earlier process token, cookie, CSRF value, or launcher secret.
+返回仅限主机的 `coding_agent_session` cookie，并设置 `HttpOnly`、`SameSite=Strict` 和 `Path=/`；由于生产环境使用环回 HTTP，因此省略 `Domain`、`Expires` 和 `Secure`。JavaScript 只能从通过身份验证的引导响应中取得 CSRF 令牌。新建的 `SecurityManager` 不得知晓任何先前进程的令牌、cookie、CSRF 值或启动器密钥。
 
-- [ ] **Step 4: Implement the three authorization levels**
+- [ ] **步骤 4：实现三种授权级别**
 
-Implement API `RequestSecurity` as:
+按以下规则实现 API `RequestSecurity`：
 
-- exchange: exact Host, exact public Origin, and one valid launch token;
-- read/SSE: exact Host and one live session cookie;
-- mutation: read checks plus exact Origin and constant-time `X-CSRF-Token` match.
+- 交换：精确 Host、精确公共 Origin 和一个有效启动令牌；
+- 读取/SSE：精确 Host 和一个有效的会话 cookie；
+- 变更：读取检查，再加上精确 Origin 和以常量时间匹配的 `X-CSRF-Token`。
 
-Internal `/_local/ready` and `/_local/reopen` use exact Host plus `X-Launcher-Secret`, never the browser cookie. Reject duplicated security headers, non-loopback configured origins in production, and any Host alias such as `localhost`. Request diagnostics may record a generated request ID and stable error code only.
+内部端点 `/_local/ready` 和 `/_local/reopen` 使用精确 Host 加 `X-Launcher-Secret`，绝不使用浏览器 cookie。拒绝重复的安全标头、生产环境中配置的非环回 Origin，以及 `localhost` 等任何 Host 别名。请求诊断只能记录生成的请求 ID 和稳定错误代码。
 
-Development mode accepts only its one explicitly configured Vite public Origin and proxy Host. It executes the same session, CSRF, launcher-secret, and mutation-gate checks as production; there is no debug authentication bypass or wildcard `localhost` rule.
+开发模式只接受唯一且显式配置的 Vite 公共 Origin 和代理 Host。它执行与生产环境相同的会话、CSRF、启动器密钥和变更关卡检查；不存在调试身份验证绕过，也不存在通配的 `localhost` 规则。
 
-- [ ] **Step 5: Run security and contract suites**
+- [ ] **步骤 5：运行安全和契约测试套件**
 
-Run: `cargo test -p coding-agent-app --test security`
+运行：`cargo test -p coding-agent-app --test security`
 
-Run: `cargo test -p coding-agent-api -p coding-agent-app`
+运行：`cargo test -p coding-agent-api -p coding-agent-app`
 
-Expected: the concurrent-exchange test has one success; every negative matrix row fails closed.
+预期：并发交换测试恰有一次成功；负向矩阵中的每一行都以拒绝方式安全失败。
 
-- [ ] **Step 6: Commit the security boundary**
+- [ ] **步骤 6：提交安全边界**
 
 ```bash
 git add crates/coding-agent-app Cargo.lock
 git commit -m "feat: protect local browser sessions"
 ```
 
-### Task 12: Wire the Protected REST API and Application Backend
+### 任务 12：接入受保护的 REST API 和应用后端
 
-**Files:**
-- Create: `crates/coding-agent-api/src/router.rs`
-- Create: `crates/coding-agent-api/tests/router.rs`
-- Create: `crates/coding-agent-api/tests/support/mod.rs`
-- Create: `crates/coding-agent-app/src/server.rs`
-- Create: `crates/coding-agent-app/tests/server.rs`
-- Modify: `crates/coding-agent-api/src/lib.rs`
-- Modify: `crates/coding-agent-app/src/lib.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 创建：`crates/coding-agent-api/src/router.rs`
+- 创建：`crates/coding-agent-api/tests/router.rs`
+- 创建：`crates/coding-agent-api/tests/support/mod.rs`
+- 创建：`crates/coding-agent-app/src/server.rs`
+- 创建：`crates/coding-agent-app/tests/server.rs`
+- 修改：`crates/coding-agent-api/src/lib.rs`
+- 修改：`crates/coding-agent-app/src/lib.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Produces: `build_api_router`, `ApplicationBackend`, `MutationGate`, and exact REST-to-domain/store error mapping.
-- Invariant: route handlers contain transport mapping only; mutations go through TaskManager/StoreWriter and repository discovery goes through Task 10 services.
+**接口：**
+- 产出：`build_api_router`、`ApplicationBackend`、`MutationGate`，以及从 REST 到领域层/存储层错误的精确映射。
+- 不变量：路由处理器只包含传输层映射；变更操作必须经过 TaskManager/StoreWriter，仓库发现必须经过任务 10 的服务。
 
-Add `http-body-util.workspace = true`, `tokio.workspace = true`, and `tower.workspace = true` to API dev-dependencies. Add `axum.workspace = true`, `http-body-util.workspace = true`, `tower.workspace = true`, and `tower-http.workspace = true` to app dependencies; `http` is already a direct app dependency from Task 11. Every API integration test begins with `mod support;`; that module owns fake backend/security/SSE ports and response decoders.
+向 API 开发依赖添加 `http-body-util.workspace = true`、`tokio.workspace = true` 和 `tower.workspace = true`。向应用依赖添加 `axum.workspace = true`、`http-body-util.workspace = true`、`tower.workspace = true` 和 `tower-http.workspace = true`；任务 11 已将 `http` 加为应用的直接依赖。每个 API 集成测试都以 `mod support;` 开头；该模块负责伪后端、安全/SSE 端口和响应解码器。
 
-- [ ] **Step 1: Write failing route matrices with fake ports**
+- [ ] **步骤 1：使用伪端口编写失败的路由矩阵测试**
 
-The API router test supplies fake `ApiBackend`, `RequestSecurity`, and `SseBackend` implementations and covers every route, method, authentication level, content type, request ID, and success/error status. Assert the router-produced OpenAPI contains exactly the approved `/api/session/exchange`, bootstrap, repository, task/detail/cancel/retry/task-events, global events, and app quit paths; cancel documents `200 TaskDto` and `202 CancellationAcceptedResponse`. Include these mutation assertions:
+API 路由测试提供伪 `ApiBackend`、`RequestSecurity` 和 `SseBackend` 实现，并覆盖每条路由、每种方法、身份验证级别、内容类型、请求 ID 以及成功/错误状态。断言路由器生成的 OpenAPI 恰好包含已批准的 `/api/session/exchange`、引导、仓库、任务/详情/取消/重试/任务事件、全局事件和应用退出路径；取消接口应记录 `200 TaskDto` 和 `202 CancellationAcceptedResponse`。包括以下变更操作断言：
 
-- repository create/pick: `201` created, `200` existing, picker cancel `204`, picker busy `409`;
-- task create: `201` first, `200` equivalent idempotent replay, `409` conflicting replay, `422` blank or over 50,000 Unicode scalars;
-- cancel: Queued `200`, Running `202`, Cancelled `200`, other terminal `409`;
-- retry: first child `201`, same direct child `200`, non-terminal `409`;
-- bounded SQLite BUSY/LOCKED exhaustion: `503 {code:"STORE_BUSY",retryable:true}` with no committed mutation;
-- accepted quit: `202 {"status":"shutting_down"}`; closed/degraded data-mutation gate: stable `503`.
+- 创建/选择仓库：新建返回 `201`，已存在返回 `200`，取消选择器返回 `204`，选择器繁忙返回 `409`；
+- 创建任务：首次返回 `201`，等价的幂等重放返回 `200`，冲突重放返回 `409`，空白或超过 50,000 个 Unicode 标量值返回 `422`；
+- 取消：Queued 返回 `200`，Running 返回 `202`，Cancelled 返回 `200`，其他终态返回 `409`；
+- 重试：首个子任务返回 `201`，同一个直接子任务返回 `200`，非终态返回 `409`；
+- 有界耗尽 SQLite BUSY/LOCKED 重试：返回 `503 {code:"STORE_BUSY",retryable:true}`，且不提交任何变更；
+- 已接受退出：返回 `202 {"status":"shutting_down"}`；已关闭/降级的数据变更关卡：返回稳定的 `503`。
 
-Add a concurrent same-request-ID test proving only one task/event is created and both responses reference the same Task.
+添加使用相同请求 ID 的并发测试，证明只创建一个任务/事件，且两个响应引用同一个 Task。
 
-Add a concurrent retry test proving many requests against one terminal source return the same direct child with one `201` and the rest `200`. While service state is StoreDegraded, verify repository/task mutations return `503 STORE_DEGRADED` but the protected quit endpoint remains available so the user can enter degraded shutdown; tests may seed Store state directly but may not call a bypassing public enqueue path.
+添加并发重试测试，证明针对同一个终态源任务的多个请求会返回同一个直接子任务，其中一个响应为 `201`，其余为 `200`。当服务状态为 StoreDegraded 时，验证仓库/任务变更返回 `503 STORE_DEGRADED`，但受保护的退出端点仍然可用，以便用户进入降级关闭流程；测试可以直接植入 Store 状态，但不得调用绕过检查的公开入队路径。
 
-Capture server info logs for requests containing a known prompt and canonical path; assert logs contain only stable request/repository/task IDs and error codes, not the prompt or full path. Explicit local debug logging may treat paths as user data but still never emits session secrets.
+捕获包含已知提示词和规范路径的请求所产生的服务器信息级日志；断言日志只包含稳定的请求/仓库/任务 ID 和错误代码，不包含提示词或完整路径。显式启用的本地调试日志可以将路径视为用户数据，但仍绝不能输出会话密钥。
 
-- [ ] **Step 2: Run route tests and verify red**
+- [ ] **步骤 2：运行路由测试并验证红灯**
 
-Run: `cargo test -p coding-agent-api --test router`
+运行：`cargo test -p coding-agent-api --test router`
 
-Expected: compilation fails because the router is not defined.
+预期：由于路由器尚未定义，编译失败。
 
-- [ ] **Step 3: Implement the API router from the OpenAPI-bearing handlers**
+- [ ] **步骤 3：基于携带 OpenAPI 元数据的处理器实现 API 路由器**
 
-Build routes with `utoipa-axum` so the runtime handler path/method and exported OpenAPI derive from the same registration. `api_openapi()` constructs the same unbound `OpenApiRouter<ApiState>` and returns its document; `build_api_router` supplies state and serves it; `export_openapi` now calls `api_openapi()` instead of the component-only Task 4 document. Apply exact Host validation outside the entire router; apply read or mutation authorization per endpoint. `POST /api/session/exchange` succeeds with `204` plus `Set-Cookie`. Every response, including rejections and panics, includes `X-Request-Id`; never reflect a malformed incoming ID.
+使用 `utoipa-axum` 构建路由，使运行时处理器的路径/方法和导出的 OpenAPI 来自同一份注册信息。`api_openapi()` 构造同一个未绑定的 `OpenApiRouter<ApiState>` 并返回其文档；`build_api_router` 提供状态并对外服务；`export_openapi` 现在调用 `api_openapi()`，而非任务 4 中只有组件的文档。在整个路由器外层应用精确 Host 验证；逐端点应用读取或变更授权。`POST /api/session/exchange` 成功时返回 `204` 和 `Set-Cookie`。包括拒绝和 panic 在内的每个响应都包含 `X-Request-Id`；绝不回显格式错误的传入 ID。
 
-Map `CreateResult` to `201`/`200`. Map stable app errors to the approved JSON envelope and never include command stderr, secrets, prompt text, or filesystem internals beyond the already-authorized repository DTO. Do not add CORS middleware.
+将 `CreateResult` 映射为 `201`/`200`。将稳定的应用错误映射到已批准的 JSON 封装，并且绝不包含命令标准错误、密钥、提示词文本，也不暴露已获授权的仓库 DTO 之外的文件系统内部信息。不要添加 CORS 中间件。
 
-- [ ] **Step 4: Implement `ApplicationBackend` and mutation-gate entry**
+- [ ] **步骤 4：实现 `ApplicationBackend` 和变更关卡入口**
 
-`ApplicationBackend` maps bootstrap/list/detail/events to one read-only Store and resolves the authenticated session's CSRF through SecurityManager. It sends create/retry through StoreWriter and cancel through TaskManager. Trim and count prompt Unicode scalar values before enqueueing. A successful create/retry notifies TaskManager only after commit; a lost notification is tolerated by reconciliation. Repository path and picker routes share RepositoryDiscovery and StoreWriter registration. All store/domain errors become API-owned errors here, never in the API crate.
+`ApplicationBackend` 将引导/列表/详情/事件映射到一个只读 Store，并通过 SecurityManager 解析已认证会话的 CSRF。它通过 StoreWriter 发送创建/重试操作，通过 TaskManager 发送取消操作。入队前先去除提示词首尾空白并统计 Unicode 标量值。创建/重试成功后，只有提交完成才通知 TaskManager；协调流程允许通知丢失。仓库路径路由和选择器路由共用 RepositoryDiscovery 与 StoreWriter 注册逻辑。所有存储层/领域层错误都在此处转换为 API 自有错误，绝不放在 API 软件包中处理。
 
-`MutationGate::enter_data_mutation()` returns an RAII guard while Ready, STORE_DEGRADED while degraded, and APP_SHUTTING_DOWN once closed. `prepare_quit()` is allowed in Ready or StoreDegraded and rejects only after Quiescing begins. Quit returns its `202` body through a response-body wrapper whose end-of-stream callback sends the shutdown signal; an integration test must receive the full response before the listener begins quiescing.
+`MutationGate::enter_data_mutation()` 在 Ready 时返回 RAII 守卫，在降级时返回 STORE_DEGRADED，关闭后返回 APP_SHUTTING_DOWN。Ready 或 StoreDegraded 状态下都允许调用 `prepare_quit()`，仅在 Quiescing 开始后才拒绝。退出操作通过响应体包装器返回其 `202` 响应体，该包装器在流结束回调中发送关闭信号；集成测试必须先收到完整响应，监听器才能开始静默退出。
 
-- [ ] **Step 5: Run API, server, manager, and store suites**
+- [ ] **步骤 5：运行 API、服务器、管理器和存储测试套件**
 
-Run: `cargo test -p coding-agent-api --test router`
+运行：`cargo test -p coding-agent-api --test router`
 
-Run: `cargo test -p coding-agent-app --test server --test task_manager --test store_writer`
+运行：`cargo test -p coding-agent-app --test server --test task_manager --test store_writer`
 
-Run: `cargo run -p coding-agent-api --bin export_openapi -- web/openapi.json`
+运行：`cargo run -p coding-agent-api --bin export_openapi -- web/openapi.json`
 
-Run: `cargo run -p coding-agent-api --bin export_openapi -- target/openapi-check.json`
+运行：`cargo run -p coding-agent-api --bin export_openapi -- target/openapi-check.json`
 
-Run: `git diff --no-index --exit-code -- web/openapi.json target/openapi-check.json`
+运行：`git diff --no-index --exit-code -- web/openapi.json target/openapi-check.json`
 
-Expected: all route matrices pass; the router path additions intentionally update the tracked contract, and two fresh exports are byte-identical.
+预期：所有路由矩阵均通过；新增路由路径会按预期更新受版本控制的契约，且两次全新导出的文件在字节层面完全相同。
 
-- [ ] **Step 6: Commit the protected command/query layer**
+- [ ] **步骤 6：提交受保护的命令/查询层**
 
 ```bash
 git add crates/coding-agent-api crates/coding-agent-app web/openapi.json Cargo.lock
 git commit -m "feat: expose protected local rest api"
 ```
 
-### Task 13: Implement Gap-Free SSE Replay and Live Streaming
+### 任务 13：实现无缺口的 SSE 重放和实时流
 
-**Files:**
-- Create: `crates/coding-agent-api/src/sse.rs`
-- Create: `crates/coding-agent-api/tests/sse.rs`
-- Modify: `crates/coding-agent-api/src/router.rs`
-- Modify: `crates/coding-agent-api/src/lib.rs`
-- Modify: `crates/coding-agent-app/src/server.rs`
-- Modify: `crates/coding-agent-app/tests/server.rs`
-- Modify: `crates/coding-agent-api/tests/support/mod.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 创建：`crates/coding-agent-api/src/sse.rs`
+- 创建：`crates/coding-agent-api/tests/sse.rs`
+- 修改：`crates/coding-agent-api/src/router.rs`
+- 修改：`crates/coding-agent-api/src/lib.rs`
+- 修改：`crates/coding-agent-app/src/server.rs`
+- 修改：`crates/coding-agent-app/tests/server.rs`
+- 修改：`crates/coding-agent-api/tests/support/mod.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Consumes: Task 4 `SseBackend`, Task 6 `EventDispatcherHandle`, read-only Store replay, and `ServiceStateController` watch.
-- Produces: authenticated `GET /api/events?after=<id>` with persisted task frames and non-persisted control frames.
-- Invariant: the last emitted persisted ID is strictly increasing; service-state controls and heartbeats never change it.
+**接口：**
+- 消费：任务 4 的 `SseBackend`、任务 6 的 `EventDispatcherHandle`、只读 Store 重放，以及 `ServiceStateController` 监视通道。
+- 产出：通过身份验证的 `GET /api/events?after=<id>`，其中包含持久化的任务帧和非持久化的控制帧。
+- 不变量：最后发出的持久化 ID 严格递增；服务状态控制帧和心跳绝不改变该 ID。
 
-Add `async-stream.workspace = true` and `tokio.workspace = true` to API dependencies. Add `futures-util.workspace = true`, `tokio-stream.workspace = true`, and `async-stream.workspace = true` to app dependencies for the port adapter.
+向 API 依赖添加 `async-stream.workspace = true` 和 `tokio.workspace = true`。向应用依赖添加 `futures-util.workspace = true`、`tokio-stream.workspace = true` 和 `async-stream.workspace = true`，用于端口适配器。
 
-- [ ] **Step 1: Write failing join, overlap, reset, lag, and heartbeat tests**
+- [ ] **步骤 1：编写失败的接合、重叠、重置、滞后和心跳测试**
 
-Use a deterministic fake `SseBackend` that can pause between subscription, high-watermark read, backlog pages, and live drain. Cover an event committed in each pause, the same event appearing in backlog and live, an out-of-order live buffer, broadcast lag, a cursor greater than database maximum, service generation changing between bootstrap and SSE, and a 15-second paused-time heartbeat.
+使用确定性的伪 `SseBackend`，它能够在订阅、高水位读取、历史积压分页和实时队列排空之间暂停。覆盖以下情形：在各个暂停点提交事件、同一事件同时出现在历史积压与实时流中、实时缓冲区乱序、广播滞后、游标大于数据库最大值、服务代次在引导和 SSE 之间发生变化，以及在暂停时间下每 15 秒发送一次心跳。
 
 ```rust
 #[tokio::test]
@@ -1819,57 +1819,57 @@ async fn subscribe_before_backlog_has_no_gap_or_duplicate() {
 }
 ```
 
-- [ ] **Step 2: Run SSE tests and verify red**
+- [ ] **步骤 2：运行 SSE 测试并验证红灯**
 
-Run: `cargo test -p coding-agent-api --test sse`
+运行：`cargo test -p coding-agent-api --test sse`
 
-Expected: compilation fails because the SSE join is not implemented.
+预期：由于 SSE 接合流程尚未实现，编译失败。
 
-- [ ] **Step 3: Implement initial service control and persistent join**
+- [ ] **步骤 3：实现初始服务控制和持久化流接合**
 
-After read authorization, subscribe to service-state and live task streams first. Immediately emit the current `ServiceStateControl`. Read current maximum ID; if `after` is greater, emit `event: stream.reset` without an `id` field and close. Otherwise page `events_between(after, high, 256)`, emit ascending IDs through `high`, sort/deduplicate buffered live items, then continue live while skipping every ID not greater than the last sent.
+读取授权通过后，先订阅服务状态流和实时任务流。立即发出当前的 `ServiceStateControl`。读取当前最大 ID；如果 `after` 更大，则发出不含 `id` 字段的 `event: stream.reset` 并关闭。否则分页读取 `events_between(after, high, 256)`，按升序发出直至 `high` 的 ID，对缓冲的实时项目排序并去重，然后继续实时发送，同时跳过所有不大于最后已发送 ID 的项目。
 
-Wire format uses persisted `id`, the domain event name, and one-line JSON data. `stream.reset` and `service.state` have no persisted ID. Unknown internal errors terminate the stream after a diagnostic log without serializing secrets.
+传输格式使用持久化的 `id`、领域事件名称和单行 JSON 数据。`stream.reset` 和 `service.state` 不带持久化 ID。遇到未知内部错误时，先记录不序列化任何密钥的诊断日志，再终止数据流。
 
-- [ ] **Step 4: Recover broadcast lag and merge service state**
+- [ ] **步骤 4：从广播滞后中恢复并合并服务状态**
 
-On `LiveEventItem::Lagged`, query the new maximum and refill SQLite pages from the last sent ID before consuming live again. Continue until caught up; never synthesize task events. Coalesce service-state watch changes and emit only generations greater than the last service generation. Interleave a `: heartbeat` comment every 15 seconds without starving either source.
+收到 `LiveEventItem::Lagged` 时，查询新的最大值，从最后已发送的 ID 开始重新填充 SQLite 分页，然后再继续消费实时流。持续追赶直至同步；绝不合成任务事件。合并服务状态监视通道的变更，仅发送代次大于上一个服务代次的状态。每 15 秒交错发送一次 `: heartbeat` 注释，同时确保两个来源都不会得不到处理。
 
-- [ ] **Step 5: Run focused and process-level SSE regressions**
+- [ ] **步骤 5：运行聚焦和进程级 SSE 回归测试**
 
-Run: `cargo test -p coding-agent-api --test sse`
+运行：`cargo test -p coding-agent-api --test sse`
 
-Run: `cargo test -p coding-agent-app --test event_dispatcher --test server`
+运行：`cargo test -p coding-agent-app --test event_dispatcher --test server`
 
-Expected: persisted output is strictly increasing and gap-free under backlog/live overlap and lag; reset closes; heartbeat carries no ID.
+预期：在历史积压/实时流重叠及广播滞后时，持久化输出仍严格递增且没有缺口；重置会关闭连接；心跳不携带 ID。
 
-- [ ] **Step 6: Commit replayable SSE**
+- [ ] **步骤 6：提交可重放的 SSE**
 
 ```bash
 git add crates/coding-agent-api crates/coding-agent-app Cargo.lock
 git commit -m "feat: stream replayable task events"
 ```
 
-### Task 14: Compose Primary and Secondary Single-Instance Startup
+### 任务 14：组装主进程与次进程的单实例启动流程
 
-**Files:**
-- Create: `crates/coding-agent-app/src/single_instance.rs`
-- Create: `crates/coding-agent-app/src/main.rs`
-- Create: `crates/coding-agent-app/tests/single_instance.rs`
-- Modify: `crates/coding-agent-app/src/platform.rs`
-- Modify: `crates/coding-agent-app/src/server.rs`
-- Modify: `crates/coding-agent-app/src/lib.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 创建：`crates/coding-agent-app/src/single_instance.rs`
+- 创建：`crates/coding-agent-app/src/main.rs`
+- 创建：`crates/coding-agent-app/tests/single_instance.rs`
+- 修改：`crates/coding-agent-app/src/platform.rs`
+- 修改：`crates/coding-agent-app/src/server.rs`
+- 修改：`crates/coding-agent-app/src/lib.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Produces: `InstanceLock`, `RuntimeDescriptor`, `PrimaryRuntime`, `SecondaryRuntime`, `StartupPhase`, `/_local/ready`, and `/_local/reopen`.
-- Invariant: lock ownership is decided before SQLite is opened; a secondary process never constructs StoreWriter or TaskManager.
+**接口：**
+- 产出：`InstanceLock`、`RuntimeDescriptor`、`PrimaryRuntime`、`SecondaryRuntime`、`StartupPhase`、`/_local/ready` 和 `/_local/reopen`。
+- 不变量：打开 SQLite 前必须确定锁的所有权；次进程绝不构造 StoreWriter 或 TaskManager。
 
-Add `serde.workspace = true`, `serde_json.workspace = true`, `time.workspace = true`, and `uuid.workspace = true` to app dependencies, and promote the existing `tracing-subscriber.workspace = true` entry from app dev-dependencies to dependencies.
+向应用依赖添加 `serde.workspace = true`、`serde_json.workspace = true`、`time.workspace = true` 和 `uuid.workspace = true`，并将现有的 `tracing-subscriber.workspace = true` 条目从应用开发依赖提升为正式依赖。
 
-- [ ] **Step 1: Write failing lock, descriptor, and startup-phase tests**
+- [ ] **步骤 1：编写失败的锁、描述符和启动阶段测试**
 
-Test the phase matrix: application-data directory creation/permission failure, lock held before descriptor publication, descriptor published while readiness says Starting, Ready reopen, malformed descriptor, wrong launcher secret, descriptor for a dead process, browser open failure, and 10-second timeout. The unwritable-path test injects the platform filesystem error, asserts one native error message, non-zero exit, and no lock/database/listener. Assert the secondary opens no database connection by injecting a Store factory that panics if called.
+测试以下阶段矩阵：应用数据目录创建/权限失败、发布描述符前已持有锁、就绪状态为 Starting 时发布描述符、Ready 状态下重新打开、描述符格式错误、启动器密钥错误、描述符指向已终止进程、浏览器打开失败，以及 10 秒超时。不可写路径测试注入平台文件系统错误，并断言只显示一条原生错误消息、进程非零退出，且不创建锁/数据库/监听器。注入一个一旦调用就 panic 的 Store 工厂，断言次进程不会打开数据库连接。
 
 ```rust
 #[tokio::test(start_paused = true)]
@@ -1885,59 +1885,59 @@ async fn secondary_waits_for_atomic_descriptor_without_opening_store() {
 }
 ```
 
-- [ ] **Step 2: Run single-instance tests and verify red**
+- [ ] **步骤 2：运行单实例测试并验证红灯**
 
-Run: `cargo test -p coding-agent-app --test single_instance`
+运行：`cargo test -p coding-agent-app --test single_instance`
 
-Expected: compilation fails because lock and descriptor types do not exist.
+预期：由于锁和描述符类型尚不存在，编译失败。
 
-- [ ] **Step 3: Implement permanent lock-file ownership and atomic descriptor publication**
+- [ ] **步骤 3：实现永久锁文件所有权和描述符原子发布**
 
-Open the permanent `instance.lock` with read/write/create and call stable `std::fs::File::try_lock`. Keep that file descriptor alive for the full primary lifetime; never delete or rename the lock file. Only a lock owner may remove a stale descriptor.
+以读取/写入/创建模式打开永久的 `instance.lock`，并调用稳定版 `std::fs::File::try_lock`。在主进程的整个生命周期内保持该文件描述符有效；绝不删除或重命名锁文件。只有锁所有者才能移除过期描述符。
 
-Publish `RuntimeDescriptor { instance_id, pid, port, started_at, launcher_secret }` to a private sibling temporary file, call `sync_all`, atomically rename to `instance.json`, and sync the parent directory where supported. Readers reopen after every retry and never read the temporary path. Validate field bounds, loopback port, UUID, PID, and owner-only permissions before contacting a primary.
+先将 `RuntimeDescriptor { instance_id, pid, port, started_at, launcher_secret }` 发布到同级私有临时文件，调用 `sync_all`，再原子重命名为 `instance.json`，并在平台支持时同步父目录。读取方每次重试后都重新打开文件，绝不读取临时路径。联系主进程前，验证字段边界、环回端口、UUID、PID 和仅所有者权限。
 
-- [ ] **Step 4: Implement exact primary composition order**
+- [ ] **步骤 4：实现严格的主进程组装顺序**
 
-The primary performs: paths → lock → stale descriptor cleanup → Store open/migrate → atomic incomplete recovery → generate SecuritySeed → bind `127.0.0.1:0` → construct SecurityManager with the exact bound origin → initialize dispatcher at recovered high watermark → start StoreWriter/TaskManager → serve Starting mode → self-probe `/_local/ready` with launcher secret → set Ready → publish descriptor → open the fragment URL.
+主进程按以下顺序执行：路径 → 加锁 → 清理过期描述符 → 打开/迁移 Store → 原子恢复未完成任务 → 生成 SecuritySeed → 绑定 `127.0.0.1:0` → 使用精确的已绑定 Origin 构造 SecurityManager → 在恢复出的高水位初始化事件分发器 → 启动 StoreWriter/TaskManager → 以 Starting 模式提供服务 → 使用启动器密钥自探测 `/_local/ready` → 设置为 Ready → 发布描述符 → 打开带片段的 URL。
 
-Application-data/runtime creation or permission failure displays a native error and exits before lock/database/listener. Migration/recovery failure displays a native error and exits before listener publication. Bind retries are finite. Browser failure keeps the server alive and shows the complete copyable URL through the native message adapter. Starting mode exposes only the launcher-protected ready probe; public API and static requests return `503 APP_STARTING`.
+应用数据目录/运行时目录创建或权限失败时，显示原生错误，并在创建锁/数据库/监听器前退出。迁移/恢复失败时，显示原生错误，并在发布监听器前退出。绑定重试次数必须有限。浏览器打开失败时保持服务器运行，并通过原生消息适配器显示可完整复制的 URL。Starting 模式只公开受启动器密钥保护的就绪探测；公共 API 和静态资源请求返回 `503 APP_STARTING`。
 
-- [ ] **Step 5: Implement secondary reopen without a second writer**
+- [ ] **步骤 5：实现不创建第二个写入器的次进程重新打开流程**
 
-On lock contention, retry descriptor read and launcher-protected readiness/reopen with bounded exponential delays totaling at most 10 seconds. `/_local/ready` returns only instance ID and state. `/_local/reopen` returns `503` until Ready; when Ready it issues a new two-minute one-time browser token and returns the full fragment URL. Open that URL and exit zero. If the locked primary cannot be verified, show an explicit error and leave lock/descriptor untouched.
+发生锁争用时，以有界指数延迟重试读取描述符以及受启动器密钥保护的就绪/重新打开请求，总时长最多 10 秒。`/_local/ready` 只返回实例 ID 和状态。`/_local/reopen` 在 Ready 前返回 `503`；进入 Ready 后签发一个新的、有效期两分钟的一次性浏览器令牌，并返回完整的带片段 URL。打开该 URL 并以零状态码退出。如果无法验证持锁的主进程，则显示明确错误，并保持锁/描述符不变。
 
-- [ ] **Step 6: Run startup and actor regression suites**
+- [ ] **步骤 6：运行启动和执行体回归测试套件**
 
-Run: `cargo test -p coding-agent-app --test single_instance --test server --test task_manager --test event_dispatcher`
+运行：`cargo test -p coding-agent-app --test single_instance --test server --test task_manager --test event_dispatcher`
 
-Expected: all phase interleavings pass; secondary tests prove no Store construction.
+预期：所有阶段交错测试均通过；次进程测试证明不会构造 Store。
 
-- [ ] **Step 7: Commit the executable composition root**
+- [ ] **步骤 7：提交可执行程序的组装根节点**
 
 ```bash
 git add crates/coding-agent-app Cargo.lock
 git commit -m "feat: launch one protected local instance"
 ```
 
-### Task 15: Implement Graceful and Degraded Shutdown
+### 任务 15：实现优雅关闭和降级关闭
 
-**Files:**
-- Modify: `crates/coding-agent-app/src/shutdown.rs`
-- Modify: `crates/coding-agent-app/src/server.rs`
-- Modify: `crates/coding-agent-app/src/task_manager.rs`
-- Modify: `crates/coding-agent-app/src/event_dispatcher.rs`
-- Modify: `crates/coding-agent-app/src/single_instance.rs`
-- Create: `crates/coding-agent-app/tests/shutdown.rs`
-- Modify: `crates/coding-agent-app/tests/support/mod.rs`
+**文件：**
+- 修改：`crates/coding-agent-app/src/shutdown.rs`
+- 修改：`crates/coding-agent-app/src/server.rs`
+- 修改：`crates/coding-agent-app/src/task_manager.rs`
+- 修改：`crates/coding-agent-app/src/event_dispatcher.rs`
+- 修改：`crates/coding-agent-app/src/single_instance.rs`
+- 创建：`crates/coding-agent-app/tests/shutdown.rs`
+- 修改：`crates/coding-agent-app/tests/support/mod.rs`
 
-**Interfaces:**
-- Produces: `ShutdownCoordinator`, `ShutdownOutcome::{Clean,Degraded}`, and signal/HTTP shutdown sources.
-- Invariant: persistent shutdown gets at most 5 seconds and the entire shutdown gets at most 10 seconds; descriptor and lock cleanup is attempted on every path.
+**接口：**
+- 产出：`ShutdownCoordinator`、`ShutdownOutcome::{Clean,Degraded}`，以及信号/HTTP 关闭来源。
+- 不变量：持久化关闭阶段最多占用 5 秒，整个关闭流程最多占用 10 秒；每条路径都必须尝试清理描述符和锁。
 
-- [ ] **Step 1: Write failing quiesce interleaving and budget tests**
+- [ ] **步骤 1：编写失败的静默化交错和时间预算测试**
 
-Pause create, retry, claim, runner event, runner result, and quit at each gate/actor boundary. Assert an operation that entered before gate close either commits before the TaskManager barrier or fails deterministically; after the barrier, no late write can leave Queued/Running. Add a permanently failing Store test where marker creation also fails and assert virtual time reaches process-exit decision by 10 seconds with descriptor removed and lock released. Run the clean-store path with `FakeScenario::IgnoresCancellation`: the durable barrier must first persist Interrupted, waiting for `done` must stop at the remaining total budget, and the process must still choose exit by 10 seconds.
+在每个关卡/执行体边界暂停创建、重试、领取、运行器事件、运行器结果和退出操作。断言在关卡关闭前进入的操作，要么在 TaskManager 屏障前提交，要么以确定方式失败；越过屏障后，任何迟到的写入都不能留下 Queued/Running 状态。添加 Store 永久失败且标记文件创建也失败的测试，并断言在虚拟时间到达 10 秒前作出进程退出决定，同时已移除描述符并释放锁。使用 `FakeScenario::IgnoresCancellation` 运行 Store 正常路径：持久化屏障必须先持久化 Interrupted，等待 `done` 必须在总时间预算的剩余时间耗尽时停止，而且进程仍必须在 10 秒前选择退出。
 
 ```rust
 #[tokio::test(start_paused = true)]
@@ -1953,70 +1953,70 @@ async fn permanent_store_failure_cannot_block_exit() {
 }
 ```
 
-- [ ] **Step 2: Run the focused suite and verify red**
+- [ ] **步骤 2：运行聚焦测试并验证红灯**
 
-Run: `cargo test -p coding-agent-app --features test-support --test shutdown`
+运行：`cargo test -p coding-agent-app --features test-support --test shutdown`
 
-Expected: shutdown ordering/budget assertions fail because no coordinator owns the complete sequence.
+预期：由于尚无协调器负责完整流程，关闭顺序/时间预算断言失败。
 
-- [ ] **Step 3: Implement normal quiesce ordering**
+- [ ] **步骤 3：实现正常静默化顺序**
 
-Accept Ctrl-C, OS termination, or the deferred Web UI quit signal once. Set service state Quiescing, close MutationGate, wait for all existing guards, then send TaskManager `quiesce_and_interrupt(deadline)` as a FIFO barrier. Match `QuiesceResult::Durable`, cancel its active tokens, wait on their done receivers only within the remaining budget, reject late event/result CAS, flush EventDispatcher through `recovery.high_watermark`, checkpoint/close SQLite handles, stop accepting HTTP, atomically remove descriptor, and drop the locked file. Match Frozen or a 5-second stage timeout by entering the fallback in Step 4.
+只接收一次 Ctrl-C、操作系统终止信号或延迟发送的 Web UI 退出信号。将服务状态设为 Quiescing，关闭 MutationGate，等待所有现有守卫退出，然后向 TaskManager 发送 `quiesce_and_interrupt(deadline)` 作为 FIFO 屏障。匹配 `QuiesceResult::Durable` 后，取消其中的活动令牌，只在剩余时间预算内等待其 `done` 接收端，拒绝迟到的事件/结果 CAS，将 EventDispatcher 刷新至 `recovery.high_watermark`，对 SQLite 句柄执行检查点并关闭，停止接受 HTTP，原子移除描述符，最后释放持锁文件句柄。若匹配到 Frozen 或该阶段达到 5 秒超时，则进入步骤 4 的回退流程。
 
-Preserve Completed/Failed committed before the barrier. Any task still Queued/Running in the bulk shutdown transaction becomes Interrupted, never Cancelled. Closing or refreshing a browser produces no shutdown signal.
+保留在屏障前已提交的 Completed/Failed 状态。批量关闭事务中仍为 Queued/Running 的任务都变为 Interrupted，绝不变为 Cancelled。关闭或刷新浏览器不得产生关闭信号。
 
-- [ ] **Step 4: Implement degraded fallback and diagnostic marker**
+- [ ] **步骤 4：实现降级回退和诊断标记**
 
-Cap the persistence stage at 5 seconds. If it expires or Store is permanently broken, freeze TaskManager in memory, cancel all tokens, close event sinks/listener, and best-effort write a private marker containing only timestamp, instance ID, and stable error code. Whether marker creation succeeds or fails, remove the descriptor, release the lock, and select a non-zero exit code before the 10-second total deadline.
+将持久化阶段限制在 5 秒以内。如果超时或 Store 永久损坏，则在内存中冻结 TaskManager，取消所有令牌，关闭事件接收器/监听器，并尽力写入一个只包含时间戳、实例 ID 和稳定错误代码的私有标记。无论标记创建成功还是失败，都要在 10 秒总截止时间前移除描述符、释放锁并选择非零退出码。
 
-Every next primary startup runs the normal incomplete recovery regardless of marker presence. Remove the marker only after recovery commits. A database open/migration failure leaves both database and marker untouched and exits without a restart loop. Before degraded exit, publish/log a user-visible stable message stating that some terminal task states could not be persisted; never claim a clean shutdown.
+此后每次主进程启动，无论标记是否存在，都运行正常的未完成任务恢复。只有恢复提交后才移除标记。数据库打开/迁移失败时，保持数据库和标记不变并退出，不进入重启循环。降级退出前，发布/记录一条用户可见的稳定消息，说明部分任务终态无法持久化；绝不声称已干净关闭。
 
-- [ ] **Step 5: Run shutdown and recovery regressions**
+- [ ] **步骤 5：运行关闭和恢复回归测试**
 
-Run: `cargo test -p coding-agent-app --features test-support --test shutdown --test degraded_recovery --test task_manager --test server --test single_instance`
+运行：`cargo test -p coding-agent-app --features test-support --test shutdown --test degraded_recovery --test task_manager --test server --test single_instance`
 
-Expected: every interleaving is terminally consistent; clean and degraded paths meet their virtual-time budgets.
+预期：每种交错执行最终都保持一致；正常和降级路径均满足各自的虚拟时间预算。
 
-- [ ] **Step 6: Commit lifecycle shutdown**
+- [ ] **步骤 6：提交生命周期关闭流程**
 
 ```bash
 git add crates/coding-agent-app
 git commit -m "feat: quiesce and recover local runtime"
 ```
 
-### Task 16: Build the Generated React Data Layer and SSE Reducer
+### 任务 16：构建生成的 React 数据层和 SSE 状态归约器
 
-**Files:**
-- Create: `web/package.json`
-- Create: `web/package-lock.json`
-- Create: `web/tsconfig.json`
-- Create: `web/tsconfig.app.json`
-- Create: `web/tsconfig.node.json`
-- Create: `web/vite.config.ts`
-- Create: `web/vitest.config.ts`
-- Create: `web/index.html`
-- Create: `web/scripts/generate-api.mjs`
-- Create: `web/src/vite-env.d.ts`
-- Create: `web/src/api/generated/schema.d.ts`
-- Create: `web/src/api/types.ts`
-- Create: `web/src/api/client.ts`
-- Create: `web/src/api/sse.ts`
-- Create: `web/src/state/model.ts`
-- Create: `web/src/state/reducer.ts`
-- Create: `web/src/state/useAgentState.ts`
-- Create: `web/src/test/setup.ts`
-- Create: `web/src/api/client.test.ts`
-- Create: `web/src/api/sse.test.ts`
-- Create: `web/src/state/reducer.test.ts`
-- Create: `web/src/state/useAgentState.test.tsx`
+**文件：**
+- 新建：`web/package.json`
+- 新建：`web/package-lock.json`
+- 新建：`web/tsconfig.json`
+- 新建：`web/tsconfig.app.json`
+- 新建：`web/tsconfig.node.json`
+- 新建：`web/vite.config.ts`
+- 新建：`web/vitest.config.ts`
+- 新建：`web/index.html`
+- 新建：`web/scripts/generate-api.mjs`
+- 新建：`web/src/vite-env.d.ts`
+- 新建：`web/src/api/generated/schema.d.ts`
+- 新建：`web/src/api/types.ts`
+- 新建：`web/src/api/client.ts`
+- 新建：`web/src/api/sse.ts`
+- 新建：`web/src/state/model.ts`
+- 新建：`web/src/state/reducer.ts`
+- 新建：`web/src/state/useAgentState.ts`
+- 新建：`web/src/test/setup.ts`
+- 新建：`web/src/api/client.test.ts`
+- 新建：`web/src/api/sse.test.ts`
+- 新建：`web/src/state/reducer.test.ts`
+- 新建：`web/src/state/useAgentState.test.tsx`
 
-**Interfaces:**
-- Produces: generated OpenAPI aliases, `ApiClient`, `SseClient`, normalized `AgentState`, pure `agentReducer`, and `useAgentState` orchestration.
-- Invariant: no TypeScript file hand-writes a server DTO shape; aliases resolve through `components["schemas"]` from generated output.
+**接口：**
+- 产出：生成的 OpenAPI 别名、`ApiClient`、`SseClient`、规范化的 `AgentState`、纯函数 `agentReducer` 和 `useAgentState` 编排逻辑。
+- 不变量：任何 TypeScript 文件都不得手写服务器 DTO 结构；别名必须通过生成输出中的 `components["schemas"]` 解析。
 
-- [ ] **Step 1: Pin the frontend toolchain and generate its lockfile**
+- [ ] **步骤 1：锁定前端工具链并生成锁文件**
 
-Use Node 24 in `engines` and these exact package versions:
+在 `engines` 中使用 Node 24，并采用以下精确的软件包版本：
 
 ```json
 {
@@ -2059,25 +2059,25 @@ Use Node 24 in `engines` and these exact package versions:
 }
 ```
 
-Create the first lockfile with `npm --prefix web install --package-lock-only`, then install only from it with `npm --prefix web ci`. Commit the lockfile; do not use a floating `npx` package.
+使用 `npm --prefix web install --package-lock-only` 创建首个锁文件，随后只能通过 `npm --prefix web ci` 按该锁文件安装。提交锁文件；不得使用版本浮动的 `npx` 软件包。
 
-Make `tsconfig.json` a build-mode reference to `tsconfig.app.json` and `tsconfig.node.json`. Both use `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `isolatedModules`, `noEmit`, and bundler module resolution. The app config targets ES2023 with DOM/DOM.Iterable and `react-jsx`; the node config supplies Node 24 types for Vite/Vitest/Playwright configs. `tsc -b` must typecheck both.
+将 `tsconfig.json` 设为构建模式引用，指向 `tsconfig.app.json` 和 `tsconfig.node.json`。二者都使用 `strict`、`noUncheckedIndexedAccess`、`exactOptionalPropertyTypes`、`isolatedModules`、`noEmit` 和打包器模块解析。应用配置以 ES2023 为目标，包含 DOM/DOM.Iterable 和 `react-jsx`；Node 配置为 Vite/Vitest/Playwright 配置文件提供 Node 24 类型。`tsc -b` 必须对二者完成类型检查。
 
-- [ ] **Step 2: Export OpenAPI, write failing client/reducer tests, and verify red**
+- [ ] **步骤 2：导出 OpenAPI，编写失败的客户端/归约器测试并确认测试为红**
 
-Run: `cargo run -p coding-agent-api --bin export_openapi -- web/openapi.json`
+运行：`cargo run -p coding-agent-api --bin export_openapi -- web/openapi.json`
 
-Run: `npm --prefix web run api:generate`
+运行：`npm --prefix web run api:generate`
 
-Write tests proving the URL fragment is cleared before exchange fetch begins, bootstrap normalizes repositories/tasks, duplicate event IDs are ignored, out-of-order/non-monotonic persisted IDs force a bootstrap, a current-schema event with an unknown named kind records a diagnostic, advances its validated persisted cursor, and continues, and an unsupported schema version forces a bootstrap. Test the streaming SSE parser across arbitrary UTF-8 chunk boundaries, CRLF/LF line endings, comment heartbeats, multi-line `data`, and an event name that was unknown when the client was built. With fake timers and injected jitter, prove reconnect delay is capped, reconnect carries `after=<lastAppliedId>`, `401` enters SessionExpired with no reconnect, clean EOF/`503` reconnect from the unchanged cursor, and malformed/oversized or EOF-truncated frames plus `stream.reset` bootstrap before reconnecting from the bootstrap cursor. If that recovery bootstrap fails, assert explicit unavailable/protocol state and capped bootstrap retry rather than a tight stream loop. Also prove a TaskDetail response replays only buffered IDs above its cursor, a slower earlier task-detail response cannot replace a later selection, older service generations cannot regress state, and cancel optimism rolls back on `503` or a competing terminal event.
+编写测试，证明 URL 片段会在交换请求开始前被清除，启动数据会规范化仓库/任务，重复事件 ID 会被忽略，乱序或非单调的持久化 ID 会强制重新获取启动数据；使用当前模式定义但名称种类未知的事件会记录诊断信息、推进其已验证的持久化游标并继续处理；不受支持的模式定义版本会强制重新获取启动数据。测试流式 SSE 解析器能处理任意 UTF-8 分块边界、CRLF/LF 行尾、注释心跳、多行 `data`，以及客户端构建时尚未知的事件名称。使用伪计时器和注入的抖动，证明重连延迟有上限，重连会携带 `after=<lastAppliedId>`，`401` 会进入 SessionExpired 且不重连，正常 EOF/`503` 会从未变的游标重连；格式错误/超大或在 EOF 处截断的帧以及 `stream.reset`，都会在从启动游标重连前先重新获取启动数据。如果该恢复性启动请求失败，应断言进入明确的不可用/协议错误状态，并以有上限的退避重试启动请求，而不是形成紧密的流重连循环。还要证明 TaskDetail 响应只重放游标之后的缓冲 ID，较慢返回的早期任务详情响应不能覆盖较晚的选择，旧服务世代不能使状态倒退，并且取消操作的乐观状态会在 `503` 或竞争性的终态事件出现时回滚。
 
-Run: `npm --prefix web run test:run -- src/api/client.test.ts src/api/sse.test.ts src/state/reducer.test.ts src/state/useAgentState.test.tsx`
+运行：`npm --prefix web run test:run -- src/api/client.test.ts src/api/sse.test.ts src/state/reducer.test.ts src/state/useAgentState.test.tsx`
 
-Expected: tests fail because client, reducer, and hook behavior is absent.
+预期：测试失败，因为客户端、归约器和钩子行为尚未实现。
 
-- [ ] **Step 3: Implement deterministic OpenAPI-to-TypeScript generation**
+- [ ] **步骤 3：实现确定性的 OpenAPI 到 TypeScript 生成流程**
 
-`generate-api.mjs` invokes the lockfile-installed `openapi-typescript` binary on `web/openapi.json`, writes a temporary sibling, and normalizes line endings to LF. Normal mode replaces `src/api/generated/schema.d.ts` only when bytes differ; `--check` compares the temporary bytes with the committed file and exits non-zero without modifying it. `types.ts` contains aliases such as:
+`generate-api.mjs` 调用锁文件所安装的 `openapi-typescript` 可执行文件处理 `web/openapi.json`，写入同目录临时文件，并将行尾规范化为 LF。普通模式仅在字节不同时替换 `src/api/generated/schema.d.ts`；`--check` 比较临时文件与已提交文件的字节，若不同则以非零状态退出，但不修改文件。`types.ts` 包含如下别名：
 
 ```ts
 import type { components } from "./generated/schema";
@@ -2088,66 +2088,66 @@ export type TaskEvent = components["schemas"]["TaskEventDto"];
 export type BootstrapResponse = components["schemas"]["BootstrapResponse"];
 ```
 
-`api:check` performs that byte comparison, so it is cross-platform and leaves the worktree untouched.
+`api:check` 执行该字节比较，因此可以跨平台运行且不会改动工作树。
 
-- [ ] **Step 4: Implement session/bootstrap and typed REST commands**
+- [ ] **步骤 4：实现会话/启动数据与类型化 REST 命令**
 
-On first load, parse `token` from `location.hash` into memory, synchronously call `history.replaceState` with path/query but no fragment, then and only then exchange it. A refresh with no fragment attempts authenticated bootstrap using the host-only cookie. `ApiClient` always uses same-origin relative URLs, `credentials: "same-origin"`, JSON decoding, and the bootstrap CSRF token for mutations. It surfaces stable code, message, retryable, request ID, and details.
+首次加载时，将 `location.hash` 中的 `token` 解析到内存中，同步调用 `history.replaceState`，保留路径/查询但移除片段，随后且仅在此之后交换令牌。刷新时如果没有片段，则使用仅限主机的 cookie 尝试经过身份验证的启动请求。`ApiClient` 始终使用同源相对 URL、`credentials: "same-origin"`、JSON 解码，并对变更请求使用启动数据中的 CSRF 令牌。它向上层提供稳定的错误码、消息、可重试标志、请求 ID 和详细信息。
 
-Generate a new client request UUID once per user create action and reuse it on retry of an ambiguous network response. Never retry a mutation with a new ID. Treat `401` as SessionExpired: stop automatic mutation retries, close SSE, and tell the user to reopen from the native application. Treat `503 STORE_BUSY` as retryable UI feedback while retaining the same mutation request ID.
+每次用户执行创建操作时只生成一次新的客户端请求 UUID，并在网络响应结果不明确时的重试中复用它。绝不使用新 ID 重试变更请求。将 `401` 视为 SessionExpired：停止自动重试变更请求，关闭 SSE，并提示用户从原生应用程序重新打开。将 `503 STORE_BUSY` 作为可重试的用户界面反馈，同时保留同一个变更请求 ID。
 
-- [ ] **Step 5: Implement custom SSE reconnect and pure event projection**
+- [ ] **步骤 5：实现自定义 SSE 重连和纯事件投影**
 
-`SseClient` uses same-origin `fetch` with cookies, `Accept: text/event-stream`, `redirect: "error"`, an `AbortController`, and a `ReadableStream` reader rather than native `EventSource`. Native `EventSource` has no catch-all for future named events, so it cannot implement the approved unknown-kind fallback. A small incremental parser uses streaming fatal-mode `TextDecoder`, accepts CRLF/LF/CR line endings, joins repeated `data:` lines with newlines, ignores comment heartbeats, preserves every named `event:` value, and dispatches only on a blank line; it handles arbitrary byte/chunk boundaries and caps buffered frame bytes. Every exit first closes/cancels the current reader, then follows exactly one recovery class: `401` enters SessionExpired and never reconnects; a clean EOF with no partial frame, transport failure, redirect rejection, `408`, `429`, and `5xx` retain the cursor and use capped-backoff reconnect; observable non-success responses other than those transient statuses, invalid content type, malformed UTF-8/JSON/envelopes, oversized or EOF-truncated frames, ID disagreement, and other protocol violations stop stream projection and require a full bootstrap before a new connection uses the bootstrap cursor. Fetch exposes a rejected redirect under `redirect: "error"` only as a network error, so the implementation deliberately does not claim to distinguish those two cases. A failed recovery bootstrap shows explicit unavailable/protocol state and retries bootstrap with capped backoff instead of reopening the same bad stream in a tight loop.
+`SseClient` 不使用原生 `EventSource`，而是使用带 cookie 的同源 `fetch`、`Accept: text/event-stream`、`redirect: "error"`、`AbortController` 和 `ReadableStream` 读取器。原生 `EventSource` 无法捕获未来新增的所有具名事件，因此无法实现已批准的未知种类回退策略。小型增量解析器使用流式严格模式 `TextDecoder`，接受 CRLF/LF/CR 行尾，以换行符合并重复的 `data:` 行，忽略注释心跳，保留每个具名 `event:` 值，并且只在空行处派发；它能够处理任意字节/分块边界，并限制缓冲帧的字节数。每次退出都先关闭/取消当前读取器，然后严格进入一种恢复类别：`401` 进入 SessionExpired 且永不重连；没有残缺帧的正常 EOF、传输失败、重定向拒绝、`408`、`429` 和 `5xx` 会保留游标，并使用有上限的退避重连；除这些暂时状态以外可观测到的非成功响应、无效内容类型、格式错误的 UTF-8/JSON/事件封装、超大或在 EOF 处截断的帧、ID 不一致以及其他协议违规，都会停止流投影，并要求完整获取启动数据后，新连接才能使用启动游标。在 `redirect: "error"` 下，Fetch 只会把被拒绝的重定向暴露为网络错误，因此实现不会声称可以区分这两种情况。恢复性启动请求失败时，应显示明确的不可用/协议错误状态，并使用有上限的退避重试启动请求，而不是在紧密循环中反复打开同一个错误数据流。
 
-Reconnect uses capped exponential delay plus injected jitter and `after=<lastAppliedId>`. The client parses JSON as `unknown`, then narrows known variants through generated OpenAPI types. For a valid positive persisted ID and supported schema, an unknown named/data kind is recorded as an ignored diagnostic and advances the cursor without changing a panel, preventing endless replay; malformed envelopes, event-name/data-kind disagreement, non-monotonic persisted IDs, unsupported schema versions, and `stream.reset` trigger a full bootstrap. Named task events, `service.state`, and `stream.reset` all travel through this one parser, so future names are observable without pre-registration.
+重连采用有上限的指数延迟、注入抖动和 `after=<lastAppliedId>`。客户端先将 JSON 解析为 `unknown`，再通过生成的 OpenAPI 类型收窄为已知变体。对于有效的正数持久化 ID 和受支持的模式定义，未知的具名/数据种类会被记录为已忽略的诊断信息，并在不改变面板的情况下推进游标，从而防止无休止重放；格式错误的事件封装、事件名称与数据种类不一致、非单调持久化 ID、不受支持的模式定义版本以及 `stream.reset` 都会触发完整的启动数据获取。具名任务事件、`service.state` 和 `stream.reset` 全部通过同一个解析器处理，因此未来新增的名称无需预先注册也可被观察到。
 
-The pure reducer stores repositories/tasks by ID, task order separately, the selected task detail projection, applied global cursor, per-selected-task live buffer, service generation, and ephemeral command state. Snapshot variants replace plan/diff/tests; activity deduplicates stable entry IDs; lifecycle variants update task summary/timeline. A known schema with an unknown kind records a diagnostic and continues. Never hydrate repositories, tasks, panels, cursors, session data, or CSRF from localStorage; only harmless view preferences may persist.
+纯归约器按 ID 存储仓库/任务，另行存储任务顺序、所选任务详情投影、已应用的全局游标、每个所选任务的实时缓冲区、服务世代和临时命令状态。快照变体会替换计划/差异/测试；活动按稳定条目 ID 去重；生命周期变体会更新任务摘要/时间线。已知模式定义中出现未知种类时，记录诊断信息并继续处理。绝不从 `localStorage` 恢复仓库、任务、面板、游标、会话数据或 CSRF；只有无害的视图偏好可以持久化。
 
-- [ ] **Step 6: Implement `useAgentState` snapshot/live joining**
+- [ ] **步骤 6：实现 `useAgentState` 的快照/实时数据接合**
 
-Start SSE immediately after bootstrap, without waiting for detail. Each selection increments a request generation, buffers its live events, and accepts the detail response only if its generation still matches. Install the snapshot, then replay sorted buffered events with `id > detail.event_cursor`; discard older/equal ones. Global task summaries keep updating for non-selected tasks. Re-selecting a task fetches a new detail rather than trusting an incomplete browser history.
+获取启动数据后立即启动 SSE，不等待详情。每次选择都会递增请求世代、缓冲其实时事件，并且只在世代仍匹配时接受详情响应。先安装快照，再重放排序后满足 `id > detail.event_cursor` 的缓冲事件；丢弃更旧或相等的事件。非选中任务的全局任务摘要仍持续更新。重新选择任务时，应重新获取详情，而不是信任不完整的浏览器历史记录。
 
-- [ ] **Step 7: Run frontend data-layer gates and commit**
+- [ ] **步骤 7：运行前端数据层门禁并提交**
 
-Run: `npm --prefix web run api:check`
+运行：`npm --prefix web run api:check`
 
-Run: `npm --prefix web run typecheck`
+运行：`npm --prefix web run typecheck`
 
-Run: `npm --prefix web run test:run`
+运行：`npm --prefix web run test:run`
 
-Expected: generation is clean and every client/reducer/hook race test passes.
+预期：生成结果无漂移，所有客户端/归约器/钩子竞态测试均通过。
 
 ```bash
 git add web/package.json web/package-lock.json web/tsconfig.json web/tsconfig.app.json web/tsconfig.node.json web/vite.config.ts web/vitest.config.ts web/index.html web/openapi.json web/scripts web/src/api web/src/state web/src/test web/src/vite-env.d.ts
 git commit -m "feat: add typed react data layer"
 ```
 
-### Task 17: Implement the React Three-Pane Workbench
+### 任务 17：实现 React 三面板工作台
 
-**Files:**
-- Create: `web/src/components/AppShell.tsx`
-- Create: `web/src/components/Sidebar.tsx`
-- Create: `web/src/components/TaskWorkspace.tsx`
-- Create: `web/src/components/TaskComposer.tsx`
-- Create: `web/src/components/PlanPane.tsx`
-- Create: `web/src/components/ActivityPane.tsx`
-- Create: `web/src/components/ResultPane.tsx`
-- Create: `web/src/components/ConnectionBanner.tsx`
-- Create: `web/src/components/ErrorBoundary.tsx`
-- Create: `web/src/components/AppShell.test.tsx`
-- Create: `web/src/components/TaskWorkspace.test.tsx`
-- Create: `web/src/styles.css`
-- Create: `web/src/main.tsx`
+**文件：**
+- 新建：`web/src/components/AppShell.tsx`
+- 新建：`web/src/components/Sidebar.tsx`
+- 新建：`web/src/components/TaskWorkspace.tsx`
+- 新建：`web/src/components/TaskComposer.tsx`
+- 新建：`web/src/components/PlanPane.tsx`
+- 新建：`web/src/components/ActivityPane.tsx`
+- 新建：`web/src/components/ResultPane.tsx`
+- 新建：`web/src/components/ConnectionBanner.tsx`
+- 新建：`web/src/components/ErrorBoundary.tsx`
+- 新建：`web/src/components/AppShell.test.tsx`
+- 新建：`web/src/components/TaskWorkspace.test.tsx`
+- 新建：`web/src/styles.css`
+- 新建：`web/src/main.tsx`
 
-**Interfaces:**
-- Consumes: Task 16 hook and generated types only.
-- Produces: desktop-first responsive three-pane workbench with repository/task navigation, task creation, cancel/retry, panel projections, and explicit app quit.
-- Invariant: Project 1 never shows merge, review-pass, deliverable, or real-code-edit controls; Completed is labeled as fake execution completion only.
+**接口：**
+- 使用：仅使用任务 16 的钩子和生成类型。
+- 产出：桌面优先的响应式三面板工作台，包含仓库/任务导航、任务创建、取消/重试、面板投影和显式退出应用功能。
+- 不变量：Project 1 绝不显示合并、审查通过、可交付或真实代码编辑控件；Completed 只能标记为假执行已完成。
 
-- [ ] **Step 1: Write failing interaction and accessibility tests**
+- [ ] **步骤 1：编写失败的交互和无障碍测试**
 
-Render the shell with a controllable hook adapter. Cover repository/task selection, empty states, create validation, the action matrix for Queued, Running, Completed, Failed, Cancelled, and Interrupted, cancellation-in-progress disabling, retry creation followed by linear retry-chain navigation, read-only controls on older attempts, quit confirmation, service banners, degraded-shutdown warning, slow/error panels, and request-ID display. Use role/name queries and keyboard user events.
+使用可控的钩子适配器渲染外壳。覆盖仓库/任务选择、空状态、创建验证，Queued、Running、Completed、Failed、Cancelled 和 Interrupted 的操作矩阵，取消进行中禁用操作，创建重试后沿线性重试链导航，较早尝试的只读控件，退出确认，服务横幅，降级关闭警告，缓慢/错误面板以及请求 ID 显示。使用角色/名称查询和键盘用户事件。
 
 ```tsx
 it("keeps cancel pending local and yields to a terminal server event", async () => {
@@ -2160,80 +2160,80 @@ it("keeps cancel pending local and yields to a terminal server event", async () 
 });
 ```
 
-Add automated assertions for landmarks, visible focus, labels, `aria-live="polite"`, and text/icon status cues independent of color.
+为地标区域、可见焦点、标签、`aria-live="polite"` 以及不依赖颜色的文本/图标状态提示添加自动化断言。
 
-- [ ] **Step 2: Run component tests and verify red**
+- [ ] **步骤 2：运行组件测试并确认测试为红**
 
-Run: `npm --prefix web run test:run -- src/components/AppShell.test.tsx src/components/TaskWorkspace.test.tsx`
+运行：`npm --prefix web run test:run -- src/components/AppShell.test.tsx src/components/TaskWorkspace.test.tsx`
 
-Expected: tests fail because the workbench components do not exist.
+预期：测试失败，因为工作台组件尚不存在。
 
-- [ ] **Step 3: Implement shell, sidebar, composer, and connection states**
+- [ ] **步骤 3：实现外壳、侧边栏、编辑器和连接状态**
 
-Use semantic header/nav/main/aside regions with visible titles. The left pane lists repositories by last opened time and tasks by creation time, exposes direct path registration plus native picker, and offers Retry for eligible interrupted/terminal tasks while keeping old attempts selectable/read-only. It preserves only harmless selection/collapse preference. The composer trims prompt, shows scalar count against 50,000, holds one stable client request ID during an ambiguous retry, and associates API errors with its fields.
+使用带可见标题的语义化 `header`/`nav`/`main`/`aside` 区域。左侧面板按最近打开时间列出仓库、按创建时间列出任务，提供直接路径注册和原生选择器，并为符合条件的已中断/终态任务提供 Retry，同时让旧尝试保持可选择但只读。它只保存无害的选择/折叠偏好。编辑器会去除提示词首尾空白，显示相对于 50,000 上限的 Unicode 标量值数量，在结果不明确的重试期间持有一个稳定的客户端请求 ID，并将 API 错误与相应字段关联。
 
-The header renders Connected, Reconnecting, Store degraded, Shutting down, Session expired, or Server unavailable. The app menu's explicit quit action is separate from browser unload; do not register `beforeunload` cancellation or shutdown handlers.
+页眉显示 Connected、Reconnecting、Store degraded、Shutting down、Session expired 或 Server unavailable。应用菜单中的显式退出操作与浏览器卸载相互独立；不得注册 `beforeunload` 取消或关闭处理器。
 
-- [ ] **Step 4: Implement center and result panes with isolated error boundaries**
+- [ ] **步骤 4：实现带独立错误边界的中间面板和结果面板**
 
-The center pane shows task title/prompt/attempt/status, three-step plan snapshot, activity, composer, and Running cancel. The right pane shows synthetic diff, test snapshots, lifecycle timeline with structured failure, and the linear retry chain with read-only navigation to older attempts. Give all evidence areas textual statuses and empty/loading/error states. Wrap plan/activity/diff/tests/timeline areas independently so a rendering failure leaves navigation and cancel usable. New activity uses one non-interruptive live region and never moves focus.
+中间面板显示任务标题/提示词/尝试/状态、三步计划快照、活动、编辑器和 Running 状态下的取消操作。右侧面板显示合成差异、测试快照、包含结构化失败信息的生命周期时间线，以及可只读导航至较早尝试的线性重试链。所有证据区域都必须提供文本状态和空白/加载/错误状态。分别用错误边界包裹计划/活动/差异/测试/时间线区域，使渲染失败时导航和取消仍可使用。新活动使用单个非打断式实时区域，且绝不移动焦点。
 
-For Running cancellation, show local Cancelling only until a REST snapshot/event resolves it or an error rolls it back. Old attempts are read-only except Retry on eligible terminal states. Never infer review or merge readiness from Completed.
+对于 Running 状态下的取消，只在 REST 快照/事件解决该状态或错误将其回滚之前显示本地 Cancelling。旧尝试均为只读，但符合条件的终态可执行 Retry。绝不能从 Completed 推断已经审查或可以合并。
 
-- [ ] **Step 5: Implement responsive layout and visual states**
+- [ ] **步骤 5：实现响应式布局和视觉状态**
 
-Use CSS Grid for three desktop columns with bounded resizable-looking surfaces but no persisted domain layout. At narrower widths, retain all three semantic regions in a stacked/tabbed presentation. Define high-contrast focus rings, reduced-motion support, non-color status glyph/text, scroll containment, and readable diff wrapping. Load no remote fonts, images, scripts, or styles.
+使用 CSS Grid 构建桌面端三列布局，各表面呈现有界且可调整大小的外观，但不持久化领域布局。宽度较窄时，以堆叠/标签页形式保留全部三个语义区域。定义高对比度焦点环、减少动态效果支持、不依赖颜色的状态图形/文本、滚动范围约束，以及易读的差异换行。不得加载远程字体、图像、脚本或样式。
 
-- [ ] **Step 6: Run UI and full frontend gates**
+- [ ] **步骤 6：运行用户界面和完整前端门禁**
 
-Run: `npm --prefix web run typecheck`
+运行：`npm --prefix web run typecheck`
 
-Run: `npm --prefix web run test:run`
+运行：`npm --prefix web run test:run`
 
-Run: `npm --prefix web run build`
+运行：`npm --prefix web run build`
 
-Expected: component/data tests pass and Vite emits `web/dist` without external asset URLs.
+预期：组件/数据测试通过，且 Vite 生成的 `web/dist` 不含外部资源 URL。
 
-- [ ] **Step 7: Commit the workbench**
+- [ ] **步骤 7：提交工作台**
 
 ```bash
 git add web/src/components web/src/styles.css web/src/main.tsx
 git commit -m "feat: add react coding workbench"
 ```
 
-### Task 18: Embed the Production Web Build and Enforce Browser Policies
+### 任务 18：嵌入生产 Web 构建并强制实施浏览器策略
 
-**Files:**
-- Modify: `crates/coding-agent-app/Cargo.toml`
-- Create: `crates/coding-agent-app/build.rs`
-- Create: `crates/coding-agent-app/src/static_assets.rs`
-- Create: `crates/coding-agent-app/tests/static_assets.rs`
-- Modify: `crates/coding-agent-app/src/server.rs`
-- Modify: `crates/coding-agent-app/src/main.rs`
-- Modify: `web/vite.config.ts`
-- Modify: `.gitignore`
+**文件：**
+- 修改：`crates/coding-agent-app/Cargo.toml`
+- 新建：`crates/coding-agent-app/build.rs`
+- 新建：`crates/coding-agent-app/src/static_assets.rs`
+- 新建：`crates/coding-agent-app/tests/static_assets.rs`
+- 修改：`crates/coding-agent-app/src/server.rs`
+- 修改：`crates/coding-agent-app/src/main.rs`
+- 修改：`web/vite.config.ts`
+- 修改：`.gitignore`
 
-**Interfaces:**
-- Produces: Cargo features `embedded-web` and `e2e`, `StaticAssetService`, SPA fallback, deterministic cache/security headers, and a release-build guard.
-- Invariant: a release binary cannot compile without embedded assets; at runtime it needs neither Node nor `web/dist`.
+**接口：**
+- 产出：Cargo 功能特性 `embedded-web` 和 `e2e`、`StaticAssetService`、SPA 回退、确定性的缓存/安全标头，以及发布构建防护。
+- 不变量：没有嵌入资源就无法编译发布二进制文件；运行时既不需要 Node，也不需要 `web/dist`。
 
-- [ ] **Step 1: Write failing static-asset and header tests**
+- [ ] **步骤 1：编写失败的静态资源和标头测试**
 
-Build a minimal Vite fixture and test `/`, one hashed JS asset, an unknown SPA route, an unknown filename with an extension, and `/api/not-a-route`. Assert MIME types, exact body bytes, `no-store` for HTML/API, one-year immutable caching for hashed assets, 404 for missing assets/API, and index fallback only for extensionless non-API GET requests accepting HTML.
+构建最小化 Vite 测试夹具，并测试 `/`、一个带哈希的 JS 资源、未知 SPA 路由、带扩展名的未知文件名以及 `/api/not-a-route`。断言 MIME 类型、精确的响应正文字节、HTML/API 使用 `no-store`、带哈希资源使用一年期不可变缓存、缺失资源/API 返回 404，并且只对接受 HTML、无扩展名且非 API 的 GET 请求执行首页回退。
 
-Assert every production response has `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`; HTML has the exact approved CSP with only self/data sources and no inline allowance. Assert no CORS header exists.
+断言每个生产响应都包含 `X-Content-Type-Options: nosniff` 和 `Referrer-Policy: no-referrer`；HTML 必须使用准确的已批准 CSP，只允许 `self`/`data` 来源，且不允许内联内容。断言不存在 CORS 标头。
 
-- [ ] **Step 2: Run the embedded-asset test and verify red**
+- [ ] **步骤 2：运行嵌入资源测试并确认测试为红**
 
-Run: `npm --prefix web run build`
+运行：`npm --prefix web run build`
 
-Run: `cargo test -p coding-agent-app --test static_assets --features embedded-web`
+运行：`cargo test -p coding-agent-app --test static_assets --features embedded-web`
 
-Expected: compilation or tests fail because the embedding service/feature is absent.
+预期：编译或测试失败，因为嵌入服务/功能特性尚未实现。
 
-- [ ] **Step 3: Define build features and release guard**
+- [ ] **步骤 3：定义构建功能特性和发布防护**
 
-Declare optional `rust-embed` and these feature edges:
+声明可选的 `rust-embed` 和以下功能特性依赖边：
 
 ```toml
 [dependencies]
@@ -2247,19 +2247,19 @@ test-support = []
 e2e = ["embedded-web", "rust-embed/debug-embed", "test-support"]
 ```
 
-`build.rs` emits `rerun-if-changed` for `../../web/dist`. `main.rs` uses `compile_error!` under `all(not(debug_assertions), not(feature = "embedded-web"))`, so an unusable release build is impossible. Debug development without `embedded-web` expects the explicit Vite proxy; E2E uses `e2e` so debug assets are truly embedded.
+`build.rs` 为 `../../web/dist` 发出 `rerun-if-changed`。`main.rs` 在 `all(not(debug_assertions), not(feature = "embedded-web"))` 条件下使用 `compile_error!`，因此不可能生成不可用的发布构建。未启用 `embedded-web` 的调试开发模式要求显式使用 Vite 代理；E2E 使用 `e2e`，确保调试资源真正嵌入。
 
-- [ ] **Step 4: Implement embedded lookup and safe SPA fallback**
+- [ ] **步骤 4：实现嵌入资源查找和安全的 SPA 回退**
 
-Derive `RustEmbed` over `web/dist`, normalize request paths without accepting backslashes, dot segments, percent-decoded traversal, or NUL, and look up exact assets first. Serve `index.html` only for GET/HEAD outside `/api` and `/_local`, without a filename extension, and with HTML accepted. Use `mime_guess`; HEAD returns identical headers and an empty body.
+针对 `web/dist` 派生 `RustEmbed`，规范化请求路径且不接受反斜杠、点路径段、百分号解码后的路径穿越或 NUL，并优先精确查找资源。仅当 GET/HEAD 请求位于 `/api` 和 `/_local` 之外、不含文件扩展名且接受 HTML 时，才提供 `index.html`。使用 `mime_guess`；HEAD 返回相同标头和空响应正文。
 
-Set Vite `build.outDir = "dist"`, `emptyOutDir = true`, and `manifest = true`. Detect content-hashed filenames from the embedded `.vite/manifest.json` rather than a permissive regex, and never serve that manifest or any dot-prefixed internal path. Hashed assets get `public,max-age=31536000,immutable`; HTML and every API response get `no-store`. The outer server layer sets CSP, nosniff, and referrer policy on success and error responses.
+设置 Vite `build.outDir = "dist"`、`emptyOutDir = true` 和 `manifest = true`。从嵌入的 `.vite/manifest.json` 中识别内容哈希文件名，而不是使用宽松的正则表达式；绝不提供该清单或任何以点开头的内部路径。带哈希资源使用 `public,max-age=31536000,immutable`；HTML 和每个 API 响应使用 `no-store`。服务器最外层为成功和错误响应设置 CSP、nosniff 和引用来源策略。
 
-- [ ] **Step 5: Verify dev proxy and production contract order**
+- [ ] **步骤 5：验证开发代理和生产契约顺序**
 
-Vite proxies only `/api` and `/_local` to an explicitly provided Axum target and preserves SSE streaming. The backend development `public_origin` is the one configured Vite origin; no wildcard localhost rule exists.
+Vite 只将 `/api` 和 `/_local` 代理到显式提供的 Axum 目标，并保持 SSE 流式传输。后端开发环境的 `public_origin` 是唯一配置的 Vite 源；不存在通配 `localhost` 规则。
 
-Run in this order:
+按以下顺序运行：
 
 ```bash
 cargo run -p coding-agent-api --bin export_openapi -- web/openapi.json
@@ -2272,131 +2272,131 @@ cargo test -p coding-agent-app --test static_assets --features embedded-web
 cargo build --release -p coding-agent-app --features embedded-web
 ```
 
-Expected: all commands pass, embedded-service tests serve the built bytes, and the guarded release executable is produced. Task 20's real-process release smoke owns the stronger proof that this artifact serves `/` from a clean directory with `web/dist` and Node unavailable; do not claim that runtime result from build-only evidence here.
+预期：所有命令均通过，嵌入服务测试提供构建后的精确字节，并生成受防护的发布可执行文件。任务 20 的真实进程发布冒烟测试负责提供更强的证明：当 `web/dist` 和 Node 均不可用时，该产物能够从干净目录提供 `/`；此处不得仅凭构建证据声称已经获得该运行时结果。
 
-- [ ] **Step 6: Commit production embedding**
+- [ ] **步骤 6：提交生产嵌入实现**
 
 ```bash
 git add .gitignore crates/coding-agent-app web/vite.config.ts Cargo.lock
 git commit -m "feat: embed secured react application"
 ```
 
-### Task 19: Add Real-Process Playwright Coverage and Fault Injection
+### 任务 19：添加真实进程 Playwright 覆盖和故障注入
 
-**Files:**
-- Create: `crates/coding-agent-app/src/test_support.rs`
-- Create: `crates/coding-agent-app/tests/process_support.rs`
-- Create: `web/playwright.config.ts`
-- Create: `web/e2e/support/localApp.ts`
-- Create: `web/e2e/local-app.spec.ts`
-- Modify: `crates/coding-agent-app/src/main.rs`
-- Modify: `crates/coding-agent-app/src/store_writer.rs`
-- Modify: `crates/coding-agent-app/src/fake_runner.rs`
+**文件：**
+- 新建：`crates/coding-agent-app/src/test_support.rs`
+- 新建：`crates/coding-agent-app/tests/process_support.rs`
+- 新建：`web/playwright.config.ts`
+- 新建：`web/e2e/support/localApp.ts`
+- 新建：`web/e2e/local-app.spec.ts`
+- 修改：`crates/coding-agent-app/src/main.rs`
+- 修改：`crates/coding-agent-app/src/store_writer.rs`
+- 修改：`crates/coding-agent-app/src/fake_runner.rs`
 
-**Interfaces:**
-- Produces: feature-gated process configuration, deterministic fake/store fault scripts, and a Playwright harness for a real Axum/SQLite/SSE/React process.
-- Invariant: production builds have no test HTTP routes, prompt magic strings, data-dir override, scenario parser, or fault injector.
+**接口：**
+- 产出：受功能特性控制的进程配置、确定性的假运行器/存储故障脚本，以及用于真实 Axum/SQLite/SSE/React 进程的 Playwright 测试框架。
+- 不变量：生产构建中不存在测试 HTTP 路由、提示词魔法字符串、数据目录覆盖、场景解析器或故障注入器。
 
-- [ ] **Step 1: Write a failing process-support contract and draft the session E2E**
+- [ ] **步骤 1：编写失败的进程支持契约并起草会话 E2E**
 
-Under `#[cfg(feature = "test-support")]`, write `tests/process_support.rs` against `ProcessTestConfig::load(path)`. Use private temporary app-data/runtime roots and a scenario file to assert the closed schema accepts the complete approved fixture, rejects an unknown field, validates all paths before actor startup, consumes the file exactly once, and leaves no scenario bytes at the source path after successful load.
+在 `#[cfg(feature = "test-support")]` 下，针对 `ProcessTestConfig::load(path)` 编写 `tests/process_support.rs`。使用私有临时应用数据/运行时根目录和场景文件，断言封闭模式定义接受完整的已批准测试夹具、拒绝未知字段、在执行单元启动前验证全部路径、恰好读取一次文件，并且成功加载后源路径不残留任何场景字节。
 
-Run: `cargo test -p coding-agent-app --features test-support --test process_support`
+运行：`cargo test -p coding-agent-app --features test-support --test process_support`
 
-Expected: compilation fails because the feature-gated `test_support` module and `ProcessTestConfig` do not exist. Do not launch the current binary for this red step: before the override is implemented it would use real user application paths.
+预期：编译失败，因为受功能特性控制的 `test_support` 模块和 `ProcessTestConfig` 尚不存在。此红灯步骤不得启动当前二进制文件：覆盖机制实现之前，它会使用真实用户应用路径。
 
-`localApp.ts` must create a private temporary app-data/runtime root and a real temporary Git/Cargo repository, spawn the binary named by `CODING_AGENT_E2E_BINARY`, wait for the atomic descriptor, call launcher-protected `/_local/reopen`, navigate to its fragment URL, and guarantee child cleanup. It records stdout/stderr only on test failure and redacts descriptor secrets.
+`localApp.ts` 必须创建私有临时应用数据/运行时根目录和真实临时 Git/Cargo 仓库，启动 `CODING_AGENT_E2E_BINARY` 指定的二进制文件，等待以原子方式发布的描述文件，调用受启动器保护的 `/_local/reopen`，导航到其片段 URL，并保证清理子进程。它只在测试失败时记录 `stdout`/`stderr`，并对描述文件中的秘密信息脱敏。
 
-Draft the first Playwright test to assert the fragment is absent from `location.href` and browser history before the exchange request is observed, bootstrap succeeds, no CORS header is present, and every page request is same-origin loopback or a `data:` URL. Its first execution happens only in Step 3, after process isolation exists and an explicit binary path has been exported.
+起草第一个 Playwright 测试，断言在观察到交换请求之前，`location.href` 和浏览器历史记录中均不存在片段；启动请求成功；不存在 CORS 标头；每个页面请求都是同源回环请求或 `data:` URL。它只能在步骤 3 中首次执行，此时进程隔离已经存在且已导出明确的二进制路径。
 
-- [ ] **Step 2: Implement compile-time-isolated test support**
+- [ ] **步骤 2：实现编译时隔离的测试支持**
 
-Under Cargo feature `test-support` only, accept environment paths for app data, runtime descriptor, and one JSON scenario file loaded before actors start. The closed schema contains ordered `FakeScenario` values, StoreWriter fault points/counts, actor pause points, virtual release signals, and marker-write failure. Reject unknown fields and delete/zero the parsed bytes after construction.
+仅在 Cargo 功能特性 `test-support` 下，接受应用数据、运行时描述文件和单个 JSON 场景文件的环境路径，并在执行单元启动前加载该场景文件。封闭模式定义包含有序的 `FakeScenario` 值、StoreWriter 故障点/次数、执行单元暂停点、虚拟释放信号和标记写入失败。拒绝未知字段，并在构造完成后删除/清零已解析的字节。
 
-Production `FakeTaskRunner` remains Success-only. Production StoreWriter has no fault branch. Expose no HTTP route for changing a scenario; the only browser-visible surface is the ordinary product API.
+生产环境的 `FakeTaskRunner` 仍只产生 Success。生产环境 StoreWriter 不包含故障分支。不得暴露用于更改场景的 HTTP 路由；浏览器唯一可见的接口是常规产品 API。
 
-Run: `cargo test -p coding-agent-app --features test-support --test process_support`
+运行：`cargo test -p coding-agent-app --features test-support --test process_support`
 
-Expected: the closed-schema, single-consumption, validation, and source-byte-removal tests pass.
+预期：封闭模式定义、单次读取、验证和源字节移除测试均通过。
 
-- [ ] **Step 3: Complete the real-process harness**
+- [ ] **步骤 3：完成真实进程测试框架**
 
-Build with `cargo build -p coding-agent-app --features e2e` after `web/dist` exists. The harness writes scenario JSON, starts one process with the feature-gated environment, reads the descriptor with bounded reopen retries, and uses the returned URL. Helpers create tasks through the visible UI, poll accessible statuses, start a second binary, kill/restart the primary with the same database, and inspect only authorized API responses.
+在 `web/dist` 存在后，使用 `cargo build -p coding-agent-app --features e2e` 构建。测试框架写入场景 JSON，使用受功能特性控制的环境启动一个进程，以有界的重新打开重试读取描述文件，并使用返回的 URL。辅助函数通过可见用户界面创建任务、轮询可访问状态、启动第二个二进制进程、使用同一数据库终止/重启主进程，并且只检查经过授权的 API 响应。
 
-Run Playwright with one worker for lifecycle scenarios. Do not use `page.route` to mock product API/SSE; interception may only fail the test on a non-loopback outbound request.
+生命周期场景使用单个工作进程运行 Playwright。不得使用 `page.route` 模拟产品 API/SSE；拦截只能在出现非回环出站请求时使测试失败。
 
-Run: `npm --prefix web run build`
+运行：`npm --prefix web run build`
 
-Run: `cargo build -p coding-agent-app --features e2e`
+运行：`cargo build -p coding-agent-app --features e2e`
 
-Run: `npm --prefix web exec -- playwright install chromium`
+运行：`npm --prefix web exec -- playwright install chromium`
 
-PowerShell: `$env:CODING_AGENT_E2E_BINARY=(Resolve-Path target/debug/coding-agent-app.exe)`
+PowerShell：`$env:CODING_AGENT_E2E_BINARY=(Resolve-Path target/debug/coding-agent-app.exe)`
 
-PowerShell: `npm --prefix web run e2e -- --grep "clears launch token"`
+PowerShell：`npm --prefix web run e2e -- --grep "clears launch token"`
 
-POSIX: `export CODING_AGENT_E2E_BINARY="$PWD/target/debug/coding-agent-app"`
+POSIX：`export CODING_AGENT_E2E_BINARY="$PWD/target/debug/coding-agent-app"`
 
-POSIX: `npm --prefix web run e2e -- --grep "clears launch token"`
+POSIX：`npm --prefix web run e2e -- --grep "clears launch token"`
 
-Expected: the first real-process test passes using only the isolated paths and explicit binary.
+预期：首个真实进程测试仅使用隔离路径和明确指定的二进制文件并顺利通过。
 
-- [ ] **Step 4: Add core workflow and concurrency E2E scenarios**
+- [ ] **步骤 4：添加核心工作流和并发 E2E 场景**
 
-Cover adding, reusing, and switching two real Git/Cargo repositories; compare each fixture's file list, lockfile bytes, and dirty status before/after discovery. Then cover task creation, deterministic plan/activity/diff/tests, refresh and full page close/reopen while tasks continue, 4 Running plus fifth/sixth Queued, cancelling the fifth before releasing a permit so only the sixth starts, Running cancel, first-commit-wins cancel/completion, failure, panic isolation, retry idempotency, old attempt read-only behavior, and UI error/request-ID rendering. Run the claim/cancel scenario separately at permit acquired, provisional handle registered, and Running committed pauses; none may expose Running without a cancellation token.
+覆盖添加、复用和切换两个真实 Git/Cargo 仓库；比较每个测试夹具在发现前后的文件列表、锁文件字节和脏状态。随后覆盖任务创建，确定性的计划/活动/差异/测试，任务继续运行时刷新以及完整关闭/重新打开页面，4 个 Running 加第五/第六个 Queued，在释放许可前取消第五个从而只有第六个启动，取消 Running，取消/完成竞争时首次提交获胜，失败，`panic` 隔离，重试幂等性，旧尝试只读行为，以及用户界面错误/请求 ID 渲染。分别在已获取许可、已注册临时句柄和已提交 Running 这三个暂停点运行领取/取消场景；任何场景都不得在没有取消令牌时暴露 Running。
 
-Add a direct unauthorized-request matrix for missing/wrong cookie, Host, Origin, CSRF, launcher secret, and launch-token replay. Verify native picker cannot be opened unauthenticated through its HTTP endpoint.
+针对 cookie、Host、Origin、CSRF、启动器秘密信息缺失或错误，以及启动令牌重放，添加直接的未授权请求矩阵。验证未经身份验证时无法通过 HTTP 端点打开原生选择器。
 
-- [ ] **Step 5: Add lifecycle, recovery, and fault E2E scenarios**
+- [ ] **步骤 5：添加生命周期、恢复和故障 E2E 场景**
 
-Cover a second process reopening the first without a second writer, forced kill at commit-before-wake, recovery-before-descriptor, and descriptor-before-browser points, restart conversion of Queued/Running to Interrupted, lost writer/dispatcher notifications, receiver lag catch-up, and stream.reset. For recoverable background terminal-write failure, assert the UI shows Store degraded, no new claim starts, recovery changes the ambiguous task to Interrupted, and the banner returns to Connected only after the persisted event is visible. During Web UI quit, release concurrent create/retry/claim/result pauses around the barrier and assert no late Queued/Running commit survives and unfinished tasks are Interrupted rather than Cancelled.
+覆盖第二个进程在不创建第二个写入器的情况下重新打开第一个进程，在提交后唤醒前、恢复后描述文件生成前，以及描述文件生成后浏览器打开前三个点强制终止，重启时将 Queued/Running 转换为 Interrupted，写入器/事件分发器通知丢失，接收端滞后追赶，以及 stream.reset。对于可恢复的后台终态写入失败，断言用户界面显示 Store degraded，不再开始新的任务领取，恢复操作将状态不明确的任务改为 Interrupted，并且只有持久化事件可见后，横幅才恢复为 Connected。在从 Web 用户界面退出期间，释放屏障周围并发的创建/重试/领取/结果暂停点，并断言不会残留迟到的 Queued/Running 提交，未完成任务为 Interrupted 而非 Cancelled。
 
-For a runner that ignores cancellation, invoke Web UI quit and assert its Task is durably Interrupted and the process does not wait beyond 10 seconds. For permanent Store failure, invoke quit from the Web UI and assert non-zero exit within 10 seconds. In one variant assert the private marker remains and, after restoring writes, the next startup interrupts incomplete tasks and removes it; in a second variant force marker creation to fail and still assert timely lock/descriptor release.
+对于忽略取消的运行器，从 Web 用户界面调用退出，并断言其 Task 已持久化为 Interrupted，且进程等待不超过 10 秒。对于永久性 Store 故障，从 Web 用户界面调用退出，并断言在 10 秒内以非零状态退出。在一个变体中，断言私有标记仍然存在，恢复写入后，下一次启动会中断未完成任务并移除该标记；在第二个变体中，强制标记创建失败，同时仍断言及时释放锁/描述文件。
 
-For TaskDetail/SSE joining, pause detail after its read snapshot, commit a live event, then release and assert the panel contains it exactly once. For service state, change generation between bootstrap and SSE and assert the first control prevents regression.
+对于 TaskDetail/SSE 接合，在详情读取快照后将其暂停，提交实时事件，再恢复执行，并断言面板恰好包含该事件一次。对于服务状态，在获取启动数据和建立 SSE 之间改变世代，并断言首个控制事件可防止状态倒退。
 
-- [ ] **Step 6: Build and run the full real-process suite**
+- [ ] **步骤 6：构建并运行完整的真实进程测试套件**
 
-Run: `npm --prefix web run build`
+运行：`npm --prefix web run build`
 
-Run: `cargo build -p coding-agent-app --features e2e`
+运行：`cargo build -p coding-agent-app --features e2e`
 
-PowerShell: `$env:CODING_AGENT_E2E_BINARY=(Resolve-Path target/debug/coding-agent-app.exe)`
+PowerShell：`$env:CODING_AGENT_E2E_BINARY=(Resolve-Path target/debug/coding-agent-app.exe)`
 
-PowerShell: `npm --prefix web run e2e`
+PowerShell：`npm --prefix web run e2e`
 
-POSIX: `export CODING_AGENT_E2E_BINARY="$PWD/target/debug/coding-agent-app"`
+POSIX：`export CODING_AGENT_E2E_BINARY="$PWD/target/debug/coding-agent-app"`
 
-POSIX: `npm --prefix web run e2e`
+POSIX：`npm --prefix web run e2e`
 
-Expected: all tests drive the real embedded application; no mocked API call or non-loopback request occurs.
+预期：所有测试都驱动真实的嵌入式应用程序；不会出现模拟 API 调用或非回环请求。
 
-- [ ] **Step 7: Commit process-level verification**
+- [ ] **步骤 7：提交进程级验证**
 
 ```bash
 git add crates/coding-agent-app web/playwright.config.ts web/e2e
 git commit -m "test: cover local app as a real process"
 ```
 
-### Task 20: Add Three-OS CI, Release Smoke, and Operator Documentation
+### 任务 20：添加三种操作系统的 CI、发布冒烟测试和运维文档
 
-**Files:**
-- Create: `.github/workflows/ci.yml`
-- Create: `crates/coding-agent-app/tests/release_smoke.rs`
-- Create: `scripts/check-placeholders.mjs`
-- Create: `README.md`
-- Modify: `Cargo.lock`
-- Modify: `web/package-lock.json`
+**文件：**
+- 新建：`.github/workflows/ci.yml`
+- 新建：`crates/coding-agent-app/tests/release_smoke.rs`
+- 新建：`scripts/check-placeholders.mjs`
+- 新建：`README.md`
+- 修改：`Cargo.lock`
+- 修改：`web/package-lock.json`
 
-**Interfaces:**
-- Produces: one Linux full-quality/E2E job, a Windows/macOS/Linux release-smoke matrix, and exact development/release runbooks.
-- Invariant: the tested release artifact runs from a clean directory with Node and `web/dist` unavailable to its child process.
+**接口：**
+- 产出：一个 Linux 完整质量/E2E 作业、一个 Windows/macOS/Linux 发布冒烟测试矩阵，以及准确的开发/发布运行手册。
+- 不变量：被测试的发布产物从干净目录运行，其子进程无法使用 Node 和 `web/dist`。
 
-- [ ] **Step 1: Write a failing cross-platform release smoke**
+- [ ] **步骤 1：编写失败的跨平台发布冒烟测试**
 
-`release_smoke.rs` reads `CODING_AGENT_RELEASE_BINARY`, copies only that executable into a clean temporary directory, removes Node-containing entries from the child's `PATH`, redirects OS application-data/runtime environment variables into the temporary tree, and asserts `node --version` cannot spawn in that same child environment. It starts the production artifact with no CLI arguments, waits for the private descriptor, asserts its port is a random `127.0.0.1` listener, uses raw HTTP/1.1 to verify launcher-protected readiness, obtains a one-time URL, exchanges it, fetches bootstrap and `/`, then sends protected quit and asserts clean exit plus descriptor removal.
+`release_smoke.rs` 读取 `CODING_AGENT_RELEASE_BINARY`，只将该可执行文件复制到干净的临时目录，从子进程的 `PATH` 中移除包含 Node 的条目，将操作系统应用数据/运行时环境变量重定向到临时目录树，并断言无法在同一子进程环境中启动 `node --version`。它在不带 CLI 参数的情况下启动生产产物，等待私有描述文件，断言其端口是随机的 `127.0.0.1` 监听器，使用原始 HTTP/1.1 验证受启动器保护的就绪状态，获取一次性 URL 并进行交换，获取启动数据和 `/`，随后发送受保护的退出请求，并断言干净退出且描述文件已移除。
 
-Build a default-feature debug application in a dedicated target directory so Task 19's embedded E2E artifact cannot be reused accidentally. Export its absolute path, then run the ignored smoke against that known non-embedded binary:
+在专用 `target` 目录中构建使用默认功能特性的调试应用，确保不会意外复用任务 19 的嵌入式 E2E 产物。导出其绝对路径，然后针对这个确定未嵌入资源的二进制文件运行被忽略的冒烟测试：
 
 ```powershell
 $redTarget = [System.IO.Path]::GetFullPath('target/release-smoke-red-app')
@@ -2413,31 +2413,31 @@ export CODING_AGENT_RELEASE_BINARY="$PWD/target/release-smoke-red-app/debug/codi
 cargo test -p coding-agent-app --test release_smoke -- --ignored --exact release_binary_starts_without_node_or_dist
 ```
 
-Expected: the test reaches its production-artifact startup/static assertion and fails because this explicit binary has no embedded web assets. Missing environment variables, a missing executable, or reuse of an `e2e` binary is not the intended red result.
+预期：测试执行到生产产物启动/静态资源断言，并因这个明确指定的二进制文件没有嵌入 Web 资源而失败。环境变量缺失、可执行文件缺失或复用 `e2e` 二进制文件，都不是预期的红灯结果。
 
-- [ ] **Step 2: Implement the release smoke without a second runtime dependency**
+- [ ] **步骤 2：在不增加第二套运行时依赖的前提下实现发布冒烟测试**
 
-Use only Rust standard-library TCP/process/file APIs plus existing serde types; do not add a Node, browser, curl, Python, or TLS client dependency. Preserve OS system directories in PATH while filtering Node directories so browser launch can use the platform mechanism. The smoke accepts a browser-open attempt but never assumes the browser page participates. All temporary data is removed after the child exits.
+只使用 Rust 标准库的 TCP/进程/文件 API 和现有 serde 类型；不得添加 Node、浏览器、curl、Python 或 TLS 客户端依赖。过滤 Node 目录时保留 PATH 中的操作系统目录，以便浏览器启动可以使用平台机制。冒烟测试允许尝试打开浏览器，但绝不假定浏览器页面会参与流程。子进程退出后移除全部临时数据。
 
-After `npm --prefix web run build`, run:
+执行 `npm --prefix web run build` 后，运行：
 
 ```bash
 cargo build --release -p coding-agent-app --features embedded-web --locked
 ```
 
-PowerShell: `$env:CODING_AGENT_RELEASE_BINARY=(Resolve-Path target/release/coding-agent-app.exe)`
+PowerShell：`$env:CODING_AGENT_RELEASE_BINARY=(Resolve-Path target/release/coding-agent-app.exe)`
 
-POSIX: `export CODING_AGENT_RELEASE_BINARY="$PWD/target/release/coding-agent-app"`
+POSIX：`export CODING_AGENT_RELEASE_BINARY="$PWD/target/release/coding-agent-app"`
 
-Then run:
+然后运行：
 
 ```bash
 cargo test -p coding-agent-app --test release_smoke --features embedded-web -- --ignored --exact release_binary_starts_without_node_or_dist
 ```
 
-- [ ] **Step 3: Add deterministic Linux quality and E2E CI**
+- [ ] **步骤 3：添加确定性的 Linux 质量和 E2E CI**
 
-The Linux job uses Node 24 and `rust-toolchain.toml`, installs dependencies/browsers first, then exports `CARGO_NET_OFFLINE=true` and `npm_config_offline=true` for all build/test gates. Run this exact order:
+Linux 作业使用 Node 24 和 `rust-toolchain.toml`，先安装依赖项/浏览器，然后为全部构建/测试门禁导出 `CARGO_NET_OFFLINE=true` 和 `npm_config_offline=true`。严格按以下顺序运行：
 
 ```bash
 cargo fetch --locked
@@ -2461,23 +2461,23 @@ cargo build --release --locked --offline -p coding-agent-app --features embedded
 node scripts/check-placeholders.mjs
 ```
 
-Export the E2E binary path explicitly. After OpenAPI/TypeScript generation, fail on any tracked diff. Playwright also fails if the page attempts a non-loopback network request.
+显式导出 E2E 二进制路径。OpenAPI/TypeScript 生成完成后，只要出现任何已跟踪差异就判定失败。如果页面尝试发出非回环网络请求，Playwright 也会判定失败。
 
-- [ ] **Step 4: Add the Windows/macOS/Linux release-smoke matrix**
+- [ ] **步骤 4：添加 Windows/macOS/Linux 发布冒烟测试矩阵**
 
-Each matrix leg runs `npm --prefix web ci`, API generation check, typecheck, frontend tests/build, Rust fmt/clippy/tests for supported platform targets, production release build, and `release_smoke.rs`. Full Chromium E2E runs on Linux; the other two platforms still exercise real listener, descriptor permissions, embedded HTML, session/bootstrap, and clean quit.
+矩阵中的每个平台都运行 `npm --prefix web ci`、API 生成检查、类型检查、前端测试/构建、针对受支持平台目标的 Rust `fmt`/`clippy`/测试、生产发布构建以及 `release_smoke.rs`。完整 Chromium E2E 在 Linux 上运行；另外两个平台仍会验证真实监听器、描述文件权限、嵌入式 HTML、会话/启动数据以及干净退出。
 
-The matrix must catch Unix case-sensitive repository identity, Windows case-insensitive identity/DACL behavior, macOS native-dialog adapter construction, lock/descriptor atomicity, and an artifact started outside the repository. Do not mark any platform smoke `continue-on-error`.
+该矩阵必须覆盖 Unix 区分大小写的仓库身份、Windows 不区分大小写的身份/DACL 行为、macOS 原生对话框适配器构造、锁/描述文件原子性，以及从仓库外启动产物。不得将任何平台的冒烟测试标记为 `continue-on-error`。
 
-- [ ] **Step 5: Document direct launch, development, security, and scope**
+- [ ] **步骤 5：记录直接启动、开发、安全和范围**
 
-README covers prerequisites, Vite-plus-Axum development with an explicit public origin, production build order, direct executable launch, app-data/runtime locations, how to exit from the Web UI, browser-open failure recovery, database backup, and stable troubleshooting codes. State plainly that Project 1 is a deterministic fake platform: it does not read/modify source, call a model, create worktrees, run repository tests, review, merge, or imply deliverability. Explicitly defer installers, macOS app bundles, Linux desktop entries, signing/notarization, auto-update, and polished launcher packaging to Project 4; none is a Project 1 CI gate.
+README 涵盖前置条件，使用明确配置的公共 Origin 开展 Vite 与 Axum 联合开发，生产构建顺序，直接启动可执行文件，应用数据/运行时位置，如何从 Web 用户界面退出，浏览器打开失败后的恢复，数据库备份，以及稳定的故障排查代码。明确说明 Project 1 是确定性的假平台：它不会读取/修改源代码、调用模型、创建工作树、运行仓库测试、审查或合并，也不表示可交付。明确将安装程序、macOS 应用程序包、Linux 桌面项、签名/公证、自动更新和完善的启动器打包推迟到 Project 4；这些都不是 Project 1 的 CI 门禁。
 
-Document the threat boundary: loopback + Host/Origin/CSRF protects against ordinary cross-site access, not a malicious process already running as the same OS user. Document that closing the browser does not stop tasks or the app.
+记录威胁边界：回环地址加 Host/Origin/CSRF 可以防御常规跨站访问，但不能防御已由同一操作系统用户运行的恶意进程。记录关闭浏览器不会停止任务或应用程序。
 
-- [ ] **Step 6: Run the final verification sequence with only Task 20 edits present**
+- [ ] **步骤 6：仅保留任务 20 改动时运行最终验证序列**
 
-Run every Task 20 CI command locally where the platform supports it, plus:
+在本地运行当前平台支持的每条任务 20 CI 命令，并额外运行：
 
 ```bash
 git diff --check
@@ -2485,17 +2485,17 @@ node scripts/check-placeholders.mjs
 git status --short
 ```
 
-`check-placeholders.mjs` obtains tracked plus untracked non-ignored paths from `git ls-files --cached --others --exclude-standard`, excludes implementation-plan markdown and its own marker-definition source, scans the remaining text files for forbidden markers, and exits zero only with no matches. Expected: format, lint, all Rust/frontend/E2E tests, OpenAPI drift, embedded release, and release smoke are green; `git diff --check` and the marker scan are clean; status lists only the Task 20 files and any lockfile deltas named above.
+`check-placeholders.mjs` 通过 `git ls-files --cached --others --exclude-standard` 获取已跟踪路径以及未被忽略的未跟踪路径，排除实施计划 Markdown 和自身的标记定义源文件，扫描其余文本文件中的禁用标记，并且仅在没有匹配项时以零状态退出。预期：格式检查、静态检查、全部 Rust/前端/E2E 测试、OpenAPI 漂移检查、嵌入式发布和发布冒烟测试均为绿；`git diff --check` 和标记扫描结果干净；状态只列出任务 20 文件和上述锁文件差异。
 
-- [ ] **Step 7: Commit CI and release documentation**
+- [ ] **步骤 7：提交 CI 和发布文档**
 
 ```bash
 git add .github/workflows/ci.yml crates/coding-agent-app/tests/release_smoke.rs scripts/check-placeholders.mjs README.md Cargo.lock web/package-lock.json
 git commit -m "build: verify local app releases"
 ```
 
-- [ ] **Step 8: Verify the committed release gate is clean**
+- [ ] **步骤 8：验证已提交的发布门禁干净**
 
-Run: `git status --short`
+运行：`git status --short`
 
-Expected: no output. If any generated or lockfile change remains, rerun its owning gate, add it to the Task 20 commit, and repeat the full affected checks before claiming completion.
+预期：无输出。如果仍有生成文件或锁文件改动，重新运行负责生成该文件的门禁，将改动加入任务 20 提交，并在声称完成前重复所有受影响的检查。
