@@ -18,7 +18,7 @@ import type { UseAgentStateResult } from "../state/useAgentState";
 import { AppShell } from "./AppShell";
 import { ConnectionBanner } from "./ConnectionBanner";
 import { ErrorBoundary } from "./ErrorBoundary";
-import { Sidebar } from "./Sidebar";
+import { repositoryPathForDisplay, Sidebar } from "./Sidebar";
 import { TaskComposer } from "./TaskComposer";
 
 const EARLIER = "2026-07-14T00:00:00Z";
@@ -118,6 +118,21 @@ function agentFixture(overrides: Partial<AgentState> = {}) {
 }
 
 describe("Sidebar", () => {
+  it("hides Windows verbatim prefixes while preserving device paths", () => {
+    expect(
+      repositoryPathForDisplay(String.raw`\\?\D:\workspace\rust\twist_drive`),
+    ).toBe(String.raw`D:\workspace\rust\twist_drive`);
+    expect(
+      repositoryPathForDisplay(String.raw`\\?\UNC\server\share\repository`),
+    ).toBe(String.raw`\\server\share\repository`);
+    expect(
+      repositoryPathForDisplay(String.raw`\\?\Volume{01234567}\repository`),
+    ).toBe(String.raw`\\?\Volume{01234567}\repository`);
+    expect(repositoryPathForDisplay("/workspace/repository")).toBe(
+      "/workspace/repository",
+    );
+  });
+
   it("sorts repositories and tasks newest first and keeps every status textual", async () => {
     const user = userEvent.setup();
     const onSelectRepository = vi.fn();

@@ -559,7 +559,7 @@ impl IsolatedChildEnvironment {
             .expect("create private non-contacted provider configuration");
         provider
             .write_all(
-                br#"{"base_url":"https://127.0.0.1:9/","model":"offline-smoke","api_key":"offline-smoke-secret"}"#,
+                br#"{"base_url":"https://127.0.0.1:9/","model":"offline-smoke","api_key":"offline-smoke-secret","tool_choice_compatibility":"strict"}"#,
             )
             .expect("write release-smoke provider configuration");
         provider

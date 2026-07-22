@@ -6,7 +6,7 @@
 
 **架构：** 新增 `coding-agent-core`，用于定义提供方/运行时端口和确定性的智能体循环；新增 `coding-agent-provider`，用于实现范围锁定的 HTTP 子集；新增 `coding-agent-runtime`，用于提供 Git、文件、进程和 Cargo 能力。`coding-agent-app` 仍是适配器和组合根：它将中立的核心事件映射为 `RunnerEvent`，通过 `StoreWriter` 串行处理尝试产物的变更，并且只有它实现 `TaskRunner`。
 
-**技术栈：** Rust 1.97、2024 版、Tokio、Axum 回环模拟服务器、基于 rustls 的 HTTPS、SHA-256、SQLite/SQLx、Unix 进程组、Windows 作业对象、React/TypeScript/Vite。
+**技术栈：** Rust 1.97、2024 版、Tokio、Axum 回环模拟服务器、基于 rustls 的默认 HTTPS、显式选择的开发私网 HTTP、SHA-256、SQLite/SQLx、Unix 进程组、Windows 作业对象、React/TypeScript/Vite。
 
 ## 全局约束
 
@@ -54,7 +54,7 @@ web/src/ and README.md
 
 ## 任务 1：建立核心端口和软件包依赖图
 
-- [x] 添加失败的 `coding-agent-core/tests/ports.rs` 契约，覆盖提供方消息、恰好一次工具调用、异步 `ModelProvider`/`ToolRuntime` 端口、取消、中立的运行器事件，以及经过验证且非零的 `AgentLimits`。
+- [x] 添加失败的 `coding-agent-core/tests/ports.rs` 契约，覆盖提供方消息、有序工具调用批次、异步 `ModelProvider`/`ToolRuntime` 端口、取消、中立的运行器事件，以及经过验证且非零的 `AgentLimits`。
 - [x] 运行 `cargo test -p coding-agent-core --test ports`，确认因软件包/API 缺失而失败。
 - [x] 向工作区添加三个软件包和最小化的核心 DTO/特征实现。提供方/运行时软件包的根模块仅编译其预期的依赖边。
 - [x] 验证：
@@ -128,21 +128,34 @@ cargo fmt --all --check
 
 ## 任务 10：验证提供方配置、模式、错误和脱敏
 
-- [x] 测试严格的 `provider.json` 模式、私有权限、远程 URL 仅允许 HTTPS、测试专用回环 HTTP、禁止 `userinfo`/`query`/`fragment`，以及不会泄露秘密的 `Debug`/`Display`。
-- [x] 测试 `messages`、单个 `tool_call_id` 往返、多次调用拒绝、未知/超大响应拒绝，以及可重试错误映射。
+- [x] 测试严格的 `provider.json` 模式、私有权限、默认仅允许 HTTPS；开发私网 HTTP 必须显式设置 `allow_insecure_http: true` 且 host 只能是 RFC 1918、IPv6 ULA 或回环 IP 字面量；拒绝 DNS、公网、链路本地、`userinfo`/`query`/`fragment`，保留测试专用回环 HTTP，并验证不会泄露秘密的 `Debug`/`Display`。
+- [x] 为 DeepSeek V4/兼容中转增加显式 `thinking: enabled|disabled` 配置；启用时安全回传工具调用轮的不透明 reasoning 协议状态，不按模型名自动猜测。
+- [x] 为不能处理命名函数选择的中转站增加严格、默认关闭的 `tool_choice_compatibility: required_as_required` 枚举；省略时保持 `strict`，拒绝未知值、错误类型和显式 `null`。
+- [x] 为 thinking 模式拒绝强制工具选择的 DeepSeek V4 线路增加 `required_as_auto`：强制验证只发送唯一 `cargo_test` 加 `"auto"`，核心仍执行 exact-one 响应门禁。
+- [x] 兼容空 `reasoning_content`、`tool_calls: null` 及与数组位置一致的可选 `index`，并将批次附带的一份普通 assistant 文本安全纳入 transcript、字节预算和秘密边界。
+- [x] 将响应模式、非空 reasoning 和结束状态错误归一为固定诊断码，不记录响应正文、未知字段名或动态反序列化错误。
+- [x] 测试 `messages`、有序 `tool_call_id` 批次往返、批内/跨轮重复拒绝、未知/超大响应拒绝，以及可重试错误映射。
 - [x] 在任何日志或用户边界之前实现脱敏。
 - [x] 运行提供方模式/脱敏测试和应用的提供方配置测试。
 
-## 任务 11：实现 HTTPS 提供方契约
+## 任务 11：实现 provider HTTPS 与显式开发私网 HTTP 契约
 
 - [x] 使用本地 Axum 服务器测试精确的 POST 路径、正文、`tools`、`tool_choice` 和 Bearer 认证行为、超时、401/429/5xx、断开连接、格式错误的正文、缺少 `Content-Length` 的分块数据洪泛、超大 JSON、压缩炸弹、拒绝 30x 重定向，以及请求 ID。
-- [x] 添加基于 rustls 的客户端；生产环境 HTTPS 不能依赖可能缺失的原生 TLS 配置。
+- [x] 精确编码三种工具选择：自动选择为 `"auto"`，强制验证为命名 `cargo_test`，最终专用为 `"none"`；逐一验证响应约束，违反时返回不可重试且不泄露响应正文的 `PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED`。
+- [x] 在显式兼容模式下，只把强制验证的线路编码改为通用 `"required"` 或 `"auto"` 并只发送 `cargo_test` 定义；解码仍按原始强制选择执行 exact-one 校验，且不进行隐藏的 HTTP 重试。自动选择、最终专用和默认严格模式保持不变。
+- [x] 测试可选 `thinking: disabled` 被精确编码为 provider 请求对象，省略该配置时默认契约不变。
+- [x] 测试 DeepSeek 兼容响应在下一轮请求中的精确工具调用往返，并保留 `null`、空字符串和非空普通 assistant 文本的语义。
+- [x] 测试中转站返回多个调用时仍按数组顺序编码为一条 assistant 消息和全部连续 tool results；保持 `parallel_tool_calls=false` 且绝不并发执行。
+- [x] 添加基于 rustls 的 HTTPS 客户端；生产环境不能依赖可能缺失的原生 TLS 配置。显式开发私网 HTTP 只跳过 TLS，不能放宽重定向、超时、字节预算或响应秘密门禁。
 - [x] 断言任何测试都不会联系未配置或真实的提供方。
 - [x] 运行 `cargo test -p coding-agent-provider --test contract -- --nocapture` 以及提供方软件包测试。
 
 ## 任务 12：实现确定性的单角色循环
 
 - [x] 使用脚本化端口测试工具调用 → 结果 → 续接 → 最终文本、无效调用、可重试/致命错误、预算、取消优先级和终态快照收集。
+- [x] 在任何副作用前原子验证整个调用批次的参数、ID、秘密和剩余预算，并按响应顺序逐项串行执行；任一后置调用无效时首个调用也不得执行。
+- [x] 将生产预算保持为有界的 20 轮模型响应和 32 次工具调用；名义工具预留采用 `min(max_tools, clamp(max_tools / 4, 3, 8))`，名义模型响应预留采用 `min(max_models, clamp(max_models / 4, 4, 5))`，生产配置对应 8/5；每轮系统策略都刷新当前工作区修订号、精确剩余额度和收敛阶段，展示的预留数还必须与各自当前剩余额度取较小值。
+- [x] 测试动态收敛状态机：探索阶段使用自动选择；任何会跨越工具预留线的整批调用，无论是否包含 `cargo_test`，都保持零执行，下一轮强制且只允许一个 `cargo_test`；测试失败后仅在剩余模型响应至少为 3、工具调用至少为 2 时回到自动选择的定向修复阶段，并在整批执行前原子保留 1 次重测工具；修复或测试导致当前修订不同于最近一次已测试修订时，下一轮立即进入只允许一个 `cargo_test` 的强制重测，不再进入探索，线路按配置使用命名选择、`"required"` 或 `"auto"`，后两者只携带唯一工具定义；当前修订通过后优先要求最终文本，只有工具额度归零且进入前重新采集的指纹仍匹配当前通过证据时才使用 `"none"`，只允许最终文本，单独仅剩最后一轮模型响应不触发该选择。
 - [x] 测试工作区修订版和指纹：必须包含已跟踪内容以及未被忽略的未跟踪内容，排除已忽略的 `target/` 输出；哈希计算必须流式且确定；每项数量/字节上限超限都必须安全拒绝；替换操作会递增修订号并将失效加入队列；开始/结束/最终指纹必须与测试绑定；测试代码或外部进程修改源文件会使通过结果失效；只有当前指纹才允许成功。
 - [x] 保持上下文有界，且永不持久化思维链或提供方原始响应正文。
 - [x] 只发出中立事件；由应用执行领域映射。
@@ -151,6 +164,7 @@ cargo fmt --all --check
 ## 任务 13：适配 `CodingAgentRunner`
 
 - [x] 测试预留/配置/就绪、初始计划/活动、事件映射、去抖/终态差异、运行中/终态测试、正常取消、事件接收端拒绝、稳定的失败映射和保留策略。
+- [x] 让真实 runner 与离线 HTTP 端到端在一个批次中依次执行替换和测试，并验证下一轮 provider transcript 的分组、顺序和 ID。
 - [x] 添加强制静默回归测试：`Interrupted` 可以保留最新的已持久化差异，且后续迟到事件仍会被拒绝。
 - [x] 使用由 `StoreWriter` 支持的产物和现有 `RunContext` 取消机制实现应用适配器。
 - [x] 终态任务转换只能由 `TaskManager` 通过 `RunnerOutcome` 完成。
@@ -170,6 +184,23 @@ cargo fmt --all --check
 - [x] 添加连接断开、测试失败、超时、取消、输出洪泛、测试通过后替换、路径逃逸和重启中断的失败 E2E。
 - [x] 更新用户界面文案、README 中的配置/威胁模型/产物/故障排查文档，以及需要明确平台门禁覆盖的 CI。
 - [x] 运行前端检查、完整格式检查、`Clippy`、工作区测试和 `git diff --check`。
+
+## 任务 16：收敛海马云中转的强制验证兼容性
+
+- [x] 使用唯一一次真实 Attempt 9 复现并取证：运行器进入强制验证，但海马云中转未遵守命名 `cargo_test`，以 `PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED` 失败；没有文件改动或测试执行。
+- [x] 实现并离线验证第一版 `required_as_auto` 配置，保持默认严格模式、单次 HTTP 请求和核心 exact-one `cargo_test` 门禁。
+- [x] 经用户明确确认创建唯一一次 Attempt 10；它完成 23 次检查工具后进入强制验证，但中转响应仍不满足 exact-one `cargo_test` 约束；`"auto"` 按上游契约允许非工具响应，因此该线路编码不能形成强制保证。尝试再次以相同错误失败，修订为 0、没有测试证据，也没有创建 Attempt 11。
+- [x] 将尚未发布的兼容值替换为 `required_as_required`：强制验证发送通用 `"required"` 加唯一 `cargo_test`，其他阶段与 exact-one 响应门禁不变。
+- [x] 增加提供方契约、应用配置和离线端到端回归，并运行格式、Clippy、工作区测试、前端检查和差异检查；所有测试不得联系真实提供方。
+- [x] Attempt 11 在 thinking 模式的强制验证轮被海马云以 HTTP 400 和 `Thinking mode does not support this tool_choice` 拒绝，证明 `required_as_required` 不适用于该线路。
+- [x] 按用户明确要求重新发布 `required_as_auto`：强制验证发送 `"auto"` 加唯一 `cargo_test`，核心继续执行 exact-one 门禁；提供方若选择最终文本仍以 `PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED` 失败，不自动放松或重试。
+
+## 任务 17：显式支持开发私网 HTTP provider
+
+- [x] 在严格 `provider.json` schema 中增加默认关闭的布尔值 `allow_insecure_http`；未知字段、错误类型和显式 `null` 仍拒绝，现有 HTTPS 配置行为不变。
+- [x] 仅当该值为 `true` 时接受 IP 字面量的 IPv4 RFC 1918、IPv6 ULA 或回环 HTTP；拒绝未选择的 HTTP、DNS、公网、IPv4/IPv6 链路本地及其他特殊用途地址，并继续拒绝 userinfo/query/fragment 和重定向。
+- [x] 添加 provider schema 与应用配置回归，证明 HTTPS 默认值、允许集合和拒绝集合；本地 mock HTTP contract 继续离线运行，不联系真实 provider。
+- [x] 更新 README 和安全边界，明确 Bearer key、任务提示词、仓库内容、工具结果和模型响应在该模式下均为明文，并将该开关限定为隔离且受信任的开发网络。
 
 ## 最终审查与验收
 

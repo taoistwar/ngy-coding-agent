@@ -644,7 +644,7 @@ pub enum StartupError {
     Security(#[from] SecurityError),
     #[error("the event dispatcher could not be started: {0}")]
     Dispatcher(#[from] EventDispatcherError),
-    #[error("the coding task runner could not be started: {0}")]
+    #[error(transparent)]
     Runner(#[from] crate::StartupRunnerFactoryError),
     #[error("the loopback listener could not be bound: {0}")]
     Listener(#[source] io::Error),
@@ -675,6 +675,10 @@ impl StartupError {
                 "The local database could not be opened, migrated, or recovered. No web server was published."
                     .to_owned()
             }
+            Self::Runner(error) => format!(
+                "The coding task runner could not be started.\n\nError code: {}",
+                error.code()
+            ),
             Self::PrimaryUnverified => {
                 "Another process owns the application lock, but it could not be verified. The live lock and runtime descriptor were left untouched."
                     .to_owned()

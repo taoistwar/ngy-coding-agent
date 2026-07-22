@@ -6,12 +6,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ActivityEvent, ActivityLevel, AgentEvent, AgentEventSink, AgentLimits, AgentRuntime,
-    ContextRedactor, ModelMessage, ModelProvider, ModelRequest, ModelResponse, PlanEvent, PlanItem,
-    PlanItemStatus, RuntimeError, TerminalSnapshot, TestCase, TestEvent, TestStatus, ToolCall,
-    ToolRequest, ToolResult, ToolStatus, WorkspaceFingerprint,
+    ContextRedactor, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelToolChoice,
+    PlanEvent, PlanItem, PlanItemStatus, RuntimeError, TerminalSnapshot, TestCase, TestEvent,
+    TestStatus, ToolCall, ToolCallBatch, ToolRequest, ToolResult, ToolStatus, WorkspaceFingerprint,
 };
 
-const SYSTEM_POLICY: &str = "Use only the supplied typed tools. Return one tool call or a concise final answer. Never claim a test passed unless its tool result says so.";
+const SYSTEM_POLICY: &str = "Use only the supplied typed tools. Return one or more tool calls, or a concise final answer. Inspect only the files required by the task, batch independent reads when useful, and stop exploring as soon as you have enough evidence. Do not modify files when the task only asks for an explanation. Before returning a final answer, run cargo_test for the current workspace state; a final answer without current successful test evidence is rejected. Preserve the validation, repair, retest, and final-answer reserve stated below. Once the current cargo_test succeeds, return the final answer on the next response without further exploration. Tool calls are executed serially in response order. Never claim a test passed unless its tool result says so.";
 const INVALID_TOOL_CALL: &str = "INVALID_TOOL_CALL";
 const PROVIDER_SECRET_DETECTED: &str = "PROVIDER_SECRET_DETECTED";
 const AGENT_STEP_LIMIT_REACHED: &str = "AGENT_STEP_LIMIT_REACHED";
@@ -21,6 +21,8 @@ const TERMINAL_DIFF_TRUNCATED: &str = "TERMINAL_DIFF_TRUNCATED";
 const TERMINAL_FINALIZATION_TIMEOUT: &str = "TERMINAL_FINALIZATION_TIMEOUT";
 const WORKSPACE_REVISION_EXHAUSTED: &str = "WORKSPACE_REVISION_EXHAUSTED";
 const MAX_TOOL_CALL_ID_BYTES: usize = 256;
+const MAX_VALIDATION_TOOL_RESERVE: u32 = 8;
+const MAX_VALIDATION_MODEL_RESERVE: u32 = 5;
 // Terminal work is best-effort after cancellation or failure, but it must not
 // keep a task alive forever when a runtime or event sink stops responding. One
 // deadline covers the terminal test event, snapshot, queued event, and diff.
@@ -114,7 +116,7 @@ impl AgentLoop {
         let task_prompt = self.redactor.redact(&input.task_prompt);
         let repository_context = self.redactor.redact(&input.repository_context);
         let mut messages = vec![
-            ModelMessage::system(SYSTEM_POLICY),
+            ModelMessage::system(""),
             ModelMessage::user(format!(
                 "Task:\n{}\n\nRepository context:\n{}",
                 task_prompt, repository_context
@@ -122,11 +124,48 @@ impl AgentLoop {
         ];
         let mut budget = Budget::default();
         let mut seen_call_ids = BTreeSet::new();
+        let mut force_validation = false;
 
-        for _ in 0..self.limits.max_model_steps() {
+        for model_step in 0..self.limits.max_model_steps() {
             if let Some(stop) = cancellation_stop(&cancellation) {
                 return self.finish(stop, &mut state, &cancellation).await;
             }
+            let remaining_model_responses = self.limits.max_model_steps() - model_step;
+            let remaining_tool_calls = self.limits.max_tool_calls() - budget.tool_calls;
+            if remaining_tool_calls == 0 && state.has_current_pass() {
+                let fingerprint = match self.fingerprint_live(&cancellation).await {
+                    Ok(fingerprint) => fingerprint,
+                    Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
+                };
+                match state.observe(fingerprint) {
+                    Ok(true) => {
+                        if let Err(stop) = self.emit_queued(&state, &cancellation).await {
+                            return self.finish(stop, &mut state, &cancellation).await;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
+                }
+            }
+            let Some(phase) = convergence_phase(
+                self.limits,
+                &state,
+                remaining_model_responses,
+                remaining_tool_calls,
+                force_validation,
+            ) else {
+                return self
+                    .finish(Stop::step_limit(), &mut state, &cancellation)
+                    .await;
+            };
+            let tool_choice = phase.tool_choice();
+            messages[0] = ModelMessage::system(system_policy(
+                self.limits,
+                state.revision,
+                remaining_model_responses,
+                remaining_tool_calls,
+                phase,
+            ));
             let Some(request_bytes) = model_request_bytes(&messages) else {
                 return self
                     .finish(Stop::context_limit(), &mut state, &cancellation)
@@ -141,6 +180,7 @@ impl AgentLoop {
                 .complete_live(
                     ModelRequest {
                         messages: messages.clone(),
+                        tool_choice,
                     },
                     &cancellation,
                 )
@@ -149,6 +189,15 @@ impl AgentLoop {
                 Ok(response) => response,
                 Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
             };
+            if !tool_choice.permits(&response) {
+                return self
+                    .finish(
+                        Stop::failed(INVALID_TOOL_CALL, false),
+                        &mut state,
+                        &cancellation,
+                    )
+                    .await;
+            }
             let Some(response_bytes) = model_response_bytes(&response) else {
                 return self
                     .finish(Stop::context_limit(), &mut state, &cancellation)
@@ -160,7 +209,7 @@ impl AgentLoop {
                     .await;
             }
 
-            let call = match response {
+            let batch = match response {
                 ModelResponse::Final { content } => {
                     return self
                         .finish(
@@ -170,9 +219,9 @@ impl AgentLoop {
                         )
                         .await;
                 }
-                ModelResponse::ToolCall(call) => call,
+                ModelResponse::ToolCalls(batch) => batch,
             };
-            if !tool_call_is_redaction_stable(&call, self.redactor.as_ref()) {
+            if !tool_call_batch_is_redaction_stable(&batch, self.redactor.as_ref()) {
                 return self
                     .finish(
                         Stop::failed(PROVIDER_SECRET_DETECTED, false),
@@ -181,7 +230,7 @@ impl AgentLoop {
                     )
                     .await;
             }
-            if !valid_tool_call(&call, &seen_call_ids) {
+            if !valid_tool_call_batch(&batch, &seen_call_ids) {
                 return self
                     .finish(
                         Stop::failed(INVALID_TOOL_CALL, false),
@@ -190,176 +239,224 @@ impl AgentLoop {
                     )
                     .await;
             }
-            seen_call_ids.insert(call.id.clone());
-            if budget.tool_calls >= self.limits.max_tool_calls() {
+            let Ok(batch_call_count) = u32::try_from(batch.calls.len()) else {
+                return self
+                    .finish(Stop::step_limit(), &mut state, &cancellation)
+                    .await;
+            };
+            let Some(next_tool_calls) = budget.tool_calls.checked_add(batch_call_count) else {
+                return self
+                    .finish(Stop::step_limit(), &mut state, &cancellation)
+                    .await;
+            };
+            if next_tool_calls > self.limits.max_tool_calls() {
                 return self
                     .finish(Stop::step_limit(), &mut state, &cancellation)
                     .await;
             }
-            budget.tool_calls += 1;
-
-            if let Err(stop) = self
-                .emit_live(
-                    AgentEvent::Activity(ActivityEvent {
-                        level: ActivityLevel::Info,
-                        message: format!("tool {} started", tool_name(&call.request)),
-                    }),
-                    &cancellation,
-                )
-                .await
+            if matches!(phase, ConvergencePhase::Explore)
+                && next_tool_calls
+                    > self
+                        .limits
+                        .max_tool_calls()
+                        .saturating_sub(validation_tool_reserve(self.limits))
             {
-                return self.finish(stop, &mut state, &cancellation).await;
+                force_validation = true;
+                continue;
             }
+            if matches!(phase, ConvergencePhase::Repair)
+                && next_tool_calls > self.limits.max_tool_calls().saturating_sub(1)
+            {
+                return self
+                    .finish(Stop::step_limit(), &mut state, &cancellation)
+                    .await;
+            }
+            if matches!(phase, ConvergencePhase::ForceCargoTest) {
+                force_validation = false;
+            }
+            budget.tool_calls = next_tool_calls;
+            seen_call_ids.extend(batch.calls.iter().map(|call| call.id.clone()));
 
-            let validation_start = if is_cargo_validation(&call.request) {
-                let fingerprint = match self.fingerprint_live(&cancellation).await {
-                    Ok(fingerprint) => fingerprint,
-                    Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
-                };
-                match state.observe(fingerprint) {
-                    Ok(true) => {
-                        if let Err(stop) = self.emit_queued(&state, &cancellation).await {
-                            return self.finish(stop, &mut state, &cancellation).await;
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
+            let mut tool_result_messages = Vec::with_capacity(batch.calls.len());
+            for call in &batch.calls {
+                if let Some(stop) = cancellation_stop(&cancellation) {
+                    return self.finish(stop, &mut state, &cancellation).await;
                 }
+
                 if let Err(stop) = self
                     .emit_live(
-                        validation_event(&call.request, state.revision, TestStatus::Running),
+                        AgentEvent::Activity(ActivityEvent {
+                            level: ActivityLevel::Info,
+                            message: format!("tool {} started", tool_name(&call.request)),
+                        }),
                         &cancellation,
                     )
                     .await
                 {
                     return self.finish(stop, &mut state, &cancellation).await;
                 }
-                Some(fingerprint)
-            } else {
-                None
-            };
 
-            let result = match self.invoke_live(call.request.clone(), &cancellation).await {
-                Ok(result) => result,
-                Err(stop) => {
-                    let terminal_test_event = validation_start.is_some().then(|| {
-                        let status = if matches!(&stop, Stop::Cancelled) {
-                            TestStatus::Cancelled
-                        } else {
-                            TestStatus::Failed
-                        };
-                        validation_event(&call.request, state.revision, status)
-                    });
-                    return self
-                        .finish_with_event(stop, &mut state, &cancellation, terminal_test_event)
-                        .await;
-                }
-            };
-
-            if matches!(call.request, ToolRequest::ReplaceFile { .. })
-                && result.status() == ToolStatus::Succeeded
-            {
-                if let Err(stop) = state.replaced() {
-                    return self.finish(stop, &mut state, &cancellation).await;
-                }
-                let mut snapshot = match self.snapshot_live(state.revision, &cancellation).await {
-                    Ok(snapshot) => snapshot,
-                    Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
-                };
-                state.record_replacement_snapshot(snapshot.fingerprint);
-                snapshot.diff.revision = state.revision;
-                if let Err(stop) = self
-                    .emit_live(AgentEvent::Diff(snapshot.diff), &cancellation)
-                    .await
-                {
-                    return self.finish(stop, &mut state, &cancellation).await;
-                }
-                if let Err(stop) = self.emit_queued(&state, &cancellation).await {
-                    return self.finish(stop, &mut state, &cancellation).await;
-                }
-                if let Err(stop) = self.emit_live(modification_plan(2), &cancellation).await {
-                    return self.finish(stop, &mut state, &cancellation).await;
-                }
-            }
-
-            if let Some(start) = validation_start {
-                let end = match self.fingerprint_live(&cancellation).await {
-                    Ok(fingerprint) => fingerprint,
-                    Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
-                };
-                if start != end {
-                    match state.observe(end) {
-                        Ok(_) => {}
+                let validation_start = if is_cargo_validation(&call.request) {
+                    let fingerprint = match self.fingerprint_live(&cancellation).await {
+                        Ok(fingerprint) => fingerprint,
+                        Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
+                    };
+                    match state.observe(fingerprint) {
+                        Ok(true) => {
+                            if let Err(stop) = self.emit_queued(&state, &cancellation).await {
+                                return self.finish(stop, &mut state, &cancellation).await;
+                            }
+                        }
+                        Ok(false) => {}
                         Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
                     }
-                    if let Err(stop) = self.emit_queued(&state, &cancellation).await {
-                        return self.finish(stop, &mut state, &cancellation).await;
-                    }
-                } else {
-                    let test_status = match result.status() {
-                        ToolStatus::Succeeded => TestStatus::Passed,
-                        ToolStatus::Failed => TestStatus::Failed,
-                    };
                     if let Err(stop) = self
                         .emit_live(
-                            validation_event(&call.request, state.revision, test_status),
+                            validation_event(&call.request, state.revision, TestStatus::Running),
                             &cancellation,
                         )
                         .await
                     {
                         return self.finish(stop, &mut state, &cancellation).await;
                     }
-                    if matches!(call.request, ToolRequest::CargoTest { .. })
-                        && result.status() == ToolStatus::Succeeded
-                    {
-                        state.passed = Some(TestEvidence {
-                            revision: state.revision,
-                            fingerprint: end,
+                    Some((fingerprint, state.revision))
+                } else {
+                    None
+                };
+
+                let result = match self.invoke_live(call.request.clone(), &cancellation).await {
+                    Ok(result) => result,
+                    Err(stop) => {
+                        let terminal_test_event = validation_start.is_some().then(|| {
+                            let status = if matches!(&stop, Stop::Cancelled) {
+                                TestStatus::Cancelled
+                            } else {
+                                TestStatus::Failed
+                            };
+                            validation_event(&call.request, state.revision, status)
                         });
-                        if let Err(stop) = self.emit_live(validation_plan(3), &cancellation).await {
-                            return self.finish(stop, &mut state, &cancellation).await;
-                        }
+                        return self
+                            .finish_with_event(stop, &mut state, &cancellation, terminal_test_event)
+                            .await;
+                    }
+                };
+
+                if matches!(call.request, ToolRequest::ReplaceFile { .. })
+                    && result.status() == ToolStatus::Succeeded
+                {
+                    if let Err(stop) = state.replaced() {
+                        return self.finish(stop, &mut state, &cancellation).await;
+                    }
+                    let mut snapshot = match self.snapshot_live(state.revision, &cancellation).await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
+                    };
+                    state.record_replacement_snapshot(snapshot.fingerprint);
+                    snapshot.diff.revision = state.revision;
+                    if let Err(stop) = self
+                        .emit_live(AgentEvent::Diff(snapshot.diff), &cancellation)
+                        .await
+                    {
+                        return self.finish(stop, &mut state, &cancellation).await;
+                    }
+                    if let Err(stop) = self.emit_queued(&state, &cancellation).await {
+                        return self.finish(stop, &mut state, &cancellation).await;
+                    }
+                    if let Err(stop) = self.emit_live(modification_plan(2), &cancellation).await {
+                        return self.finish(stop, &mut state, &cancellation).await;
                     }
                 }
-            }
 
-            let redacted_content = self.redactor.redact(result.content());
-            let contextual_result = tool_result_context(
-                &result,
-                &redacted_content,
-                redacted_content != result.content(),
-            );
-            if !budget
-                .consume_tool_result(contextual_result.len(), self.limits.max_tool_result_bytes())
-            {
-                return self
-                    .finish(Stop::context_limit(), &mut state, &cancellation)
-                    .await;
-            }
-            if let Err(stop) = self
-                .emit_live(
-                    AgentEvent::Activity(ActivityEvent {
-                        level: match result.status() {
-                            ToolStatus::Succeeded => ActivityLevel::Info,
-                            ToolStatus::Failed => ActivityLevel::Warning,
-                        },
-                        message: format!(
-                            "tool {} {}",
-                            tool_name(&call.request),
-                            match result.status() {
-                                ToolStatus::Succeeded => "succeeded",
-                                ToolStatus::Failed => "failed",
+                if let Some((start, tested_revision)) = validation_start {
+                    let end = match self.fingerprint_live(&cancellation).await {
+                        Ok(fingerprint) => fingerprint,
+                        Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
+                    };
+                    if start != end {
+                        match state.observe(end) {
+                            Ok(_) => {}
+                            Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
+                        }
+                        if let Err(stop) = self.emit_queued(&state, &cancellation).await {
+                            return self.finish(stop, &mut state, &cancellation).await;
+                        }
+                    } else {
+                        let test_status = match result.status() {
+                            ToolStatus::Succeeded => TestStatus::Passed,
+                            ToolStatus::Failed => TestStatus::Failed,
+                        };
+                        if let Err(stop) = self
+                            .emit_live(
+                                validation_event(&call.request, state.revision, test_status),
+                                &cancellation,
+                            )
+                            .await
+                        {
+                            return self.finish(stop, &mut state, &cancellation).await;
+                        }
+                        if matches!(call.request, ToolRequest::CargoTest { .. })
+                            && result.status() == ToolStatus::Succeeded
+                        {
+                            state.passed = Some(TestEvidence {
+                                revision: state.revision,
+                                fingerprint: end,
+                            });
+                            if let Err(stop) =
+                                self.emit_live(validation_plan(3), &cancellation).await
+                            {
+                                return self.finish(stop, &mut state, &cancellation).await;
                             }
-                        ),
-                    }),
-                    &cancellation,
-                )
-                .await
-            {
-                return self.finish(stop, &mut state, &cancellation).await;
+                        }
+                    }
+                    if is_cargo_test(&call.request) {
+                        state.last_tested_revision = Some(tested_revision);
+                    }
+                }
+
+                let redacted_content = self.redactor.redact(result.content());
+                let contextual_result = tool_result_context(
+                    &result,
+                    &redacted_content,
+                    redacted_content != result.content(),
+                );
+                if !budget.consume_tool_result(
+                    contextual_result.len(),
+                    self.limits.max_tool_result_bytes(),
+                ) {
+                    return self
+                        .finish(Stop::context_limit(), &mut state, &cancellation)
+                        .await;
+                }
+                if let Err(stop) = self
+                    .emit_live(
+                        AgentEvent::Activity(ActivityEvent {
+                            level: match result.status() {
+                                ToolStatus::Succeeded => ActivityLevel::Info,
+                                ToolStatus::Failed => ActivityLevel::Warning,
+                            },
+                            message: format!(
+                                "tool {} {}",
+                                tool_name(&call.request),
+                                match result.status() {
+                                    ToolStatus::Succeeded => "succeeded",
+                                    ToolStatus::Failed => "failed",
+                                }
+                            ),
+                        }),
+                        &cancellation,
+                    )
+                    .await
+                {
+                    return self.finish(stop, &mut state, &cancellation).await;
+                }
+                tool_result_messages.push(ModelMessage::tool_result(
+                    call.id.clone(),
+                    contextual_result,
+                ));
             }
-            messages.push(ModelMessage::AssistantToolCall(call.clone()));
-            messages.push(ModelMessage::tool_result(call.id, contextual_result));
+            messages.push(ModelMessage::AssistantToolCalls(batch));
+            messages.extend(tool_result_messages);
         }
 
         self.finish(Stop::step_limit(), &mut state, &cancellation)
@@ -603,9 +700,16 @@ struct WorkspaceState {
     revision: u64,
     fingerprint: Option<WorkspaceFingerprint>,
     passed: Option<TestEvidence>,
+    last_tested_revision: Option<u64>,
 }
 
 impl WorkspaceState {
+    fn has_current_pass(&self) -> bool {
+        self.passed.as_ref().is_some_and(|passed| {
+            passed.revision == self.revision && self.fingerprint == Some(passed.fingerprint)
+        })
+    }
+
     fn observe(&mut self, fingerprint: WorkspaceFingerprint) -> Result<bool, Stop> {
         if self
             .fingerprint
@@ -709,6 +813,125 @@ fn cancellation_stop(cancellation: &CancellationToken) -> Option<Stop> {
     cancellation.is_cancelled().then_some(Stop::Cancelled)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvergencePhase {
+    Explore,
+    ForceCargoTest,
+    Repair,
+    FinalPreferred,
+    FinalOnly,
+}
+
+impl ConvergencePhase {
+    const fn tool_choice(self) -> ModelToolChoice {
+        match self {
+            Self::ForceCargoTest => ModelToolChoice::RequiredCargoTest,
+            Self::FinalOnly => ModelToolChoice::None,
+            Self::Explore | Self::Repair | Self::FinalPreferred => ModelToolChoice::Auto,
+        }
+    }
+}
+
+fn convergence_phase(
+    limits: AgentLimits,
+    state: &WorkspaceState,
+    remaining_model_responses: u32,
+    remaining_tool_calls: u32,
+    force_validation: bool,
+) -> Option<ConvergencePhase> {
+    if state.has_current_pass() {
+        return Some(if remaining_tool_calls == 0 {
+            ConvergencePhase::FinalOnly
+        } else {
+            ConvergencePhase::FinalPreferred
+        });
+    }
+    if remaining_tool_calls == 0 || remaining_model_responses < 2 {
+        return None;
+    }
+    if state
+        .last_tested_revision
+        .is_some_and(|revision| revision != state.revision)
+    {
+        return Some(ConvergencePhase::ForceCargoTest);
+    }
+    if state.last_tested_revision == Some(state.revision) {
+        return (remaining_tool_calls >= 2 && remaining_model_responses >= 3)
+            .then_some(ConvergencePhase::Repair);
+    }
+    if force_validation
+        || remaining_tool_calls <= validation_tool_reserve(limits)
+        || remaining_model_responses <= validation_model_reserve(limits)
+    {
+        Some(ConvergencePhase::ForceCargoTest)
+    } else {
+        Some(ConvergencePhase::Explore)
+    }
+}
+
+fn validation_tool_reserve(limits: AgentLimits) -> u32 {
+    (limits.max_tool_calls() / 4)
+        .clamp(3, MAX_VALIDATION_TOOL_RESERVE)
+        .min(limits.max_tool_calls())
+}
+
+fn validation_model_reserve(limits: AgentLimits) -> u32 {
+    (limits.max_model_steps() / 4)
+        .clamp(4, MAX_VALIDATION_MODEL_RESERVE)
+        .min(limits.max_model_steps())
+}
+
+fn system_policy(
+    limits: AgentLimits,
+    revision: u64,
+    remaining_model_responses: u32,
+    remaining_tool_calls: u32,
+    phase: ConvergencePhase,
+) -> String {
+    let phase_instruction = match phase {
+        ConvergencePhase::Explore => {
+            "Tool choice is automatic. Inspect only what the task requires and do not consume the validation reserve."
+        }
+        ConvergencePhase::ForceCargoTest => {
+            "Inspection is paused. This response must call cargo_test exactly once and must not call another tool or return a final answer."
+        }
+        ConvergencePhase::Repair => {
+            "The current revision has already failed cargo_test. Use the existing failure evidence for a targeted repair; do not repeat the same test until the workspace revision changes."
+        }
+        ConvergencePhase::FinalPreferred => {
+            "The current revision has passed cargo_test. Return the concise final answer now without another tool call."
+        }
+        ConvergencePhase::FinalOnly => {
+            "The current revision has passed cargo_test and tools are disabled. Return the concise final answer now."
+        }
+    };
+    format!(
+        "{SYSTEM_POLICY} The task ceilings are {} model responses and {} total tool calls; these are ceilings, not targets. Before this response, {} model responses (including this one) and {} tool calls remain. {} tool calls and {} model responses are reserved for validation, repair, retest, and the final answer. The current workspace revision is {}. {phase_instruction}",
+        limits.max_model_steps(),
+        limits.max_tool_calls(),
+        remaining_model_responses,
+        remaining_tool_calls,
+        validation_tool_reserve(limits).min(remaining_tool_calls),
+        validation_model_reserve(limits).min(remaining_model_responses),
+        revision,
+    )
+}
+
+fn is_cargo_test(request: &ToolRequest) -> bool {
+    matches!(request, ToolRequest::CargoTest { .. })
+}
+
+fn valid_tool_call_batch(batch: &ToolCallBatch, seen: &BTreeSet<String>) -> bool {
+    if batch.calls.is_empty() {
+        return false;
+    }
+    let mut batch_ids = BTreeSet::new();
+    batch
+        .calls
+        .iter()
+        .all(|call| valid_tool_call(call, seen) && batch_ids.insert(call.id.as_str()))
+}
+
 fn valid_tool_call(call: &ToolCall, seen: &BTreeSet<String>) -> bool {
     !call.id.is_empty()
         && call.id.len() <= MAX_TOOL_CALL_ID_BYTES
@@ -751,6 +974,24 @@ fn valid_tool_request(request: &ToolRequest) -> bool {
         }
         ToolRequest::GitStatus | ToolRequest::GitDiff => true,
     }
+}
+
+fn tool_call_batch_is_redaction_stable(
+    batch: &ToolCallBatch,
+    redactor: &dyn ContextRedactor,
+) -> bool {
+    batch
+        .assistant_content
+        .as_ref()
+        .is_none_or(|content| redactor.redact(content) == *content)
+        && batch
+            .reasoning_content
+            .as_ref()
+            .is_none_or(|content| redactor.redact(content) == *content)
+        && batch
+            .calls
+            .iter()
+            .all(|call| tool_call_is_redaction_stable(call, redactor))
 }
 
 fn tool_call_is_redaction_stable(call: &ToolCall, redactor: &dyn ContextRedactor) -> bool {
@@ -825,9 +1066,7 @@ fn model_message_bytes(message: &ModelMessage) -> Option<usize> {
         ModelMessage::System(content)
         | ModelMessage::User(content)
         | ModelMessage::Assistant(content) => 1usize.checked_add(content.len()),
-        ModelMessage::AssistantToolCall(call) => 1usize
-            .checked_add(call.id.len())?
-            .checked_add(tool_request_bytes(&call.request)?),
+        ModelMessage::AssistantToolCalls(batch) => tool_call_batch_bytes(batch),
         ModelMessage::ToolResult {
             tool_call_id,
             content,
@@ -840,10 +1079,19 @@ fn model_message_bytes(message: &ModelMessage) -> Option<usize> {
 fn model_response_bytes(response: &ModelResponse) -> Option<usize> {
     match response {
         ModelResponse::Final { content } => 1usize.checked_add(content.len()),
-        ModelResponse::ToolCall(call) => 1usize
-            .checked_add(call.id.len())?
-            .checked_add(tool_request_bytes(&call.request)?),
+        ModelResponse::ToolCalls(batch) => tool_call_batch_bytes(batch),
     }
+}
+
+fn tool_call_batch_bytes(batch: &ToolCallBatch) -> Option<usize> {
+    let batch_bytes = 1usize
+        .checked_add(batch.assistant_content.as_ref().map_or(0, String::len))?
+        .checked_add(batch.reasoning_content.as_ref().map_or(0, String::len))?;
+    batch.calls.iter().try_fold(batch_bytes, |total, call| {
+        total
+            .checked_add(call.id.len())?
+            .checked_add(tool_request_bytes(&call.request)?)
+    })
 }
 
 fn tool_request_bytes(request: &ToolRequest) -> Option<usize> {

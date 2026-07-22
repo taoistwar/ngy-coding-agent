@@ -12,11 +12,15 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, Request, Response, StatusCode};
 use axum::routing::{any, post};
-use coding_agent_core::{ModelMessage, ModelProvider, ModelRequest, ModelResponse};
+use coding_agent_core::{
+    ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelToolChoice, ProviderError,
+    ToolCall, ToolCallBatch, ToolRequest,
+};
 use coding_agent_provider::{
     ChatCompletionsClient, ChatCompletionsProvider, ClientLimits, ClientLimitsError,
     PROVIDER_CANCELLED, PROVIDER_RATE_LIMITED, PROVIDER_REDIRECT_REJECTED,
-    PROVIDER_REQUEST_BYTE_LIMIT_REACHED, PROVIDER_RESPONSE_INVALID,
+    PROVIDER_REQUEST_BYTE_LIMIT_REACHED, PROVIDER_RESPONSE_FINISH_UNSUPPORTED,
+    PROVIDER_RESPONSE_INVALID, PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED,
     PROVIDER_TASK_BYTE_LIMIT_REACHED, PROVIDER_TRANSPORT_FAILED, PROVIDER_UNAUTHORIZED,
     PROVIDER_UNAVAILABLE, ProviderConfig, encode_chat_completions_request,
 };
@@ -34,6 +38,7 @@ fn request_fixture() -> ModelRequest {
             ModelMessage::system("bounded policy"),
             ModelMessage::user("known-private-prompt"),
         ],
+        tool_choice: ModelToolChoice::Auto,
     }
 }
 
@@ -47,6 +52,28 @@ fn final_response(content: &str) -> Vec<u8> {
             "index": 0,
             "message": {"role": "assistant", "content": content},
             "finish_reason": "stop"
+        }]
+    }))
+    .unwrap()
+}
+
+fn cargo_test_response() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "forced-test",
+                    "type": "function",
+                    "function": {
+                        "name": "cargo_test",
+                        "arguments": "{\"timeout_ms\":120000}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
         }]
     }))
     .unwrap()
@@ -68,15 +95,39 @@ fn provider(server: &MockServer, limits: ClientLimits) -> ChatCompletionsProvide
 }
 
 fn client(server: &MockServer, limits: ClientLimits) -> ChatCompletionsClient {
+    client_with_options(server, limits, None, None)
+}
+
+fn client_with_thinking(
+    server: &MockServer,
+    limits: ClientLimits,
+    thinking: Option<&str>,
+) -> ChatCompletionsClient {
+    client_with_options(server, limits, thinking, None)
+}
+
+fn client_with_options(
+    server: &MockServer,
+    limits: ClientLimits,
+    thinking: Option<&str>,
+    tool_choice_compatibility: Option<&str>,
+) -> ChatCompletionsClient {
     let base_url = server.base_url();
     let parsed = url::Url::parse(&base_url).unwrap();
     assert_eq!(parsed.host_str(), Some("127.0.0.1"));
-    let encoded = serde_json::to_vec(&serde_json::json!({
+    let mut config = serde_json::json!({
         "base_url": base_url,
         "model": "coding-model",
         "api_key": API_KEY,
-    }))
-    .unwrap();
+    });
+    if let Some(thinking) = thinking {
+        config["thinking"] = serde_json::Value::String(thinking.to_owned());
+    }
+    if let Some(tool_choice_compatibility) = tool_choice_compatibility {
+        config["tool_choice_compatibility"] =
+            serde_json::Value::String(tool_choice_compatibility.to_owned());
+    }
+    let encoded = serde_json::to_vec(&config).unwrap();
     let config = ProviderConfig::from_json_allow_loopback_http_for_test(&encoded).unwrap();
     ChatCompletionsClient::new(config, limits).expect("construct local provider client")
 }
@@ -131,6 +182,32 @@ struct CapturedRequest {
     body: Bytes,
 }
 
+#[derive(Clone)]
+struct CaptureFixedState {
+    sender: mpsc::UnboundedSender<CapturedRequest>,
+    response_body: Bytes,
+}
+
+async fn capture_fixed_response(
+    State(state): State<CaptureFixedState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 256 * 1024).await.unwrap();
+    state
+        .sender
+        .send(CapturedRequest {
+            headers: parts.headers,
+            body,
+        })
+        .unwrap();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(state.response_body))
+        .unwrap()
+}
+
 async fn capture_success(
     State(sender): State<mpsc::UnboundedSender<CapturedRequest>>,
     request: Request<Body>,
@@ -149,6 +226,47 @@ async fn capture_success(
         .header("x-request-id", "request-123")
         .body(Body::from(final_response("done")))
         .unwrap()
+}
+
+async fn fixed_final_success() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(final_response("done")))
+        .unwrap()
+}
+
+async fn fixed_cargo_test_success() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(cargo_test_response()))
+        .unwrap()
+}
+
+async fn fixed_body_success(State(body): State<Bytes>) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn complete_with_body(
+    body: Vec<u8>,
+    tool_choice: ModelToolChoice,
+) -> Result<ModelResponse, ProviderError> {
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(fixed_body_success))
+            .with_state(Bytes::from(body)),
+    )
+    .await;
+    let mut request = request_fixture();
+    request.tool_choice = tool_choice;
+    provider(&server, test_limits())
+        .complete(request, CancellationToken::new())
+        .await
 }
 
 #[tokio::test]
@@ -221,6 +339,453 @@ async fn exact_post_body_bearer_and_safe_response_metadata() {
         assert!(!rendered.contains(API_KEY));
         assert!(!rendered.contains("known-private-prompt"));
     }
+}
+
+#[tokio::test]
+async fn client_enforces_none_and_required_cargo_test_response_contracts() {
+    let final_server =
+        MockServer::spawn(Router::new().route("/v1/chat/completions", post(fixed_final_success)))
+            .await;
+    let final_provider = provider(&final_server, test_limits());
+
+    let mut none_request = request_fixture();
+    none_request.tool_choice = ModelToolChoice::None;
+    assert!(matches!(
+        final_provider
+            .complete(none_request, CancellationToken::new())
+            .await,
+        Ok(ModelResponse::Final { .. })
+    ));
+
+    let mut required_request = request_fixture();
+    required_request.tool_choice = ModelToolChoice::RequiredCargoTest;
+    let error = final_provider
+        .complete(required_request, CancellationToken::new())
+        .await
+        .expect_err("a final response violates required cargo_test");
+    assert_eq!(error.code, PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED);
+    assert!(!error.retryable);
+
+    let tool_server = MockServer::spawn(
+        Router::new().route("/v1/chat/completions", post(fixed_cargo_test_success)),
+    )
+    .await;
+    let tool_provider = provider(&tool_server, test_limits());
+    let mut required_request = request_fixture();
+    required_request.tool_choice = ModelToolChoice::RequiredCargoTest;
+    assert!(matches!(
+        tool_provider
+            .complete(required_request, CancellationToken::new())
+            .await,
+        Ok(ModelResponse::ToolCalls(ToolCallBatch { calls, .. }))
+            if matches!(calls.as_slice(), [ToolCall { request: ToolRequest::CargoTest { .. }, .. }])
+    ));
+
+    let mut none_request = request_fixture();
+    none_request.tool_choice = ModelToolChoice::None;
+    let error = tool_provider
+        .complete(none_request, CancellationToken::new())
+        .await
+        .expect_err("a tool response violates none");
+    assert_eq!(error.code, PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED);
+    assert!(!error.retryable);
+}
+
+#[tokio::test]
+async fn required_as_required_uses_one_request_with_only_cargo_test_and_keeps_logical_validation() {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let response_body = cargo_test_response();
+    let response_bytes = response_body.len();
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(capture_fixed_response))
+            .with_state(CaptureFixedState {
+                sender,
+                response_body: Bytes::from(response_body),
+            }),
+    )
+    .await;
+    let provider = client_with_options(
+        &server,
+        test_limits(),
+        Some("disabled"),
+        Some("required_as_required"),
+    )
+    .start_task();
+    let mut request = request_fixture();
+    request.tool_choice = ModelToolChoice::RequiredCargoTest;
+
+    let response = provider
+        .complete(request, CancellationToken::new())
+        .await
+        .expect("the compatibility wire still satisfies the logical required choice");
+    assert!(matches!(
+        response,
+        ModelResponse::ToolCalls(ToolCallBatch { calls, .. })
+            if matches!(calls.as_slice(), [ToolCall { request: ToolRequest::CargoTest { .. }, .. }])
+    ));
+
+    let captured = receiver
+        .recv()
+        .await
+        .expect("captured compatibility request");
+    let request_bytes = captured.body.len();
+    let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(body["tool_choice"], "required");
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert_eq!(body["parallel_tool_calls"], false);
+    let tools = body["tools"].as_array().expect("compatibility tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "cargo_test");
+    assert_eq!(
+        provider.task_provider_bytes(),
+        request_bytes + response_bytes,
+        "the single compatibility exchange is charged exactly once"
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn required_as_auto_uses_one_request_with_only_cargo_test_and_keeps_logical_validation() {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let response_body = cargo_test_response();
+    let response_bytes = response_body.len();
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(capture_fixed_response))
+            .with_state(CaptureFixedState {
+                sender,
+                response_body: Bytes::from(response_body),
+            }),
+    )
+    .await;
+    let provider = client_with_options(
+        &server,
+        test_limits(),
+        Some("enabled"),
+        Some("required_as_auto"),
+    )
+    .start_task();
+    let mut request = request_fixture();
+    request.tool_choice = ModelToolChoice::RequiredCargoTest;
+
+    let response = provider
+        .complete(request, CancellationToken::new())
+        .await
+        .expect("the auto wire still satisfies the logical required choice");
+    assert!(matches!(
+        response,
+        ModelResponse::ToolCalls(ToolCallBatch { calls, .. })
+            if matches!(calls.as_slice(), [ToolCall { request: ToolRequest::CargoTest { .. }, .. }])
+    ));
+
+    let captured = receiver
+        .recv()
+        .await
+        .expect("captured compatibility request");
+    let request_bytes = captured.body.len();
+    let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["parallel_tool_calls"], false);
+    let tools = body["tools"].as_array().expect("compatibility tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "cargo_test");
+    assert_eq!(
+        provider.task_provider_bytes(),
+        request_bytes + response_bytes
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn compatibility_modes_do_not_retry_or_relax_a_secret_bearing_choice_violation() {
+    for (compatibility, expected_wire) in [
+        ("required_as_required", "required"),
+        ("required_as_auto", "auto"),
+    ] {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let server = MockServer::spawn(
+            Router::new()
+                .route("/v1/chat/completions", post(capture_fixed_response))
+                .with_state(CaptureFixedState {
+                    sender,
+                    response_body: Bytes::from(final_response(API_KEY)),
+                }),
+        )
+        .await;
+        let provider =
+            client_with_options(&server, test_limits(), None, Some(compatibility)).start_task();
+        let mut request = request_fixture();
+        request.tool_choice = ModelToolChoice::RequiredCargoTest;
+
+        let error = provider
+            .complete(request, CancellationToken::new())
+            .await
+            .expect_err("a final answer still violates the logical required choice");
+        assert_eq!(error.code, PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED);
+        assert!(!error.retryable);
+        for rendered in [format!("{error}"), format!("{error:?}")] {
+            assert!(!rendered.contains(API_KEY));
+        }
+
+        let captured = receiver.recv().await.expect("captured one request");
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["tool_choice"], expected_wire);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn compatibility_modes_reject_final_wrong_tool_and_multiple_tests_with_one_hit_each() {
+    let tool_response = |calls: serde_json::Value| {
+        serde_json::to_vec(&serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": calls
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap()
+    };
+    let cargo_call = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": "cargo_test",
+                "arguments": "{\"timeout_ms\":120000}"
+            }
+        })
+    };
+    for (compatibility, expected_wire) in [
+        ("required_as_required", "required"),
+        ("required_as_auto", "auto"),
+    ] {
+        let cases = [
+            final_response("done"),
+            tool_response(serde_json::json!([{
+                "id": "wrong-tool",
+                "type": "function",
+                "function": {"name": "git_status", "arguments": "{}"}
+            }])),
+            tool_response(serde_json::json!([
+                cargo_call("cargo-one"),
+                cargo_call("cargo-two")
+            ])),
+        ];
+
+        for response_body in cases {
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let server = MockServer::spawn(
+                Router::new()
+                    .route("/v1/chat/completions", post(capture_fixed_response))
+                    .with_state(CaptureFixedState {
+                        sender,
+                        response_body: Bytes::from(response_body),
+                    }),
+            )
+            .await;
+            let provider =
+                client_with_options(&server, test_limits(), None, Some(compatibility)).start_task();
+            let mut request = request_fixture();
+            request.tool_choice = ModelToolChoice::RequiredCargoTest;
+
+            let error = provider
+                .complete(request, CancellationToken::new())
+                .await
+                .expect_err("the logical required choice must remain exact");
+            assert_eq!(error.code, PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED);
+            assert!(!error.retryable);
+
+            let captured = receiver.recv().await.expect("captured the only request");
+            let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+            assert_eq!(body["tool_choice"], expected_wire);
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(body["tools"][0]["function"]["name"], "cargo_test");
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn required_as_required_leaves_auto_and_none_wires_unchanged() {
+    for (tool_choice, expected) in [
+        (ModelToolChoice::Auto, serde_json::json!("auto")),
+        (ModelToolChoice::None, serde_json::json!("none")),
+    ] {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let server = MockServer::spawn(
+            Router::new()
+                .route("/v1/chat/completions", post(capture_fixed_response))
+                .with_state(CaptureFixedState {
+                    sender,
+                    response_body: Bytes::from(final_response("done")),
+                }),
+        )
+        .await;
+        let provider =
+            client_with_options(&server, test_limits(), None, Some("required_as_required"))
+                .start_task();
+        let mut request = request_fixture();
+        request.tool_choice = tool_choice;
+
+        assert!(matches!(
+            provider.complete(request, CancellationToken::new()).await,
+            Ok(ModelResponse::Final { .. })
+        ));
+        let captured = receiver.recv().await.expect("captured scoped-mode request");
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["tool_choice"], expected);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 8);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn explicit_tool_choice_violations_have_one_stable_safe_error_code() {
+    let tool_response = |calls: serde_json::Value, finish_reason: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": calls
+                },
+                "finish_reason": finish_reason
+            }]
+        }))
+        .unwrap()
+    };
+    let final_wire = |content: &str, finish_reason: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish_reason
+            }]
+        }))
+        .unwrap()
+    };
+    let cargo_call = serde_json::json!({
+        "id": "cargo",
+        "type": "function",
+        "function": {"name": "cargo_test", "arguments": "{\"timeout_ms\":120000}"}
+    });
+    let unknown_call = serde_json::json!({
+        "id": "unknown",
+        "type": "function",
+        "function": {"name": "unknown_tool", "arguments": "known-provider-secret"}
+    });
+    let git_call = serde_json::json!({
+        "id": "status",
+        "type": "function",
+        "function": {"name": "git_status", "arguments": "{}"}
+    });
+
+    let violations = [
+        (
+            ModelToolChoice::None,
+            tool_response(serde_json::json!([cargo_call.clone()]), "stop"),
+        ),
+        (
+            ModelToolChoice::None,
+            tool_response(serde_json::json!([unknown_call.clone()]), "tool_calls"),
+        ),
+        (
+            ModelToolChoice::RequiredCargoTest,
+            final_wire("done", "stop"),
+        ),
+        (ModelToolChoice::RequiredCargoTest, final_wire("", "length")),
+        (
+            ModelToolChoice::RequiredCargoTest,
+            tool_response(serde_json::json!([git_call]), "tool_calls"),
+        ),
+        (
+            ModelToolChoice::RequiredCargoTest,
+            tool_response(serde_json::json!([unknown_call.clone()]), "tool_calls"),
+        ),
+        (
+            ModelToolChoice::RequiredCargoTest,
+            tool_response(
+                serde_json::json!([cargo_call.clone(), unknown_call]),
+                "tool_calls",
+            ),
+        ),
+    ];
+    for (choice, body) in violations {
+        let error = complete_with_body(body, choice)
+            .await
+            .expect_err("the response must violate the explicit tool choice");
+        assert_eq!(error.code, PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED);
+        assert!(!error.retryable);
+        for rendered in [format!("{error}"), format!("{error:?}")] {
+            assert!(!rendered.contains(API_KEY));
+            assert!(!rendered.contains("unknown_tool"));
+        }
+    }
+
+    let wrong_finish = tool_response(serde_json::json!([cargo_call.clone()]), "stop");
+    let error = complete_with_body(wrong_finish, ModelToolChoice::RequiredCargoTest)
+        .await
+        .expect_err("a valid required tool with the wrong finish remains a finish error");
+    assert_eq!(error.code, PROVIDER_RESPONSE_FINISH_UNSUPPORTED);
+
+    let invalid_arguments = serde_json::json!({
+        "id": "cargo",
+        "type": "function",
+        "function": {"name": "cargo_test", "arguments": "known-provider-secret"}
+    });
+    let error = complete_with_body(
+        tool_response(serde_json::json!([invalid_arguments]), "tool_calls"),
+        ModelToolChoice::RequiredCargoTest,
+    )
+    .await
+    .expect_err("invalid required-tool arguments remain an invalid response");
+    assert_eq!(error.code, PROVIDER_RESPONSE_INVALID);
+    assert!(!format!("{error:?}").contains(API_KEY));
+}
+
+#[tokio::test]
+async fn explicitly_disabled_thinking_is_sent_without_changing_the_default_contract() {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(capture_success))
+            .with_state(sender),
+    )
+    .await;
+    let provider = client_with_thinking(&server, test_limits(), Some("disabled")).start_task();
+
+    provider
+        .complete(request_fixture(), CancellationToken::new())
+        .await
+        .expect("local completion succeeds");
+
+    let captured = receiver.recv().await.expect("captured one request");
+    let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(body["thinking"]["type"], "disabled");
 }
 
 async fn status_response(State(status): State<StatusCode>) -> Response<Body> {
@@ -729,7 +1294,7 @@ async fn secret_request_id() -> Response<Body> {
         .header(CONTENT_TYPE, "application/json")
         .header(
             "x-request-id",
-            format!("known-private-prompt-{}", "x".repeat(300)),
+            format!("known-second-call-secret-{}", "x".repeat(300)),
         )
         .body(Body::from(final_response("done")))
         .unwrap()
@@ -741,8 +1306,36 @@ async fn request_id_metadata_is_bounded_and_redacted_before_exposure() {
         MockServer::spawn(Router::new().route("/v1/chat/completions", post(secret_request_id)))
             .await;
     let provider = provider(&server, test_limits());
+    let mut request = request_fixture();
+    request
+        .messages
+        .push(ModelMessage::AssistantToolCalls(ToolCallBatch {
+            assistant_content: None,
+            reasoning_content: None,
+            calls: vec![
+                ToolCall {
+                    id: "safe-first".to_owned(),
+                    request: ToolRequest::GitStatus,
+                },
+                ToolCall {
+                    id: "private-second".to_owned(),
+                    request: ToolRequest::SearchText {
+                        query: "known-second-call-secret".to_owned(),
+                        path: ".".to_owned(),
+                        glob: None,
+                        limit: 10,
+                    },
+                },
+            ],
+        }));
+    request
+        .messages
+        .push(ModelMessage::tool_result("safe-first", "clean"));
+    request
+        .messages
+        .push(ModelMessage::tool_result("private-second", "matches"));
     provider
-        .complete(request_fixture(), CancellationToken::new())
+        .complete(request, CancellationToken::new())
         .await
         .unwrap();
     let metadata = provider.last_response_metadata().unwrap();
@@ -751,7 +1344,47 @@ async fn request_id_metadata_is_bounded_and_redacted_before_exposure() {
     assert!(request_id.starts_with("<redacted>-"));
     assert!(request_id.ends_with("<truncated>"));
     assert!(!format!("{metadata:?}").contains(API_KEY));
-    assert!(!format!("{metadata:?}").contains("known-private-prompt"));
+    assert!(!format!("{metadata:?}").contains("known-second-call-secret"));
+}
+
+async fn reasoning_secret_request_id() -> Response<Body> {
+    Response::builder()
+        .header(CONTENT_TYPE, "application/json")
+        .header("x-request-id", "known-reasoning-metadata-secret")
+        .body(Body::from(final_response("done")))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn reasoning_history_is_part_of_request_metadata_redaction() {
+    let server = MockServer::spawn(
+        Router::new().route("/v1/chat/completions", post(reasoning_secret_request_id)),
+    )
+    .await;
+    let provider = client_with_thinking(&server, test_limits(), Some("enabled")).start_task();
+    let mut request = request_fixture();
+    request
+        .messages
+        .push(ModelMessage::AssistantToolCalls(ToolCallBatch {
+            assistant_content: None,
+            reasoning_content: Some("known-reasoning-metadata-secret".to_owned()),
+            calls: vec![ToolCall {
+                id: "reasoning-call".to_owned(),
+                request: ToolRequest::GitStatus,
+            }],
+        }));
+    request
+        .messages
+        .push(ModelMessage::tool_result("reasoning-call", "clean"));
+
+    provider
+        .complete(request, CancellationToken::new())
+        .await
+        .expect("thinking history request succeeds");
+
+    let metadata = provider.last_response_metadata().unwrap();
+    assert_eq!(metadata.request_id(), Some("<redacted>"));
+    assert!(!format!("{metadata:?}").contains("known-reasoning-metadata-secret"));
 }
 
 async fn api_key_final_response() -> Response<Body> {
@@ -774,12 +1407,52 @@ async fn api_key_tool_argument_response() -> Response<Body> {
             "message": {
                 "role": "assistant",
                 "content": null,
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call-safe-first",
+                        "type": "function",
+                        "function": {
+                            "name": "git_status",
+                            "arguments": "{}",
+                        }
+                    },
+                    {
+                        "index": 1,
+                        "id": "call-secret-echo",
+                        "type": "function",
+                        "function": {
+                            "name": "replace_file",
+                            "arguments": arguments,
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .unwrap();
+    Response::builder()
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(response))
+        .unwrap()
+}
+
+async fn api_key_assistant_tool_content_response() -> Response<Body> {
+    let response = serde_json::to_vec(&serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": format!("I found {API_KEY}"),
+                "reasoning_content": "",
                 "tool_calls": [{
-                    "id": "call-secret-echo",
+                    "index": 0,
+                    "id": "call-secret-content",
                     "type": "function",
                     "function": {
-                        "name": "replace_file",
-                        "arguments": arguments,
+                        "name": "git_status",
+                        "arguments": "{}",
                     }
                 }]
             },
@@ -798,6 +1471,10 @@ async fn successful_responses_cannot_echo_the_configured_api_key_to_runtime() {
     for router in [
         Router::new().route("/v1/chat/completions", post(api_key_final_response)),
         Router::new().route("/v1/chat/completions", post(api_key_tool_argument_response)),
+        Router::new().route(
+            "/v1/chat/completions",
+            post(api_key_assistant_tool_content_response),
+        ),
     ] {
         let server = MockServer::spawn(router).await;
         let error = provider(&server, test_limits())

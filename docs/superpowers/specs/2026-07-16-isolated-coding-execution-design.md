@@ -177,7 +177,7 @@ Unix supervisor 以 `waitid(..., WNOWAIT)` 保留 leader PID/PGID 锚，并让�
 
 子进程先 `env_clear()`，再加入最小白名单：平台必需的系统路径变量、临时目录、locale，以及显式允许的 Cargo/Rust 工具链变量。默认不转发 token、cookie、云凭据、SSH agent、Git askpass、代理、CI secrets 或用户自定义环境变量。
 
-provider 凭据只由应用进程用于 HTTP Authorization，不进入模型消息、工具结果或子进程环境。日志记录 endpoint origin、状态码和 request id，但不记录 Authorization、完整请求 body、完整模型响应或疑似 secret。统一脱敏器覆盖 tracing、activity 和用户可见失败消息。
+provider 凭据只由应用进程用于 HTTP Authorization，不进入模型消息、工具结果或子进程环境。日志记录 endpoint origin、状态码和 request id，但不记录 Authorization、完整请求 body、完整模型响应或疑似 secret。统一脱敏器覆盖 tracing、activity 和用户可见失败消息。默认 HTTPS 在传输中保护 Authorization 和任务内容；显式开发私网 HTTP 不提供该保护，Bearer key、任务 prompt、仓库片段、工具结果与模型响应都可能被路径上的设备读取或篡改。日志脱敏和本地私有文件权限不能补偿这种传输风险。
 
 Project 2 的 Cargo 命令默认设置离线模式，避免正常依赖解析隐式访问 registry；依赖未缓存时返回明确可重试失败。这不构成对恶意 build/test 代码的网络封锁。应用自身除 provider 外不主动访问其他出站目标。
 
@@ -185,37 +185,116 @@ Project 2 的 Cargo 命令默认设置离线模式，避免正常依赖解析隐
 
 第一版只支持一个 OpenAI-compatible Chat Completions 风格 endpoint：
 
-- 配置：`base_url`、`model`、`api_key`、连接/请求超时；
+- 配置：`base_url`、`model`、`api_key`，以及可选的 `thinking=enabled|disabled`、
+  `tool_choice_compatibility=required_as_required|required_as_auto` 和
+  `allow_insecure_http=true|false`；连接/请求超时由应用固定；
 - `POST /v1/chat/completions`；
 - system/user/assistant/tool messages；
-- tools 数组、`tool_choice=auto`；
-- assistant 的单个 tool call；
-- tool result 通过对应 `tool_call_id` 返回；
+- tools 数组，以及按收敛阶段选择的三种逻辑 `tool_choice`：自动选择编码为 `"auto"`，
+  强制验证默认编码为 `{"type":"function","function":{"name":"cargo_test"}}`，
+  最终专用阶段编码为 `"none"`。显式启用 `required_as_required` 时，只把强制验证的线路
+  编码改为 `"required"`；启用 `required_as_auto` 时改为 `"auto"`。两种模式都把 tools
+  数组缩减为唯一的 `cargo_test` 定义；逻辑选择仍是强制验证；
+- assistant 的一个非空、有序 tool-call 批次；
+- 每个 tool result 通过对应 `tool_call_id` 按批次顺序返回；
 - 非流式 JSON 响应；
-- 不使用 vendor 私有 reasoning 字段、response cache、files、web search 或并行工具调用。
+- 不使用 response cache、files、web search 或并行工具执行。thinking 可显式启用或关闭；
+  启用时工具调用响应中的非空 `reasoning_content` 作为不透明协议状态留在当前任务内并
+  随对应 assistant 消息回传，不进入事件或持久化存储。工具调用批次可以附带一份普通 assistant 文本；该文本进入显式
+  transcript，只计入一次请求/响应字节预算与秘密检查，并在全部工具结果后的下一轮
+  请求中原样回传。兼容层还接受 `tool_calls: null`；每个调用的 `index` 可省略，存在时
+  必须等于其数组位置，但不放宽未知字段和工具参数的严格校验。
 
 HTTP client 禁止自动 redirect，Authorization 永远不跨 origin 转发；默认禁用内容自动解压，若实现解压则对解压后字节另设硬上限。每轮 request、response body 和整个任务累计 provider 字节分别受限。response body 在聚合和 JSON 解析前按流计数，不能依赖 `Content-Length`，超限立即取消读取并返回稳定错误；30x、无长度 chunk 洪泛、超大 JSON 与压缩炸弹都是离线 contract 测试。
 
-生产 provider transport 固定使用 rustls，不依赖系统 native TLS。可复用 client 只持有不可变配置与连接池；每个 agent run 通过 `start_task` 创建独立 provider session，累计字节预算与响应 metadata 不跨 task 共享。默认 connect/request timeout 分别为 10/120 秒，request/response/task provider 字节上限分别为 1 MiB/1 MiB/8 MiB；成功响应若回显配置 API key，也必须在 provider 边界以稳定错误拒绝。
+响应诊断只使用固定错误码：JSON 类型/字段不受支持、非空 reasoning、结束状态不匹配和
+违反本轮 `tool_choice` 分别归类，JSON 语法错误仍使用通用无效响应错误。自动选择允许
+最终文本或合法工具调用；命名选择必须恰好返回一个 `cargo_test`；禁用工具只允许最终
+文本。违反约束统一返回不可重试的 `PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED`。任何分类
+都不得拼接 serde 错误、未知字段名、响应值或完整正文。
 
-如果响应包含多个 tool calls，Project 2 返回 `PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS`，不猜测顺序。Project 3 再定义确定性多调用处理。
+`required_as_required` 和 `required_as_auto` 只是显式、确定性的线路编码兼容，不是响应约束降级：解码始终使用
+原始逻辑选择，因此最终文本、零调用、其他工具或多个调用仍以相同稳定错误安全拒绝，且
+不会执行工具。兼容模式不会在一次失败后补发隐藏的 HTTP 请求，不额外消费模型调用或
+提供方字节预算，也不按域名、模型名或 `thinking` 值推断线路能力。自动选择和最终专用
+阶段的编码及工具集合完全不变。
 
-配置来自应用私有 data directory 下的 `provider.json`，严格 schema 为 `{ "base_url": "https://...", "model": "...", "api_key": "..." }`，其中 API key 必须是 8–4096 字节的可打印 ASCII；拒绝未知字段、非 HTTPS 远端 URL、带 userinfo/query/fragment 的 base URL 和非私有文件权限；测试可显式允许 loopback HTTP。配置只在成功获得 primary instance lock 后读取，因此 secondary launch 不依赖配置。缺少或无效配置时 primary 启动失败并给出稳定配置错误，不得悄悄回落到 fake runner。测试通过依赖注入使用 fake/mock runner。
+HTTPS provider transport 固定使用 rustls，不依赖系统 native TLS。只有显式启用
+`allow_insecure_http` 且目标属于下述受限地址集合时，开发测试线路才可跳过 TLS；连接池、
+超时、重定向禁令、字节预算和秘密响应门禁均不因此放宽。可复用 client 只持有不可变配置
+与连接池；每个 agent run 通过 `start_task` 创建独立 provider session，累计字节预算与响应
+metadata 不跨 task 共享。默认 connect/request timeout 分别为 10/120 秒，
+request/response/task provider 字节上限分别为 1 MiB/1 MiB/8 MiB；成功响应若回显配置
+API key，也必须在 provider 边界以稳定错误拒绝。
+
+即使请求继续发送 `parallel_tool_calls=false`，兼容中转仍可能返回多个 tool calls。
+Project 2 把响应数组作为唯一顺序：先对非空批次中的全部 ID、参数、秘密边界和剩余
+工具预算做原子预检，任一失败时零执行；全部通过后再逐项 `await` 串行执行。普通工具
+失败仍形成有界结果并继续批内后续调用，runtime 致命错误或取消立即停止余下调用。
+下一轮请求只写入一条包含完整批次的 assistant 消息，随后写入全部同序 tool results。
+
+配置来自应用私有 data directory 下的 `provider.json`，严格 schema 为
+`{ "base_url": "https://...", "model": "...", "api_key": "...", "thinking"?: "enabled" | "disabled", "tool_choice_compatibility"?: "strict" | "required_as_required" | "required_as_auto", "allow_insecure_http"?: boolean }`，
+其中 API key 必须是 8–4096 字节的可打印 ASCII。`tool_choice_compatibility` 省略时默认为
+`strict`，只允许上述精确枚举值，显式 `null` 也拒绝。`allow_insecure_http` 省略时默认为
+`false`，显式 `null` 或非布尔值拒绝；省略或为 `false` 时只允许 HTTPS。它为 `true` 时，
+HTTP host 必须是 IP 字面量，并且只能是 IPv4 RFC 1918、IPv6 ULA 或回环地址；DNS 名称、
+公网 IP、IPv4/IPv6 链路本地地址和其他特殊用途地址均拒绝。无论 scheme 如何，都拒绝带
+userinfo/query/fragment 的 base URL。测试辅助入口仍只显式允许 IP 字面量回环 HTTP，
+不得借此扩大生产解析策略。配置只在成功获得 primary instance lock 后读取，因此
+secondary launch 不依赖配置。缺少或无效配置时 primary 启动失败并给出稳定配置错误，
+不得悄悄回落到 fake runner。测试通过依赖注入使用 fake/mock runner。
 
 ## 10. 单角色 Agent 循环
 
 输入由固定 system policy、任务 prompt、仓库/Cargo 元数据和工具 schema 组成。循环每轮只接受两类结果：
 
-1. 一个结构合法的 tool call：执行后加入截断过的 tool result，并继续；
+1. 一个结构合法的非空 tool-call 批次：原子预检后按响应顺序串行执行，加入同序且有界的 tool results，并继续；
 2. 一个最终文本：runner 先采集最终 Git diff，并验证最近一次真实测试绑定当前 workspace revision，再决定成功或失败。
 
-任务 prompt、仅含 package/integration-test selector 的仓库上下文、工具结果和最终文本都在 provider 边界执行相同的 secret redaction；若 tool-call id 或参数经过 redaction 会发生变化，则以 `PROVIDER_SECRET_DETECTED` 在执行前 fail closed。普通工具失败作为带 `tool_status=failed` 与明确 `truncated` 标记的有界结果继续循环；provider/runtime 原始消息、响应体和 chain-of-thought 不进入事件或 outcome。
+任务 prompt、仅含 package/integration-test selector 的仓库上下文、工具结果和最终文本都在 provider 边界执行相同的 secret redaction；若批次 assistant 文本、任一 tool-call id 或参数经过 redaction 会发生变化，则以 `PROVIDER_SECRET_DETECTED` 在执行整个批次前 fail closed。普通工具失败作为带 `tool_status=failed` 与明确 `truncated` 标记的有界结果继续循环；provider/runtime 原始消息、响应体和 chain-of-thought 不进入事件或 outcome。
 
 runner 在内存中维护单调 `workspace_revision`：每次成功 `replace_file` 后递增，并立即发布 queued test snapshot 使旧 passed 视图失效。由于 Cargo/build/test 或其他受信宿主进程也可能改写代码，测试开始前、测试结束后和最终成功判断前都通过受控 Git plumbing 计算 workspace fingerprint。
 
 fingerprint 集合与最终可交付 diff 集合一致：包含所有 tracked 文件的 index 身份/状态/内容，以及所有非 ignored untracked 文件的相对路径、类型和内容；仓库自身 `.gitignore`/`.gitattributes` 生效，但固定清空 system/global excludes 与 attributes，避免宿主配置隐藏交付物。排除 Git ignored 文件和目录（包括正常 `target/` 构建制品），拒绝 symlink/reparse、gitlink/submodule、unmerged index、assume-unchanged 与 skip-worktree/sparse 状态。输入按原始路径字节的确定性顺序、handle-relative no-follow 方式流式哈希，并在前后重复校验 Git 列表、状态、文件 metadata 与 namespace identity；文件数、单文件字节或累计字节安全上限一旦触发就 fail closed，不能用截断 fingerprint 证明测试有效。只有开始与结束 fingerprint 相同且最终 fingerprint 仍相同的 passed 测试才能绑定当前 revision。任何不一致都会递增/刷新 revision、发布 queued 失效状态并要求重测。正常成功要求至少一次必需测试在当前 revision 和 fingerprint 上 passed；Project 3 再把该证据提升为持久 generation/diff digest。
 
-每次成功替换后立即采集稳定 fingerprint/diff/fingerprint 快照并发布 neutral diff；terminal success/failure/cancel 再强制采集一次。terminal diff 任一文件被截断时仍保留快照，但以 `TERMINAL_DIFF_TRUNCATED` 拒绝 Completed。模型轮数/工具调用耗尽使用 retryable `AGENT_STEP_LIMIT_REACHED`，provider/context/tool-result 字节耗尽使用 retryable `AGENT_CONTEXT_LIMIT_REACHED`。
+每次成功替换后立即采集稳定 fingerprint/diff/fingerprint 快照并发布 neutral diff；terminal success/failure/cancel 再强制采集一次。terminal diff 任一文件被截断时仍保留快照，但以 `TERMINAL_DIFF_TRUNCATED` 拒绝 Completed。
+
+生产循环最多允许 20 轮模型响应和 32 次工具调用。名义工具预留使用整数运算
+`min(max_tools, clamp(max_tools / 4, 3, 8))`，名义模型响应预留使用
+`min(max_models, clamp(max_models / 4, 4, 5))`；因此生产配置正好预留 8 次工具调用和
+5 轮模型响应。每轮请求前都重写首条系统消息，明确当前工作区修订号、精确剩余额度
+（模型响应数包含本轮）和当前阶段；消息中展示的工具与模型响应预留分别再与对应的当前
+剩余额度取较小值，不能宣称预留了已经不存在的额度。
+
+收敛状态机包括以下阶段：
+
+1. 探索：`tool_choice="auto"`，只检查任务必需内容，不消耗验证预留；
+2. 强制验证：逻辑 `tool_choice` 必须且只能接受一个 `cargo_test`；严格模式在线路上
+   使用命名 `cargo_test`，`required_as_required` 使用 `"required"`，`required_as_auto`
+   使用 `"auto"`；两种显式兼容模式都只暴露 `cargo_test` 定义；
+3. 修复：当前修订的 `cargo_test` 失败后，只有剩余模型响应至少为 3 且剩余工具调用至少
+   为 2 时才使用 `tool_choice="auto"` 进入本阶段；根据失败证据做定向修复，要求在修订
+   变化前不要重复相同测试，并在批次执行前原子保留至少 1 次工具调用用于重测；
+4. 优先最终：当前修订通过后仍使用 `tool_choice="auto"`，但系统策略要求不再调用工具，
+   立即返回最终文本；
+5. 最终专用：仅当工具额度为零且当前修订仍有有效通过证据时使用
+   `tool_choice="none"`，只允许最终文本；进入本阶段前必须重新采集工作区指纹，只有
+   指纹未变、通过证据仍绑定当前修订时才可继续。仅剩最后一轮模型响应不构成进入条件。
+
+探索阶段完成整批原子校验后，如果一个批次会越过工具调用预留线，无论其中是否包含
+`cargo_test`，整个批次都零执行：不扣减工具调用额度、不记录调用 ID，也不写入对话
+记录；已经收到的模型响应及其提供方字节仍照常计入预算。下一轮直接进入强制验证。
+修复批次也在执行前原子校验剩余预算；任何会占用最后 1 次重测工具的批次都不会执行，
+并以步骤额度耗尽结束。测试失败后仅在 3 轮模型响应和 2 次工具调用的最低剩余额度下
+进入修复；成功替换或任何工作区指纹变化都会产生新修订并使旧测试通过证据失效，完成前
+必须对新修订重新执行 `cargo_test`。若修复或测试过程造成当前修订不同于最近一次已测试
+修订，状态机下一轮立即进入强制验证；线路按配置发送命名 `cargo_test`、`"required"` 或
+`"auto"`，后两者都只携带唯一的 `cargo_test` 定义，不会重新进入探索。只有最终文本、当前修订的通过证据和终态
+指纹三者一致时才能 Completed。
+模型轮数/工具调用耗尽使用 retryable
+`AGENT_STEP_LIMIT_REACHED`，provider/context/tool-result 字节耗尽使用 retryable
+`AGENT_CONTEXT_LIMIT_REACHED`。
 
 停止条件：
 
@@ -290,7 +369,7 @@ Project 2 不新增 chain-of-thought、provider 原始消息或任意 JSON 事�
 - `PROVIDER_UNAUTHORIZED`
 - `PROVIDER_RATE_LIMITED`
 - `PROVIDER_RESPONSE_INVALID`
-- `PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS`
+- `PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED`
 - `AGENT_STEP_LIMIT_REACHED`
 - `AGENT_CONTEXT_LIMIT_REACHED`
 
@@ -303,10 +382,10 @@ Project 2 不新增 chain-of-thought、provider 原始消息或任意 JSON 事�
 1. runtime 单元测试：路径规范化、`.git` 保护、symlink/junction 静态与竞态逃逸、digest 冲突、原子替换、输出截断、环境白名单；
 2. process 集成测试：成功、非零退出、timeout、cancellation、孙进程清理，覆盖 Windows 和 Unix；
 3. Git 集成测试：dirty 原仓库不进入 worktree、分支/目录唯一、retry 隔离、创建失败恢复、hook 不执行、外部 filter/config 拒绝、external diff/textconv 不执行；
-4. provider contract 测试：本地 mock HTTP server 验证 request schema、tool_call_id、鉴权脱敏、读取前 body 上限、禁止 redirect/自动解压和错误映射；
-5. core 状态机测试：工具循环、预算、非法工具、取消和 terminal 采集；
-6. app 集成测试：真实 `CodingAgentRunner` 通过既有 sink 产生可重放 plan/activity/diff/tests；
-7. 离线端到端：临时 Rust Git repo + mock provider，模型脚本读取文件、替换内容、执行 `cargo test`，最终 task Completed 且原工作目录不变；另测“test passed 后再次 replace”、“测试程序修改 tracked 文件后退出 0”和外部进程在测试后修改文件都会使旧结果失效；
+4. provider contract 测试：本地 mock HTTP server 验证 request schema、三种 `tool_choice` 的精确编码与响应约束、严格默认值、两种兼容模式只改写强制验证线路并发送唯一 `cargo_test` 且仍执行 exact-one 校验、有序 tool-call 批次及全部 `tool_call_id`、鉴权脱敏、读取前 body 上限、禁止 redirect/自动解压和错误映射；配置测试另验证默认 HTTPS、显式私网/ULA/回环 IP HTTP，以及拒绝未选择的 HTTP、DNS、公网、链路本地、错误类型和显式 `null`；
+5. core 状态机测试：批次原子预检、串行工具循环、最终预留公式及当前剩余额度显示上限、20/32 生产预算下的 8/5 验证预留、包含或不包含 `cargo_test` 的跨预留线批次均零执行、修复阶段的 3/2 最低剩余额度及原子保留 1 次重测工具、修复或测试造成修订变化后立即强制重测、工具额度归零后刷新指纹再进入只接受最终文本的最终专用阶段、非法工具、取消和 terminal 采集；
+6. app 集成测试：真实 `CodingAgentRunner` 通过既有 sink 处理多调用批次并产生可重放 plan/activity/diff/tests；
+7. 离线端到端：临时 Rust Git repo + mock provider，模型脚本读取文件，在同一批次中依次替换内容和执行 `cargo test`，最终 task Completed 且原工作目录不变；另测“test passed 后再次 replace”、“测试程序修改 tracked 文件后退出 0”和外部进程在测试后修改文件都会使旧结果失效；
 8. 失败端到端：测试失败、provider 断连、超时、取消、输出洪泛和重启中断。
 
 默认 CI 不访问真实 provider。真实 provider smoke 只能显式启用且不得打印 secret。

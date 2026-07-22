@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use coding_agent_core::{
     ActivityEvent, ActivityLevel, AgentEvent, AgentLimits, DiffEvent, ModelMessage, ModelProvider,
-    ModelRequest, ModelResponse, PlanEvent, RuntimeError, TestEvent, TestStatus, ToolCall,
-    ToolRequest, ToolResult, ToolRuntime,
+    ModelRequest, ModelResponse, ModelToolChoice, PlanEvent, RuntimeError, TestEvent, TestStatus,
+    ToolCall, ToolCallBatch, ToolRequest, ToolResult, ToolRuntime,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -21,9 +21,19 @@ impl ModelProvider for ScriptedProvider {
     ) -> Result<ModelResponse, coding_agent_core::ProviderError> {
         assert!(!cancellation.is_cancelled());
         self.requests.lock().unwrap().push(request);
-        Ok(ModelResponse::ToolCall(ToolCall {
-            id: "call-1".to_owned(),
-            request: ToolRequest::GitStatus,
+        Ok(ModelResponse::ToolCalls(ToolCallBatch {
+            assistant_content: None,
+            reasoning_content: None,
+            calls: vec![
+                ToolCall {
+                    id: "call-1".to_owned(),
+                    request: ToolRequest::GitStatus,
+                },
+                ToolCall {
+                    id: "call-2".to_owned(),
+                    request: ToolRequest::GitDiff,
+                },
+            ],
         }))
     }
 }
@@ -47,41 +57,53 @@ impl ToolRuntime for ScriptedRuntime {
 }
 
 #[tokio::test]
-async fn provider_and_runtime_ports_preserve_one_tool_call_id() {
+async fn provider_and_runtime_ports_preserve_an_ordered_tool_call_batch() {
     let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::default());
     let runtime: Arc<dyn ToolRuntime> = Arc::new(ScriptedRuntime::default());
     let cancellation = CancellationToken::new();
     let request = ModelRequest {
         messages: vec![ModelMessage::user("inspect the repository")],
+        tool_choice: ModelToolChoice::Auto,
     };
 
     let response = provider
         .complete(request, cancellation.clone())
         .await
         .unwrap();
-    let ModelResponse::ToolCall(call) = response else {
-        panic!("scripted provider must return exactly one call");
+    let ModelResponse::ToolCalls(batch) = response else {
+        panic!("scripted provider must return a tool-call batch");
     };
-    let result = runtime
-        .invoke(call.request.clone(), cancellation.clone())
-        .await
-        .unwrap();
-    let assistant_message = ModelMessage::AssistantToolCall(call.clone());
-    let tool_message = ModelMessage::tool_result(call.id.clone(), result.content());
+    let mut tool_messages = Vec::new();
+    for call in &batch.calls {
+        let result = runtime
+            .invoke(call.request.clone(), cancellation.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.content(), "clean");
+        assert!(!result.truncated());
+        tool_messages.push(ModelMessage::tool_result(call.id.clone(), result.content()));
+    }
+    let assistant_message = ModelMessage::AssistantToolCalls(batch.clone());
 
-    assert_eq!(call.id, "call-1");
-    assert_eq!(result.content(), "clean");
-    assert!(!result.truncated());
+    assert_eq!(
+        batch
+            .calls
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>(),
+        ["call-1", "call-2"]
+    );
     assert!(matches!(
         assistant_message,
-        ModelMessage::AssistantToolCall(ToolCall { ref id, .. }) if id == "call-1"
+        ModelMessage::AssistantToolCalls(ToolCallBatch { ref calls, .. })
+            if calls.len() == 2
     ));
     assert!(matches!(
-        tool_message,
+        &tool_messages[1],
         ModelMessage::ToolResult {
-            ref tool_call_id,
+            tool_call_id,
             ..
-        } if tool_call_id == "call-1"
+        } if tool_call_id == "call-2"
     ));
 }
 

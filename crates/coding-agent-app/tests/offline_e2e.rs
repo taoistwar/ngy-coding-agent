@@ -54,6 +54,8 @@ static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Success,
+    RequiredAsRequiredSuccess,
+    RequiredAsAutoSuccess,
     TestFailure,
     ReplaceAfterPass,
     PathEscape,
@@ -184,9 +186,70 @@ async fn provider_request(
             }
             _ => panic!("unexpected path-escape provider request {call}"),
         },
+        Scenario::RequiredAsRequiredSuccess => {
+            required_compatibility_response(&body, call, "required")
+        }
+        Scenario::RequiredAsAutoSuccess => required_compatibility_response(&body, call, "auto"),
         Scenario::Success | Scenario::TestFailure | Scenario::ReplaceAfterPass => {
             scripted_coding_response(&state, &body, call)
         }
+    }
+}
+
+fn required_compatibility_response(
+    request: &serde_json::Value,
+    call: usize,
+    forced_wire: &str,
+) -> Response<Body> {
+    match call {
+        0 => tool_response(
+            "compat-read-source",
+            "read_file",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "start_line": 1,
+                "end_line": 20
+            }),
+        ),
+        1 => {
+            let result = latest_tool_payload(request);
+            let digest = result["sha256"]
+                .as_str()
+                .expect("read_file result carries SHA-256");
+            tool_response(
+                "compat-replace-source",
+                "replace_file",
+                serde_json::json!({
+                    "path": "src/lib.rs",
+                    "expected_sha256": digest,
+                    "content": CHANGED_SOURCE
+                }),
+            )
+        }
+        2 => {
+            assert_latest_tool_status(request, "succeeded");
+            assert_eq!(request["tool_choice"], forced_wire);
+            let tools = request["tools"]
+                .as_array()
+                .expect("compatibility request tools array");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0]["function"]["name"], "cargo_test");
+            tool_response(
+                "compat-test-answer",
+                "cargo_test",
+                serde_json::json!({
+                    "package": PACKAGE,
+                    "test": "answer",
+                    "timeout_ms": 30_000
+                }),
+            )
+        }
+        3 => {
+            assert_latest_tool_status(request, "succeeded");
+            assert_eq!(request["tool_choice"], "auto");
+            final_response("compatibility task finished")
+        }
+        _ => panic!("unexpected compatibility provider request {call}"),
     }
 }
 
@@ -220,6 +283,28 @@ fn scripted_coding_response(
             } else {
                 CHANGED_SOURCE
             };
+            if state.scenario == Scenario::Success {
+                return tool_batch_response(vec![
+                    (
+                        "replace-source",
+                        "replace_file",
+                        serde_json::json!({
+                            "path": "src/lib.rs",
+                            "expected_sha256": digest,
+                            "content": content
+                        }),
+                    ),
+                    (
+                        "test-answer",
+                        "cargo_test",
+                        serde_json::json!({
+                            "package": PACKAGE,
+                            "test": "answer",
+                            "timeout_ms": 30_000
+                        }),
+                    ),
+                ]);
+            }
             tool_response(
                 "replace-source",
                 "replace_file",
@@ -229,6 +314,21 @@ fn scripted_coding_response(
                     "content": content
                 }),
             )
+        }
+        2 if state.scenario == Scenario::Success => {
+            assert_tool_status(request, "replace-source", "succeeded");
+            assert_tool_status(request, "test-answer", "succeeded");
+            let assistant = request["messages"]
+                .as_array()
+                .expect("provider messages array")
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "assistant")
+                .expect("assistant batch message");
+            assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 2);
+            assert_eq!(assistant["tool_calls"][0]["id"], "replace-source");
+            assert_eq!(assistant["tool_calls"][1]["id"], "test-answer");
+            final_response("offline task finished")
         }
         2 => {
             let result = latest_tool_payload(request);
@@ -278,6 +378,22 @@ fn scripted_coding_response(
         }
         4 if state.scenario == Scenario::ReplaceAfterPass => {
             assert_latest_tool_status(request, "succeeded");
+            assert_eq!(
+                request["tool_choice"]["function"]["name"], "cargo_test",
+                "a post-pass replacement must force immediate revalidation"
+            );
+            tool_response(
+                "retest-after-pass",
+                "cargo_test",
+                serde_json::json!({
+                    "package": PACKAGE,
+                    "test": "answer",
+                    "timeout_ms": 30_000
+                }),
+            )
+        }
+        5 if state.scenario == Scenario::ReplaceAfterPass => {
+            assert_latest_tool_status(request, "failed");
             final_response("stale test must not prove completion")
         }
         _ => panic!("unexpected scripted provider request {call}"),
@@ -300,6 +416,20 @@ fn assert_latest_tool_status(request: &serde_json::Value, expected: &str) {
     assert!(
         content.starts_with(&format!("[tool_status={expected};")),
         "expected a {expected} tool result, got: {content}"
+    );
+}
+
+fn assert_tool_status(request: &serde_json::Value, tool_call_id: &str, expected: &str) {
+    let content = request["messages"]
+        .as_array()
+        .expect("provider messages array")
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == tool_call_id)
+        .and_then(|message| message["content"].as_str())
+        .expect("matching tool result");
+    assert!(
+        content.starts_with(&format!("[tool_status={expected};")),
+        "expected {tool_call_id} to be {expected}, got: {content}"
     );
 }
 
@@ -332,6 +462,39 @@ fn tool_response(id: &str, name: &str, arguments: serde_json::Value) -> Response
                         "arguments": serde_json::to_string(&arguments).unwrap()
                     }
                 }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+}
+
+fn tool_batch_response(calls: Vec<(&str, &str, serde_json::Value)>) -> Response<Body> {
+    let calls = calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, name, arguments))| {
+            serde_json::json!({
+                "index": index,
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": serde_json::to_string(&arguments).unwrap()
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json_response(serde_json::json!({
+        "id": "chatcmpl-batch",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "offline-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Applying the change and validating it.",
+                "tool_calls": calls
             },
             "finish_reason": "tool_calls"
         }]
@@ -506,8 +669,20 @@ impl E2eFixture {
             provider_client,
             attempts,
             Arc::new(SystemWallClock),
-            AgentLimits::try_new(16, 32, 4 * 1024 * 1024, 512 * 1024)
-                .expect("valid E2E agent limits"),
+            AgentLimits::try_new(
+                16,
+                if matches!(
+                    scenario,
+                    Scenario::RequiredAsRequiredSuccess | Scenario::RequiredAsAutoSuccess
+                ) {
+                    5
+                } else {
+                    32
+                },
+                4 * 1024 * 1024,
+                512 * 1024,
+            )
+            .expect("valid E2E agent limits"),
             CodingAgentRunnerConfig::try_new(Duration::from_secs(10), Duration::from_millis(10))
                 .expect("valid E2E runner config"),
         ));
@@ -662,10 +837,16 @@ fn normalized_path_text(value: &str) -> String {
 }
 
 fn provider_client(provider: &MockProvider, scenario: Scenario) -> ChatCompletionsClient {
+    let tool_choice_compatibility = match scenario {
+        Scenario::RequiredAsRequiredSuccess => "required_as_required",
+        Scenario::RequiredAsAutoSuccess => "required_as_auto",
+        _ => "strict",
+    };
     let encoded = serde_json::to_vec(&serde_json::json!({
         "base_url": provider.base_url(),
         "model": "offline-model",
         "api_key": API_KEY,
+        "tool_choice_compatibility": tool_choice_compatibility,
     }))
     .unwrap();
     let config = ProviderConfig::from_json_allow_loopback_http_for_test(&encoded)
@@ -885,7 +1066,44 @@ async fn offline_success_runs_real_pipeline_and_persisted_event_dto_replay() {
             .collect::<Vec<_>>(),
         "persisted event DTO replay diverged from the task event stream"
     );
-    assert_eq!(fixture.provider.state.calls.load(Ordering::Acquire), 4);
+    assert_eq!(fixture.provider.state.calls.load(Ordering::Acquire), 3);
+}
+
+#[tokio::test]
+async fn compatibility_modes_force_one_visible_cargo_test_without_an_http_retry() {
+    let _guard = E2E_LOCK.lock().await;
+    for scenario in [
+        Scenario::RequiredAsRequiredSuccess,
+        Scenario::RequiredAsAutoSuccess,
+    ] {
+        let fixture = E2eFixture::new(scenario).await;
+        let task = fixture
+            .enqueue("change the answer and validate through the compatibility mode")
+            .await;
+
+        let completed = fixture
+            .wait_for_status(task.id, TaskStatus::Completed)
+            .await;
+        assert!(completed.failure.is_none(), "scenario={scenario:?}");
+        let detail = fixture.store.task_detail(task.id).await.unwrap().unwrap();
+        assert_eq!(
+            detail.diff.as_ref().expect("completed task diff").revision,
+            1
+        );
+        assert_eq!(
+            detail.tests.as_ref().expect("completed task tests").status,
+            TestStatus::Passed
+        );
+
+        let requests = fixture.provider.state.requests();
+        assert_eq!(
+            requests.len(),
+            4,
+            "compatibility mode must not add an HTTP retry; scenario={scenario:?}"
+        );
+        assert_eq!(fixture.provider.state.calls.load(Ordering::Acquire), 4);
+        fixture.assert_isolation_invariants(task.id).await;
+    }
 }
 
 #[tokio::test]
@@ -916,7 +1134,9 @@ async fn real_test_failure_replace_after_pass_and_path_escape_fail_closed() {
                 assert_eq!(detail.tests.unwrap().status, TestStatus::Failed);
             }
             Scenario::ReplaceAfterPass => {
-                assert_eq!(detail.tests.unwrap().status, TestStatus::Queued);
+                assert_eq!(detail.tests.unwrap().status, TestStatus::Failed);
+                let requests = fixture.provider.state.requests();
+                assert_eq!(requests[4]["tool_choice"]["function"]["name"], "cargo_test");
                 assert_eq!(
                     std::fs::read_to_string(
                         fixture

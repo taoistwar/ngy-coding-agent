@@ -1,30 +1,54 @@
-use coding_agent_core::{
-    ModelMessage, ModelRequest, ModelResponse, ProviderError, ToolCall, ToolRequest,
-};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
-use crate::error::{invalid_request, invalid_response, unsupported_multiple_tool_calls};
+use coding_agent_core::{
+    ModelMessage, ModelRequest, ModelResponse, ModelToolChoice, ProviderError, ToolCall,
+    ToolCallBatch, ToolRequest,
+};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Value, error::Category, json};
+
+use crate::config::{ProviderThinkingMode, ProviderToolChoiceCompatibility};
+use crate::error::{
+    invalid_request, invalid_response, rejected_response_reasoning, tool_choice_violated,
+    unsupported_response_finish, unsupported_response_schema,
+};
 
 pub fn encode_chat_completions_request(
     model: &str,
     request: &ModelRequest,
 ) -> Result<Vec<u8>, ProviderError> {
+    encode_chat_completions_request_with_options(
+        model,
+        request,
+        None,
+        ProviderToolChoiceCompatibility::Strict,
+    )
+}
+
+pub(crate) fn encode_chat_completions_request_with_options(
+    model: &str,
+    request: &ModelRequest,
+    thinking_mode: Option<ProviderThinkingMode>,
+    tool_choice_compatibility: ProviderToolChoiceCompatibility,
+) -> Result<Vec<u8>, ProviderError> {
     if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
         return Err(invalid_request("The provider model is invalid."));
     }
 
+    validate_tool_call_round_trips(&request.messages)?;
     let messages = request
         .messages
         .iter()
         .map(encode_message)
         .collect::<Result<Vec<_>, _>>()?;
-    validate_tool_call_round_trips(&request.messages)?;
     let wire = ChatCompletionsRequestWire {
         model,
         messages,
-        tools: tool_definitions(),
-        tool_choice: "auto",
+        tools: tool_definitions_for_request(request.tool_choice, tool_choice_compatibility),
+        tool_choice: encode_tool_choice(request.tool_choice, tool_choice_compatibility),
+        thinking: thinking_mode.map(|mode| ThinkingWire {
+            kind: mode.request_value(),
+        }),
         parallel_tool_calls: false,
         stream: false,
     };
@@ -36,13 +60,32 @@ pub fn decode_chat_completions_response(
     encoded: &[u8],
     max_response_bytes: usize,
 ) -> Result<ModelResponse, ProviderError> {
+    decode_chat_completions_response_with_tool_choice(
+        encoded,
+        max_response_bytes,
+        ModelToolChoice::Auto,
+        None,
+    )
+}
+
+pub(crate) fn decode_chat_completions_response_with_tool_choice(
+    encoded: &[u8],
+    max_response_bytes: usize,
+    tool_choice: ModelToolChoice,
+    thinking_mode: Option<ProviderThinkingMode>,
+) -> Result<ModelResponse, ProviderError> {
     if encoded.len() > max_response_bytes {
         return Err(invalid_response(
             "The provider response exceeded the configured byte limit.",
         ));
     }
-    let response: ChatCompletionsResponseWire = serde_json::from_slice(encoded)
-        .map_err(|_| invalid_response("The provider response JSON is invalid."))?;
+    let response: ChatCompletionsResponseWire =
+        serde_json::from_slice(encoded).map_err(|error| match error.classify() {
+            Category::Data => unsupported_response_schema(),
+            Category::Syntax | Category::Eof | Category::Io => {
+                invalid_response("The provider response JSON is invalid.")
+            }
+        })?;
     if response.choices.len() != 1 {
         return Err(invalid_response(
             "The provider response must contain exactly one choice.",
@@ -69,46 +112,71 @@ pub fn decode_chat_completions_response(
             "The provider response message role is unsupported.",
         ));
     }
-    if choice.message.tool_calls.len() > 1 {
-        return Err(unsupported_multiple_tool_calls());
+    let reasoning_content = choice
+        .message
+        .reasoning_content
+        .filter(|content| !content.is_empty());
+    if reasoning_content.is_some() && thinking_mode != Some(ProviderThinkingMode::Enabled) {
+        return Err(rejected_response_reasoning());
     }
-
-    if let Some(call) = choice.message.tool_calls.into_iter().next() {
-        if choice
+    let has_tool_calls = !choice.message.tool_calls.is_empty();
+    match tool_choice {
+        ModelToolChoice::Auto => {}
+        ModelToolChoice::None if has_tool_calls => return Err(tool_choice_violated()),
+        ModelToolChoice::None => {}
+        ModelToolChoice::RequiredCargoTest
+            if choice.message.tool_calls.len() != 1
+                || choice.message.tool_calls[0].function.name != "cargo_test" =>
+        {
+            return Err(tool_choice_violated());
+        }
+        ModelToolChoice::RequiredCargoTest => {}
+    }
+    if has_tool_calls {
+        let assistant_content = choice.message.content;
+        if choice.finish_reason.as_deref() != Some("tool_calls") {
+            return Err(unsupported_response_finish());
+        }
+        let mut ids = BTreeSet::new();
+        let calls = choice
             .message
-            .content
-            .as_deref()
-            .is_some_and(|content| !content.is_empty())
-        {
-            return Err(invalid_response(
-                "The provider response ambiguously contains text and a tool call.",
-            ));
-        }
-        if choice.finish_reason.as_deref() != Some("tool_calls")
-            || call.kind != "function"
-            || call.id.is_empty()
-            || call.id.len() > 256
-            || call.id.chars().any(char::is_control)
-        {
-            return Err(invalid_response(
-                "The provider tool call envelope is invalid.",
-            ));
-        }
-        let request = decode_tool_request(&call.function.name, &call.function.arguments)?;
-        return Ok(ModelResponse::ToolCall(ToolCall {
-            id: call.id,
-            request,
+            .tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(expected_index, call)| {
+                if call.kind != "function"
+                    || call.index.is_some_and(|index| index != expected_index)
+                    || call.id.is_empty()
+                    || call.id.len() > 256
+                    || call.id.chars().any(char::is_control)
+                    || !ids.insert(call.id.clone())
+                {
+                    return Err(invalid_response(
+                        "The provider tool call envelope is invalid.",
+                    ));
+                }
+                let request = decode_tool_request(&call.function.name, &call.function.arguments)?;
+                Ok(ToolCall {
+                    id: call.id,
+                    request,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(ModelResponse::ToolCalls(ToolCallBatch {
+            assistant_content,
+            reasoning_content,
+            calls,
         }));
     }
 
+    if choice.finish_reason.as_deref() != Some("stop") {
+        return Err(unsupported_response_finish());
+    }
     let content = choice
         .message
         .content
         .ok_or_else(|| invalid_response("The provider response has no supported content."))?;
-    if choice.finish_reason.as_deref() != Some("stop")
-        || content.is_empty()
-        || content.len() > max_response_bytes
-    {
+    if content.is_empty() || content.len() > max_response_bytes {
         return Err(invalid_response(
             "The provider final response content is invalid.",
         ));
@@ -117,33 +185,52 @@ pub fn decode_chat_completions_response(
 }
 
 fn validate_tool_call_round_trips(messages: &[ModelMessage]) -> Result<(), ProviderError> {
-    let mut pending: Option<&str> = None;
+    let mut pending = Vec::new();
+    let mut next_result = 0usize;
+    let mut seen = BTreeSet::new();
     for message in messages {
         match message {
-            ModelMessage::AssistantToolCall(call) if pending.is_none() => {
-                pending = Some(call.id.as_str());
+            ModelMessage::AssistantToolCalls(batch) if pending.is_empty() => {
+                if batch.calls.is_empty()
+                    || batch
+                        .calls
+                        .iter()
+                        .any(|call| !seen.insert(call.id.as_str()))
+                {
+                    return Err(invalid_request(
+                        "Provider tool call batches must be non-empty with unique IDs.",
+                    ));
+                }
+                pending.extend(batch.calls.iter().map(|call| call.id.as_str()));
+                next_result = 0;
             }
             ModelMessage::ToolResult { tool_call_id, .. }
-                if pending.is_some_and(|expected| expected == tool_call_id) =>
+                if pending
+                    .get(next_result)
+                    .is_some_and(|expected| *expected == tool_call_id) =>
             {
-                pending = None;
+                next_result += 1;
+                if next_result == pending.len() {
+                    pending.clear();
+                    next_result = 0;
+                }
             }
-            ModelMessage::AssistantToolCall(_) | ModelMessage::ToolResult { .. } => {
+            ModelMessage::AssistantToolCalls(_) | ModelMessage::ToolResult { .. } => {
                 return Err(invalid_request(
-                    "Provider tool calls and results must have one matching ID.",
+                    "Provider tool calls and results must have matching ordered IDs.",
                 ));
             }
-            _ if pending.is_some() => {
+            _ if !pending.is_empty() => {
                 return Err(invalid_request(
-                    "A provider tool result must immediately follow its tool call.",
+                    "Provider tool results must immediately follow their tool calls.",
                 ));
             }
             _ => {}
         }
     }
-    if pending.is_some() {
+    if !pending.is_empty() {
         return Err(invalid_request(
-            "A provider tool call is missing its matching result.",
+            "A provider tool call batch is missing matching results.",
         ));
     }
     Ok(())
@@ -154,9 +241,39 @@ struct ChatCompletionsRequestWire<'a> {
     model: &'a str,
     messages: Vec<Value>,
     tools: Vec<Value>,
-    tool_choice: &'static str,
+    tool_choice: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingWire>,
     parallel_tool_calls: bool,
     stream: bool,
+}
+
+fn encode_tool_choice(
+    choice: ModelToolChoice,
+    compatibility: ProviderToolChoiceCompatibility,
+) -> Value {
+    match (choice, compatibility) {
+        (
+            ModelToolChoice::RequiredCargoTest,
+            ProviderToolChoiceCompatibility::RequiredAsRequired,
+        ) => {
+            json!("required")
+        }
+        (ModelToolChoice::RequiredCargoTest, ProviderToolChoiceCompatibility::RequiredAsAuto) => {
+            json!("auto")
+        }
+        (ModelToolChoice::Auto, _) => json!("auto"),
+        (ModelToolChoice::None, _) => json!("none"),
+        (ModelToolChoice::RequiredCargoTest, _) => {
+            json!({"type": "function", "function": {"name": "cargo_test"}})
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ThinkingWire {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 fn encode_message(message: &ModelMessage) -> Result<Value, ProviderError> {
@@ -164,23 +281,40 @@ fn encode_message(message: &ModelMessage) -> Result<Value, ProviderError> {
         ModelMessage::System(content) => Ok(json!({"role": "system", "content": content})),
         ModelMessage::User(content) => Ok(json!({"role": "user", "content": content})),
         ModelMessage::Assistant(content) => Ok(json!({"role": "assistant", "content": content})),
-        ModelMessage::AssistantToolCall(call) => {
-            if call.id.is_empty() || call.id.len() > 256 || call.id.chars().any(char::is_control) {
-                return Err(invalid_request("The provider tool call ID is invalid."));
+        ModelMessage::AssistantToolCalls(batch) => {
+            if batch.calls.is_empty() {
+                return Err(invalid_request("The provider tool call batch is empty."));
             }
-            let (name, arguments) = encode_tool_request(&call.request);
-            let arguments = serde_json::to_string(&arguments).map_err(|_| {
-                invalid_request("The provider tool call arguments could not be encoded.")
-            })?;
-            Ok(json!({
+            let calls = batch
+                .calls
+                .iter()
+                .map(|call| {
+                    if call.id.is_empty()
+                        || call.id.len() > 256
+                        || call.id.chars().any(char::is_control)
+                    {
+                        return Err(invalid_request("The provider tool call ID is invalid."));
+                    }
+                    let (name, arguments) = encode_tool_request(&call.request);
+                    let arguments = serde_json::to_string(&arguments).map_err(|_| {
+                        invalid_request("The provider tool call arguments could not be encoded.")
+                    })?;
+                    Ok(json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    }))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut encoded = json!({
                 "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": call.id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": arguments}
-                }]
-            }))
+                "content": batch.assistant_content.as_deref(),
+                "tool_calls": calls
+            });
+            if let Some(reasoning) = batch.reasoning_content.as_deref() {
+                encoded["reasoning_content"] = json!(reasoning);
+            }
+            Ok(encoded)
         }
         ModelMessage::ToolResult {
             tool_call_id,
@@ -420,12 +554,23 @@ struct AssistantMessageWire {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_tool_calls")]
     tool_calls: Vec<ToolCallWire>,
+}
+
+fn deserialize_tool_calls<'de, D>(deserializer: D) -> Result<Vec<ToolCallWire>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Vec<ToolCallWire>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolCallWire {
+    #[serde(default)]
+    index: Option<usize>,
     id: String,
     #[serde(rename = "type")]
     kind: String,
@@ -437,6 +582,24 @@ struct ToolCallWire {
 struct FunctionCallWire {
     name: String,
     arguments: String,
+}
+
+fn tool_definitions_for_request(
+    choice: ModelToolChoice,
+    compatibility: ProviderToolChoiceCompatibility,
+) -> Vec<Value> {
+    if matches!(
+        (choice, compatibility),
+        (
+            ModelToolChoice::RequiredCargoTest,
+            ProviderToolChoiceCompatibility::RequiredAsRequired
+                | ProviderToolChoiceCompatibility::RequiredAsAuto
+        )
+    ) {
+        vec![cargo_test_tool_definition()]
+    } else {
+        tool_definitions()
+    }
 }
 
 fn tool_definitions() -> Vec<Value> {
@@ -491,16 +654,7 @@ fn tool_definitions() -> Vec<Value> {
             }),
             &["timeout_ms"],
         ),
-        function_tool(
-            "cargo_test",
-            "Run the bounded typed Cargo test operation.",
-            json!({
-                "package": {"type": ["string", "null"]},
-                "test": {"type": ["string", "null"]},
-                "timeout_ms": {"type": "integer", "minimum": 1}
-            }),
-            &["timeout_ms"],
-        ),
+        cargo_test_tool_definition(),
         function_tool(
             "git_status",
             "Read the sanitized repository status.",
@@ -514,6 +668,19 @@ fn tool_definitions() -> Vec<Value> {
             &[],
         ),
     ]
+}
+
+fn cargo_test_tool_definition() -> Value {
+    function_tool(
+        "cargo_test",
+        "Run the bounded typed Cargo test operation.",
+        json!({
+            "package": {"type": ["string", "null"]},
+            "test": {"type": ["string", "null"]},
+            "timeout_ms": {"type": "integer", "minimum": 1}
+        }),
+        &["timeout_ms"],
+    )
 }
 
 fn function_tool(
@@ -535,4 +702,105 @@ fn function_tool(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enabled_thinking_round_trips_opaque_reasoning_for_tool_calls() {
+        let response = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":"opaque state","tool_calls":[{"id":"call-1","type":"function","function":{"name":"git_status","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let decoded = decode_chat_completions_response_with_tool_choice(
+            response,
+            response.len(),
+            ModelToolChoice::Auto,
+            Some(ProviderThinkingMode::Enabled),
+        )
+        .expect("enabled thinking accepts reasoning state");
+        let ModelResponse::ToolCalls(batch) = decoded else {
+            panic!("expected tool calls");
+        };
+        assert_eq!(batch.reasoning_content.as_deref(), Some("opaque state"));
+
+        let encoded = encode_chat_completions_request_with_options(
+            "coding-model",
+            &ModelRequest {
+                messages: vec![
+                    ModelMessage::AssistantToolCalls(batch),
+                    ModelMessage::tool_result("call-1", "clean"),
+                ],
+                tool_choice: ModelToolChoice::Auto,
+            },
+            Some(ProviderThinkingMode::Enabled),
+            ProviderToolChoiceCompatibility::Strict,
+        )
+        .expect("reasoning state is re-encoded");
+        let body: Value = serde_json::from_slice(&encoded).expect("request JSON");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["messages"][0]["reasoning_content"], "opaque state");
+    }
+
+    #[test]
+    fn required_as_required_changes_only_the_logical_required_wire() {
+        for (choice, expected_wire, expected_tool_count) in [
+            (ModelToolChoice::Auto, json!("auto"), 8),
+            (ModelToolChoice::None, json!("none"), 8),
+            (ModelToolChoice::RequiredCargoTest, json!("required"), 1),
+        ] {
+            let encoded = encode_chat_completions_request_with_options(
+                "coding-model",
+                &ModelRequest {
+                    messages: vec![ModelMessage::user("finish safely")],
+                    tool_choice: choice,
+                },
+                None,
+                ProviderToolChoiceCompatibility::RequiredAsRequired,
+            )
+            .expect("encode required compatibility request");
+            let body: Value = serde_json::from_slice(&encoded).expect("request JSON");
+
+            assert_eq!(body["tool_choice"], expected_wire);
+            let tools = body["tools"].as_array().expect("tools array");
+            assert_eq!(tools.len(), expected_tool_count);
+            if choice == ModelToolChoice::RequiredCargoTest {
+                assert_eq!(tools[0]["function"]["name"], "cargo_test");
+            }
+        }
+    }
+
+    #[test]
+    fn required_as_auto_changes_only_the_logical_required_wire() {
+        for (choice, expected_tool_count) in [
+            (ModelToolChoice::Auto, 8),
+            (ModelToolChoice::None, 8),
+            (ModelToolChoice::RequiredCargoTest, 1),
+        ] {
+            let encoded = encode_chat_completions_request_with_options(
+                "coding-model",
+                &ModelRequest {
+                    messages: vec![ModelMessage::user("finish safely")],
+                    tool_choice: choice,
+                },
+                Some(ProviderThinkingMode::Enabled),
+                ProviderToolChoiceCompatibility::RequiredAsAuto,
+            )
+            .expect("encode auto compatibility request");
+            let body: Value = serde_json::from_slice(&encoded).expect("request JSON");
+
+            assert_eq!(
+                body["tool_choice"],
+                match choice {
+                    ModelToolChoice::None => json!("none"),
+                    ModelToolChoice::Auto | ModelToolChoice::RequiredCargoTest => json!("auto"),
+                }
+            );
+            assert_eq!(body["thinking"]["type"], "enabled");
+            let tools = body["tools"].as_array().expect("tools array");
+            assert_eq!(tools.len(), expected_tool_count);
+            if choice == ModelToolChoice::RequiredCargoTest {
+                assert_eq!(tools[0]["function"]["name"], "cargo_test");
+            }
+        }
+    }
 }

@@ -119,7 +119,7 @@ Project 1 不调用模型、不修改仓库、不创建 worktree。它建立后�
 - 证据记录工作区 generation 或 diff digest；
 - 只有最终 generation 上的必需检查全部通过，任务才能进入可交付状态；
 - 新增独立于 `TaskStatus` 的持久质量门 `delivery_readiness`；只有 Reviewer 在最终 generation 上批准才可为 `ReviewApproved`，旧任务或缺失该字段一律视为 `Unreviewed`；
-- 模型工具调用保留 `tool_call_id`，并确定性处理 provider 返回的多调用结果。
+- 延续 Project 2 已实现的有序多调用 transcript 与 `tool_call_id` 语义，并确保三个角色之间不共享或重排调用批次。
 
 角色使用同一 provider 配置是允许的，但不得共享隐式对话历史。Reviewer 运行的命令仍只作用于任务 worktree。
 

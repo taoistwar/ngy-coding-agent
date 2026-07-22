@@ -40,11 +40,38 @@ pub struct ProviderConfig {
     chat_completions_url: Url,
     model: String,
     api_key: ApiKey,
+    thinking_mode: Option<ProviderThinkingMode>,
+    tool_choice_compatibility: ProviderToolChoiceCompatibility,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderThinkingMode {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderToolChoiceCompatibility {
+    #[default]
+    Strict,
+    RequiredAsRequired,
+    RequiredAsAuto,
+}
+
+impl ProviderThinkingMode {
+    pub(crate) const fn request_value(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 impl ProviderConfig {
     pub fn from_json(encoded: &[u8]) -> Result<Self, ProviderConfigError> {
-        Self::parse(encoded, BaseUrlPolicy::HttpsOnly)
+        Self::parse(encoded, BaseUrlPolicy::Configured)
     }
 
     /// Explicit escape hatch for local mock servers in tests.
@@ -74,6 +101,14 @@ impl ProviderConfig {
         &self.api_key
     }
 
+    pub const fn thinking_mode(&self) -> Option<ProviderThinkingMode> {
+        self.thinking_mode
+    }
+
+    pub const fn tool_choice_compatibility(&self) -> ProviderToolChoiceCompatibility {
+        self.tool_choice_compatibility
+    }
+
     pub fn redactor(&self) -> SecretRedactor {
         SecretRedactor::new().with_secret(self.api_key.expose_secret())
     }
@@ -87,7 +122,7 @@ impl ProviderConfig {
         let wire: ProviderConfigWire = serde_json::from_slice(encoded)
             .map_err(|_| ProviderConfigError::new(ProviderConfigErrorReason::InvalidDocument))?;
 
-        let base_url = validate_base_url(&wire.base_url, policy)?;
+        let base_url = validate_base_url(&wire.base_url, wire.allow_insecure_http, policy)?;
         if wire.model.is_empty()
             || wire.model.len() > MAX_MODEL_BYTES
             || wire.model.trim() != wire.model
@@ -117,6 +152,8 @@ impl ProviderConfig {
             chat_completions_url,
             model: wire.model,
             api_key: ApiKey(wire.api_key),
+            thinking_mode: wire.thinking,
+            tool_choice_compatibility: wire.tool_choice_compatibility,
         })
     }
 }
@@ -144,15 +181,25 @@ struct ProviderConfigWire {
     base_url: String,
     model: String,
     api_key: String,
+    #[serde(default)]
+    allow_insecure_http: bool,
+    #[serde(default)]
+    thinking: Option<ProviderThinkingMode>,
+    #[serde(default)]
+    tool_choice_compatibility: ProviderToolChoiceCompatibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BaseUrlPolicy {
-    HttpsOnly,
+    Configured,
     HttpsOrLoopbackHttpForTests,
 }
 
-fn validate_base_url(raw: &str, policy: BaseUrlPolicy) -> Result<Url, ProviderConfigError> {
+fn validate_base_url(
+    raw: &str,
+    allow_insecure_http: bool,
+    policy: BaseUrlPolicy,
+) -> Result<Url, ProviderConfigError> {
     if raw.is_empty() || raw.len() > MAX_BASE_URL_BYTES || raw.chars().any(char::is_control) {
         return Err(ProviderConfigError::new(
             ProviderConfigErrorReason::InvalidBaseUrl,
@@ -184,8 +231,9 @@ fn validate_base_url(raw: &str, policy: BaseUrlPolicy) -> Result<Url, ProviderCo
     match url.scheme() {
         "https" => {}
         "http"
-            if policy == BaseUrlPolicy::HttpsOrLoopbackHttpForTests
-                && is_ip_literal_loopback(&url) => {}
+            if (allow_insecure_http && is_ip_literal_private_or_loopback(&url))
+                || (policy == BaseUrlPolicy::HttpsOrLoopbackHttpForTests
+                    && is_ip_literal_loopback(&url)) => {}
         _ => {
             return Err(ProviderConfigError::new(
                 ProviderConfigErrorReason::InsecureBaseUrl,
@@ -219,6 +267,14 @@ fn is_ip_literal_loopback(url: &Url) -> bool {
     }
 }
 
+fn is_ip_literal_private_or_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback() || address.is_private(),
+        Some(Host::Ipv6(address)) => address.is_loopback() || address.is_unique_local(),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderConfigErrorReason {
     DocumentTooLarge,
@@ -238,7 +294,9 @@ impl ProviderConfigErrorReason {
             Self::DocumentTooLarge => "the configuration document is too large",
             Self::InvalidDocument => "the configuration document does not match the schema",
             Self::InvalidBaseUrl => "the provider base URL is invalid",
-            Self::InsecureBaseUrl => "the provider base URL must use HTTPS",
+            Self::InsecureBaseUrl => {
+                "the provider base URL must use HTTPS or explicitly allow private-network HTTP"
+            }
             Self::BaseUrlUserInfo => "the provider base URL must not contain user information",
             Self::BaseUrlQuery => "the provider base URL must not contain a query",
             Self::BaseUrlFragment => "the provider base URL must not contain a fragment",

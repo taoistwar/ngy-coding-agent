@@ -582,6 +582,12 @@ fn parse_host_path(value: &OsStr) -> Result<Vec<PathBuf>, ToolDiscoveryError> {
 
     let mut directories = Vec::new();
     for directory in std::env::split_paths(value) {
+        // An empty PATH component conventionally means the current directory.
+        // Never grant that implicit lookup, but tolerate common leading,
+        // trailing, and repeated separators by ignoring the component.
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
         validate_unambiguous_absolute_path(&directory)
             .map_err(|_| ToolDiscoveryError::HostPathInvalid)?;
         if !directories.contains(&directory) {
@@ -986,6 +992,14 @@ mod tests {
             parse_host_path(OsStr::new("")),
             Err(ToolDiscoveryError::HostPathInvalid)
         );
+    }
+
+    #[test]
+    fn path_parser_ignores_empty_components_without_searching_the_current_directory() {
+        let absolute = absolute_test_path("tool-discovery-absolute");
+        let encoded = std::env::join_paths([Path::new(""), &absolute, Path::new("")]).unwrap();
+
+        assert_eq!(parse_host_path(&encoded).unwrap(), vec![absolute]);
     }
 
     #[test]

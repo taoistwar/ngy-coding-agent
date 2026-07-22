@@ -15,7 +15,7 @@ use coding_agent_app::{
 use coding_agent_core::{
     AgentLimits, AgentRuntime, ContextRedactor, DiffEvent, DiffFile, DiffFileStatus, ModelMessage,
     ModelProvider, ModelRequest, ModelResponse, ProviderError, RuntimeError, TerminalSnapshot,
-    ToolCall, ToolRequest, ToolResult, ToolRuntime, WorkspaceFingerprint,
+    ToolCall, ToolCallBatch, ToolRequest, ToolResult, ToolRuntime, WorkspaceFingerprint,
 };
 use coding_agent_domain::{CanonicalPath, EventCursor, Task, TaskEventKind, TaskId, TaskStatus};
 use coding_agent_runtime::WorktreeIdentity;
@@ -56,21 +56,27 @@ impl TaskModelProviderFactory for ScriptedProviderFactory {
         self.starts.fetch_add(1, Ordering::SeqCst);
         let responses = match self.mode {
             ProviderMode::SuccessfulChange => VecDeque::from([
-                Ok(ModelResponse::ToolCall(ToolCall {
-                    id: "replace-1".to_owned(),
-                    request: ToolRequest::ReplaceFile {
-                        path: "src/lib.rs".to_owned(),
-                        expected_sha256: None,
-                        content: "pub fn changed() {}\n".to_owned(),
-                    },
-                })),
-                Ok(ModelResponse::ToolCall(ToolCall {
-                    id: "test-1".to_owned(),
-                    request: ToolRequest::CargoTest {
-                        package: Some("demo".to_owned()),
-                        test: None,
-                        timeout_ms: 1_000,
-                    },
+                Ok(ModelResponse::ToolCalls(ToolCallBatch {
+                    assistant_content: None,
+                    reasoning_content: None,
+                    calls: vec![
+                        ToolCall {
+                            id: "replace-1".to_owned(),
+                            request: ToolRequest::ReplaceFile {
+                                path: "src/lib.rs".to_owned(),
+                                expected_sha256: None,
+                                content: "pub fn changed() {}\n".to_owned(),
+                            },
+                        },
+                        ToolCall {
+                            id: "test-1".to_owned(),
+                            request: ToolRequest::CargoTest {
+                                package: Some("demo".to_owned()),
+                                test: None,
+                                timeout_ms: 1_000,
+                            },
+                        },
+                    ],
                 })),
                 Ok(ModelResponse::Final {
                     content: "done".to_owned(),
@@ -474,6 +480,7 @@ async fn runner_persists_ready_artifact_and_maps_live_and_terminal_panels() {
         .requests
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(requests.len(), 2);
     let first_user = requests[0]
         .messages
         .iter()
@@ -484,6 +491,25 @@ async fn runner_persists_ready_artifact_and_maps_live_and_terminal_panels() {
         .unwrap();
     assert!(first_user.contains("Cargo package demo"));
     assert!(!first_user.contains(&fixture.base.repository.git_root.to_string()));
+    let ModelMessage::AssistantToolCalls(batch) = &requests[1].messages[2] else {
+        panic!("the second provider request must preserve one ordered assistant batch");
+    };
+    assert_eq!(
+        batch
+            .calls
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>(),
+        ["replace-1", "test-1"]
+    );
+    assert!(matches!(
+        &requests[1].messages[3],
+        ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "replace-1"
+    ));
+    assert!(matches!(
+        &requests[1].messages[4],
+        ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "test-1"
+    ));
     assert!(
         requests
             .iter()

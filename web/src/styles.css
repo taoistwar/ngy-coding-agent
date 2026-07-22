@@ -251,13 +251,63 @@ ol {
 }
 
 .workbench-grid {
+  --sidebar-width: 19rem;
+  --results-width: 25rem;
+
+  position: relative;
   display: grid;
   grid-template-columns:
-    minmax(16rem, 20rem)
+    var(--sidebar-width)
     minmax(25rem, 1fr)
-    minmax(21rem, 28rem);
+    var(--results-width);
   min-height: 0;
   overflow: hidden;
+}
+
+.column-resize-handle {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  bottom: 0;
+  width: 0.8rem;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  transform: translateX(-50%);
+}
+
+.column-resize-handle::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--border);
+  content: "";
+  transform: translateX(-50%);
+  transition:
+    width 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.column-resize-handle:hover::before,
+.column-resize-handle:focus-visible::before,
+.column-resize-handle:active::before {
+  width: 3px;
+  background: var(--accent);
+  box-shadow: 0 0 0.7rem rgb(152 168 255 / 0.45);
+}
+
+.sidebar-resize-handle {
+  left: var(--sidebar-width);
+}
+
+.results-resize-handle {
+  right: var(--results-width);
+  transform: translateX(50%);
 }
 
 .sidebar,
@@ -430,6 +480,17 @@ ol {
   background: rgb(17 19 26 / 0.66);
 }
 
+.result-pane > *,
+.result-pane p,
+.result-pane strong,
+.result-pane span,
+.result-pane time,
+.result-pane code {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .task-composer {
   margin-bottom: 1.4rem;
   border: 1px solid var(--border);
@@ -515,6 +576,7 @@ ol {
 }
 
 .attempt-chain {
+  min-width: 0;
   margin: 1rem 0;
 }
 
@@ -527,17 +589,25 @@ ol {
 
 .attempt-chain ol {
   display: flex;
+  max-width: 100%;
+  flex-wrap: wrap;
   gap: 0.45rem;
-  overflow-x: auto;
   padding: 0.15rem 0.15rem 0.35rem;
 }
 
+.attempt-chain li {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .attempt-link {
+  max-width: 100%;
   min-height: 2rem;
   padding: 0.35rem 0.62rem;
   color: var(--text-muted);
   font-size: 0.76rem;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .attempt-link.selected {
@@ -568,6 +638,7 @@ ol {
 .panel-heading-row,
 .diff-file-heading {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.65rem;
   align-items: center;
   justify-content: space-between;
@@ -577,7 +648,7 @@ ol {
 .diff-file-heading > span:last-child {
   color: var(--text-faint);
   font-size: 0.75rem;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .plan-list,
@@ -697,6 +768,11 @@ ol {
   border-left: 2px solid var(--danger);
   padding-left: 0.55rem;
   color: var(--danger) !important;
+  white-space: normal;
+}
+
+.failure-panel p {
+  white-space: normal;
 }
 
 .empty-state {
@@ -768,6 +844,10 @@ ol {
 
   .sidebar {
     grid-row: 1 / span 2;
+  }
+
+  .column-resize-handle {
+    display: none;
   }
 
   .workspace-pane {

@@ -46,6 +46,18 @@ function timestamp(value: string): number {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
+export function repositoryPathForDisplay(path: string): string {
+  const verbatimPrefix = "\\\\?\\";
+  if (!path.startsWith(verbatimPrefix)) return path;
+
+  const remainder = path.slice(verbatimPrefix.length);
+  const uncPrefix = "UNC\\";
+  if (remainder.slice(0, uncPrefix.length).toUpperCase() === uncPrefix) {
+    return `\\\\${remainder.slice(uncPrefix.length)}`;
+  }
+  return /^[A-Za-z]:[\\/]/u.test(remainder) ? remainder : path;
+}
+
 function sidebarError(error: unknown): SidebarError {
   if (typeof error !== "object" || error === null) {
     return { message: "The request failed.", requestId: null };
@@ -228,7 +240,7 @@ export function Sidebar({
                   onClick={() => selectRepository(repository.id)}
                 >
                   <strong>{repository.display_name}</strong>
-                  <span>{repository.selected_path}</span>
+                  <span>{repositoryPathForDisplay(repository.selected_path)}</span>
                 </button>
               </li>
             ))}

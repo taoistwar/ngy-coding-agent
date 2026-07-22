@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Repository, Task } from "../api/types";
 import type { UseAgentStateResult } from "../state/useAgentState";
 import { ConnectionBanner } from "./ConnectionBanner";
+import { ResizableWorkbench } from "./ResizableWorkbench";
 import { Sidebar } from "./Sidebar";
 import { TaskComposer } from "./TaskComposer";
 import { TaskWorkspace } from "./TaskWorkspace";
@@ -171,10 +172,7 @@ export function AppShell({ agent }: AppShellProps) {
         </button>
       </header>
 
-      <div
-        className="workbench-grid"
-        inert={quitDialogOpen ? true : undefined}
-      >
+      <ResizableWorkbench inert={quitDialogOpen}>
         <Sidebar
           repositories={repositories}
           tasks={tasks}
@@ -211,7 +209,7 @@ export function AppShell({ agent }: AppShellProps) {
             />
           }
         />
-      </div>
+      </ResizableWorkbench>
 
       {quitDialogOpen ? (
         <div

@@ -42,23 +42,38 @@ npm --prefix web ci
 `http://127.0.0.1:5173` 提供 UI。Axum 仍会绑定随机的回环端口，并继续执行
 Host 和 Origin 精确匹配、会话及 CSRF 检查。开发环境不存在身份验证绕过机制。
 
-在第一个终端中启动 Axum：
+### 在第一个终端中启动 Axum：
 
 ```bash
 cargo run -p coding-agent-app
 ```
 
-进程会在下文列出的运行时目录中发布 `instance.json`。读取其中的 `port`，设置
-明确的代理目标，然后在第二个终端中启动 Vite。在 Windows PowerShell 中：
+### 第二个终端中启动 Vite
+
+只有第一个终端中的主进程成功启动并保持运行时，它才会在下文列出的运行时目录中
+发布 `instance.json`；正常退出时会移除该文件。请等到 `cargo run` 完成编译并开始
+运行应用程序，再读取其中的 `port`、设置明确的代理目标，然后在第二个终端中启动
+Vite。
+
+#### 在 Windows PowerShell 上：
 
 ```powershell
 $descriptor = Join-Path $env:LOCALAPPDATA 'ngy\coding-agent\data\run\instance.json'
+if (-not (Test-Path -LiteralPath $descriptor -PathType Leaf)) {
+    throw 'instance.json 尚未生成；请确认第一个终端中的 coding-agent-app 仍在运行且没有启动错误。'
+}
 $port = (Get-Content -LiteralPath $descriptor | ConvertFrom-Json).port
 $env:CODING_AGENT_AXUM_TARGET = "http://127.0.0.1:$port"
 npm --prefix web run dev
 ```
 
-在 Linux 上，先选择描述符路径，再启动 Vite：
+仅存在 `instance.lock` 并不表示主进程正在运行；该锁文件会永久保留。如果
+`instance.json` 不存在，请回到第一个终端重新运行 `cargo run -p coding-agent-app`，
+并先处理其中的启动错误，不要继续启动 Vite。
+
+#### 在 Linux 上：
+
+先选择描述符路径，再启动 Vite：
 
 ```bash
 if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
@@ -71,7 +86,7 @@ export CODING_AGENT_AXUM_TARGET="http://127.0.0.1:$port"
 npm --prefix web run dev
 ```
 
-在 macOS 上：
+#### 在 macOS 上：
 
 ```bash
 descriptor="$HOME/Library/Application Support/com.ngy.coding-agent/run/instance.json"
@@ -79,6 +94,8 @@ port="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[
 export CODING_AGENT_AXUM_TARGET="http://127.0.0.1:$port"
 npm --prefix web run dev
 ```
+
+#### 辅助进程认证
 
 Vite 就绪后，再运行一次 `cargo run -p coding-agent-app`。这个短暂运行的辅助
 进程会向主进程请求新的单次使用 URL，并在已配置的 Vite Origin 打开 UI。
@@ -125,9 +142,111 @@ PowerShell 中则使用 `.\target\release\coding-agent-app.exe`。
 }
 ```
 
-生产环境的基础 URL 必须使用 HTTPS，且不能包含用户信息、查询参数或片段。客户端
-会向 `v1/chat/completions` 发送 Chat Completions 请求，拒绝重定向，使用 rustls
-TLS 后端，并对连接、请求、响应和任务累计量施加上限。API 密钥必须由 8 到 4096
+对于默认开启思考模式的 DeepSeek V4，请显式加入 `thinking`。如果像海马云这样的
+兼容中转站不能正确处理命名函数 `tool_choice`，还应显式启用
+`tool_choice_compatibility`：
+
+```json
+{
+  "base_url": "https://provider.example/",
+  "model": "deepseek-v4-flash",
+  "api_key": "replace-with-the-provider-key",
+  "thinking": "enabled",
+  "tool_choice_compatibility": "required_as_auto"
+}
+```
+
+### 开发私网 HTTP（显式且不安全）
+
+默认配置和生产环境都要求 HTTPS。仅当开发测试环境中的提供方确实没有 TLS 时，才可
+同时使用私网 HTTP URL 并显式设置 `"allow_insecure_http": true`：
+
+```json
+{
+  "base_url": "http://172.16.1.20:19001/",
+  "model": "deepseek-v4-flash",
+  "api_key": "replace-with-the-provider-key",
+  "thinking": "enabled",
+  "tool_choice_compatibility": "required_as_auto",
+  "allow_insecure_http": true
+}
+```
+
+`allow_insecure_http` 是可选布尔值，省略或设为 `false` 时不会放宽 HTTPS 要求。即使
+显式设为 `true`，HTTP 主机也必须是 IP 字面量，并且只能属于 IPv4 RFC 1918 私网、
+IPv6 ULA 或回环地址。DNS 主机名、公网地址以及 IPv4/IPv6 链路本地地址仍会被拒绝；
+该开关也不会放宽对 userinfo、查询参数、片段或重定向的限制。
+
+此模式没有 TLS。Bearer API key、任务提示词、发送给模型的仓库内容、工具结果和模型
+响应都会在网络上以明文传输，也可能被路径上的设备读取或篡改。它只能用于隔离且受信任
+的开发网络，绝不能用于生产环境；条件允许时，即使在私网中也应优先部署 HTTPS。修改
+配置后必须完全退出并重新启动应用程序。
+
+`thinking` 是可选配置，允许值为 `enabled` 和 `disabled`，客户端分别编码为
+`{"thinking":{"type":"enabled"}}` 和 `{"thinking":{"type":"disabled"}}`。
+启用后，模型在工具调用响应中返回的非空 `reasoning_content` 会作为不透明协议状态
+留在当前任务内，并随对应 assistant 工具调用消息回传给提供方，以支持多轮思考；它
+不会显示为最终回答或写入持久化任务数据。该内容仍受响应字节预算和 API 密钥边界检查。
+关闭或未配置思考时，只接受省略、`null` 或空字符串形式的 `reasoning_content`，非空
+内容会被拒绝。工具调用消息同时携带的普通 assistant 文本也会经过相同检查并在下一轮
+请求中原样回传；它不会被误当成思维链。若中转站在一个 assistant 消息中返回多个工具调用，应用会先原子校验整个
+批次，再严格按数组顺序逐个执行，最后以一条 assistant 消息和同序的全部工具结果
+继续对话；任何后置调用无效、含秘密或超出剩余预算时，整个批次都不会开始执行。
+不要为不支持 `thinking` 参数的普通 OpenAI-compatible 模型添加此项。
+
+`tool_choice_compatibility` 也是可选配置。省略它或设置为 `strict` 时，客户端保持
+标准命名函数编码。`required_as_required` 只改变强制验证请求在线路上的表示：客户端
+发送 `tool_choice="required"`；`required_as_auto` 则用于 thinking 模式不接受强制选择的
+DeepSeek V4 兼容线路，发送 `tool_choice="auto"`。两种兼容模式都会把可见工具缩减为唯一的
+`cargo_test`，核心逻辑约束不变：响应仍必须恰好包含一个 `cargo_test`，最终文本、其他工具
+或多个调用都会被拒绝。兼容模式不会在失败后自动补发第二次 HTTP 请求，也不会按域名或
+模型名猜测中转站能力。
+DeepSeek [官方 Chat Completions 契约](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion/)
+支持通用 `"required"`，但这并不能证明任意中转站都会完整透传；仍须通过该中转站
+单独实测。不要仅因使用 DeepSeek 就启用它；只有线路
+不能遵守命名工具选择、并且确认支持通用强制选择时才需要此项。修改配置
+后必须完全退出并重新启动应用程序，再从失败的尝试明确重试。
+
+### 动态收敛与工具选择
+
+运行器会在每轮请求前刷新系统策略，向模型提供当前工作区修订号、精确的剩余模型
+响应数和工具调用数，以及当前收敛阶段。名义工具预留按
+`min(工具总上限, clamp(工具总上限 / 4, 3, 8))` 计算，名义模型响应预留按
+`min(模型响应总上限, clamp(模型响应总上限 / 4, 4, 5))` 计算，其中除法为整数除法。
+每轮系统策略显示的预留数还会与对应的当前剩余额度取较小值，绝不会显示超过实际剩余
+工具调用或模型响应的预留。生产上限是 20 轮模型响应和 32 次工具调用，名义预留正好为
+5 轮模型响应和 8 次工具调用。核心会根据阶段选择以下三种逻辑约束；各线路编码如下：
+
+| 阶段 | 默认线路编码 | `required_as_required` | `required_as_auto` | 响应约束 |
+| --- | --- | --- | --- | --- |
+| 探索、测试失败后的修复，以及测试通过后的优先收尾 | `"auto"` | 不变 | 不变 | 可以返回最终文本或受支持的工具调用；通过测试后的系统策略要求模型立即返回最终文本。 |
+| 强制验证 | `{"type":"function","function":{"name":"cargo_test"}}` | `"required"`，只发送 `cargo_test` | `"auto"`，只发送 `cargo_test` | 必须且只能返回一个 `cargo_test` 调用。 |
+| 最终专用 | `"none"` | 不变 | 不变 | 只允许返回最终文本，不允许任何工具调用。 |
+
+探索阶段中，如果一个完整工具调用批次会越过验证预留线，无论其中是否包含
+`cargo_test`，运行器都会让整个批次保持零执行：不增加工具调用计数、不记录调用 ID，
+也不把该批次加入对话记录；已经收到的模型响应仍计入模型响应和提供方字节预算。下一轮
+会强制要求唯一的 `cargo_test`。测试失败后，只有剩余模型响应至少为 3 且剩余工具调用
+至少为 2 时才进入修复阶段；该阶段继续使用 `"auto"`，要求根据失败证据做定向修复，
+并在整批执行前原子检查预算，至少留下 1 次工具调用用于重测。不得在未修改的同一修订
+上重复测试。任何替换或工作区指纹变化形成新修订，都会使旧的通过证据失效；任务完成前
+必须重新测试新修订。若修复或测试过程造成当前修订不同于最近一次已测试修订，下一轮会
+立即进入只允许一个 `cargo_test` 的强制重测，不再返回探索阶段；严格模式发送命名工具
+选择；`required_as_required` 发送通用强制选择，`required_as_auto` 发送自动选择，二者都只
+提供唯一的 `cargo_test` 工具定义，并保持相同的严格响应校验。
+
+当前修订通过测试后，运行器先使用 `"auto"` 要求模型立即给出最终文本。只有工具调用
+额度归零且当前通过证据仍然有效时，才会进入最终专用阶段；进入前运行器会重新采集工作区
+指纹，指纹未变才发送 `"none"` 并只接受最终文本。仅剩最后一轮模型响应并不会单独触发
+`"none"`。提供方返回的响应若违反本轮 `tool_choice`，请求会以不可重试的
+`PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED` 失败，错误中不会包含提供方响应正文。
+
+除上述显式的开发私网 HTTP 例外外，基础 URL 必须使用 HTTPS；生产环境始终必须使用
+HTTPS。基础 URL 不能包含用户信息、查询参数或片段。该值应
+指向版本段之前的服务根或兼容前缀，**不要**在末尾包含 `/v1`；客户端会自行追加
+`v1/chat/completions`。例如，提供方文档给出的地址若为 `https://provider.example/v1`，
+这里应填写 `https://provider.example/`。客户端拒绝重定向，使用 rustls TLS 后端，
+并对连接、请求、响应和任务累计量施加上限。API 密钥必须由 8 到 4096
 个可打印且非空格的 ASCII 字节组成。应用程序将所配置的密钥用于提供方授权和
 边界脱敏；它不会把密钥从 `provider.json` 复制到 SQLite、模型消息、子进程环境、
 活动事件或普通日志中。这不是通用的内容扫描机制：任务提示词和保留的仓库构件
@@ -136,6 +255,41 @@ TLS 后端，并对连接、请求、响应和任务累计量施加上限。API 
 该文件必须是私有的普通文件，且不能是链接。在 Unix 上使用 `0600` 模式，例如
 `chmod 600 provider.json`。在 Windows 上，确保只有当前用户可以访问；应用程序
 会验证已打开的文件句柄，并拒绝重解析点或权限过宽的 ACL。数据目录也应保持私有。
+
+### Windows 快速配置
+
+在 Windows 上，生产配置文件的默认位置是
+`%LOCALAPPDATA%\ngy\coding-agent\data\provider.json`。可以先在 PowerShell 中运行
+以下命令，用记事本打开该文件（文件不存在时请创建它）：
+
+```powershell
+$data = Join-Path $env:LOCALAPPDATA 'ngy\coding-agent\data'
+New-Item -ItemType Directory -Force -Path $data | Out-Null
+$provider = Join-Path $data 'provider.json'
+notepad.exe $provider
+```
+
+将上面的严格 JSON 配置填入文件并保存。不要把真实 API 密钥粘贴到终端、问题报告或
+聊天中，也不要把该文件加入 Git。随后用以下命令移除继承权限，并确保只有当前
+Windows 用户拥有访问权：
+
+```powershell
+$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls.exe $provider /grant:r "${me}:(F)"
+icacls.exe $provider /inheritance:r
+```
+
+完成后重新启动应用程序：
+
+```powershell
+cargo run -p coding-agent-app
+```
+
+如果原生对话框显示 `Error code: PROVIDER_CONFIG_INVALID`，请首先检查上述文件是否
+存在。配置缺失、JSON 不符合严格模式、ACL 不够私有，或者 HTTP URL 没有同时配置
+`"allow_insecure_http": true`、主机不是允许的私网/回环 IP 字面量，都会阻止运行器
+启动，并统一归入该错误码；这不是 Cargo 或 Git 编译失败。旧版本可能只显示重复的
+`the coding task runner could not be started`，排查方法相同。
 
 ## 数据与运行时文件
 
@@ -221,19 +375,25 @@ UI 显示的错误包含稳定的代码和请求 ID。将错误与本地日志�
 | `APP_RESTARTED` | 崩溃/重启恢复期间，一个未完成的任务被中断。需要时请明确重试。 |
 | `APP_SHUTDOWN` | 应用程序正常退出时，一个未完成的任务被中断。 |
 | `STORE_WRITE_FAILED` | 某个任务存在结果不明确的后台写入，因此在恢复期间被持久化地标记为中断。 |
-| `PROVIDER_CONFIG_INVALID` | 创建符合严格模式定义且保持私有的 `provider.json`；检查 HTTPS、字段名、文件权限、模型和 API 密钥。生产环境绝不会回退到假运行器。 |
+| `PROVIDER_CONFIG_INVALID` | 创建符合严格模式定义且保持私有的 `provider.json`；检查 HTTPS、字段名、文件权限、模型和 API 密钥。开发私网 HTTP 还必须显式设置 `"allow_insecure_http": true`，且主机只能是允许的私网/回环 IP 字面量；DNS、公网和链路本地 HTTP 会被拒绝。生产环境绝不会回退到假运行器。 |
 | `PROVIDER_UNAUTHORIZED` | 检查所配置的 API 密钥和提供方账户，但不要把密钥写入日志或问题报告。 |
+| `PROVIDER_REQUEST_REJECTED` | 提供方拒绝了请求。首先确认 `base_url` 末尾没有 `/v1`，因为客户端会自行追加版本路径；然后检查模型是否支持 Chat Completions、函数工具调用以及请求中的模型名。 |
 | `PROVIDER_RATE_LIMITED` / `PROVIDER_UNAVAILABLE` / `PROVIDER_TRANSPORT_FAILED` | 提供方触发限流、发生故障、断开连接或超时。请在提供方恢复正常后重试。 |
 | `PROVIDER_REQUEST_BYTE_LIMIT_REACHED` / `PROVIDER_TASK_BYTE_LIMIT_REACHED` | 与提供方的交互超过了单次请求或任务累计字节预算。请缩小任务范围后重试。 |
-| `PROVIDER_RESPONSE_INVALID` / `PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS` / `PROVIDER_REDIRECT_REJECTED` | 端点未遵守受支持的单工具调用 Chat Completions 契约。请检查提供方兼容性和基础 URL。 |
+| `PROVIDER_RESPONSE_REASONING_REJECTED` | 未启用思考时，提供方仍返回了非空思维链。需要思考模型时设置 `"thinking":"enabled"`；需要关闭时确认模型和中转站支持 `thinking.type=disabled`。错误不会包含思维链正文。 |
+| `PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED` | 提供方没有遵守本轮的自动、指定 `cargo_test` 或禁用工具约束。不支持命名函数选择但支持通用 `"required"` 时使用 `required_as_required`；DeepSeek V4 thinking 线路拒绝强制 `tool_choice` 时使用 `required_as_auto`。完全重启应用后再明确重试；响应仍须恰好返回一个 `cargo_test`。该错误不可自动重试，且不会包含响应正文。 |
+| `PROVIDER_RESPONSE_FINISH_UNSUPPORTED` | 提供方返回了缺失、未知或与文本/工具调用不匹配的结束状态。请检查模型的 Chat Completions 工具调用兼容性。 |
+| `PROVIDER_RESPONSE_SCHEMA_UNSUPPORTED` | 提供方返回的 JSON 可以解析，但字段或类型不属于受支持的严格响应模式。错误不会包含响应正文或未知字段名。 |
+| `PROVIDER_RESPONSE_INVALID` / `PROVIDER_REDIRECT_REJECTED` | 响应不是有效 JSON、超出限制、工具调用批次无效或违反其他受支持的 Chat Completions 契约。若 DeepSeek V4 或其中转服务默认开启思考模式，请在 `provider.json` 加入 `"thinking": "disabled"` 并完全重启应用；其他模型请检查提供方兼容性和基础 URL。 |
+| `PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS` | 这是旧版本留下的历史失败码。当前版本已支持按响应顺序串行处理多个工具调用；完全重启新版本后，从该失败尝试重试即可。 |
 | `GIT_HEAD_UNBORN` | 创建任务之前，请先提交仓库的初始修订版。系统有意不使用工作目录中的未提交字节。 |
 | `WORKTREE_CREATE_FAILED` / `WORKTREE_STATE_INCONSISTENT` | 检查保留的尝试构件。请手动解决分支/路径标识冲突；应用程序不会删除未知对象。 |
 | `WORKTREE_PATH_ESCAPE` | 预留的尝试路径或 Cargo 工作区逃逸出了受信任的仓库/构件根目录。请检查已注册的仓库和保留的构件，而不要削弱边界。 |
 | `FILE_NOT_TEXT` / `FILE_TOO_LARGE` / `FILE_CHANGED_SINCE_READ` / `ATOMIC_REPLACE_FAILED` | 无法安全读取或原子替换所请求的文件。请先检查保留的工作树状态，再重试。 |
 | `COMMAND_NOT_ALLOWED` / `COMMAND_TIMED_OUT` / `PROCESS_TREE_CLEANUP_FAILED` | 某个命令或 `.git` 路径违反了固定工具契约、发生超时，或无法安全进入静止状态。有界输出会作为明确标注已截断的工具证据返回。请检查工作树并终止任何可疑的仓库进程，然后再重试。 |
 | `CARGO_METADATA_FAILED` / `CARGO_DEPENDENCY_UNAVAILABLE_OFFLINE` | 修复 Cargo 工作区或明确预取其依赖项；任务中的 Cargo 命令不会从网络获取内容。 |
-| `AGENT_STEP_LIMIT_REACHED` / `AGENT_CONTEXT_LIMIT_REACHED` | 有界代理循环在得到有效最终结果前耗尽了步骤或上下文预算。请缩小任务范围后重试。 |
-| `CURRENT_TEST_REQUIRED` | 最终工作树指纹没有对应的已通过 Cargo 测试证据。请在最后一次源代码更改后运行相关测试。 |
+| `AGENT_STEP_LIMIT_REACHED` / `AGENT_CONTEXT_LIMIT_REACHED` | 有界代理循环在得到有效最终结果前耗尽了步骤或上下文预算。每轮系统策略都会给出精确剩余额度、当前收敛阶段，以及不超过对应剩余额度的预留数；生产上限为 20 轮模型响应和 32 次工具调用，名义预留为 5 轮模型响应和 8 次工具调用。若正常规模的任务仍超限，请缩小任务范围后重试。 |
+| `CURRENT_TEST_REQUIRED` | 最终工作树指纹没有对应当前修订的已通过 Cargo 测试证据。任何替换或指纹变化都会建立新修订并令旧证据失效；请在最后一次源代码更改后重新测试。 |
 | `TERMINAL_DIFF_TRUNCATED` | 保留的最终差异超过安全上限，因此任务未被标记为 Completed。请检查工作树，并将变更拆分为较小的任务。 |
 | `TERMINAL_FINALIZATION_TIMEOUT` | 最终测试/差异证据未能在有界的终态收尾时间窗口内稳定下来。请检查保留的工作树，并仅在所有仓库进程停止后重试。 |
 | `TOOLCHAIN_DISCOVERY_FAILED` | 启动时无法固定所需的 Git/Rust 工具。请检查 Git 2.45+ 和当前 Rust 工具链，再重新启动。 |

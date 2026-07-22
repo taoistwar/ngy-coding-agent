@@ -17,7 +17,7 @@ pub use event::{
 };
 pub use limits::{AgentLimits, AgentLimitsError};
 pub use model::{
-    ModelMessage, ModelRequest, ModelResponse, TerminalSnapshot, ToolCall, ToolRequest, ToolResult,
-    ToolStatus, WorkspaceFingerprint,
+    ModelMessage, ModelRequest, ModelResponse, ModelToolChoice, TerminalSnapshot, ToolCall,
+    ToolCallBatch, ToolRequest, ToolResult, ToolStatus, WorkspaceFingerprint,
 };
 pub use ports::{AgentEventSink, AgentRuntime, ContextRedactor, ModelProvider, ToolRuntime};

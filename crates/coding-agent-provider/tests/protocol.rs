@@ -1,8 +1,12 @@
-use coding_agent_core::{ModelMessage, ModelRequest, ModelResponse, ToolCall, ToolRequest};
+use coding_agent_core::{
+    ModelMessage, ModelRequest, ModelResponse, ModelToolChoice, ToolCall, ToolCallBatch,
+    ToolRequest,
+};
 use coding_agent_provider::{
-    PROVIDER_RATE_LIMITED, PROVIDER_RESPONSE_INVALID, PROVIDER_UNAUTHORIZED,
-    PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS, decode_chat_completions_response,
-    encode_chat_completions_request, map_http_status,
+    PROVIDER_RATE_LIMITED, PROVIDER_RESPONSE_FINISH_UNSUPPORTED, PROVIDER_RESPONSE_INVALID,
+    PROVIDER_RESPONSE_REASONING_REJECTED, PROVIDER_RESPONSE_SCHEMA_UNSUPPORTED,
+    PROVIDER_UNAUTHORIZED, decode_chat_completions_response, encode_chat_completions_request,
+    map_http_status,
 };
 
 #[test]
@@ -20,9 +24,14 @@ fn request_encodes_supported_messages_and_one_tool_call_id_round_trip() {
             ModelMessage::system("policy"),
             ModelMessage::user("inspect"),
             ModelMessage::assistant("I will inspect."),
-            ModelMessage::AssistantToolCall(call),
+            ModelMessage::AssistantToolCalls(ToolCallBatch {
+                assistant_content: None,
+                reasoning_content: None,
+                calls: vec![call],
+            }),
             ModelMessage::tool_result("call-17", "file contents"),
         ],
+        tool_choice: ModelToolChoice::Auto,
     };
 
     let encoded =
@@ -36,6 +45,7 @@ fn request_encodes_supported_messages_and_one_tool_call_id_round_trip() {
     assert_eq!(json["messages"][0]["role"], "system");
     assert_eq!(json["messages"][1]["role"], "user");
     assert_eq!(json["messages"][2]["role"], "assistant");
+    assert!(json["messages"][3]["content"].is_null());
     assert_eq!(json["messages"][3]["tool_calls"][0]["id"], "call-17");
     assert_eq!(
         json["messages"][3]["tool_calls"][0]["function"]["name"],
@@ -68,6 +78,39 @@ fn request_encodes_supported_messages_and_one_tool_call_id_round_trip() {
 }
 
 #[test]
+fn strict_request_encodes_all_supported_tool_choices_exactly() {
+    for (tool_choice, expected) in [
+        (ModelToolChoice::Auto, serde_json::json!("auto")),
+        (ModelToolChoice::None, serde_json::json!("none")),
+        (
+            ModelToolChoice::RequiredCargoTest,
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "cargo_test"}
+            }),
+        ),
+    ] {
+        let encoded = encode_chat_completions_request(
+            "coding-model",
+            &ModelRequest {
+                messages: vec![ModelMessage::user("finish safely")],
+                tool_choice,
+            },
+        )
+        .expect("encode supported tool choice");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(json["tool_choice"], expected);
+        assert_eq!(json["parallel_tool_calls"], false);
+        assert_eq!(
+            json["tools"].as_array().map(Vec::len),
+            Some(8),
+            "strict mode keeps the complete tool set for every logical choice"
+        );
+    }
+}
+
+#[test]
 fn request_rejects_a_mismatched_or_unpaired_tool_result_id() {
     let call = ToolCall {
         id: "call-17".to_owned(),
@@ -75,14 +118,85 @@ fn request_rejects_a_mismatched_or_unpaired_tool_result_id() {
     };
     for messages in [
         vec![
-            ModelMessage::AssistantToolCall(call.clone()),
+            ModelMessage::AssistantToolCalls(ToolCallBatch {
+                assistant_content: None,
+                reasoning_content: None,
+                calls: vec![call.clone()],
+            }),
             ModelMessage::tool_result("different-call", "clean"),
         ],
         vec![ModelMessage::tool_result("call-17", "clean")],
-        vec![ModelMessage::AssistantToolCall(call.clone())],
+        vec![ModelMessage::AssistantToolCalls(ToolCallBatch {
+            assistant_content: None,
+            reasoning_content: None,
+            calls: vec![call.clone()],
+        })],
     ] {
-        let error = encode_chat_completions_request("coding-model", &ModelRequest { messages })
-            .expect_err("tool result IDs must be paired exactly");
+        let error = encode_chat_completions_request(
+            "coding-model",
+            &ModelRequest {
+                messages,
+                tool_choice: ModelToolChoice::Auto,
+            },
+        )
+        .expect_err("tool result IDs must be paired exactly");
+        assert!(!error.retryable);
+    }
+
+    let ordered_batch = ToolCallBatch {
+        assistant_content: Some("Inspecting.".to_owned()),
+        reasoning_content: None,
+        calls: vec![
+            ToolCall {
+                id: "first".to_owned(),
+                request: ToolRequest::GitStatus,
+            },
+            ToolCall {
+                id: "second".to_owned(),
+                request: ToolRequest::GitDiff,
+            },
+        ],
+    };
+    let duplicate_batch = ToolCallBatch {
+        assistant_content: None,
+        reasoning_content: None,
+        calls: vec![
+            ToolCall {
+                id: "same".to_owned(),
+                request: ToolRequest::GitStatus,
+            },
+            ToolCall {
+                id: "same".to_owned(),
+                request: ToolRequest::GitDiff,
+            },
+        ],
+    };
+    for messages in [
+        vec![
+            ModelMessage::AssistantToolCalls(ordered_batch.clone()),
+            ModelMessage::tool_result("second", "diff"),
+            ModelMessage::tool_result("first", "clean"),
+        ],
+        vec![
+            ModelMessage::AssistantToolCalls(ordered_batch.clone()),
+            ModelMessage::tool_result("first", "clean"),
+        ],
+        vec![ModelMessage::AssistantToolCalls(duplicate_batch)],
+        vec![
+            ModelMessage::AssistantToolCalls(ordered_batch.clone()),
+            ModelMessage::tool_result("first", "clean"),
+            ModelMessage::assistant("interleaved"),
+            ModelMessage::tool_result("second", "diff"),
+        ],
+    ] {
+        let error = encode_chat_completions_request(
+            "coding-model",
+            &ModelRequest {
+                messages,
+                tool_choice: ModelToolChoice::Auto,
+            },
+        )
+        .expect_err("tool result batches must be complete, unique, contiguous, and ordered");
         assert!(!error.retryable);
     }
 }
@@ -118,13 +232,17 @@ fn response_decodes_exactly_one_typed_tool_call_and_preserves_its_id() {
         decode_chat_completions_response(&encoded, 16 * 1024).expect("decode one tool call");
     assert_eq!(
         decoded,
-        ModelResponse::ToolCall(ToolCall {
-            id: "call-17".to_owned(),
-            request: ToolRequest::ReadFile {
-                path: "src/lib.rs".to_owned(),
-                start_line: 1,
-                end_line: 20,
-            },
+        ModelResponse::ToolCalls(ToolCallBatch {
+            assistant_content: None,
+            reasoning_content: None,
+            calls: vec![ToolCall {
+                id: "call-17".to_owned(),
+                request: ToolRequest::ReadFile {
+                    path: "src/lib.rs".to_owned(),
+                    start_line: 1,
+                    end_line: 20,
+                },
+            }],
         })
     );
 }
@@ -141,6 +259,106 @@ fn final_text_response_is_supported() {
 }
 
 #[test]
+fn disabled_thinking_empty_marker_is_supported_but_reasoning_content_is_rejected() {
+    let disabled = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done","reasoning_content":null},"finish_reason":"stop"}]}"#;
+    assert_eq!(
+        decode_chat_completions_response(disabled, disabled.len()).unwrap(),
+        ModelResponse::Final {
+            content: "done".to_owned()
+        }
+    );
+
+    let empty = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done","reasoning_content":""},"finish_reason":"stop"}]}"#;
+    assert_eq!(
+        decode_chat_completions_response(empty, empty.len()).unwrap(),
+        ModelResponse::Final {
+            content: "done".to_owned()
+        }
+    );
+
+    let reasoning = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done","reasoning_content":"known-secret-reasoning"},"finish_reason":"stop"}]}"#;
+    let error = decode_chat_completions_response(reasoning, reasoning.len())
+        .expect_err("non-null reasoning content remains outside the supported subset");
+    assert_eq!(error.code, PROVIDER_RESPONSE_REASONING_REJECTED);
+    for rendered in [format!("{error:?}"), format!("{error}")] {
+        assert!(!rendered.contains("known-secret-reasoning"));
+        assert!(!rendered.contains("reasoning_content"));
+    }
+}
+
+#[test]
+fn tool_call_assistant_content_is_preserved_for_the_next_request() {
+    let encoded = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"I will inspect the repository.","reasoning_content":"","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"git_status","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+    let response = decode_chat_completions_response(encoded, encoded.len())
+        .expect("DeepSeek-compatible tool call response");
+    let ModelResponse::ToolCalls(batch) = response else {
+        panic!("expected one tool-call batch");
+    };
+    assert_eq!(
+        batch.assistant_content.as_deref(),
+        Some("I will inspect the repository.")
+    );
+    assert_eq!(batch.calls[0].id, "call-1");
+
+    let request = ModelRequest {
+        messages: vec![
+            ModelMessage::AssistantToolCalls(batch),
+            ModelMessage::tool_result("call-1", "clean"),
+        ],
+        tool_choice: ModelToolChoice::Auto,
+    };
+    let round_trip = encode_chat_completions_request("coding-model", &request)
+        .expect("encode assistant tool-call context");
+    let json: serde_json::Value = serde_json::from_slice(&round_trip).unwrap();
+    assert_eq!(
+        json["messages"][0]["content"],
+        "I will inspect the repository."
+    );
+    assert!(json["messages"][0].get("reasoning_content").is_none());
+
+    let empty = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"call-empty","type":"function","function":{"name":"git_status","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+    let empty_response = decode_chat_completions_response(empty, empty.len())
+        .expect("empty assistant tool-call content is preserved");
+    let ModelResponse::ToolCalls(empty_batch) = empty_response else {
+        panic!("expected one tool-call batch");
+    };
+    assert_eq!(empty_batch.assistant_content.as_deref(), Some(""));
+
+    let empty_request = ModelRequest {
+        messages: vec![
+            ModelMessage::AssistantToolCalls(empty_batch),
+            ModelMessage::tool_result("call-empty", "clean"),
+        ],
+        tool_choice: ModelToolChoice::Auto,
+    };
+    let empty_round_trip = encode_chat_completions_request("coding-model", &empty_request)
+        .expect("encode empty assistant tool-call context");
+    let empty_json: serde_json::Value = serde_json::from_slice(&empty_round_trip).unwrap();
+    assert_eq!(empty_json["messages"][0]["content"], "");
+}
+
+#[test]
+fn nullable_tool_calls_and_only_array_position_indices_are_supported() {
+    let no_call = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done","tool_calls":null},"finish_reason":"stop"}]}"#;
+    assert_eq!(
+        decode_chat_completions_response(no_call, no_call.len()).unwrap(),
+        ModelResponse::Final {
+            content: "done".to_owned()
+        }
+    );
+
+    for invalid in [
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"index":1,"id":"call-1","type":"function","function":{"name":"git_status","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#.as_slice(),
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"same","type":"function","function":{"name":"git_status","arguments":"{}"}},{"index":1,"id":"same","type":"function","function":{"name":"git_diff","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#.as_slice(),
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"git_status","arguments":"{}"}},{"index":0,"id":"two","type":"function","function":{"name":"git_diff","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#.as_slice(),
+    ] {
+        let error = decode_chat_completions_response(invalid, invalid.len())
+            .expect_err("tool call indices and IDs must preserve one ordered batch");
+        assert_eq!(error.code, PROVIDER_RESPONSE_INVALID);
+    }
+}
+
+#[test]
 fn empty_final_text_is_not_a_supported_completion() {
     let encoded = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}]}"#;
     let error = decode_chat_completions_response(encoded, encoded.len()).unwrap_err();
@@ -153,13 +371,19 @@ fn finish_reason_must_exactly_match_the_response_kind() {
     for encoded in [
         br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"partial"},"finish_reason":"length"}]}"#.as_slice(),
         br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"filtered"},"finish_reason":"content_filter"}]}"#.as_slice(),
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"known-secret-finish"}]}"#.as_slice(),
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done"}}]}"#.as_slice(),
         br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":null}]}"#.as_slice(),
         br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"tool_calls"}]}"#.as_slice(),
         br#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"one","type":"function","function":{"name":"git_status","arguments":"{}"}}]},"finish_reason":"stop"}]}"#.as_slice(),
     ] {
         let error = decode_chat_completions_response(encoded, encoded.len()).unwrap_err();
-        assert_eq!(error.code, PROVIDER_RESPONSE_INVALID);
+        assert_eq!(error.code, PROVIDER_RESPONSE_FINISH_UNSUPPORTED);
         assert!(!error.retryable);
+        for rendered in [format!("{error:?}"), format!("{error}")] {
+            assert!(!rendered.contains("known-secret-finish"));
+            assert!(!rendered.contains("finish_reason"));
+        }
     }
 }
 
@@ -186,33 +410,92 @@ fn provider_rejects_tool_call_ids_above_the_core_256_byte_limit() {
 }
 
 #[test]
-fn multiple_tool_calls_have_the_locked_project_two_error() {
+fn multiple_tool_calls_preserve_response_order_and_round_trip_as_one_message() {
     let encoded = br#"{
-      "choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[
-        {"id":"one","type":"function","function":{"name":"git_status","arguments":"{}"}},
-        {"id":"two","type":"function","function":{"name":"git_diff","arguments":"{}"}}
+      "choices":[{"index":0,"message":{"role":"assistant","content":"Inspecting.","tool_calls":[
+        {"index":0,"id":"one","type":"function","function":{"name":"git_status","arguments":"{}"}},
+        {"index":1,"id":"two","type":"function","function":{"name":"git_diff","arguments":"{}"}}
       ]},"finish_reason":"tool_calls"}]
     }"#;
 
-    let error = decode_chat_completions_response(encoded, encoded.len()).unwrap_err();
-    assert_eq!(error.code, PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS);
-    assert!(!error.retryable);
+    let response = decode_chat_completions_response(encoded, encoded.len())
+        .expect("ordered multiple tool calls are supported");
+    let ModelResponse::ToolCalls(batch) = response else {
+        panic!("expected a tool-call batch");
+    };
+    assert_eq!(batch.assistant_content.as_deref(), Some("Inspecting."));
+    assert_eq!(
+        batch
+            .calls
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+    assert!(matches!(batch.calls[0].request, ToolRequest::GitStatus));
+    assert!(matches!(batch.calls[1].request, ToolRequest::GitDiff));
+
+    let request = ModelRequest {
+        messages: vec![
+            ModelMessage::AssistantToolCalls(batch),
+            ModelMessage::tool_result("one", "clean"),
+            ModelMessage::tool_result("two", "diff"),
+        ],
+        tool_choice: ModelToolChoice::Auto,
+    };
+    let round_trip = encode_chat_completions_request("coding-model", &request)
+        .expect("encode one assistant batch with ordered results");
+    let json: serde_json::Value = serde_json::from_slice(&round_trip).unwrap();
+    assert_eq!(json["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(json["messages"][0]["tool_calls"][0]["id"], "one");
+    assert_eq!(json["messages"][0]["tool_calls"][1]["id"], "two");
+    assert_eq!(json["messages"][1]["tool_call_id"], "one");
+    assert_eq!(json["messages"][2]["tool_call_id"], "two");
 }
 
 #[test]
-fn unknown_fields_tools_and_arguments_are_rejected_without_raw_body_echo() {
-    let fixtures: &[&[u8]] = &[
-        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"unknown":"known-secret-body"}"#,
-        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"one","type":"function","function":{"name":"run_shell","arguments":"{\"command\":\"known-secret-body\"}"}}]},"finish_reason":"tool_calls"}]}"#,
-        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"one","type":"function","function":{"name":"git_status","arguments":"{\"unknown\":\"known-secret-body\"}"}}]},"finish_reason":"tool_calls"}]}"#,
-    ];
-
-    for encoded in fixtures {
+fn response_schema_data_errors_are_classified_without_raw_body_echo() {
+    for encoded in [
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"known-secret-field":"known-secret-body"}"#.as_slice(),
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"done","known-secret-field":"known-secret-body"},"finish_reason":"stop"}]}"#.as_slice(),
+        br#"{"choices":"known-secret-body"}"#.as_slice(),
+        br#"{"known-secret-field":"known-secret-body"}"#.as_slice(),
+    ] {
         let error = decode_chat_completions_response(encoded, 16 * 1024)
-            .expect_err("unknown response data must fail closed");
+            .expect_err("unsupported response schemas must fail closed");
+        assert_eq!(error.code, PROVIDER_RESPONSE_SCHEMA_UNSUPPORTED);
+        for rendered in [format!("{error:?}"), format!("{error}")] {
+            assert!(!rendered.contains("known-secret-field"));
+            assert!(!rendered.contains("known-secret-body"));
+        }
+    }
+}
+
+#[test]
+fn malformed_json_keeps_the_generic_code_without_raw_body_echo() {
+    let encoded = br#"{"choices":"known-secret-body"#;
+    let error = decode_chat_completions_response(encoded, encoded.len())
+        .expect_err("malformed JSON must fail closed");
+    assert_eq!(error.code, PROVIDER_RESPONSE_INVALID);
+    for rendered in [format!("{error:?}"), format!("{error}")] {
+        assert!(!rendered.contains("known-secret-body"));
+    }
+}
+
+#[test]
+fn tool_names_and_argument_schemas_keep_the_existing_invalid_code() {
+    for encoded in [
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"one","type":"function","function":{"name":"run_shell","arguments":"{\"command\":\"known-secret-body\"}"}}]},"finish_reason":"tool_calls"}]}"#.as_slice(),
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"one","type":"function","function":{"name":"git_status","arguments":"{\"known-secret-field\":\"known-secret-body\"}"}}]},"finish_reason":"tool_calls"}]}"#.as_slice(),
+        br#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"safe","type":"function","function":{"name":"git_status","arguments":"{}"}},{"index":1,"id":"bad","type":"function","function":{"name":"git_diff","arguments":"{\"known-secret-field\":\"known-secret-body\"}"}}]},"finish_reason":"tool_calls"}]}"#.as_slice(),
+    ] {
+        let error = decode_chat_completions_response(encoded, 16 * 1024)
+            .expect_err("tool validation must keep its existing error code");
         assert_eq!(error.code, PROVIDER_RESPONSE_INVALID);
-        assert!(!format!("{error:?}").contains("known-secret-body"));
-        assert!(!format!("{error}").contains("known-secret-body"));
+        for rendered in [format!("{error:?}"), format!("{error}")] {
+            assert!(!rendered.contains("known-secret-field"));
+            assert!(!rendered.contains("known-secret-body"));
+        }
     }
 }
 

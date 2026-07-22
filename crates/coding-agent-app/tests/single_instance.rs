@@ -540,6 +540,18 @@ async fn locked_primary_requires_private_valid_provider_config_before_binding_li
     assert!(!fixture.paths.instance_descriptor.exists());
     let messages = fixture.calls.messages();
     assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].0, "Coding Agent could not start");
+    assert_eq!(
+        messages[0].1,
+        "The coding task runner could not be started.\n\nError code: PROVIDER_CONFIG_INVALID"
+    );
+    assert_eq!(
+        messages[0]
+            .1
+            .matches("coding task runner could not be started")
+            .count(),
+        1
+    );
     assert!(!messages[0].1.contains("provider.json"));
 }
 

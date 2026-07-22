@@ -5,7 +5,7 @@ pub enum ModelMessage {
     System(String),
     User(String),
     Assistant(String),
-    AssistantToolCall(ToolCall),
+    AssistantToolCalls(ToolCallBatch),
     ToolResult {
         tool_call_id: String,
         content: String,
@@ -36,12 +36,45 @@ impl ModelMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
     pub messages: Vec<ModelMessage>,
+    pub tool_choice: ModelToolChoice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelToolChoice {
+    Auto,
+    None,
+    RequiredCargoTest,
+}
+
+impl ModelToolChoice {
+    pub fn permits(self, response: &ModelResponse) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::None => matches!(response, ModelResponse::Final { .. }),
+            Self::RequiredCargoTest => matches!(
+                response,
+                ModelResponse::ToolCalls(ToolCallBatch { calls, .. })
+                    if matches!(calls.as_slice(), [ToolCall { request: ToolRequest::CargoTest { .. }, .. }])
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelResponse {
-    ToolCall(ToolCall),
+    ToolCalls(ToolCallBatch),
     Final { content: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallBatch {
+    /// Optional assistant text that accompanied the calls and must remain in provider history.
+    pub assistant_content: Option<String>,
+    /// Opaque provider reasoning state required to continue a thinking-mode tool-call turn.
+    /// It is never surfaced as user-visible assistant content.
+    pub reasoning_content: Option<String>,
+    /// Tool calls in the exact order returned by the provider.
+    pub calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

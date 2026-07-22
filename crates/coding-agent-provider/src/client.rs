@@ -13,14 +13,14 @@ use reqwest::header::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::error::tool_choice_violated;
 use crate::error::{
     TransportFailure, cancelled, client_init_failed, invalid_response, map_http_status,
     map_transport_failure, request_limit_reached, task_byte_limit_reached,
 };
-use crate::{
-    ProviderConfig, SecretRedactor, decode_chat_completions_response,
-    encode_chat_completions_request,
-};
+use crate::protocol::decode_chat_completions_response_with_tool_choice;
+use crate::protocol::encode_chat_completions_request_with_options;
+use crate::{ProviderConfig, SecretRedactor};
 
 const JSON_MEDIA_TYPE: &str = "application/json";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -280,7 +280,12 @@ impl ChatCompletionsProvider {
             return Err(cancelled());
         }
         let inner = &self.client.inner;
-        let encoded = encode_chat_completions_request(inner.config.model(), &request)?;
+        let encoded = encode_chat_completions_request_with_options(
+            inner.config.model(),
+            &request,
+            inner.config.thinking_mode(),
+            inner.config.tool_choice_compatibility(),
+        )?;
         if encoded.len() > inner.limits.max_request_bytes() {
             return Err(request_limit_reached());
         }
@@ -353,8 +358,15 @@ impl ChatCompletionsProvider {
             self.task_budget.charge(chunk.len())?;
             aggregate.extend_from_slice(&chunk);
         }
-        let decoded =
-            decode_chat_completions_response(&aggregate, inner.limits.max_response_bytes())?;
+        let decoded = decode_chat_completions_response_with_tool_choice(
+            &aggregate,
+            inner.limits.max_response_bytes(),
+            request.tool_choice,
+            inner.config.thinking_mode(),
+        )?;
+        if !request.tool_choice.permits(&decoded) {
+            return Err(tool_choice_violated());
+        }
         if response_contains_secret(&decoded, inner.config.api_key().expose_secret()) {
             return Err(invalid_response(
                 "The provider response contained protected configuration data.",
@@ -467,8 +479,19 @@ fn request_metadata_redactor(config: &ProviderConfig, request: &ModelRequest) ->
             ModelMessage::System(content)
             | ModelMessage::User(content)
             | ModelMessage::Assistant(content) => redactor.with_secret(content.as_str()),
-            ModelMessage::AssistantToolCall(call) => {
-                with_tool_request_secrets(redactor.with_secret(call.id.as_str()), &call.request)
+            ModelMessage::AssistantToolCalls(batch) => {
+                let mut batch_redactor = redactor;
+                if let Some(content) = &batch.assistant_content {
+                    batch_redactor = batch_redactor.with_secret(content.as_str());
+                }
+                if let Some(reasoning) = &batch.reasoning_content {
+                    batch_redactor = batch_redactor.with_secret(reasoning.as_str());
+                }
+                for call in &batch.calls {
+                    batch_redactor = batch_redactor.with_secret(call.id.as_str());
+                    batch_redactor = with_tool_request_secrets(batch_redactor, &call.request);
+                }
+                batch_redactor
             }
             ModelMessage::ToolResult {
                 tool_call_id,
@@ -532,8 +555,18 @@ fn with_tool_request_secrets(
 fn response_contains_secret(response: &ModelResponse, secret: &str) -> bool {
     match response {
         ModelResponse::Final { content } => content.contains(secret),
-        ModelResponse::ToolCall(call) => {
-            call.id.contains(secret) || tool_request_contains_secret(&call.request, secret)
+        ModelResponse::ToolCalls(batch) => {
+            batch
+                .assistant_content
+                .as_deref()
+                .is_some_and(|content| content.contains(secret))
+                || batch
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|content| content.contains(secret))
+                || batch.calls.iter().any(|call| {
+                    call.id.contains(secret) || tool_request_contains_secret(&call.request, secret)
+                })
         }
     }
 }

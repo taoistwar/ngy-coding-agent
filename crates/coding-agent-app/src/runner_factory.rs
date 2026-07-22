@@ -19,6 +19,8 @@ use crate::{
 };
 
 const PRODUCTION_CONCURRENCY: NonZeroU32 = NonZeroU32::new(1).unwrap();
+const PRODUCTION_MAX_MODEL_STEPS: u32 = 20;
+const PRODUCTION_MAX_TOOL_CALLS: u32 = 32;
 const ARTIFACT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Capabilities made available only after private paths are prepared, the
@@ -251,8 +253,7 @@ impl StartupRunnerFactory for ProductionStartupRunnerFactory {
             provisioners,
             runtimes,
         ));
-        let limits = AgentLimits::try_new(16, 32, 8 * 1024 * 1024, 256 * 1024)
-            .expect("constant production agent limits are valid");
+        let limits = production_agent_limits();
         let runner = Arc::new(CodingAgentRunner::new(
             context.writer().clone(),
             provider,
@@ -273,6 +274,16 @@ fn production_process_limits() -> ProcessLimits {
         Duration::from_secs(5),
     )
     .expect("constant production process limits are valid")
+}
+
+fn production_agent_limits() -> AgentLimits {
+    AgentLimits::try_new(
+        PRODUCTION_MAX_MODEL_STEPS,
+        PRODUCTION_MAX_TOOL_CALLS,
+        8 * 1024 * 1024,
+        256 * 1024,
+    )
+    .expect("constant production agent limits are valid")
 }
 
 impl FixedStartupRunnerFactory {
@@ -302,8 +313,9 @@ mod tests {
     use coding_agent_store::Store;
 
     use super::{
-        PRODUCTION_CONCURRENCY, ProductionStartupRunnerFactory, StartupRunnerContext,
-        StartupRunnerFactory, StartupRunnerFactoryError, StartupRunnerSelection,
+        PRODUCTION_CONCURRENCY, PRODUCTION_MAX_MODEL_STEPS, PRODUCTION_MAX_TOOL_CALLS,
+        ProductionStartupRunnerFactory, StartupRunnerContext, StartupRunnerFactory,
+        StartupRunnerFactoryError, StartupRunnerSelection, production_agent_limits,
     };
     use crate::{
         EventDispatcherHandle, FakeTaskRunner, PlatformPaths, PrivateFile, StoreWriterHandle,
@@ -330,6 +342,16 @@ mod tests {
         assert_eq!(PRODUCTION_CONCURRENCY.get(), 1);
     }
 
+    #[test]
+    fn production_agent_budget_allows_bounded_multi_call_planning() {
+        let limits = production_agent_limits();
+
+        assert_eq!(limits.max_model_steps(), PRODUCTION_MAX_MODEL_STEPS);
+        assert_eq!(limits.max_tool_calls(), PRODUCTION_MAX_TOOL_CALLS);
+        assert_eq!(limits.max_model_steps(), 20);
+        assert_eq!(limits.max_tool_calls(), 32);
+    }
+
     #[tokio::test]
     async fn production_factory_builds_a_noncontacted_https_runner_with_concurrency_one() {
         let temporary = tempfile::tempdir().unwrap();
@@ -342,7 +364,7 @@ mod tests {
         let mut provider = PrivateFile::create_new(paths.data_dir.join("provider.json")).unwrap();
         provider
             .write_all(
-                br#"{"base_url":"https://127.0.0.1:9/","model":"offline-unit","api_key":"offline-unit-secret"}"#,
+                br#"{"base_url":"https://127.0.0.1:9/","model":"offline-unit","api_key":"offline-unit-secret","tool_choice_compatibility":"required_as_required"}"#,
             )
             .unwrap();
         provider.as_file().sync_all().unwrap();

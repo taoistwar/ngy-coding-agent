@@ -4,12 +4,14 @@ use coding_agent_app::{
     PROVIDER_CONFIG_INVALID, PlatformPaths, PrivateFile, ProviderConfigLoadErrorKind,
     load_provider_config,
 };
+use coding_agent_provider::ProviderToolChoiceCompatibility;
 
 fn valid_json(api_key: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "base_url": "https://provider.example",
         "model": "coding-model",
         "api_key": api_key,
+        "tool_choice_compatibility": "required_as_required",
     }))
     .unwrap()
 }
@@ -36,8 +38,48 @@ fn app_loads_the_exact_private_provider_json_from_its_data_directory() {
     let config = load_provider_config(&paths).expect("load private config");
     assert_eq!(config.model(), "coding-model");
     assert_eq!(config.base_url().as_str(), "https://provider.example/");
+    assert_eq!(
+        config.tool_choice_compatibility(),
+        ProviderToolChoiceCompatibility::RequiredAsRequired
+    );
     assert!(format!("{}", config.api_key()).contains("redacted"));
     assert!(!format!("{config:?}").contains("known-provider-secret"));
+}
+
+#[test]
+fn app_loads_an_explicit_private_ip_http_development_provider() {
+    let (_temp, paths) = fixture();
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "base_url": "http://172.16.1.20:19001",
+        "model": "deepseek-v4-flash",
+        "api_key": "known-provider-secret",
+        "allow_insecure_http": true,
+        "thinking": "enabled",
+        "tool_choice_compatibility": "required_as_auto",
+    }))
+    .expect("encode private-network development provider");
+    write_private_config(&paths, &encoded);
+
+    let config = load_provider_config(&paths).expect("load explicit private HTTP provider");
+    assert_eq!(config.base_url().as_str(), "http://172.16.1.20:19001/");
+    assert_eq!(config.model(), "deepseek-v4-flash");
+    assert!(!format!("{config:?}").contains("known-provider-secret"));
+}
+
+#[test]
+fn invalid_tool_choice_compatibility_uses_the_secret_safe_app_diagnostic() {
+    let (_temp, paths) = fixture();
+    write_private_config(
+        &paths,
+        br#"{"base_url":"https://provider.example","model":"m","api_key":"known-provider-secret","tool_choice_compatibility":"invalid-known-provider-secret"}"#,
+    );
+
+    let error = load_provider_config(&paths).expect_err("reject invalid compatibility mode");
+    assert_eq!(error.kind(), ProviderConfigLoadErrorKind::Invalid);
+    assert_eq!(error.code(), PROVIDER_CONFIG_INVALID);
+    assert!(!error.retryable());
+    assert!(!format!("{error:?}").contains("known-provider-secret"));
+    assert!(!format!("{error}").contains("known-provider-secret"));
 }
 
 #[test]

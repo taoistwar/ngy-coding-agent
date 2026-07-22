@@ -4,6 +4,11 @@ pub const PROVIDER_CONFIG_INVALID: &str = "PROVIDER_CONFIG_INVALID";
 pub const PROVIDER_UNAUTHORIZED: &str = "PROVIDER_UNAUTHORIZED";
 pub const PROVIDER_RATE_LIMITED: &str = "PROVIDER_RATE_LIMITED";
 pub const PROVIDER_RESPONSE_INVALID: &str = "PROVIDER_RESPONSE_INVALID";
+pub const PROVIDER_RESPONSE_SCHEMA_UNSUPPORTED: &str = "PROVIDER_RESPONSE_SCHEMA_UNSUPPORTED";
+pub const PROVIDER_RESPONSE_REASONING_REJECTED: &str = "PROVIDER_RESPONSE_REASONING_REJECTED";
+pub const PROVIDER_RESPONSE_FINISH_UNSUPPORTED: &str = "PROVIDER_RESPONSE_FINISH_UNSUPPORTED";
+pub const PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED: &str = "PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED";
+/// Legacy code retained so persisted failures from older builds remain recognizable.
 pub const PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS: &str =
     "PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS";
 pub const PROVIDER_REDIRECT_REJECTED: &str = "PROVIDER_REDIRECT_REJECTED";
@@ -65,16 +70,40 @@ pub(crate) fn invalid_response(message: &'static str) -> ProviderError {
     safe_error(PROVIDER_RESPONSE_INVALID, message, false)
 }
 
-pub(crate) fn invalid_request(message: &'static str) -> ProviderError {
-    safe_error(PROVIDER_REQUEST_REJECTED, message, false)
-}
-
-pub(crate) fn unsupported_multiple_tool_calls() -> ProviderError {
+pub(crate) fn unsupported_response_schema() -> ProviderError {
     safe_error(
-        PROVIDER_UNSUPPORTED_MULTIPLE_TOOL_CALLS,
-        "The provider returned multiple tool calls, which this version does not support.",
+        PROVIDER_RESPONSE_SCHEMA_UNSUPPORTED,
+        "The provider response schema is unsupported.",
         false,
     )
+}
+
+pub(crate) fn rejected_response_reasoning() -> ProviderError {
+    safe_error(
+        PROVIDER_RESPONSE_REASONING_REJECTED,
+        "The provider response contains unsupported reasoning output.",
+        false,
+    )
+}
+
+pub(crate) fn unsupported_response_finish() -> ProviderError {
+    safe_error(
+        PROVIDER_RESPONSE_FINISH_UNSUPPORTED,
+        "The provider response completion state is unsupported.",
+        false,
+    )
+}
+
+pub(crate) fn tool_choice_violated() -> ProviderError {
+    safe_error(
+        PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED,
+        "The provider response did not honor the requested tool choice.",
+        false,
+    )
+}
+
+pub(crate) fn invalid_request(message: &'static str) -> ProviderError {
+    safe_error(PROVIDER_REQUEST_REJECTED, message, false)
 }
 
 pub(crate) fn client_init_failed() -> ProviderError {
