@@ -239,7 +239,7 @@ impl ToolRuntime for RuntimeSession {
         }
         match request {
             ToolRequest::ListFiles { path, depth, limit } => {
-                let path = match RelativePath::parse(path) {
+                let path = match parse_inspection_path(path) {
                     Ok(path) => path,
                     Err(_) => return Ok(failed_result("COMMAND_NOT_ALLOWED")),
                 };
@@ -320,7 +320,7 @@ impl ToolRuntime for RuntimeSession {
                 glob,
                 limit,
             } => {
-                let path = match RelativePath::parse(path) {
+                let path = match parse_inspection_path(path) {
                     Ok(path) => path,
                     Err(_) => return Ok(failed_result("COMMAND_NOT_ALLOWED")),
                 };
@@ -682,6 +682,13 @@ fn is_path_token_character(character: char) -> bool {
     character.is_alphanumeric() || matches!(character, '_' | '-' | '.')
 }
 
+fn parse_inspection_path(path: String) -> Result<RelativePath, crate::RelativePathError> {
+    // Models and users conventionally spell the current directory as `.`. The
+    // capability layer represents the worktree root as an empty relative path,
+    // so accept that one unambiguous alias at the typed-tool boundary.
+    RelativePath::parse(if path == "." { String::new() } else { path })
+}
+
 fn success_result(value: Value, truncated: bool) -> ToolResult {
     if truncated {
         ToolResult::truncated_text(value.to_string())
@@ -811,6 +818,18 @@ mod tests {
     #[test]
     fn defaults_are_fully_validated_and_model_independent() {
         let _ = RuntimeSessionLimits::project_2_defaults();
+    }
+
+    #[test]
+    fn inspection_paths_accept_dot_as_the_worktree_root() {
+        assert!(parse_inspection_path(".".to_owned()).unwrap().is_root());
+        assert_eq!(
+            parse_inspection_path("src/lib.rs".to_owned())
+                .unwrap()
+                .as_slash_str(),
+            "src/lib.rs"
+        );
+        assert!(parse_inspection_path("../outside".to_owned()).is_err());
     }
 
     #[test]
