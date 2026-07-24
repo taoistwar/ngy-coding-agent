@@ -119,7 +119,7 @@ test("a dropped create wake converges through the dispatcher poll exactly once",
         (task) => task.status === "running",
         "the released task to enter Running",
       );
-      await expect(page.locator(".task-status-label")).toHaveText("Status: running");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: running");
       await page.getByRole("button", { name: "Cancel task", exact: true }).click();
       await waitForTask(
         context.request,
@@ -128,7 +128,7 @@ test("a dropped create wake converges through the dispatcher poll exactly once",
         (task) => task.status === "cancelled",
         "the blocking task to cancel",
       );
-      await expect(page.locator(".task-status-label")).toHaveText("Status: cancelled");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: cancelled");
 
       const finalEvents = await taskEvents(context.request, app.origin, created.id);
       expect(finalEvents.filter((event) => event.kind === "task.queued")).toHaveLength(1);
@@ -227,6 +227,7 @@ test("a newer service control cannot regress behind a paused bootstrap snapshot"
       recoveryReleasePath = roots.releaseSignalPath("recovery-after-service-change");
       return {
         ...successScenario(),
+        fake_scenarios: ["failure"],
         store_writer_faults: [
           {
             point: "fail_before_execute",
@@ -322,6 +323,7 @@ test("store degradation stays visible until recovery persists the interrupted ta
       recoveryReleasePath = roots.releaseSignalPath("release-degraded-recovery");
       return {
         ...successScenario(),
+        fake_scenarios: ["failure"],
         store_writer_faults: [
           {
             point: "fail_before_execute",
@@ -382,7 +384,7 @@ test("store degradation stays visible until recovery persists the interrupted ta
       const recoveryEvents = await taskEvents(context.request, app.origin, created.id);
       expect(recoveryEvents.filter((event) => event.kind === "task.interrupted")).toHaveLength(1);
 
-      await expect(page.locator(".task-status-label")).toHaveText("Status: interrupted");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: interrupted");
       await expect(
         page.locator(".failure-panel").getByText("STORE_WRITE_FAILED", { exact: true }),
       ).toBeVisible();

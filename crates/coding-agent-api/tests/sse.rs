@@ -10,9 +10,10 @@ use coding_agent_api::{
     SseBackend, TaskEventDto, build_api_router,
 };
 use coding_agent_domain::{
-    ActivityEntry, ActivityLevel, ClientRequestId, DiffSnapshot, EventId, PlanSnapshot,
-    RepositoryId, Task, TaskEvent, TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestSnapshot,
-    TestStatus, UtcTimestamp,
+    ActivityEntry, ActivityLevel, ClientRequestId, DeliveryReadiness, DiffSnapshot, EventId,
+    NewReviewEvidence, PlanSnapshot, RepositoryId, RequiredCheck, ReviewDecisionSource,
+    ReviewEvidence, ReviewFinding, ReviewVerdict, Task, TaskEvent, TaskEventPayload, TaskFailure,
+    TaskId, TaskStatus, TestSnapshot, TestStatus, UtcTimestamp, WorkspaceDigest,
 };
 use futures_util::{StreamExt as _, poll, stream};
 use http::StatusCode;
@@ -792,7 +793,7 @@ async fn heartbeat_arrives_at_fifteen_seconds_and_has_no_id() {
 #[tokio::test]
 async fn all_persisted_variants_use_the_exact_named_event_and_matching_json_id() {
     let events = all_wire_events();
-    let sse = ScriptedSse::finite([10], events, Vec::new(), Vec::new());
+    let sse = ScriptedSse::finite([11], events, Vec::new(), Vec::new());
     let (_, body) = finite_body(connect(sse, 0).await).await;
     let expected = [
         "task.queued",
@@ -801,6 +802,7 @@ async fn all_persisted_variants_use_the_exact_named_event_and_matching_json_id()
         "activity.appended",
         "diff.updated",
         "test.updated",
+        "review.updated",
         "task.completed",
         "task.failed",
         "task.cancelled",
@@ -817,6 +819,27 @@ async fn all_persisted_variants_use_the_exact_named_event_and_matching_json_id()
         let id = (index + 1) as i64;
         assert!(frame.contains(&format!("id: {id}\n")), "{frame}");
         assert!(frame.contains(&format!("\"id\":{id}")), "{frame}");
+        if name == "review.updated" {
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data:").map(str::trim))
+                .expect("review frame data");
+            let data: serde_json::Value = serde_json::from_str(data).unwrap();
+            let review = &data["payload"]["review"];
+            assert_eq!(review["decision_source"], "system");
+            assert_eq!(review["verdict"], "changes_requested");
+            assert_eq!(review["coverage"], serde_json::Value::Null);
+            assert_eq!(review["required_checks"][0]["kind"], "cargo_test");
+            assert_eq!(
+                review["required_checks"][0]["package"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                review["required_checks"][0]["integration_test"],
+                serde_json::Value::Null
+            );
+            assert_eq!(review.as_object().unwrap().len(), 12);
+        }
     }
 }
 
@@ -886,18 +909,10 @@ fn all_wire_events() -> Vec<TaskEventDto> {
             task: task_with_status(2, TaskStatus::Running),
         },
         TaskEventPayload::PlanUpdated {
-            plan: PlanSnapshot {
-                revision: 1,
-                items: Vec::new(),
-            },
+            plan: PlanSnapshot::legacy(1, Vec::new()),
         },
         TaskEventPayload::ActivityAppended {
-            entry: ActivityEntry {
-                id: "activity".to_owned(),
-                level: ActivityLevel::Info,
-                message: "safe".to_owned(),
-                created_at: timestamp(),
-            },
+            entry: ActivityEntry::legacy("activity", ActivityLevel::Info, "safe", timestamp()),
         },
         TaskEventPayload::DiffUpdated {
             diff: DiffSnapshot {
@@ -912,17 +927,20 @@ fn all_wire_events() -> Vec<TaskEventDto> {
                 cases: Vec::new(),
             },
         },
+        TaskEventPayload::ReviewUpdated {
+            review: system_review(),
+        },
         TaskEventPayload::TaskCompleted {
-            task: task_with_status(7, TaskStatus::Completed),
+            task: task_with_status(8, TaskStatus::Completed),
         },
         TaskEventPayload::TaskFailed {
-            task: task_with_status(8, TaskStatus::Failed),
+            task: task_with_status(9, TaskStatus::Failed),
         },
         TaskEventPayload::TaskCancelled {
-            task: task_with_status(9, TaskStatus::Cancelled),
+            task: task_with_status(10, TaskStatus::Cancelled),
         },
         TaskEventPayload::TaskInterrupted {
-            task: task_with_status(10, TaskStatus::Interrupted),
+            task: task_with_status(11, TaskStatus::Interrupted),
         },
     ];
     payloads
@@ -937,6 +955,26 @@ fn all_wire_events() -> Vec<TaskEventDto> {
             ))
         })
         .collect()
+}
+
+fn system_review() -> ReviewEvidence {
+    let digest = WorkspaceDigest::try_new("a".repeat(64)).unwrap();
+    let required_checks = vec![RequiredCheck::try_cargo_test("tests", None, None).unwrap()];
+    let evidence = NewReviewEvidence::try_new(
+        1,
+        ReviewDecisionSource::System,
+        0,
+        digest,
+        ReviewVerdict::ChangesRequested,
+        "workspace changed",
+        vec![ReviewFinding::system_workspace_changed(1).unwrap()],
+        Vec::new(),
+        required_checks,
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    ReviewEvidence::try_from_new(evidence, timestamp()).unwrap()
 }
 
 fn task(id: i64) -> Task {
@@ -969,6 +1007,7 @@ fn task_with_status(id: i64, status: TaskStatus) -> Task {
         repository_id: RepositoryId::new(),
         prompt: "safe fixture".to_owned(),
         status,
+        delivery_readiness: DeliveryReadiness::Unreviewed,
         attempt: 1,
         retry_of: None,
         created_at: timestamp(),

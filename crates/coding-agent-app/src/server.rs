@@ -666,6 +666,7 @@ impl ApiBackend for ApplicationBackend {
             activity: detail.activity.into_iter().map(Into::into).collect(),
             diff: detail.diff.map(Into::into),
             tests: detail.tests.map(Into::into),
+            reviews: detail.reviews.into_iter().map(Into::into).collect(),
             timeline: detail.timeline.into_iter().map(Into::into).collect(),
             event_cursor: detail.event_cursor.get(),
         })

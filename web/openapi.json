@@ -1167,6 +1167,15 @@
   },
   "components": {
     "schemas": {
+      "ActivityActorDto": {
+        "type": "string",
+        "enum": [
+          "system",
+          "planner",
+          "executor",
+          "reviewer"
+        ]
+      },
       "ActivityAppendedEventDto": {
         "type": "object",
         "required": [
@@ -1224,10 +1233,15 @@
         "required": [
           "id",
           "level",
+          "actor",
+          "role_run",
           "message",
           "created_at"
         ],
         "properties": {
+          "actor": {
+            "$ref": "#/components/schemas/ActivityActorDto"
+          },
           "created_at": {
             "$ref": "#/components/schemas/UtcTimestampDto"
           },
@@ -1239,6 +1253,15 @@
           },
           "message": {
             "type": "string"
+          },
+          "role_run": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "maximum": 9007199254740991,
+            "minimum": 1
           }
         }
       },
@@ -1360,6 +1383,150 @@
       "CanonicalPathDto": {
         "type": "string"
       },
+      "CargoCheckDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "package"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CargoCheckKind"
+          },
+          "package": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$"
+          }
+        }
+      },
+      "CargoCheckKind": {
+        "type": "string",
+        "enum": [
+          "cargo_check"
+        ]
+      },
+      "CargoTestDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "package",
+          "integration_test"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "integration_test": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CargoTestKind"
+          },
+          "package": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$"
+          }
+        }
+      },
+      "CargoTestKind": {
+        "type": "string",
+        "enum": [
+          "cargo_test"
+        ]
+      },
+      "CheckActorDto": {
+        "type": "string",
+        "enum": [
+          "executor",
+          "reviewer"
+        ]
+      },
+      "CheckEvidenceDto": {
+        "type": "object",
+        "required": [
+          "check_id",
+          "actor",
+          "role_run",
+          "workspace_generation",
+          "workspace_digest",
+          "status",
+          "duration_ms",
+          "summary",
+          "truncated"
+        ],
+        "properties": {
+          "actor": {
+            "$ref": "#/components/schemas/CheckActorDto"
+          },
+          "check_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "role_run": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          },
+          "status": {
+            "$ref": "#/components/schemas/CheckEvidenceStatusDto"
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 2048,
+            "minLength": 1
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "workspace_digest": {
+            "$ref": "#/components/schemas/WorkspaceDigestDto"
+          },
+          "workspace_generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          }
+        }
+      },
+      "CheckEvidenceStatusDto": {
+        "type": "string",
+        "enum": [
+          "passed",
+          "failed",
+          "cancelled"
+        ]
+      },
       "CreateTaskRequest": {
         "type": "object",
         "required": [
@@ -1380,6 +1547,14 @@
             "format": "uuid"
           }
         }
+      },
+      "DeliveryReadinessDto": {
+        "type": "string",
+        "enum": [
+          "unreviewed",
+          "review_approved",
+          "review_rejected"
+        ]
       },
       "DiffFileDto": {
         "type": "object",
@@ -1496,14 +1671,34 @@
           }
         }
       },
+      "FindingSeverityDto": {
+        "type": "string",
+        "enum": [
+          "blocking",
+          "advisory"
+        ]
+      },
       "PlanItemDto": {
         "type": "object",
         "required": [
           "id",
           "title",
+          "description",
+          "acceptance_criteria",
           "status"
         ],
         "properties": {
+          "acceptance_criteria": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 4096
+          },
           "id": {
             "type": "string"
           },
@@ -1511,7 +1706,8 @@
             "$ref": "#/components/schemas/PlanItemStatusDto"
           },
           "title": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 256
           }
         }
       },
@@ -1526,20 +1722,42 @@
       "PlanSnapshotDto": {
         "type": "object",
         "required": [
+          "format_version",
           "revision",
-          "items"
+          "summary",
+          "items",
+          "initial_required_checks"
         ],
         "properties": {
+          "format_version": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 0
+          },
+          "initial_required_checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequiredCheckDto"
+            },
+            "maxItems": 16
+          },
           "items": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PlanItemDto"
-            }
+            },
+            "maxItems": 32
           },
           "revision": {
             "type": "integer",
             "format": "int64",
+            "maximum": 9007199254740991,
             "minimum": 0
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 4096
           }
         }
       },
@@ -1647,6 +1865,262 @@
             "$ref": "#/components/schemas/CanonicalPathDto"
           }
         }
+      },
+      "RequiredCheckDto": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CargoCheckDto"
+          },
+          {
+            "$ref": "#/components/schemas/CargoTestDto"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "cargo_check": "#/components/schemas/CargoCheckDto",
+            "cargo_test": "#/components/schemas/CargoTestDto"
+          }
+        }
+      },
+      "ReviewChunkIndexDto": {
+        "type": "integer",
+        "maximum": 7,
+        "minimum": 0
+      },
+      "ReviewCoverageDto": {
+        "type": "object",
+        "required": [
+          "generation",
+          "workspace_digest",
+          "manifest_sha256",
+          "covered_chunks",
+          "total_chunks"
+        ],
+        "properties": {
+          "covered_chunks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReviewChunkIndexDto"
+            },
+            "maxItems": 8
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "total_chunks": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 8,
+            "minimum": 0
+          },
+          "workspace_digest": {
+            "$ref": "#/components/schemas/WorkspaceDigestDto"
+          }
+        }
+      },
+      "ReviewDecisionSourceDto": {
+        "type": "string",
+        "enum": [
+          "reviewer",
+          "system"
+        ]
+      },
+      "ReviewEvidenceDto": {
+        "type": "object",
+        "required": [
+          "round",
+          "decision_source",
+          "workspace_generation",
+          "workspace_digest",
+          "verdict",
+          "summary",
+          "findings",
+          "added_required_checks",
+          "required_checks",
+          "check_evidence",
+          "coverage",
+          "created_at"
+        ],
+        "properties": {
+          "added_required_checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequiredCheckDto"
+            },
+            "maxItems": 16
+          },
+          "check_evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckEvidenceDto"
+            },
+            "maxItems": 16
+          },
+          "coverage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewCoverageDto"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "decision_source": {
+            "$ref": "#/components/schemas/ReviewDecisionSourceDto"
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReviewFindingDto"
+            },
+            "maxItems": 32
+          },
+          "required_checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequiredCheckDto"
+            },
+            "maxItems": 16,
+            "minItems": 1
+          },
+          "round": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 3,
+            "minimum": 1
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/ReviewVerdictDto"
+          },
+          "workspace_digest": {
+            "$ref": "#/components/schemas/WorkspaceDigestDto"
+          },
+          "workspace_generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          }
+        }
+      },
+      "ReviewFindingDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "severity",
+          "message",
+          "path",
+          "line"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^review-[1-3]-finding-([1-9]|[12][0-9]|3[0-2])$"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 2048,
+            "minLength": 1
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096,
+            "minLength": 1
+          },
+          "severity": {
+            "$ref": "#/components/schemas/FindingSeverityDto"
+          }
+        }
+      },
+      "ReviewUpdatedEventDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "schema_version",
+          "task_id",
+          "kind",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ReviewUpdatedKind"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/ReviewUpdatedPayloadDto"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ReviewUpdatedKind": {
+        "type": "string",
+        "enum": [
+          "review.updated"
+        ]
+      },
+      "ReviewUpdatedPayloadDto": {
+        "type": "object",
+        "required": [
+          "review"
+        ],
+        "properties": {
+          "review": {
+            "$ref": "#/components/schemas/ReviewEvidenceDto"
+          }
+        }
+      },
+      "ReviewVerdictDto": {
+        "type": "string",
+        "enum": [
+          "approved",
+          "changes_requested"
+        ]
       },
       "ServiceStateControl": {
         "type": "object",
@@ -1828,6 +2302,7 @@
         "required": [
           "task",
           "activity",
+          "reviews",
           "timeline",
           "event_cursor"
         ],
@@ -1862,6 +2337,13 @@
               }
             ]
           },
+          "reviews": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReviewEvidenceDto"
+            },
+            "maxItems": 3
+          },
           "task": {
             "$ref": "#/components/schemas/TaskDto"
           },
@@ -1891,6 +2373,7 @@
           "repository_id",
           "prompt",
           "status",
+          "delivery_readiness",
           "attempt",
           "created_at",
           "last_event_id"
@@ -1907,6 +2390,9 @@
           },
           "created_at": {
             "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "delivery_readiness": {
+            "$ref": "#/components/schemas/DeliveryReadinessDto"
           },
           "failure": {
             "oneOf": [
@@ -1986,6 +2472,9 @@
             "$ref": "#/components/schemas/TestUpdatedEventDto"
           },
           {
+            "$ref": "#/components/schemas/ReviewUpdatedEventDto"
+          },
+          {
             "$ref": "#/components/schemas/TaskCompletedEventDto"
           },
           {
@@ -2004,6 +2493,7 @@
             "activity.appended": "#/components/schemas/ActivityAppendedEventDto",
             "diff.updated": "#/components/schemas/DiffUpdatedEventDto",
             "plan.updated": "#/components/schemas/PlanUpdatedEventDto",
+            "review.updated": "#/components/schemas/ReviewUpdatedEventDto",
             "task.cancelled": "#/components/schemas/TaskCancelledEventDto",
             "task.completed": "#/components/schemas/TaskCompletedEventDto",
             "task.failed": "#/components/schemas/TaskFailedEventDto",
@@ -2023,6 +2513,7 @@
           "activity.appended",
           "diff.updated",
           "test.updated",
+          "review.updated",
           "task.completed",
           "task.failed",
           "task.cancelled",
@@ -2386,6 +2877,30 @@
       "UtcTimestampDto": {
         "type": "string",
         "format": "date-time"
+      },
+      "WorkspaceDigestAlgorithmDto": {
+        "type": "string",
+        "enum": [
+          "workspace_fingerprint_v1"
+        ]
+      },
+      "WorkspaceDigestDto": {
+        "type": "object",
+        "required": [
+          "algorithm",
+          "value"
+        ],
+        "properties": {
+          "algorithm": {
+            "$ref": "#/components/schemas/WorkspaceDigestAlgorithmDto"
+          },
+          "value": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
       }
     }
   }

@@ -10,14 +10,17 @@ use coding_agent_core::{
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::review_diff::ReviewDiffState;
 use crate::{
     AtomicFileReplacer, AtomicReplaceError, AtomicReplaceLimits, CargoCatalog, CargoRunResult,
     CargoRunStatus, CargoToolError, CargoToolLimits, CargoTools, CommandPolicyError, DiffCollector,
-    DiffError, DiffLimits, FileEntryKind, FileToolError, FileToolLimits, FileTools,
-    FingerprintError, FingerprintLimits, GitRunResult, GitRunStatus, GitToolError, GitToolLimits,
-    GitTools, ProcessLimits, ProvisionedWorktree, RelativePath, ToolchainPaths,
+    DiffError, DiffLimits, ExecutionDirectory, FileEntryKind, FileToolError, FileToolLimits,
+    FileTools, FingerprintError, FingerprintLimits, GitRunResult, GitRunStatus, GitToolError,
+    GitToolLimits, GitTools, ProcessLimits, ProvisionedWorktree, RelativePath, ToolchainPaths,
     WorkspaceFingerprinter,
 };
+
+pub const ATTEMPT_IDENTITY_MISMATCH: &str = "ATTEMPT_IDENTITY_MISMATCH";
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeSessionLimits {
@@ -28,6 +31,7 @@ pub struct RuntimeSessionLimits {
     git: GitToolLimits,
     diff: DiffLimits,
     fingerprint: FingerprintLimits,
+    validation_timeout: Duration,
 }
 
 impl RuntimeSessionLimits {
@@ -41,6 +45,7 @@ impl RuntimeSessionLimits {
         diff: DiffLimits,
         fingerprint: FingerprintLimits,
     ) -> Self {
+        let validation_timeout = process.max_command_timeout();
         Self {
             process,
             files,
@@ -49,20 +54,35 @@ impl RuntimeSessionLimits {
             git,
             diff,
             fingerprint,
+            validation_timeout,
         }
+    }
+
+    /// Overrides the Project 3 validation deadline at trusted product
+    /// composition time. Model/provider requests never receive this control.
+    pub fn try_with_validation_timeout(
+        mut self,
+        validation_timeout: Duration,
+    ) -> Result<Self, CommandPolicyError> {
+        if validation_timeout.is_zero() || validation_timeout > self.process.max_command_timeout() {
+            return Err(CommandPolicyError::InvalidTimeout);
+        }
+        self.validation_timeout = validation_timeout;
+        Ok(self)
     }
 
     /// Conservative Project 2 defaults. Applications may supply lower trusted
     /// limits, but model input never selects these bounds.
     pub fn project_2_defaults() -> Self {
+        let process = ProcessLimits::try_new(
+            512 * 1024,
+            256 * 1024,
+            Duration::from_secs(10 * 60),
+            Duration::from_secs(5),
+        )
+        .expect("constant process limits are valid");
         Self {
-            process: ProcessLimits::try_new(
-                512 * 1024,
-                256 * 1024,
-                Duration::from_secs(10 * 60),
-                Duration::from_secs(5),
-            )
-            .expect("constant process limits are valid"),
+            process,
             files: FileToolLimits::try_new(
                 2 * 1024 * 1024,
                 16 * 1024 * 1024,
@@ -96,22 +116,27 @@ impl RuntimeSessionLimits {
                 128 * 1024 * 1024,
             )
             .expect("constant fingerprint limits are valid"),
+            validation_timeout: process.max_command_timeout(),
         }
     }
 }
 
 /// Concrete per-attempt implementation of every model-visible tool plus the
-/// fingerprint and terminal snapshot operations used by `AgentLoop`.
+/// fingerprint, validation, review-diff, and terminal snapshot operations used
+/// by the multi-role role loops.
 #[derive(Debug)]
 pub struct RuntimeSession {
+    attempt_work_tree: Arc<ExecutionDirectory>,
     files: Arc<FileTools>,
     replacer: Arc<AtomicFileReplacer>,
-    cargo: CargoTools,
+    pub(crate) cargo: CargoTools,
     git: GitTools,
-    diff: DiffCollector,
-    fingerprint: WorkspaceFingerprinter,
+    pub(crate) diff: DiffCollector,
+    pub(crate) fingerprint: WorkspaceFingerprinter,
     cargo_catalog: CargoCatalog,
-    output_redactor: KnownPathRedactor,
+    pub(crate) output_redactor: KnownPathRedactor,
+    pub(crate) validation_timeout: Duration,
+    pub(crate) review_diff_state: ReviewDiffState,
 }
 
 impl RuntimeSession {
@@ -122,6 +147,7 @@ impl RuntimeSession {
         limits: RuntimeSessionLimits,
     ) -> Result<Self, RuntimeSessionError> {
         let work_tree = worktree.work_tree();
+        let attempt_work_tree = Arc::clone(&work_tree);
         let file_root = work_tree
             .cloned_root_capability()
             .map_err(RuntimeSessionError::CommandPolicy)?;
@@ -172,6 +198,7 @@ impl RuntimeSession {
         )
         .map_err(RuntimeSessionError::Fingerprint)?;
         Ok(Self {
+            attempt_work_tree,
             files: Arc::new(FileTools::new(file_root, limits.files)),
             replacer: Arc::new(AtomicFileReplacer::new(replace_root, limits.replace)),
             cargo,
@@ -180,6 +207,8 @@ impl RuntimeSession {
             fingerprint,
             cargo_catalog: worktree.cargo_catalog().clone(),
             output_redactor,
+            validation_timeout: limits.validation_timeout,
+            review_diff_state: ReviewDiffState::default(),
         })
     }
 
@@ -190,6 +219,19 @@ impl RuntimeSession {
     /// Bounded repository context safe to place in the initial model request.
     pub fn repository_context(&self) -> String {
         self.cargo_catalog.repository_context()
+    }
+
+    /// Revalidates the retained no-follow worktree capability for this exact
+    /// attempt. The caller receives a stable, non-sensitive error instead of
+    /// path or platform-specific identity details.
+    pub fn verify_attempt_identity(&self) -> Result<(), RuntimeError> {
+        self.attempt_work_tree.revalidate().map_err(|_| {
+            RuntimeError::new(
+                ATTEMPT_IDENTITY_MISMATCH,
+                "the isolated attempt worktree identity no longer matches",
+                false,
+            )
+        })
     }
 
     async fn stable_terminal_snapshot(
@@ -529,7 +571,7 @@ fn captured_stream(stream: &crate::CapturedStream, redactor: &KnownPathRedactor)
 const REDACTED_PATH: &str = "<redacted-path>";
 
 #[derive(Clone)]
-struct KnownPathRedactor {
+pub(crate) struct KnownPathRedactor {
     patterns: Vec<String>,
 }
 
@@ -617,7 +659,7 @@ impl KnownPathRedactor {
         }
     }
 
-    fn redact(&self, value: &str) -> String {
+    pub(crate) fn redact(&self, value: &str) -> String {
         self.patterns
             .iter()
             .fold(value.to_owned(), |redacted, pattern| {

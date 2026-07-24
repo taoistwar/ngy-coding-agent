@@ -1,5 +1,14 @@
 use crate::{ClientRequestId, DomainError, EventId, RepositoryId, TaskId, UtcTimestamp};
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryReadiness {
+    #[default]
+    Unreviewed,
+    ReviewApproved,
+    ReviewRejected,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -76,6 +85,8 @@ pub struct Task {
     pub repository_id: RepositoryId,
     pub prompt: String,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub delivery_readiness: DeliveryReadiness,
     pub attempt: u32,
     pub retry_of: Option<TaskId>,
     pub created_at: UtcTimestamp,
@@ -108,7 +119,18 @@ impl Task {
             TaskStatus::Interrupted => task.finished_at.is_some() && task.failure.is_some(),
         };
 
-        if !state_is_valid {
+        let readiness_is_valid = match task.delivery_readiness {
+            DeliveryReadiness::Unreviewed => true,
+            DeliveryReadiness::ReviewApproved => task.status == TaskStatus::Completed,
+            DeliveryReadiness::ReviewRejected => {
+                task.status == TaskStatus::Failed
+                    && task.failure.as_ref().is_some_and(|failure| {
+                        failure.code == "REVIEW_REJECTED" && failure.retryable
+                    })
+            }
+        };
+
+        if !state_is_valid || !readiness_is_valid {
             return Err(DomainError::InvalidTaskState);
         }
 

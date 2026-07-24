@@ -4,8 +4,9 @@ use std::fs;
 use std::path::Path;
 
 use coding_agent_app::{
-    ActorPausePoint, FakeScenario, ProcessTestConfig, ProcessTestEnvironment, StartupDependencies,
-    StoreWriterFaultPoint, StoreWriterOperationKind, TEST_PICKER_PROBE_FILE, VirtualReleaseTarget,
+    ActorPausePoint, FakeScenario, LegacyV2Seed, ProcessTestConfig, ProcessTestEnvironment,
+    StartupDependencies, StoreWriterFaultPoint, StoreWriterOperationKind, TEST_PICKER_PROBE_FILE,
+    VirtualReleaseTarget,
 };
 
 #[test]
@@ -43,6 +44,7 @@ fn complete_process_scenario_is_closed_validated_and_consumed_once() {
         VirtualReleaseTarget::ActorClaimPermitAcquired
     );
     assert!(config.marker_write_failure);
+    assert_eq!(config.legacy_v2_seed, LegacyV2Seed::None);
 
     assert!(
         !scenario_path.exists()
@@ -198,6 +200,27 @@ fn unknown_fields_are_rejected_without_consuming_the_source() {
 }
 
 #[test]
+fn legacy_v2_seed_is_required_and_cannot_silently_default() {
+    let fixture = tempfile::tempdir().expect("create process-support fixture");
+    let scenario_path = fixture.path().join("scenario.json");
+    write_scenario(
+        &scenario_path,
+        &fixture.path().join("claim-permit.release"),
+        "",
+    );
+    let scenario = fs::read_to_string(&scenario_path)
+        .expect("read scenario")
+        .replace("  \"legacy_v2_seed\": { \"kind\": \"none\" },\n", "");
+    fs::write(&scenario_path, scenario).expect("remove required legacy seed field");
+
+    let error = ProcessTestConfig::load(&scenario_path)
+        .expect_err("a missing legacy seed field must be rejected");
+
+    assert!(error.to_string().contains("legacy_v2_seed"));
+    assert!(scenario_path.exists(), "invalid input is not consumed");
+}
+
+#[test]
 fn every_configured_path_is_validated_before_consumption() {
     let fixture = tempfile::tempdir().expect("create process-support fixture");
     let scenario_path = fixture.path().join("scenario.json");
@@ -331,6 +354,7 @@ fn write_scenario(path: &Path, signal_path: &Path, extra_field: &str) {
   "store_writer_faults": [{{ "point": "fail_before_execute", "operation": "create_task", "count": 2 }}],
   "actor_pauses": ["claim_permit_acquired"],
   "virtual_release_signals": [{{ "name": "claim-permit", "path": {signal_path}, "target": "actor_claim_permit_acquired" }}],
+  "legacy_v2_seed": {{ "kind": "none" }},
   "marker_write_failure": true{extra_field}
 }}"#
     );

@@ -94,6 +94,10 @@ impl ProcessLimits {
             cleanup_timeout,
         })
     }
+
+    pub(crate) const fn max_command_timeout(self) -> Duration {
+        self.max_command_timeout
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

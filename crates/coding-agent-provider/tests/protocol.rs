@@ -1,24 +1,24 @@
 use coding_agent_core::{
-    ModelMessage, ModelRequest, ModelResponse, ModelToolChoice, ToolCall, ToolCallBatch,
-    ToolRequest,
+    ActionRequest, AllowedActions, ModelMessage, ModelRequest, ModelResponse, ModelToolChoice,
+    RetainedToolResult, RuntimeActionRequest, ToolCall, ToolCallBatch, ToolRequest, ToolStatus,
 };
 use coding_agent_provider::{
     PROVIDER_RATE_LIMITED, PROVIDER_RESPONSE_FINISH_UNSUPPORTED, PROVIDER_RESPONSE_INVALID,
     PROVIDER_RESPONSE_REASONING_REJECTED, PROVIDER_RESPONSE_SCHEMA_UNSUPPORTED,
-    PROVIDER_UNAUTHORIZED, decode_chat_completions_response, encode_chat_completions_request,
-    map_http_status,
+    PROVIDER_UNAUTHORIZED, SecretRedactor, decode_chat_completions_response,
+    encode_chat_completions_request, map_http_status,
 };
 
 #[test]
 fn request_encodes_supported_messages_and_one_tool_call_id_round_trip() {
-    let call = ToolCall {
-        id: "call-17".to_owned(),
-        request: ToolRequest::ReadFile {
+    let call = ToolCall::runtime(
+        "call-17",
+        ToolRequest::ReadFile {
             path: "src/lib.rs".to_owned(),
             start_line: 1,
             end_line: 20,
         },
-    };
+    );
     let request = ModelRequest {
         messages: vec![
             ModelMessage::system("policy"),
@@ -31,6 +31,7 @@ fn request_encodes_supported_messages_and_one_tool_call_id_round_trip() {
             }),
             ModelMessage::tool_result("call-17", "file contents"),
         ],
+        allowed_actions: AllowedActions::legacy(),
         tool_choice: ModelToolChoice::Auto,
     };
 
@@ -78,6 +79,51 @@ fn request_encodes_supported_messages_and_one_tool_call_id_round_trip() {
 }
 
 #[test]
+fn retained_wrapper_is_byte_for_byte_the_provider_tool_message_wire() {
+    let tool_call_id = r#"call-"quoted"\slash"#;
+    let retained = RetainedToolResult::try_from_parts(
+        tool_call_id,
+        r#"result has "quotes" and a \backslash"#,
+        ToolStatus::Succeeded,
+        false,
+        &SecretRedactor::new(),
+    )
+    .unwrap();
+    let request = ModelRequest {
+        messages: vec![
+            ModelMessage::AssistantToolCalls(ToolCallBatch {
+                assistant_content: None,
+                reasoning_content: None,
+                calls: vec![ToolCall::runtime(tool_call_id, ToolRequest::GitStatus)],
+            }),
+            retained.clone().into_model_message(),
+        ],
+        allowed_actions: AllowedActions::legacy(),
+        tool_choice: ModelToolChoice::Auto,
+    };
+
+    let encoded = encode_chat_completions_request("coding-model", &request).unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let provider_message = serde_json::to_vec(&wire["messages"][1]).unwrap();
+
+    assert_eq!(retained.wrapper_bytes(), provider_message);
+    assert!(
+        encoded
+            .windows(retained.wrapper_len())
+            .any(|window| window == retained.wrapper_bytes()),
+        "the full provider request must embed the exact wrapper bytes counted by core"
+    );
+    assert_eq!(
+        std::str::from_utf8(retained.wrapper_bytes()).unwrap(),
+        format!(
+            "{{\"content\":{},\"role\":\"tool\",\"tool_call_id\":{}}}",
+            serde_json::to_string(retained.content()).unwrap(),
+            serde_json::to_string(tool_call_id).unwrap()
+        )
+    );
+}
+
+#[test]
 fn strict_request_encodes_all_supported_tool_choices_exactly() {
     for (tool_choice, expected) in [
         (ModelToolChoice::Auto, serde_json::json!("auto")),
@@ -94,7 +140,8 @@ fn strict_request_encodes_all_supported_tool_choices_exactly() {
             "coding-model",
             &ModelRequest {
                 messages: vec![ModelMessage::user("finish safely")],
-                tool_choice,
+                allowed_actions: AllowedActions::legacy(),
+                tool_choice: tool_choice.clone(),
             },
         )
         .expect("encode supported tool choice");
@@ -104,18 +151,21 @@ fn strict_request_encodes_all_supported_tool_choices_exactly() {
         assert_eq!(json["parallel_tool_calls"], false);
         assert_eq!(
             json["tools"].as_array().map(Vec::len),
-            Some(8),
-            "strict mode keeps the complete tool set for every logical choice"
+            Some(
+                if matches!(tool_choice, ModelToolChoice::RequiredCargoTest) {
+                    1
+                } else {
+                    8
+                }
+            ),
+            "required choices expose only their exact action schema"
         );
     }
 }
 
 #[test]
 fn request_rejects_a_mismatched_or_unpaired_tool_result_id() {
-    let call = ToolCall {
-        id: "call-17".to_owned(),
-        request: ToolRequest::GitStatus,
-    };
+    let call = ToolCall::runtime("call-17", ToolRequest::GitStatus);
     for messages in [
         vec![
             ModelMessage::AssistantToolCalls(ToolCallBatch {
@@ -136,6 +186,7 @@ fn request_rejects_a_mismatched_or_unpaired_tool_result_id() {
             "coding-model",
             &ModelRequest {
                 messages,
+                allowed_actions: AllowedActions::legacy(),
                 tool_choice: ModelToolChoice::Auto,
             },
         )
@@ -147,28 +198,16 @@ fn request_rejects_a_mismatched_or_unpaired_tool_result_id() {
         assistant_content: Some("Inspecting.".to_owned()),
         reasoning_content: None,
         calls: vec![
-            ToolCall {
-                id: "first".to_owned(),
-                request: ToolRequest::GitStatus,
-            },
-            ToolCall {
-                id: "second".to_owned(),
-                request: ToolRequest::GitDiff,
-            },
+            ToolCall::runtime("first", ToolRequest::GitStatus),
+            ToolCall::runtime("second", ToolRequest::GitDiff),
         ],
     };
     let duplicate_batch = ToolCallBatch {
         assistant_content: None,
         reasoning_content: None,
         calls: vec![
-            ToolCall {
-                id: "same".to_owned(),
-                request: ToolRequest::GitStatus,
-            },
-            ToolCall {
-                id: "same".to_owned(),
-                request: ToolRequest::GitDiff,
-            },
+            ToolCall::runtime("same", ToolRequest::GitStatus),
+            ToolCall::runtime("same", ToolRequest::GitDiff),
         ],
     };
     for messages in [
@@ -193,6 +232,7 @@ fn request_rejects_a_mismatched_or_unpaired_tool_result_id() {
             "coding-model",
             &ModelRequest {
                 messages,
+                allowed_actions: AllowedActions::legacy(),
                 tool_choice: ModelToolChoice::Auto,
             },
         )
@@ -235,14 +275,14 @@ fn response_decodes_exactly_one_typed_tool_call_and_preserves_its_id() {
         ModelResponse::ToolCalls(ToolCallBatch {
             assistant_content: None,
             reasoning_content: None,
-            calls: vec![ToolCall {
-                id: "call-17".to_owned(),
-                request: ToolRequest::ReadFile {
+            calls: vec![ToolCall::runtime(
+                "call-17",
+                ToolRequest::ReadFile {
                     path: "src/lib.rs".to_owned(),
                     start_line: 1,
                     end_line: 20,
                 },
-            }],
+            )],
         })
     );
 }
@@ -305,6 +345,7 @@ fn tool_call_assistant_content_is_preserved_for_the_next_request() {
             ModelMessage::AssistantToolCalls(batch),
             ModelMessage::tool_result("call-1", "clean"),
         ],
+        allowed_actions: AllowedActions::legacy(),
         tool_choice: ModelToolChoice::Auto,
     };
     let round_trip = encode_chat_completions_request("coding-model", &request)
@@ -329,6 +370,7 @@ fn tool_call_assistant_content_is_preserved_for_the_next_request() {
             ModelMessage::AssistantToolCalls(empty_batch),
             ModelMessage::tool_result("call-empty", "clean"),
         ],
+        allowed_actions: AllowedActions::legacy(),
         tool_choice: ModelToolChoice::Auto,
     };
     let empty_round_trip = encode_chat_completions_request("coding-model", &empty_request)
@@ -432,8 +474,14 @@ fn multiple_tool_calls_preserve_response_order_and_round_trip_as_one_message() {
             .collect::<Vec<_>>(),
         ["one", "two"]
     );
-    assert!(matches!(batch.calls[0].request, ToolRequest::GitStatus));
-    assert!(matches!(batch.calls[1].request, ToolRequest::GitDiff));
+    assert!(matches!(
+        batch.calls[0].request,
+        ActionRequest::Runtime(RuntimeActionRequest::Tool(ToolRequest::GitStatus))
+    ));
+    assert!(matches!(
+        batch.calls[1].request,
+        ActionRequest::Runtime(RuntimeActionRequest::Tool(ToolRequest::GitDiff))
+    ));
 
     let request = ModelRequest {
         messages: vec![
@@ -441,6 +489,7 @@ fn multiple_tool_calls_preserve_response_order_and_round_trip_as_one_message() {
             ModelMessage::tool_result("one", "clean"),
             ModelMessage::tool_result("two", "diff"),
         ],
+        allowed_actions: AllowedActions::legacy(),
         tool_choice: ModelToolChoice::Auto,
     };
     let round_trip = encode_chat_completions_request("coding-model", &request)

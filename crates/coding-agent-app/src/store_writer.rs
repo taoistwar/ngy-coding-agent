@@ -5,14 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coding_agent_domain::{
-    EventId, NewRepository, NewTask, TaskEventPayload, TaskFailure, TaskId, TaskStatus,
-    UtcTimestamp,
+    EventId, NewRepository, NewReviewEvidence, NewTask, RepositoryId, TaskEventPayload,
+    TaskFailure, TaskId, TaskStatus, UtcTimestamp,
 };
 use coding_agent_store::{
-    AppendEventOutcome, AttemptArtifactIdentity, CreateTaskOutcome, RecoveryOutcome,
-    RegisterRepositoryOutcome, ReserveAttemptArtifact, ReserveAttemptArtifactOutcome,
-    RetryTaskOutcome, Store, StoreError, TaskTransition, TransitionOutcome,
-    UpdateAttemptArtifactOutcome,
+    AppendEventOutcome, AttemptArtifactIdentity, CreateTaskOutcome, FinalizeReviewedTaskOutcome,
+    RecordReviewOutcome, RecoveryOutcome, RegisterRepositoryOutcome, ReserveAttemptArtifact,
+    ReserveAttemptArtifactOutcome, RetryTaskOutcome, Store, StoreError, TaskTransition,
+    TransitionOutcome, UpdateAttemptArtifactOutcome,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
@@ -24,6 +24,8 @@ const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(200),
     Duration::from_millis(400),
 ];
+const COMPLETED_TRANSITION_BYPASS: &str =
+    "Completed tasks must be committed through finalize_reviewed_task";
 
 pub trait EventWake: Send + Sync + 'static {
     fn wake(&self);
@@ -33,6 +35,22 @@ pub trait EventWake: Send + Sync + 'static {
 pub struct WriteReceipt<T> {
     pub value: T,
     pub event_id: Option<EventId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordReviewRequest {
+    pub task_id: TaskId,
+    pub expected_repository_id: RepositoryId,
+    pub expected_attempt: u32,
+    pub evidence: NewReviewEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeReviewedTaskRequest {
+    pub task_id: TaskId,
+    pub expected_repository_id: RepositoryId,
+    pub expected_attempt: u32,
+    pub evidence: NewReviewEvidence,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +77,8 @@ enum StoreWriterOperation {
         task_id: TaskId,
         payload: TaskEventPayload,
     },
+    RecordReview(RecordReviewRequest),
+    FinalizeReviewedTask(FinalizeReviewedTaskRequest),
     ReserveAttemptArtifact(ReserveAttemptArtifact),
     MarkAttemptArtifactReady(AttemptArtifactIdentity),
     MarkAttemptArtifactInconsistent {
@@ -78,6 +98,8 @@ enum StoreWriterOperationOutcome {
     RetryTask(RetryTaskOutcome),
     TransitionWithEvent(TransitionOutcome),
     AppendRunningEvent(AppendEventOutcome),
+    RecordReview(Box<RecordReviewOutcome>),
+    FinalizeReviewedTask(Box<FinalizeReviewedTaskOutcome>),
     ReserveAttemptArtifact(ReserveAttemptArtifactOutcome),
     UpdateAttemptArtifact(UpdateAttemptArtifactOutcome),
     RecoverIncomplete(RecoveryOutcome),
@@ -99,6 +121,8 @@ impl StoreWriterOperation {
                 TaskTransition::Interrupted(_) => StoreWriterOperationKind::InterruptTask,
             },
             Self::AppendRunningEvent { .. } => StoreWriterOperationKind::AppendRunningEvent,
+            Self::RecordReview(_) => StoreWriterOperationKind::RecordReview,
+            Self::FinalizeReviewedTask(_) => StoreWriterOperationKind::FinalizeReviewedTask,
             Self::ReserveAttemptArtifact(_) => StoreWriterOperationKind::ReserveAttemptArtifact,
             Self::MarkAttemptArtifactReady(_) => StoreWriterOperationKind::MarkAttemptArtifactReady,
             Self::MarkAttemptArtifactInconsistent { .. } => {
@@ -118,7 +142,9 @@ impl StoreWriterOperationOutcome {
             Self::CreateTask(CreateTaskOutcome::Created { .. })
             | Self::RetryTask(RetryTaskOutcome::Created { .. })
             | Self::TransitionWithEvent(TransitionOutcome::Applied { .. })
-            | Self::AppendRunningEvent(AppendEventOutcome::Applied { .. }) => true,
+            | Self::AppendRunningEvent(AppendEventOutcome::Applied { .. })
+            | Self::RecordReview(_)
+            | Self::FinalizeReviewedTask(_) => true,
             Self::CreateTask(CreateTaskOutcome::Existing { .. })
             | Self::RetryTask(RetryTaskOutcome::Existing { .. })
             | Self::TransitionWithEvent(TransitionOutcome::Conflict { .. })
@@ -159,6 +185,8 @@ pub enum StoreWriterOperationKind {
     CancelTask,
     InterruptTask,
     AppendRunningEvent,
+    RecordReview,
+    FinalizeReviewedTask,
     ReserveAttemptArtifact,
     MarkAttemptArtifactReady,
     MarkAttemptArtifactInconsistent,
@@ -442,14 +470,39 @@ impl StoreWriterBackend for Store {
                     task_id,
                     expected,
                     transition,
-                } => self
-                    .transition_with_event(task_id, expected, transition)
-                    .await
-                    .map(StoreWriterOperationOutcome::TransitionWithEvent),
+                } => {
+                    if matches!(transition, TaskTransition::Completed) {
+                        Err(completed_transition_bypass_error())
+                    } else {
+                        self.transition_with_event(task_id, expected, transition)
+                            .await
+                            .map(StoreWriterOperationOutcome::TransitionWithEvent)
+                    }
+                }
                 StoreWriterOperation::AppendRunningEvent { task_id, payload } => self
                     .append_running_event(task_id, payload)
                     .await
                     .map(StoreWriterOperationOutcome::AppendRunningEvent),
+                StoreWriterOperation::RecordReview(request) => self
+                    .record_review(
+                        request.task_id,
+                        request.expected_repository_id,
+                        request.expected_attempt,
+                        request.evidence,
+                    )
+                    .await
+                    .map(|outcome| StoreWriterOperationOutcome::RecordReview(Box::new(outcome))),
+                StoreWriterOperation::FinalizeReviewedTask(request) => self
+                    .finalize_reviewed_task(
+                        request.task_id,
+                        request.expected_repository_id,
+                        request.expected_attempt,
+                        request.evidence,
+                    )
+                    .await
+                    .map(|outcome| {
+                        StoreWriterOperationOutcome::FinalizeReviewedTask(Box::new(outcome))
+                    }),
                 StoreWriterOperation::ReserveAttemptArtifact(input) => self
                     .reserve_attempt_artifact(input)
                     .await
@@ -562,18 +615,90 @@ impl StoreWriterHandle {
         receive(receiver).await
     }
 
-    pub async fn transition_with_event(
+    pub async fn start_task(
+        &self,
+        task_id: TaskId,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<TransitionOutcome>, StoreWriterError> {
+        self.transition_with_event(
+            task_id,
+            TaskStatus::Queued,
+            TaskTransition::Running,
+            deadline,
+        )
+        .await
+    }
+
+    pub async fn cancel_task(
+        &self,
+        task_id: TaskId,
+        expected: TaskStatus,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<TransitionOutcome>, StoreWriterError> {
+        self.transition_with_event(task_id, expected, TaskTransition::Cancelled, deadline)
+            .await
+    }
+
+    pub async fn fail_task(
+        &self,
+        task_id: TaskId,
+        failure: TaskFailure,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<TransitionOutcome>, StoreWriterError> {
+        self.transition_with_event(
+            task_id,
+            TaskStatus::Running,
+            TaskTransition::Failed(failure),
+            deadline,
+        )
+        .await
+    }
+
+    async fn transition_with_event(
         &self,
         task_id: TaskId,
         expected: TaskStatus,
         transition: TaskTransition,
         deadline: Instant,
     ) -> Result<WriteReceipt<TransitionOutcome>, StoreWriterError> {
+        if matches!(transition, TaskTransition::Completed) {
+            return Err(completed_transition_bypass_error().into());
+        }
         let (response, receiver) = oneshot::channel();
         self.send(WriteCommand::TransitionWithEvent {
             task_id,
             expected,
             transition,
+            deadline,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn record_review(
+        &self,
+        request: RecordReviewRequest,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<RecordReviewOutcome>, StoreWriterError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(WriteCommand::RecordReview {
+            request,
+            deadline,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn finalize_reviewed_task(
+        &self,
+        request: FinalizeReviewedTaskRequest,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<FinalizeReviewedTaskOutcome>, StoreWriterError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(WriteCommand::FinalizeReviewedTask {
+            request,
             deadline,
             response,
         })
@@ -700,6 +825,17 @@ enum WriteCommand {
         deadline: Instant,
         response: oneshot::Sender<Result<WriteReceipt<AppendEventOutcome>, StoreWriterError>>,
     },
+    RecordReview {
+        request: RecordReviewRequest,
+        deadline: Instant,
+        response: oneshot::Sender<Result<WriteReceipt<RecordReviewOutcome>, StoreWriterError>>,
+    },
+    FinalizeReviewedTask {
+        request: FinalizeReviewedTaskRequest,
+        deadline: Instant,
+        response:
+            oneshot::Sender<Result<WriteReceipt<FinalizeReviewedTaskOutcome>, StoreWriterError>>,
+    },
     ReserveAttemptArtifact {
         input: ReserveAttemptArtifact,
         deadline: Instant,
@@ -797,6 +933,10 @@ async fn run_writer(
                 deadline,
                 response,
             } => {
+                if matches!(transition, TaskTransition::Completed) {
+                    let _ = response.send(Err(completed_transition_bypass_error().into()));
+                    continue;
+                }
                 let operation = StoreWriterOperation::TransitionWithEvent {
                     task_id,
                     expected,
@@ -831,6 +971,52 @@ async fn run_writer(
                         };
                         receipt_and_wake(value, event_id, &*wake)
                     });
+                let _ = response.send(result);
+            }
+            WriteCommand::RecordReview {
+                request,
+                deadline,
+                response,
+            } => {
+                let result = execute(
+                    &*backend,
+                    StoreWriterOperation::RecordReview(request),
+                    deadline,
+                )
+                .await
+                .and_then(expect_record_review)
+                .map(|value| {
+                    let event_id = match &value {
+                        RecordReviewOutcome::Applied { event_id, .. }
+                        | RecordReviewOutcome::Existing { event_id, .. } => Some(*event_id),
+                    };
+                    receipt_and_wake(value, event_id, &*wake)
+                });
+                let _ = response.send(result);
+            }
+            WriteCommand::FinalizeReviewedTask {
+                request,
+                deadline,
+                response,
+            } => {
+                let result = execute(
+                    &*backend,
+                    StoreWriterOperation::FinalizeReviewedTask(request),
+                    deadline,
+                )
+                .await
+                .and_then(expect_finalize_reviewed_task)
+                .map(|value| {
+                    let event_id = match &value {
+                        FinalizeReviewedTaskOutcome::Applied {
+                            terminal_event_id, ..
+                        }
+                        | FinalizeReviewedTaskOutcome::Existing {
+                            terminal_event_id, ..
+                        } => Some(*terminal_event_id),
+                    };
+                    receipt_and_wake(value, event_id, &*wake)
+                });
                 let _ = response.send(result);
             }
             WriteCommand::RecoverIncomplete {
@@ -982,6 +1168,10 @@ fn unexpected_outcome() -> StoreWriterError {
     ))
 }
 
+fn completed_transition_bypass_error() -> StoreError {
+    StoreError::InvariantViolation(COMPLETED_TRANSITION_BYPASS)
+}
+
 fn expect_repository(
     outcome: StoreWriterOperationOutcome,
 ) -> Result<RegisterRepositoryOutcome, StoreWriterError> {
@@ -1023,6 +1213,24 @@ fn expect_append(
 ) -> Result<AppendEventOutcome, StoreWriterError> {
     match outcome {
         StoreWriterOperationOutcome::AppendRunningEvent(value) => Ok(value),
+        _ => Err(unexpected_outcome()),
+    }
+}
+
+fn expect_record_review(
+    outcome: StoreWriterOperationOutcome,
+) -> Result<RecordReviewOutcome, StoreWriterError> {
+    match outcome {
+        StoreWriterOperationOutcome::RecordReview(value) => Ok(*value),
+        _ => Err(unexpected_outcome()),
+    }
+}
+
+fn expect_finalize_reviewed_task(
+    outcome: StoreWriterOperationOutcome,
+) -> Result<FinalizeReviewedTaskOutcome, StoreWriterError> {
+    match outcome {
+        StoreWriterOperationOutcome::FinalizeReviewedTask(value) => Ok(*value),
         _ => Err(unexpected_outcome()),
     }
 }
@@ -1207,6 +1415,88 @@ mod tests {
                 "do not retry SQLite code {code}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn completed_transition_is_rejected_by_backend_and_internal_command_without_side_effects()
+    {
+        let fixture = unit_fixture().await;
+        let queued = fixture
+            .store
+            .create_task(new_task(&fixture.repository, "review finalization only"))
+            .await
+            .expect("create task")
+            .task()
+            .clone();
+        let running = match fixture
+            .store
+            .transition_with_event(queued.id, TaskStatus::Queued, TaskTransition::Running)
+            .await
+            .expect("start task")
+        {
+            TransitionOutcome::Applied { task, .. } => task,
+            TransitionOutcome::Conflict { .. } => panic!("fixture transition must apply"),
+        };
+        let before = fixture
+            .store
+            .bootstrap_snapshot()
+            .await
+            .expect("load before snapshot");
+
+        let backend_error = StoreWriterBackend::execute(
+            &fixture.store,
+            StoreWriterOperation::TransitionWithEvent {
+                task_id: running.id,
+                expected: TaskStatus::Running,
+                transition: TaskTransition::Completed,
+            },
+        )
+        .await
+        .expect_err("backend must reject generic Completed");
+        assert!(matches!(
+            backend_error,
+            StoreWriterError::Store(StoreError::InvariantViolation(message))
+                if message == COMPLETED_TRANSITION_BYPASS
+        ));
+
+        let wake = Arc::new(CountingWake::default());
+        let writer = StoreWriterHandle::spawn(fixture.store.clone(), wake.clone(), 4);
+        let (response, receiver) = oneshot::channel();
+        writer
+            .send(WriteCommand::TransitionWithEvent {
+                task_id: running.id,
+                expected: TaskStatus::Running,
+                transition: TaskTransition::Completed,
+                deadline: deadline(),
+                response,
+            })
+            .await
+            .expect("send internal command");
+        let command_error = receive::<TransitionOutcome>(receiver)
+            .await
+            .expect_err("internal command must reject generic Completed");
+        assert!(matches!(
+            command_error,
+            StoreWriterError::Store(StoreError::InvariantViolation(message))
+                if message == COMPLETED_TRANSITION_BYPASS
+        ));
+
+        let after = fixture
+            .store
+            .bootstrap_snapshot()
+            .await
+            .expect("load after snapshot");
+        assert_eq!(after.latest_event_id, before.latest_event_id);
+        assert_eq!(
+            after
+                .tasks
+                .iter()
+                .find(|task| task.id == running.id)
+                .expect("running task remains")
+                .status,
+            TaskStatus::Running
+        );
+        assert_eq!(wake.count(), 0);
     }
 
     #[tokio::test]
@@ -1922,10 +2212,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     fn plan_payload(revision: u64) -> TaskEventPayload {
         TaskEventPayload::PlanUpdated {
-            plan: coding_agent_domain::PlanSnapshot {
-                revision,
-                items: Vec::new(),
-            },
+            plan: coding_agent_domain::PlanSnapshot::legacy(revision, Vec::new()),
         }
     }
 }

@@ -1,13 +1,13 @@
 mod support;
 
-#[cfg(feature = "test-support")]
-use coding_agent_app::FakeScenario;
 use coding_agent_app::{
     CancelOutcome, FakeRunnerConfig, QuiesceResult, RunnerEvent, RunnerEventError, ServiceState,
     StoreWriterError, TaskManagerError,
 };
+#[cfg(feature = "test-support")]
+use coding_agent_app::{FakeScenario, StoreWriterFaultPoint, StoreWriterOperationKind};
 use coding_agent_domain::{
-    ActivityEntry, ActivityLevel, DiffFile, DiffFileStatus, DiffSnapshot, PlanItem, PlanItemStatus,
+    ActivityEntry, ActivityLevel, DiffFile, DiffFileStatus, DiffSnapshot, PlanItemStatus,
     PlanSnapshot, TaskEventKind, TaskFailure, TaskStatus, TestCase, TestSnapshot, TestStatus,
 };
 use tokio::time::{Duration, Instant};
@@ -223,16 +223,13 @@ async fn runner_event_sink_accepts_only_panel_events_and_rejects_late_events() {
 async fn each_bounded_sink_variant_returns_its_committed_event_id() {
     let fixture = support::task_manager_fixture(1).await;
     let events = vec![
-        RunnerEvent::PlanUpdated(PlanSnapshot {
-            revision: 1,
-            items: Vec::new(),
-        }),
-        RunnerEvent::ActivityAppended(ActivityEntry {
-            id: "activity-1".to_owned(),
-            level: ActivityLevel::Info,
-            message: "working".to_owned(),
-            created_at: support::timestamp(),
-        }),
+        RunnerEvent::PlanUpdated(PlanSnapshot::legacy(1, Vec::new())),
+        RunnerEvent::ActivityAppended(ActivityEntry::legacy(
+            "activity-1",
+            ActivityLevel::Info,
+            "working",
+            support::timestamp(),
+        )),
         RunnerEvent::DiffUpdated(DiffSnapshot {
             revision: 1,
             files: Vec::new(),
@@ -287,6 +284,50 @@ async fn completed_and_cancelled_are_decided_by_the_first_terminal_commit() {
     assert_eq!(
         cancel_wins.load(task.id).await.status,
         TaskStatus::Cancelled
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn approved_finalize_entered_first_makes_later_cancel_not_cancellable() {
+    let (fixture, controller) = support::paused_finalize_task_manager_fixture().await;
+    let completion = fixture.runner.push_completion_gate();
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+
+    completion.release.notify_one();
+    controller
+        .wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1)
+        .await;
+    assert_eq!(
+        controller.hit_count(
+            StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+            StoreWriterOperationKind::FinalizeReviewedTask,
+        ),
+        1
+    );
+    let cancel = tokio::spawn({
+        let manager = fixture.manager.clone();
+        async move { manager.cancel(task.id).await }
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!cancel.is_finished());
+
+    assert_eq!(
+        controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+        1
+    );
+    assert!(matches!(
+        cancel.await.unwrap(),
+        Err(TaskManagerError::TaskNotCancellable { .. })
+    ));
+    let persisted = fixture.load(task.id).await;
+    assert_eq!(persisted.status, TaskStatus::Completed);
+    assert_eq!(
+        persisted.delivery_readiness,
+        coding_agent_domain::DeliveryReadiness::ReviewApproved
     );
 }
 
@@ -479,10 +520,10 @@ async fn a_degraded_service_rejects_runner_events_without_persistence() {
     let fixture = support::task_manager_fixture(1).await;
     let append = fixture
         .runner
-        .push_event_gate(RunnerEvent::PlanUpdated(PlanSnapshot {
-            revision: 7,
-            items: Vec::new(),
-        }));
+        .push_event_gate(RunnerEvent::PlanUpdated(PlanSnapshot::legacy(
+            7,
+            Vec::new(),
+        )));
     let task = fixture.enqueue_tasks(1, true).await.remove(0);
     fixture.wait_for_status(task.id, TaskStatus::Running).await;
     fixture.state.set(ServiceState::StoreDegraded).unwrap();
@@ -540,39 +581,50 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
             TaskEventKind::DiffUpdated,
             TaskEventKind::TestUpdated,
             TaskEventKind::TestUpdated,
+            TaskEventKind::ReviewUpdated,
             TaskEventKind::TaskCompleted,
         ]
     );
 
     let detail = fixture.detail(task.id).await;
+    let plan = detail.plan.as_ref().expect("fake runner persists its plan");
+    assert_eq!(plan.format_version(), 1);
+    assert_eq!(plan.revision(), 1);
     assert_eq!(
-        detail.plan,
-        Some(PlanSnapshot {
-            revision: 1,
-            items: vec![
-                PlanItem {
-                    id: "fake-plan".to_owned(),
-                    title: "Prepare deterministic plan".to_owned(),
-                    status: PlanItemStatus::Completed,
-                },
-                PlanItem {
-                    id: "fake-diff".to_owned(),
-                    title: "Generate synthetic diff".to_owned(),
-                    status: PlanItemStatus::Completed,
-                },
-                PlanItem {
-                    id: "fake-tests".to_owned(),
-                    title: "Report synthetic tests".to_owned(),
-                    status: PlanItemStatus::Completed,
-                },
-            ],
-        })
+        plan.items()
+            .iter()
+            .map(|item| (item.id(), item.title(), item.status()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "fake-plan",
+                "Prepare deterministic plan",
+                PlanItemStatus::Completed
+            ),
+            (
+                "fake-diff",
+                "Generate synthetic diff",
+                PlanItemStatus::Completed
+            ),
+            (
+                "fake-tests",
+                "Report synthetic tests",
+                PlanItemStatus::Completed
+            ),
+        ]
     );
+    assert_eq!(plan.initial_required_checks().len(), 1);
+    assert_eq!(plan.initial_required_checks()[0].id(), "fake-cargo-test");
+    assert_eq!(
+        detail.task.delivery_readiness,
+        coding_agent_domain::DeliveryReadiness::ReviewApproved
+    );
+    assert_eq!(detail.reviews.len(), 1);
     assert_eq!(
         detail
             .activity
             .iter()
-            .map(|entry| (entry.id.as_str(), entry.message.as_str()))
+            .map(|entry| (entry.id(), entry.message()))
             .collect::<Vec<_>>(),
         vec![
             ("fake-plan-ready", "Prepared deterministic plan"),
@@ -584,13 +636,13 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
         detail
             .activity
             .iter()
-            .all(|entry| entry.created_at == detail.task.started_at.unwrap())
+            .all(|entry| entry.created_at() == detail.task.started_at.unwrap())
     );
     assert!(
         detail
             .activity
             .iter()
-            .all(|entry| entry.level == ActivityLevel::Info)
+            .all(|entry| entry.level() == ActivityLevel::Info)
     );
     assert_eq!(
         detail.diff,
@@ -609,7 +661,7 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
     assert_eq!(
         detail.tests,
         Some(TestSnapshot {
-            revision: 2,
+            revision: 1,
             status: TestStatus::Passed,
             cases: vec![TestCase {
                 id: "fake-test".to_owned(),
@@ -635,7 +687,7 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
                 }],
             },
             TestSnapshot {
-                revision: 2,
+                revision: 1,
                 status: TestStatus::Passed,
                 cases: vec![TestCase {
                     id: "fake-test".to_owned(),
@@ -646,6 +698,15 @@ async fn fake_runner_emits_the_approved_panel_sequence() {
                 }],
             },
         ]
+    );
+    let review_generation = detail.reviews[0].workspace_generation();
+    assert_eq!(
+        detail.diff.as_ref().map(|diff| diff.revision),
+        Some(review_generation)
+    );
+    assert_eq!(
+        detail.tests.as_ref().map(|tests| tests.revision),
+        Some(review_generation)
     );
 }
 
@@ -718,7 +779,42 @@ async fn scripted_fake_runner_blocking_observes_cancellation_without_a_release()
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn scripted_fake_runner_can_ignore_cancellation_until_explicit_release() {
+async fn scripted_fake_runner_blocking_release_persists_panels_before_approval() {
+    let fixture = support::scripted_fake_runner_fixture([FakeScenario::Blocking], 1).await;
+    let task = fixture.start("ordinary prompt").await;
+
+    assert!(fixture.runner.release(task.id));
+    fixture
+        .wait_for_status(task.id, TaskStatus::Completed)
+        .await;
+
+    let detail = fixture.detail(task.id).await;
+    let review_generation = detail.reviews[0].workspace_generation();
+    assert_eq!(
+        detail.diff.as_ref().map(|diff| diff.revision),
+        Some(review_generation)
+    );
+    assert_eq!(
+        detail.tests.as_ref().map(|tests| tests.revision),
+        Some(review_generation)
+    );
+    assert_eq!(
+        fixture.event_kinds(task.id).await,
+        vec![
+            TaskEventKind::TaskQueued,
+            TaskEventKind::TaskStarted,
+            TaskEventKind::PlanUpdated,
+            TaskEventKind::DiffUpdated,
+            TaskEventKind::TestUpdated,
+            TaskEventKind::ReviewUpdated,
+            TaskEventKind::TaskCompleted,
+        ]
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cancel_processed_first_overrides_late_approved_outcome() {
     let fixture =
         support::scripted_fake_runner_fixture([FakeScenario::IgnoresCancellation], 1).await;
     let task = fixture.start("ordinary prompt").await;
@@ -734,8 +830,12 @@ async fn scripted_fake_runner_can_ignore_cancellation_until_explicit_release() {
     assert_eq!(fixture.load(task.id).await.status, TaskStatus::Running);
     assert!(fixture.runner.release(task.id));
     fixture
-        .wait_for_status(task.id, TaskStatus::Completed)
+        .wait_for_status(task.id, TaskStatus::Cancelled)
         .await;
+    assert_eq!(
+        fixture.load(task.id).await.delivery_readiness,
+        coding_agent_domain::DeliveryReadiness::Unreviewed
+    );
 }
 
 #[cfg(feature = "test-support")]

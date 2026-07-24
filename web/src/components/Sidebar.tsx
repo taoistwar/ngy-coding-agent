@@ -34,6 +34,12 @@ const STATUS_LABEL: Record<Task["status"], string> = {
   interrupted: "Interrupted",
 };
 
+const READINESS_LABEL: Record<Task["delivery_readiness"], string> = {
+  unreviewed: "Unreviewed",
+  review_approved: "Review approved",
+  review_rejected: "Review rejected",
+};
+
 const RETRYABLE_STATUSES = new Set<Task["status"]>([
   "completed",
   "failed",
@@ -267,9 +273,18 @@ export function Sidebar({
                   <strong>{value.prompt}</strong>
                   <span>Attempt {value.attempt}</span>
                 </button>
-                <span className={`task-list-status status-${value.status}`}>
-                  <span aria-hidden="true">{value.status === "completed" ? "✓" : "◆"}</span>{" "}
-                  {STATUS_LABEL[value.status]}
+                <span className="task-list-badges">
+                  <span className={`task-list-status status-${value.status}`}>
+                    <span aria-hidden="true">
+                      {value.status === "completed" ? "✓" : "◆"}
+                    </span>{" "}
+                    {STATUS_LABEL[value.status]}
+                  </span>
+                  <span
+                    className={`task-list-readiness readiness-${value.delivery_readiness}`}
+                  >
+                    {READINESS_LABEL[value.delivery_readiness]}
+                  </span>
                 </span>
                 {RETRYABLE_STATUSES.has(value.status) &&
                 !tasks.some((candidate) => candidate.retry_of === value.id) ? (

@@ -5,8 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 coding-agent-domain = { path = "../coding-agent-domain" }
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
@@ -14,5 +19,6 @@ time.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+coding-agent-store = { path = ".", features = ["test-support"] }
 tempfile.workspace = true
 tokio.workspace = true

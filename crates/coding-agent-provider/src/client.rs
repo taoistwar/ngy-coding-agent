@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use coding_agent_core::{
-    ModelMessage, ModelProvider, ModelRequest, ModelResponse, ProviderError, ToolRequest,
+    ActionRequest, ModelMessage, ModelProvider, ModelRequest, ModelResponse, PreparedModelProvider,
+    PreparedProviderRequest, ProviderError, RawProviderResponse,
 };
 use futures_util::StreamExt as _;
 use reqwest::header::{
@@ -258,6 +259,67 @@ pub struct ChatCompletionsProvider {
     last_metadata: Arc<Mutex<Option<ProviderResponseMetadata>>>,
 }
 
+/// A single-use Chat Completions request prepared for exact core-side budget
+/// preflight.
+///
+/// Protocol bytes and the originating model request are deliberately private,
+/// and the type does not implement `Debug` or `Clone`.
+struct PreparedChatCompletionsRequest {
+    provider: ChatCompletionsProvider,
+    encoded: Vec<u8>,
+    request: ModelRequest,
+    metadata_redactor: SecretRedactor,
+    maximum_response_bytes: usize,
+}
+
+#[async_trait::async_trait]
+impl PreparedProviderRequest for PreparedChatCompletionsRequest {
+    fn encoded_len(&self) -> usize {
+        self.encoded.len()
+    }
+
+    fn maximum_response_bytes(&self) -> usize {
+        self.maximum_response_bytes
+    }
+
+    async fn send(
+        self: Box<Self>,
+        cancellation: CancellationToken,
+    ) -> Result<Box<dyn RawProviderResponse>, ProviderError> {
+        let provider = self.provider.clone();
+        provider
+            .send_prepared_inner(*self, cancellation)
+            .await
+            .map(|response| Box::new(response) as Box<dyn RawProviderResponse>)
+    }
+}
+
+/// A single-use raw Chat Completions response awaiting core-side byte
+/// accounting before decode.
+///
+/// Neither the response body nor its originating request is publicly
+/// accessible. A deferred error represents a failure discovered after an HTTP
+/// response was obtained, allowing core to charge the actual body length (even
+/// zero) before `decode` returns the stable provider error.
+struct RawChatCompletionsResponse {
+    provider: ChatCompletionsProvider,
+    encoded: Vec<u8>,
+    encoded_len: usize,
+    request: ModelRequest,
+    deferred_error: Option<ProviderError>,
+}
+
+impl RawProviderResponse for RawChatCompletionsResponse {
+    fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
+    fn decode(self: Box<Self>) -> Result<ModelResponse, ProviderError> {
+        let provider = self.provider.clone();
+        provider.decode_inner(*self)
+    }
+}
+
 impl ChatCompletionsProvider {
     pub fn task_provider_bytes(&self) -> usize {
         self.task_budget.used()
@@ -279,6 +341,16 @@ impl ChatCompletionsProvider {
         if cancellation.is_cancelled() {
             return Err(cancelled());
         }
+        let prepared = <Self as PreparedModelProvider>::prepare(self, request)?;
+        let raw = prepared.send(cancellation).await?;
+        raw.decode()
+    }
+
+    fn prepare_inner(
+        &self,
+        request: ModelRequest,
+    ) -> Result<PreparedChatCompletionsRequest, ProviderError> {
+        self.clear_metadata();
         let inner = &self.client.inner;
         let encoded = encode_chat_completions_request_with_options(
             inner.config.model(),
@@ -290,6 +362,31 @@ impl ChatCompletionsProvider {
             return Err(request_limit_reached());
         }
         let metadata_redactor = request_metadata_redactor(&inner.config, &request);
+        Ok(PreparedChatCompletionsRequest {
+            provider: self.clone(),
+            encoded,
+            request,
+            metadata_redactor,
+            maximum_response_bytes: inner.limits.max_response_bytes(),
+        })
+    }
+
+    async fn send_prepared_inner(
+        &self,
+        prepared: PreparedChatCompletionsRequest,
+        cancellation: CancellationToken,
+    ) -> Result<RawChatCompletionsResponse, ProviderError> {
+        self.clear_metadata();
+        let PreparedChatCompletionsRequest {
+            encoded,
+            request,
+            metadata_redactor,
+            ..
+        } = prepared;
+        let inner = &self.client.inner;
+        // Core has already charged this exact prepared request before calling
+        // `send`. Mirror that accounting even if cancellation wins in the
+        // narrow interval after preflight and before provider contact.
         self.task_budget.charge(encoded.len())?;
         if cancellation.is_cancelled() {
             return Err(cancelled());
@@ -312,22 +409,21 @@ impl ChatCompletionsProvider {
 
         let status = response.status();
         self.capture_metadata(status.as_u16(), response.headers(), &metadata_redactor);
-        if !status.is_success() {
-            return Err(map_http_status(status.as_u16()));
-        }
-        if !content_encoding_is_identity(response.headers()) {
-            return Err(invalid_response(
+        let response_error = if !status.is_success() {
+            Some(map_http_status(status.as_u16()))
+        } else if !content_encoding_is_identity(response.headers()) {
+            Some(invalid_response(
                 "The provider response content encoding is unsupported.",
-            ));
-        }
-        if !content_type_is_json(response.headers()) {
-            return Err(invalid_response(
+            ))
+        } else if !content_type_is_json(response.headers()) {
+            Some(invalid_response(
                 "The provider response content type is unsupported.",
-            ));
-        }
-        if declared_length_exceeds(response.headers(), inner.limits.max_response_bytes()) {
-            return Err(response_limit_error());
-        }
+            ))
+        } else if declared_length_exceeds(response.headers(), inner.limits.max_response_bytes()) {
+            Some(response_limit_error())
+        } else {
+            None
+        };
 
         let mut received = 0usize;
         let mut aggregate = Vec::with_capacity(
@@ -341,27 +437,73 @@ impl ChatCompletionsProvider {
         loop {
             let next = tokio::select! {
                 biased;
-                () = cancellation.cancelled() => return Err(cancelled()),
+                () = cancellation.cancelled() => {
+                    return Ok(self.raw_response(
+                        request,
+                        aggregate,
+                        received,
+                        response_error.or_else(|| Some(cancelled())),
+                    ));
+                },
                 next = stream.next() => next,
             };
             let Some(chunk) = next else {
                 break;
             };
-            let chunk = chunk.map_err(map_reqwest_error)?;
-            received = received
-                .checked_add(chunk.len())
-                .ok_or_else(response_limit_error)?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    return Ok(self.raw_response(
+                        request,
+                        aggregate,
+                        received,
+                        response_error.or_else(|| Some(map_reqwest_error(error))),
+                    ));
+                }
+            };
+            received = match received.checked_add(chunk.len()) {
+                Some(received) => received,
+                None => {
+                    self.task_budget.exhaust();
+                    return Err(response_limit_error());
+                }
+            };
             if received > inner.limits.max_response_bytes() {
                 self.task_budget.exhaust();
-                return Err(response_limit_error());
+                return Ok(self.raw_response(
+                    request,
+                    aggregate,
+                    received,
+                    response_error.or_else(|| Some(response_limit_error())),
+                ));
             }
-            self.task_budget.charge(chunk.len())?;
+            if let Err(error) = self.task_budget.charge(chunk.len()) {
+                return Ok(self.raw_response(request, aggregate, received, Some(error)));
+            }
             aggregate.extend_from_slice(&chunk);
         }
+        Ok(self.raw_response(request, aggregate, received, response_error))
+    }
+
+    fn decode_inner(
+        &self,
+        raw: RawChatCompletionsResponse,
+    ) -> Result<ModelResponse, ProviderError> {
+        let RawChatCompletionsResponse {
+            encoded,
+            request,
+            deferred_error,
+            ..
+        } = raw;
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
+        let inner = &self.client.inner;
         let decoded = decode_chat_completions_response_with_tool_choice(
-            &aggregate,
+            &encoded,
             inner.limits.max_response_bytes(),
-            request.tool_choice,
+            &request.allowed_actions,
+            &request.tool_choice,
             inner.config.thinking_mode(),
         )?;
         if !request.tool_choice.permits(&decoded) {
@@ -373,6 +515,22 @@ impl ChatCompletionsProvider {
             ));
         }
         Ok(decoded)
+    }
+
+    fn raw_response(
+        &self,
+        request: ModelRequest,
+        encoded: Vec<u8>,
+        encoded_len: usize,
+        deferred_error: Option<ProviderError>,
+    ) -> RawChatCompletionsResponse {
+        RawChatCompletionsResponse {
+            provider: self.clone(),
+            encoded,
+            encoded_len,
+            request,
+            deferred_error,
+        }
     }
 
     fn clear_metadata(&self) {
@@ -413,6 +571,16 @@ impl fmt::Debug for ChatCompletionsProvider {
             .field("task_provider_bytes", &self.task_provider_bytes())
             .field("authorization", &"<redacted>")
             .finish_non_exhaustive()
+    }
+}
+
+impl PreparedModelProvider for ChatCompletionsProvider {
+    fn prepare(
+        &self,
+        request: ModelRequest,
+    ) -> Result<Box<dyn PreparedProviderRequest>, ProviderError> {
+        self.prepare_inner(request)
+            .map(|request| Box::new(request) as Box<dyn PreparedProviderRequest>)
     }
 }
 
@@ -489,7 +657,7 @@ fn request_metadata_redactor(config: &ProviderConfig, request: &ModelRequest) ->
                 }
                 for call in &batch.calls {
                     batch_redactor = batch_redactor.with_secret(call.id.as_str());
-                    batch_redactor = with_tool_request_secrets(batch_redactor, &call.request);
+                    batch_redactor = with_action_request_secrets(batch_redactor, &call.request);
                 }
                 batch_redactor
             }
@@ -504,50 +672,14 @@ fn request_metadata_redactor(config: &ProviderConfig, request: &ModelRequest) ->
     redactor
 }
 
-fn with_tool_request_secrets(
+fn with_action_request_secrets(
     mut redactor: SecretRedactor,
-    request: &ToolRequest,
+    request: &ActionRequest,
 ) -> SecretRedactor {
-    match request {
-        ToolRequest::ListFiles { path, .. } | ToolRequest::ReadFile { path, .. } => {
-            redactor = redactor.with_secret(path.as_str());
-        }
-        ToolRequest::SearchText {
-            query, path, glob, ..
-        } => {
-            redactor = redactor
-                .with_secret(query.as_str())
-                .with_secret(path.as_str());
-            if let Some(glob) = glob {
-                redactor = redactor.with_secret(glob.as_str());
-            }
-        }
-        ToolRequest::ReplaceFile {
-            path,
-            expected_sha256,
-            content,
-        } => {
-            redactor = redactor
-                .with_secret(path.as_str())
-                .with_secret(content.as_str());
-            if let Some(expected_sha256) = expected_sha256 {
-                redactor = redactor.with_secret(expected_sha256.as_str());
-            }
-        }
-        ToolRequest::CargoCheck { package, .. } => {
-            if let Some(package) = package {
-                redactor = redactor.with_secret(package.as_str());
-            }
-        }
-        ToolRequest::CargoTest { package, test, .. } => {
-            if let Some(package) = package {
-                redactor = redactor.with_secret(package.as_str());
-            }
-            if let Some(test) = test {
-                redactor = redactor.with_secret(test.as_str());
-            }
-        }
-        ToolRequest::GitStatus | ToolRequest::GitDiff => {}
+    let mut values = Vec::new();
+    request.visit_strings(&mut |value| values.push(value.to_owned()));
+    for value in values {
+        redactor = redactor.with_secret(&value);
     }
     redactor
 }
@@ -564,46 +696,11 @@ fn response_contains_secret(response: &ModelResponse, secret: &str) -> bool {
                     .reasoning_content
                     .as_deref()
                     .is_some_and(|content| content.contains(secret))
-                || batch.calls.iter().any(|call| {
-                    call.id.contains(secret) || tool_request_contains_secret(&call.request, secret)
-                })
+                || batch
+                    .calls
+                    .iter()
+                    .any(|call| call.id.contains(secret) || call.request.contains_secret(secret))
         }
-    }
-}
-
-fn tool_request_contains_secret(request: &ToolRequest, secret: &str) -> bool {
-    match request {
-        ToolRequest::ListFiles { path, .. } | ToolRequest::ReadFile { path, .. } => {
-            path.contains(secret)
-        }
-        ToolRequest::SearchText {
-            query, path, glob, ..
-        } => {
-            query.contains(secret)
-                || path.contains(secret)
-                || glob.as_deref().is_some_and(|glob| glob.contains(secret))
-        }
-        ToolRequest::ReplaceFile {
-            path,
-            expected_sha256,
-            content,
-        } => {
-            path.contains(secret)
-                || expected_sha256
-                    .as_deref()
-                    .is_some_and(|expected_sha256| expected_sha256.contains(secret))
-                || content.contains(secret)
-        }
-        ToolRequest::CargoCheck { package, .. } => package
-            .as_deref()
-            .is_some_and(|package| package.contains(secret)),
-        ToolRequest::CargoTest { package, test, .. } => {
-            package
-                .as_deref()
-                .is_some_and(|package| package.contains(secret))
-                || test.as_deref().is_some_and(|test| test.contains(secret))
-        }
-        ToolRequest::GitStatus | ToolRequest::GitDiff => false,
     }
 }
 

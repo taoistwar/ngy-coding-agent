@@ -2,12 +2,21 @@ mod support;
 
 use std::sync::Arc;
 
-use coding_agent_app::{ServiceState, ServiceStateController, StoreWriterError, StoreWriterHandle};
-use coding_agent_domain::{CanonicalPath, PlanSnapshot, TaskEventPayload, TaskStatus};
+use coding_agent_app::{
+    FinalizeReviewedTaskRequest, RecordReviewRequest, ServiceState, ServiceStateController,
+    StoreWriterError, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterHandle,
+    StoreWriterOperationKind, StoreWriterTestController,
+};
+use coding_agent_domain::{
+    CanonicalPath, CheckActor, CheckEvidence, CheckEvidenceStatus, DeliveryReadiness,
+    FindingSeverity, NewReviewEvidence, PlanItem, PlanItemStatus, PlanSnapshot, RepositoryId,
+    RequiredCheck, ReviewCoverageEvidence, ReviewDecisionSource, ReviewFinding, ReviewVerdict,
+    Task, TaskEventPayload, TaskStatus, WorkspaceDigest,
+};
 use coding_agent_store::{
-    AppendEventOutcome, AttemptArtifactIdentity, AttemptArtifactState, RegisterRepositoryOutcome,
-    ReserveAttemptArtifact, ReserveAttemptArtifactOutcome, TaskTransition, TransitionOutcome,
-    UpdateAttemptArtifactOutcome,
+    AppendEventOutcome, AttemptArtifactIdentity, AttemptArtifactState, FinalizeReviewedTaskOutcome,
+    RecordReviewOutcome, RegisterRepositoryOutcome, ReserveAttemptArtifact,
+    ReserveAttemptArtifactOutcome, TransitionOutcome, UpdateAttemptArtifactOutcome,
 };
 use tokio::time::{Duration, Instant};
 
@@ -195,6 +204,212 @@ async fn artifact_lifecycle_is_serialized_through_writer_without_event_wakes() {
 }
 
 #[tokio::test]
+async fn review_receipts_rewake_applied_and_existing_at_the_original_event_watermark() {
+    let fixture = support::writer_fixture().await;
+    let task = running_review_task(
+        &fixture.writer,
+        fixture.repository.id,
+        "intermediate review",
+    )
+    .await;
+    let request = RecordReviewRequest {
+        task_id: task.id,
+        expected_repository_id: task.repository_id,
+        expected_attempt: task.attempt,
+        evidence: changes_requested(1),
+    };
+    let before_wakes = fixture.wake.count();
+
+    let applied = fixture
+        .writer
+        .record_review(request.clone(), support::deadline())
+        .await
+        .expect("record review");
+    let applied_event_id = match &applied.value {
+        RecordReviewOutcome::Applied { event_id, .. } => *event_id,
+        RecordReviewOutcome::Existing { .. } => panic!("first review must apply"),
+    };
+    assert_eq!(applied.event_id, Some(applied_event_id));
+    assert_eq!(
+        fixture
+            .store
+            .bootstrap_snapshot()
+            .await
+            .unwrap()
+            .latest_event_id
+            .get(),
+        applied_event_id.get()
+    );
+
+    let existing = fixture
+        .writer
+        .record_review(request, support::deadline())
+        .await
+        .expect("replay exact review");
+    assert!(matches!(
+        existing.value,
+        RecordReviewOutcome::Existing { event_id, .. } if event_id == applied_event_id
+    ));
+    assert_eq!(existing.event_id, Some(applied_event_id));
+    assert_eq!(
+        fixture
+            .store
+            .bootstrap_snapshot()
+            .await
+            .unwrap()
+            .latest_event_id
+            .get(),
+        applied_event_id.get()
+    );
+    assert_eq!(fixture.wake.count(), before_wakes + 2);
+}
+
+#[tokio::test]
+async fn finalization_receipts_use_terminal_high_watermark_and_rewake_existing() {
+    let fixture = support::writer_fixture().await;
+    let task = running_review_task(&fixture.writer, fixture.repository.id, "final review").await;
+    let request = FinalizeReviewedTaskRequest {
+        task_id: task.id,
+        expected_repository_id: task.repository_id,
+        expected_attempt: task.attempt,
+        evidence: approved(1),
+    };
+    let before_wakes = fixture.wake.count();
+
+    let applied = fixture
+        .writer
+        .finalize_reviewed_task(request.clone(), support::deadline())
+        .await
+        .expect("finalize reviewed task");
+    let (review_event_id, terminal_event_id) = match &applied.value {
+        FinalizeReviewedTaskOutcome::Applied {
+            task,
+            review_event_id,
+            terminal_event_id,
+            ..
+        } => {
+            assert_eq!(task.status, TaskStatus::Completed);
+            assert_eq!(task.delivery_readiness, DeliveryReadiness::ReviewApproved);
+            (*review_event_id, *terminal_event_id)
+        }
+        FinalizeReviewedTaskOutcome::Existing { .. } => panic!("first finalization must apply"),
+    };
+    assert!(review_event_id < terminal_event_id);
+    assert_eq!(applied.event_id, Some(terminal_event_id));
+    assert_eq!(
+        fixture
+            .store
+            .bootstrap_snapshot()
+            .await
+            .unwrap()
+            .latest_event_id
+            .get(),
+        terminal_event_id.get()
+    );
+
+    let existing = fixture
+        .writer
+        .finalize_reviewed_task(request, support::deadline())
+        .await
+        .expect("replay exact finalization");
+    assert!(matches!(
+        existing.value,
+        FinalizeReviewedTaskOutcome::Existing {
+            review_event_id: existing_review,
+            terminal_event_id: existing_terminal,
+            ..
+        } if existing_review == review_event_id && existing_terminal == terminal_event_id
+    ));
+    assert_eq!(existing.event_id, Some(terminal_event_id));
+    assert_eq!(
+        fixture
+            .store
+            .bootstrap_snapshot()
+            .await
+            .unwrap()
+            .latest_event_id
+            .get(),
+        terminal_event_id.get()
+    );
+    assert_eq!(fixture.wake.count(), before_wakes + 2);
+}
+
+#[tokio::test]
+async fn review_fault_filters_distinguish_record_from_finalize() {
+    let fixture = support::store_fixture().await;
+    let controller = Arc::new(
+        StoreWriterTestController::try_new([
+            StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::FailBeforeExecute,
+                operation: Some(StoreWriterOperationKind::RecordReview),
+                count: 1,
+            },
+            StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::FailBeforeExecute,
+                operation: Some(StoreWriterOperationKind::FinalizeReviewedTask),
+                count: 1,
+            },
+        ])
+        .unwrap(),
+    );
+    let wake = Arc::new(support::CountingWake::default());
+    let writer = StoreWriterHandle::spawn_with_test_controller(
+        fixture.store.clone(),
+        wake,
+        8,
+        controller.clone(),
+    );
+    let task = running_review_task(&writer, fixture.repository.id, "fault kinds").await;
+
+    let record = writer
+        .record_review(
+            RecordReviewRequest {
+                task_id: task.id,
+                expected_repository_id: task.repository_id,
+                expected_attempt: task.attempt,
+                evidence: changes_requested(1),
+            },
+            support::deadline(),
+        )
+        .await;
+    assert!(matches!(record, Err(StoreWriterError::Store(_))));
+    assert_eq!(
+        controller.hit_count(
+            StoreWriterFaultPoint::FailBeforeExecute,
+            StoreWriterOperationKind::RecordReview,
+        ),
+        1
+    );
+    assert_eq!(
+        controller.hit_count(
+            StoreWriterFaultPoint::FailBeforeExecute,
+            StoreWriterOperationKind::FinalizeReviewedTask,
+        ),
+        0
+    );
+
+    let finalize = writer
+        .finalize_reviewed_task(
+            FinalizeReviewedTaskRequest {
+                task_id: task.id,
+                expected_repository_id: task.repository_id,
+                expected_attempt: task.attempt,
+                evidence: approved(1),
+            },
+            support::deadline(),
+        )
+        .await;
+    assert!(matches!(finalize, Err(StoreWriterError::Store(_))));
+    assert_eq!(
+        controller.hit_count(
+            StoreWriterFaultPoint::FailBeforeExecute,
+            StoreWriterOperationKind::FinalizeReviewedTask,
+        ),
+        1
+    );
+}
+
+#[tokio::test]
 async fn committed_event_outcomes_wake_once_and_non_events_do_not() {
     let fixture = support::writer_fixture().await;
     let input = support::new_task(fixture.repository.id, "event wake matrix");
@@ -216,12 +431,7 @@ async fn committed_event_outcomes_wake_once_and_non_events_do_not() {
 
     let running = fixture
         .writer
-        .transition_with_event(
-            task.id,
-            TaskStatus::Queued,
-            TaskTransition::Running,
-            support::deadline(),
-        )
+        .start_task(task.id, support::deadline())
         .await
         .unwrap();
     assert!(matches!(running.value, TransitionOutcome::Applied { .. }));
@@ -232,10 +442,7 @@ async fn committed_event_outcomes_wake_once_and_non_events_do_not() {
         .append_running_event(
             task.id,
             TaskEventPayload::PlanUpdated {
-                plan: PlanSnapshot {
-                    revision: 1,
-                    items: Vec::new(),
-                },
+                plan: PlanSnapshot::legacy(1, Vec::new()),
             },
             support::deadline(),
         )
@@ -246,17 +453,46 @@ async fn committed_event_outcomes_wake_once_and_non_events_do_not() {
 
     let conflict = fixture
         .writer
-        .transition_with_event(
-            task.id,
-            TaskStatus::Queued,
-            TaskTransition::Cancelled,
-            support::deadline(),
-        )
+        .cancel_task(task.id, TaskStatus::Queued, support::deadline())
         .await
         .unwrap();
     assert!(matches!(conflict.value, TransitionOutcome::Conflict { .. }));
     assert_eq!(conflict.event_id, None);
     assert_eq!(fixture.wake.count(), 3);
+}
+
+#[tokio::test]
+async fn typed_fail_task_owns_the_running_to_failed_transition() {
+    let fixture = support::writer_fixture().await;
+    let task = fixture
+        .writer
+        .create_task(
+            support::new_task(fixture.repository.id, "typed failure"),
+            support::deadline(),
+        )
+        .await
+        .unwrap()
+        .value
+        .task()
+        .clone();
+    fixture
+        .writer
+        .start_task(task.id, support::deadline())
+        .await
+        .unwrap();
+    let failure = support::failure("TYPED_FAILURE");
+
+    let receipt = fixture
+        .writer
+        .fail_task(task.id, failure.clone(), support::deadline())
+        .await
+        .unwrap();
+
+    let TransitionOutcome::Applied { task, .. } = receipt.value else {
+        panic!("typed fail must commit the running task");
+    };
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(task.failure, Some(failure));
 }
 
 #[tokio::test]
@@ -273,12 +509,7 @@ async fn retry_task_is_idempotent_and_wakes_only_for_the_new_child_event() {
     let task = created.value.task().clone();
     fixture
         .writer
-        .transition_with_event(
-            task.id,
-            TaskStatus::Queued,
-            TaskTransition::Cancelled,
-            support::deadline(),
-        )
+        .cancel_task(task.id, TaskStatus::Queued, support::deadline())
         .await
         .unwrap();
     let before = fixture.wake.count();
@@ -359,6 +590,137 @@ async fn bulk_recovery_preserves_outcome_watermark_and_wakes_once() {
         receipt.value.last_event_id.unwrap().get()
     );
     assert_eq!(fixture.wake.count(), before + 1);
+}
+
+async fn running_review_task(
+    writer: &StoreWriterHandle,
+    repository_id: RepositoryId,
+    prompt: &str,
+) -> Task {
+    let queued = writer
+        .create_task(
+            support::new_task(repository_id, prompt),
+            support::deadline(),
+        )
+        .await
+        .expect("create review task")
+        .value
+        .task()
+        .clone();
+    let running = match writer
+        .start_task(queued.id, support::deadline())
+        .await
+        .expect("start review task")
+        .value
+    {
+        TransitionOutcome::Applied { task, .. } => task,
+        TransitionOutcome::Conflict { .. } => panic!("fixture transition must apply"),
+    };
+    let plan = PlanSnapshot::try_structured(
+        1,
+        "Implement and review the approved plan",
+        vec![
+            PlanItem::try_structured(
+                "step-1",
+                "Implement",
+                "Implement the requested behavior",
+                vec!["All required checks pass".to_owned()],
+                PlanItemStatus::Completed,
+            )
+            .unwrap(),
+        ],
+        vec![required_check()],
+    )
+    .unwrap();
+    writer
+        .append_running_event(
+            running.id,
+            TaskEventPayload::PlanUpdated { plan },
+            support::deadline(),
+        )
+        .await
+        .expect("persist structured plan");
+    running
+}
+
+fn required_check() -> RequiredCheck {
+    RequiredCheck::try_cargo_test(
+        "project3-cargo-test",
+        Some("coding-agent-app".to_owned()),
+        None,
+    )
+    .unwrap()
+}
+
+fn review_digest(round: u8) -> WorkspaceDigest {
+    let digit = char::from(b'a' + round - 1);
+    WorkspaceDigest::try_new(digit.to_string().repeat(64)).unwrap()
+}
+
+fn passed_check(round: u8, check: &RequiredCheck, digest: &WorkspaceDigest) -> CheckEvidence {
+    CheckEvidence::try_for_check(
+        check,
+        CheckActor::Executor,
+        u32::from(round),
+        u64::from(round),
+        digest.clone(),
+        CheckEvidenceStatus::Passed,
+        10,
+        "cargo test passed",
+        false,
+    )
+    .unwrap()
+}
+
+fn changes_requested(round: u8) -> NewReviewEvidence {
+    let digest = review_digest(round);
+    let check = required_check();
+    NewReviewEvidence::try_new(
+        round,
+        ReviewDecisionSource::Reviewer,
+        u64::from(round),
+        digest.clone(),
+        ReviewVerdict::ChangesRequested,
+        format!("round {round} changes requested"),
+        vec![
+            ReviewFinding::try_for_review(
+                round,
+                1,
+                FindingSeverity::Blocking,
+                "A blocking issue remains",
+                Some("src/lib.rs".to_owned()),
+                Some(1),
+            )
+            .unwrap(),
+        ],
+        Vec::new(),
+        vec![check.clone()],
+        vec![passed_check(round, &check, &digest)],
+        None,
+    )
+    .unwrap()
+}
+
+fn approved(round: u8) -> NewReviewEvidence {
+    let digest = review_digest(round);
+    let check = required_check();
+    NewReviewEvidence::try_new(
+        round,
+        ReviewDecisionSource::Reviewer,
+        u64::from(round),
+        digest.clone(),
+        ReviewVerdict::Approved,
+        format!("round {round} approved"),
+        Vec::new(),
+        Vec::new(),
+        vec![check.clone()],
+        vec![passed_check(round, &check, &digest)],
+        Some(
+            ReviewCoverageEvidence::try_new(u64::from(round), digest, "f".repeat(64), vec![0], 1)
+                .unwrap(),
+        ),
+    )
+    .unwrap()
 }
 
 #[tokio::test]

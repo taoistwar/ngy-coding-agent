@@ -10,6 +10,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         2,
         include_str!("../migrations/0002_task_attempt_artifacts.sql"),
     ),
+    (3, include_str!("../migrations/0003_multi_role_quality.sql")),
 ];
 
 pub(crate) async fn run(pool: &SqlitePool) -> Result<(), StoreError> {

@@ -6,15 +6,17 @@ import type {
   DiffSnapshot,
   PlanSnapshot,
   Repository,
+  ReviewEvidence,
   Task,
   TaskDetail,
   TaskEvent,
   TestSnapshot,
 } from "../api/types";
 import { initialAgentState } from "./model";
-import { agentReducer } from "./reducer";
+import { agentReducer, inspectEventProjection } from "./reducer";
 
 const NOW = "2026-07-15T00:00:00Z";
+const REVIEW_TASK_ID = "11111111-1111-4111-8111-111111111111";
 
 function repository(id: string): Repository {
   return {
@@ -39,9 +41,14 @@ function task(
     client_request_id: `request-${id}`,
     prompt: `work on ${id}`,
     status,
+    delivery_readiness: "unreviewed",
     attempt: 1,
     last_event_id: lastEventId,
     created_at: NOW,
+    retry_of: null,
+    started_at: null,
+    finished_at: null,
+    failure: null,
   };
 }
 
@@ -68,6 +75,123 @@ function detail(value: Task, cursor = 10): TaskDetail {
     diff: null,
     tests: null,
     timeline: [],
+    reviews: [],
+  };
+}
+
+function reviewPlan(): PlanSnapshot {
+  return {
+    format_version: 1,
+    revision: 1,
+    summary: "Implement and verify the requested change.",
+    items: [
+      {
+        id: "plan-item-1",
+        title: "Implement",
+        description: "Implement the requested change.",
+        acceptance_criteria: ["The required test passes."],
+        status: "running",
+      },
+    ],
+    initial_required_checks: [
+      {
+        id: "check-cargo-test",
+        kind: "cargo_test",
+        package: null,
+        integration_test: null,
+      },
+    ],
+  };
+}
+
+function reviewTask(lastEventId = 10): Task {
+  return {
+    ...task(REVIEW_TASK_ID, "running", lastEventId),
+    repository_id: "22222222-2222-4222-8222-222222222222",
+    client_request_id: "33333333-3333-4333-8333-333333333333",
+    started_at: NOW,
+  };
+}
+
+function reviewDetail(reviews: ReviewEvidence[] = [], cursor = 10): TaskDetail {
+  return {
+    ...detail(reviewTask(cursor), cursor),
+    plan: reviewPlan(),
+    reviews,
+  };
+}
+
+function reviewEvidence(round: number): ReviewEvidence {
+  const workspaceDigest = {
+    algorithm: "workspace_fingerprint_v1" as const,
+    value: "a".repeat(64),
+  };
+  const requiredCheck = {
+    id: "check-cargo-test",
+    kind: "cargo_test" as const,
+    package: null,
+    integration_test: null,
+  };
+  return {
+    round,
+    decision_source: "reviewer",
+    workspace_generation: 3,
+    workspace_digest: workspaceDigest,
+    verdict: round === 1 ? "changes_requested" : "approved",
+    summary:
+      round === 1
+        ? "A blocking issue remains."
+        : `Approved in round ${round}`,
+    findings:
+      round === 1
+        ? [
+            {
+              id: "review-1-finding-1",
+              severity: "blocking",
+              message: "Fix the blocking issue.",
+              path: "src/lib.rs",
+              line: 7,
+            },
+          ]
+        : [],
+    added_required_checks: [],
+    required_checks: [requiredCheck],
+    check_evidence: [
+      {
+        check_id: requiredCheck.id,
+        actor: "executor",
+        role_run: round,
+        workspace_generation: 3,
+        workspace_digest: workspaceDigest,
+        status: round === 1 ? "failed" : "passed",
+        duration_ms: 12,
+        summary: "passed",
+        truncated: false,
+      },
+    ],
+    coverage: {
+      generation: 3,
+      workspace_digest: workspaceDigest,
+      manifest_sha256: "b".repeat(64),
+      covered_chunks: [],
+      total_chunks: 0,
+    },
+    created_at: NOW,
+  };
+}
+
+function reviewEvent(
+  id: number,
+  review: ReviewEvidence,
+  taskId = "task-1",
+): Extract<TaskEvent, { kind: "review.updated" }> {
+  return {
+    id,
+    schema_version: 1,
+    task_id: taskId,
+    kind: "review.updated",
+    created_at: NOW,
+    payload: { review },
   };
 }
 
@@ -140,8 +264,19 @@ describe("agentReducer", () => {
     });
 
     const plan: PlanSnapshot = {
+      format_version: 1,
       revision: 2,
-      items: [{ id: "p-1", title: "ship", status: "running" }],
+      summary: "Ship the requested change",
+      items: [
+        {
+          id: "p-1",
+          title: "ship",
+          description: "Implement the requested change",
+          acceptance_criteria: ["The focused tests pass"],
+          status: "running",
+        },
+      ],
+      initial_required_checks: [],
     };
     const diff: DiffSnapshot = {
       revision: 3,
@@ -172,6 +307,8 @@ describe("agentReducer", () => {
     const entry: ActivityEntry = {
       id: "activity-1",
       level: "info",
+      actor: "executor",
+      role_run: 1,
       message: "done",
       created_at: NOW,
     };
@@ -228,6 +365,283 @@ describe("agentReducer", () => {
     expect(state.selectedDetail?.diff).toEqual(diff);
     expect(state.selectedDetail?.tests).toEqual(tests);
     expect(state.selectedDetail?.event_cursor).toBe(15);
+  });
+
+  it("appends reviews, deduplicates an exact round replay, and leaves lifecycle quality state authoritative", () => {
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap({ tasks: [reviewTask()] }),
+    });
+    state = agentReducer(state, {
+      type: "task.selected",
+      taskId: REVIEW_TASK_ID,
+    });
+    state = agentReducer(state, {
+      type: "detail.received",
+      taskId: REVIEW_TASK_ID,
+      generation: state.selectionGeneration,
+      detail: reviewDetail(),
+    });
+
+    const first = reviewEvidence(1);
+    const second = reviewEvidence(2);
+    state = agentReducer(state, {
+      type: "event.received",
+      event: reviewEvent(11, first, REVIEW_TASK_ID),
+    });
+    state = agentReducer(state, {
+      type: "event.received",
+      event: reviewEvent(12, structuredClone(first), REVIEW_TASK_ID),
+    });
+    state = agentReducer(state, {
+      type: "event.received",
+      event: reviewEvent(13, second, REVIEW_TASK_ID),
+    });
+
+    expect(state.selectedDetail?.reviews).toEqual([first, second]);
+    expect(state.selectedDetail?.event_cursor).toBe(13);
+    expect(state.appliedEventId).toBe(13);
+    expect(state.selectedDetail?.task.status).toBe("running");
+    expect(state.selectedDetail?.task.delivery_readiness).toBe("unreviewed");
+    expect(state.tasksById[REVIEW_TASK_ID]?.status).toBe("running");
+    expect(state.tasksById[REVIEW_TASK_ID]?.delivery_readiness).toBe(
+      "unreviewed",
+    );
+  });
+
+  it("does not commit a conflicting review cursor before authoritative recovery", () => {
+    const first = reviewEvidence(1);
+    const conflicting = {
+      ...structuredClone(first),
+      summary: "A different payload for the same review round.",
+    };
+    const conflictEvent = reviewEvent(11, conflicting, REVIEW_TASK_ID);
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap({ tasks: [reviewTask()] }),
+    });
+    state = agentReducer(state, {
+      type: "task.selected",
+      taskId: REVIEW_TASK_ID,
+    });
+    state = agentReducer(state, {
+      type: "detail.received",
+      taskId: REVIEW_TASK_ID,
+      generation: state.selectionGeneration,
+      detail: reviewDetail([first]),
+    });
+
+    const preflight = inspectEventProjection(state, conflictEvent);
+    expect(preflight).toEqual({
+      kind: "conflict",
+      reason: "review_payload_conflict",
+    });
+    state = agentReducer(state, {
+      type: "event.conflicted",
+      event: conflictEvent,
+      reason: "review_payload_conflict",
+    });
+
+    expect(state.appliedEventId).toBe(10);
+    expect(state.selectedDetail?.reviews).toEqual([first]);
+    expect(state.snapshotRecovery).toEqual({
+      conflictEventId: 11,
+      reason: "review_payload_conflict",
+    });
+    expect(state.recoveryBuffer.map(({ id }) => id)).toEqual([11]);
+    expect(state.connection).toBe("recovering");
+    expect(state.diagnostics.at(-1)).toEqual(
+      expect.objectContaining({ id: 11, kind: "review.updated" }),
+    );
+
+    state = agentReducer(state, {
+      type: "recovery.received",
+      bootstrap: bootstrap({
+        latest_event_id: 11,
+        tasks: [reviewTask(11)],
+      }),
+      bufferedEvents: [conflictEvent],
+    });
+
+    expect(state.appliedEventId).toBe(11);
+    expect(state.snapshotRecovery).toBeNull();
+    expect(state.recoveryBuffer).toEqual([]);
+    expect(state.selectedDetail).toBeNull();
+    expect(state.detailLoading).toBe(true);
+  });
+
+  it("marks a round gap stale, commits its normal cursor, and replaces it at the detail boundary", () => {
+    const second = reviewEvidence(2);
+    const gapEvent = reviewEvent(11, second, REVIEW_TASK_ID);
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap({ tasks: [reviewTask()] }),
+    });
+    state = agentReducer(state, {
+      type: "task.selected",
+      taskId: REVIEW_TASK_ID,
+    });
+    state = agentReducer(state, {
+      type: "detail.received",
+      taskId: REVIEW_TASK_ID,
+      generation: state.selectionGeneration,
+      detail: reviewDetail(),
+    });
+
+    state = agentReducer(state, {
+      type: "event.received",
+      event: gapEvent,
+    });
+
+    expect(state.appliedEventId).toBe(11);
+    expect(state.detailStale).toBe(true);
+    expect(state.detailLoading).toBe(true);
+    expect(state.selectedDetail?.event_cursor).toBe(11);
+    expect(state.selectedDetail?.reviews).toEqual([]);
+    expect(state.selectedDetail?.task.status).toBe("running");
+    expect(state.selectedDetail?.task.delivery_readiness).toBe("unreviewed");
+
+    state = agentReducer(state, {
+      type: "detail.received",
+      taskId: REVIEW_TASK_ID,
+      generation: state.selectionGeneration,
+      detail: reviewDetail([reviewEvidence(1), second], 11),
+    });
+
+    expect(state.detailStale).toBe(false);
+    expect(state.detailLoading).toBe(false);
+    expect(state.selectedDetail?.reviews.map(({ round }) => round)).toEqual([
+      1, 2,
+    ]);
+  });
+
+  it("atomically discards recovery events through the watermark and applies only later ids", () => {
+    const first = reviewEvidence(1);
+    const conflictEvent = reviewEvent(
+      11,
+      { ...structuredClone(first), summary: "Conflicting payload." },
+      REVIEW_TASK_ID,
+    );
+    const laterEvent: TaskEvent = {
+      id: 12,
+      schema_version: 1,
+      task_id: REVIEW_TASK_ID,
+      kind: "activity.appended",
+      created_at: NOW,
+      payload: {
+        entry: {
+          id: "activity-after-recovery",
+          level: "info",
+          actor: "system",
+          role_run: null,
+          message: "Committed after the recovery snapshot.",
+          created_at: NOW,
+        },
+      },
+    };
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap({ tasks: [reviewTask()] }),
+    });
+    state = agentReducer(state, {
+      type: "task.selected",
+      taskId: REVIEW_TASK_ID,
+    });
+    state = agentReducer(state, {
+      type: "detail.received",
+      taskId: REVIEW_TASK_ID,
+      generation: state.selectionGeneration,
+      detail: reviewDetail([first]),
+    });
+    state = agentReducer(state, {
+      type: "event.conflicted",
+      event: conflictEvent,
+      reason: "review_payload_conflict",
+    });
+    state = agentReducer(state, {
+      type: "event.received",
+      event: laterEvent,
+    });
+
+    expect(state.appliedEventId).toBe(10);
+    expect(state.recoveryBuffer.map(({ id }) => id)).toEqual([11, 12]);
+
+    state = agentReducer(state, {
+      type: "recovery.received",
+      bootstrap: bootstrap({
+        latest_event_id: 11,
+        tasks: [reviewTask(11)],
+      }),
+      bufferedEvents: [conflictEvent, laterEvent],
+    });
+
+    expect(state.appliedEventId).toBe(12);
+    expect(state.tasksById[REVIEW_TASK_ID]?.last_event_id).toBe(12);
+    expect(state.liveBufferByTaskId[REVIEW_TASK_ID]?.map(({ id }) => id)).toEqual([
+      12,
+    ]);
+    expect(state.snapshotRecovery).toBeNull();
+  });
+
+  it("keeps recovery pending when a post-watermark buffer cannot be projected", () => {
+    const first = reviewEvidence(1);
+    const conflictEvent = reviewEvent(
+      11,
+      { ...structuredClone(first), summary: "Conflicting payload." },
+      REVIEW_TASK_ID,
+    );
+    const invalidLaterEvent = {
+      id: 12,
+      schema_version: 2,
+      task_id: REVIEW_TASK_ID,
+      kind: "activity.appended",
+      created_at: NOW,
+      payload: {
+        entry: {
+          id: "invalid-schema-event",
+          level: "info",
+          actor: "system",
+          role_run: null,
+          message: "Must not be committed.",
+          created_at: NOW,
+        },
+      },
+    } as TaskEvent;
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap({ tasks: [reviewTask()] }),
+    });
+    state = agentReducer(state, {
+      type: "task.selected",
+      taskId: REVIEW_TASK_ID,
+    });
+    state = agentReducer(state, {
+      type: "detail.received",
+      taskId: REVIEW_TASK_ID,
+      generation: state.selectionGeneration,
+      detail: reviewDetail([first]),
+    });
+    state = agentReducer(state, {
+      type: "event.conflicted",
+      event: conflictEvent,
+      reason: "review_payload_conflict",
+    });
+
+    const recovered = agentReducer(state, {
+      type: "recovery.received",
+      bootstrap: bootstrap({
+        latest_event_id: 11,
+        tasks: [reviewTask(11)],
+      }),
+      bufferedEvents: [conflictEvent, invalidLaterEvent],
+    });
+
+    expect(recovered.appliedEventId).toBe(10);
+    expect(recovered.snapshotRecovery).toEqual(state.snapshotRecovery);
+    expect(recovered.connection).toBe("recovering");
+    expect(recovered.tasksById[REVIEW_TASK_ID]).toEqual(
+      state.tasksById[REVIEW_TASK_ID],
+    );
   });
 
   it("updates lifecycle summaries and timeline, including non-selected tasks", () => {

@@ -1,10 +1,14 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coding_agent_core::{
-    ActivityEvent, ActivityLevel, AgentEvent, AgentLimits, DiffEvent, ModelMessage, ModelProvider,
-    ModelRequest, ModelResponse, ModelToolChoice, PlanEvent, RuntimeError, TestEvent, TestStatus,
-    ToolCall, ToolCallBatch, ToolRequest, ToolResult, ToolRuntime,
+    ActivityEvent, ActivityLevel, AgentEvent, AgentLimits, AllowedActions, DiffEvent,
+    MAX_VALIDATION_MODEL_RESULT_BYTES, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
+    ModelToolChoice, PlanEvent, PreparedModelProvider, PreparedProviderRequest, ProviderError,
+    RawProviderResponse, RepositoryCheckCatalog, RuntimeError, TestEvent, TestStatus, ToolCall,
+    ToolCallBatch, ToolRequest, ToolResult, ToolRuntime, ValidationObservation, ValidationRuntime,
 };
+use coding_agent_domain::{CheckEvidenceStatus, RequiredCheck, RequiredCheckSelector};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -25,15 +29,69 @@ impl ModelProvider for ScriptedProvider {
             assistant_content: None,
             reasoning_content: None,
             calls: vec![
-                ToolCall {
-                    id: "call-1".to_owned(),
-                    request: ToolRequest::GitStatus,
-                },
-                ToolCall {
-                    id: "call-2".to_owned(),
-                    request: ToolRequest::GitDiff,
-                },
+                ToolCall::runtime("call-1", ToolRequest::GitStatus),
+                ToolCall::runtime("call-2", ToolRequest::GitDiff),
             ],
+        }))
+    }
+}
+
+struct ScriptedPreparedRequest {
+    encoded_len: usize,
+    maximum_response_bytes: usize,
+    sends: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PreparedProviderRequest for ScriptedPreparedRequest {
+    fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
+    fn maximum_response_bytes(&self) -> usize {
+        self.maximum_response_bytes
+    }
+
+    async fn send(
+        self: Box<Self>,
+        cancellation: CancellationToken,
+    ) -> Result<Box<dyn RawProviderResponse>, ProviderError> {
+        assert!(!cancellation.is_cancelled());
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(ScriptedRawResponse { encoded_len: 17 }))
+    }
+}
+
+struct ScriptedRawResponse {
+    encoded_len: usize,
+}
+
+impl RawProviderResponse for ScriptedRawResponse {
+    fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
+    fn decode(self: Box<Self>) -> Result<ModelResponse, ProviderError> {
+        Ok(ModelResponse::Final {
+            content: "done".to_owned(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct ScriptedPreparedProvider {
+    sends: Arc<AtomicUsize>,
+}
+
+impl PreparedModelProvider for ScriptedPreparedProvider {
+    fn prepare(
+        &self,
+        _request: ModelRequest,
+    ) -> Result<Box<dyn PreparedProviderRequest>, ProviderError> {
+        Ok(Box::new(ScriptedPreparedRequest {
+            encoded_len: 41,
+            maximum_response_bytes: 73,
+            sends: self.sends.clone(),
         }))
     }
 }
@@ -41,6 +99,45 @@ impl ModelProvider for ScriptedProvider {
 #[derive(Default)]
 struct ScriptedRuntime {
     requests: Mutex<Vec<ToolRequest>>,
+}
+
+struct TypedCatalog {
+    selectors: Vec<RequiredCheckSelector>,
+}
+
+#[async_trait::async_trait]
+impl RepositoryCheckCatalog for TypedCatalog {
+    async fn required_check_selectors(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<RequiredCheckSelector>, RuntimeError> {
+        assert!(!cancellation.is_cancelled());
+        Ok(self.selectors.clone())
+    }
+}
+
+struct TypedValidationRuntime;
+
+#[async_trait::async_trait]
+impl ValidationRuntime for TypedValidationRuntime {
+    async fn run_validation(
+        &self,
+        check: RequiredCheck,
+        cancellation: CancellationToken,
+    ) -> Result<ValidationObservation, RuntimeError> {
+        assert!(!cancellation.is_cancelled());
+        // The deliberately contradictory display text proves the typed fields
+        // are supplied independently rather than parsed from ToolResult.
+        ValidationObservation::try_new(
+            ToolResult::text(
+                r#"{"package":"attacker","test":"attacker","status":"failed","duration_ms":999}"#,
+            ),
+            check,
+            CheckEvidenceStatus::Passed,
+            7,
+            false,
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -57,12 +154,50 @@ impl ToolRuntime for ScriptedRuntime {
 }
 
 #[tokio::test]
+async fn prepared_provider_port_is_scriptable_and_never_sends_during_prepare() {
+    let sends = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn PreparedModelProvider> = Arc::new(ScriptedPreparedProvider {
+        sends: sends.clone(),
+    });
+    let request = ModelRequest {
+        messages: vec![ModelMessage::user("inspect")],
+        allowed_actions: AllowedActions::legacy(),
+        tool_choice: ModelToolChoice::Auto,
+    };
+
+    {
+        let rejected_by_preflight = provider.prepare(request.clone()).unwrap();
+        let accounting = rejected_by_preflight.as_ref();
+        assert_eq!(accounting.encoded_len(), 41);
+        assert_eq!(accounting.maximum_response_bytes(), 73);
+    }
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        0,
+        "a core budget rejection after prepare must not contact the provider"
+    );
+
+    let prepared = provider.prepare(request).unwrap();
+    let raw = prepared.send(CancellationToken::new()).await.unwrap();
+    let response_accounting = raw.as_ref();
+    assert_eq!(response_accounting.encoded_len(), 17);
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        raw.decode().unwrap(),
+        ModelResponse::Final {
+            content: "done".to_owned()
+        }
+    );
+}
+
+#[tokio::test]
 async fn provider_and_runtime_ports_preserve_an_ordered_tool_call_batch() {
     let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::default());
     let runtime: Arc<dyn ToolRuntime> = Arc::new(ScriptedRuntime::default());
     let cancellation = CancellationToken::new();
     let request = ModelRequest {
         messages: vec![ModelMessage::user("inspect the repository")],
+        allowed_actions: AllowedActions::legacy(),
         tool_choice: ModelToolChoice::Auto,
     };
 
@@ -76,7 +211,13 @@ async fn provider_and_runtime_ports_preserve_an_ordered_tool_call_batch() {
     let mut tool_messages = Vec::new();
     for call in &batch.calls {
         let result = runtime
-            .invoke(call.request.clone(), cancellation.clone())
+            .invoke(
+                call.request
+                    .clone()
+                    .into_tool_request()
+                    .expect("legacy provider returns runtime tools"),
+                cancellation.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(result.content(), "clean");
@@ -105,6 +246,64 @@ async fn provider_and_runtime_ports_preserve_an_ordered_tool_call_batch() {
             ..
         } if tool_call_id == "call-2"
     ));
+}
+
+#[tokio::test]
+async fn quality_ports_exchange_only_typed_selectors_and_authoritative_fields() {
+    let selector =
+        RequiredCheckSelector::try_cargo_test(Some("trusted_pkg".to_owned()), None).unwrap();
+    let catalog = TypedCatalog {
+        selectors: vec![selector.clone()],
+    };
+    let selectors = catalog
+        .required_check_selectors(CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(selectors, vec![selector.clone()]);
+
+    let check = RequiredCheck::try_from_selector("check-1", selector).unwrap();
+    let observation = TypedValidationRuntime
+        .run_validation(check.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(observation.check(), &check);
+    assert_eq!(observation.status(), CheckEvidenceStatus::Passed);
+    assert_eq!(observation.duration_ms(), 7);
+    assert!(!observation.truncated());
+    assert!(observation.model_result().content().contains("attacker"));
+}
+
+#[test]
+fn validation_observation_constructor_closes_struct_literal_and_size_bypasses() {
+    let check = RequiredCheck::try_cargo_check("check-1", None).unwrap();
+    let oversized = "x".repeat(MAX_VALIDATION_MODEL_RESULT_BYTES + 1);
+    assert!(
+        ValidationObservation::try_new(
+            ToolResult::text(oversized),
+            check.clone(),
+            CheckEvidenceStatus::Passed,
+            1,
+            false,
+        )
+        .is_err()
+    );
+    assert!(
+        ValidationObservation::try_new(
+            ToolResult::failed_text("display failure"),
+            check,
+            CheckEvidenceStatus::Passed,
+            1,
+            false,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn integration_test_selector_requires_a_typed_package() {
+    assert!(RequiredCheckSelector::try_cargo_test(None, Some("integration".to_owned())).is_err());
+    assert!(RequiredCheckSelector::try_cargo_test(None, None).is_ok());
 }
 
 #[test]

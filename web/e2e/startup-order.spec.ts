@@ -54,6 +54,7 @@ test("descriptor publication precedes browser dispatch with positive and negativ
               target: "actor_descriptor_before_browser",
             },
           ],
+          legacy_v2_seed: { kind: "none" },
           marker_write_failure: false,
         };
       },
@@ -92,6 +93,7 @@ test("restart recovery completes before a replacement descriptor is published", 
       store_writer_faults: [],
       actor_pauses: [],
       virtual_release_signals: [],
+      legacy_v2_seed: { kind: "none" },
       marker_write_failure: false,
     },
     async (app) => {
@@ -106,7 +108,7 @@ test("restart recovery completes before a replacement descriptor is published", 
         "running",
         "the recovery fixture task to enter Running",
       );
-      await expect(page.locator(".task-status-label")).toHaveText("Status: running");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: running");
 
       await app.hardKillPrimaryPreservingRoot();
       const releasePath = path.join(
@@ -125,6 +127,7 @@ test("restart recovery completes before a replacement descriptor is published", 
             target: "actor_recovery_before_descriptor",
           },
         ],
+        legacy_v2_seed: { kind: "none" },
         marker_write_failure: false,
       });
       void restart.catch(() => undefined);
@@ -171,7 +174,7 @@ test("restart recovery completes before a replacement descriptor is published", 
       await page
         .getByRole("button", { name: "Recovery ordering task Attempt 1", exact: true })
         .click();
-      await expect(page.locator(".task-status-label")).toHaveText("Status: interrupted");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: interrupted");
       await expect(page.getByRole("list", { name: "Tasks" })).toContainText("Interrupted");
       await quitThroughUi(page, app);
     },

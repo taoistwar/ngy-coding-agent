@@ -4,6 +4,7 @@ mod artifacts;
 mod migrate;
 mod projection;
 mod repositories;
+mod reviews;
 mod tasks;
 
 use std::path::Path;
@@ -15,6 +16,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 pub use projection::{BootstrapSnapshot, EventPage, TaskDetail};
 pub use repositories::RegisterRepositoryOutcome;
+pub use reviews::{FinalizeReviewedTaskOutcome, RecordReviewOutcome};
 pub use tasks::{
     AppendEventOutcome, CreateTaskOutcome, RecoveryOutcome, RetryTaskOutcome, TaskTransition,
     TransitionOutcome,
@@ -34,6 +36,8 @@ pub enum StoreError {
     InvalidClientRequestId(uuid::Error),
     #[error("stored task status is invalid: {0}")]
     InvalidTaskStatus(String),
+    #[error("stored task delivery readiness is invalid: {0}")]
+    InvalidDeliveryReadiness(String),
     #[error("stored task event kind is invalid: {0}")]
     InvalidEventKind(String),
     #[error("stored task event schema version is invalid: {0}")]
@@ -122,6 +126,16 @@ impl Store {
         checkpoint
     }
 
+    /// Closes every handle sharing this store's pool without exposing raw SQL access.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    /// Raw database access for integration fixtures and explicit test-support builds.
+    ///
+    /// Production release builds intentionally omit this escape hatch so reviewed
+    /// task finalization cannot be bypassed outside the store's typed API.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool

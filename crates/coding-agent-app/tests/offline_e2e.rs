@@ -26,7 +26,6 @@ use coding_agent_app::{
     ServiceState, ServiceStateController, StoreWriterHandle, SystemWallClock, TaskManagerHandle,
     WallClock, WorktreeCodingAgentAttemptFactory,
 };
-use coding_agent_core::AgentLimits;
 use coding_agent_domain::{
     CanonicalPath, EventCursor, NewRepository, Repository, Task, TaskEventKind, TaskFailure,
     TaskId, TaskStatus, TestStatus, UtcTimestamp,
@@ -69,7 +68,6 @@ struct ProviderState {
     scenario: Scenario,
     calls: AtomicUsize,
     requests: Mutex<Vec<serde_json::Value>>,
-    replacement_sha256: Mutex<Option<String>>,
 }
 
 impl ProviderState {
@@ -78,7 +76,6 @@ impl ProviderState {
             scenario,
             calls: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
-            replacement_sha256: Mutex::new(None),
         }
     }
 
@@ -164,240 +161,461 @@ async fn provider_request(
     let call = state.calls.fetch_add(1, Ordering::AcqRel);
 
     match state.scenario {
-        Scenario::Disconnect => disconnected_response(),
-        Scenario::Timeout | Scenario::Blocking => {
+        Scenario::Disconnect if call == 0 => disconnected_response(),
+        Scenario::Timeout if call == 0 => {
             tokio::time::sleep(Duration::from_secs(30)).await;
             final_response("late")
         }
-        Scenario::OutputFlood => output_flood_response(),
-        Scenario::PathEscape => match call {
-            0 => tool_response(
-                "read-escape",
+        Scenario::Blocking if call == 0 => {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            final_response("late")
+        }
+        Scenario::OutputFlood if call == 0 => output_flood_response(),
+        _ => match request_role(&body) {
+            WireRole::Planner => project_3_plan_response(),
+            WireRole::Executor => {
+                project_3_executor_response(state.scenario, &body, request_role_run(&body))
+            }
+            WireRole::Reviewer => project_3_reviewer_response(&body, request_role_run(&body)),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireRole {
+    Planner,
+    Executor,
+    Reviewer,
+}
+
+fn request_role(body: &serde_json::Value) -> WireRole {
+    let policy = body["messages"][0]["content"]
+        .as_str()
+        .expect("role system policy");
+    if policy.contains("Planner #1") {
+        WireRole::Planner
+    } else if policy.contains("Executor") {
+        WireRole::Executor
+    } else if policy.contains("Reviewer") {
+        WireRole::Reviewer
+    } else {
+        panic!("unknown role policy: {policy}");
+    }
+}
+
+fn request_role_run(body: &serde_json::Value) -> u8 {
+    if request_role(body) == WireRole::Planner {
+        return 1;
+    }
+    request_handoff(body)["role_run"]
+        .as_u64()
+        .and_then(|value| u8::try_from(value).ok())
+        .expect("bounded role run")
+}
+
+fn request_handoff(body: &serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(
+        body["messages"][1]["content"]
+            .as_str()
+            .expect("canonical role handoff"),
+    )
+    .expect("role handoff JSON")
+}
+
+fn project_3_plan_response() -> Response<Body> {
+    tool_response(
+        "planner-submit",
+        "submit_plan",
+        serde_json::json!({
+            "summary": "Change and validate the offline answer",
+            "steps": [{
+                "title": "Implement and validate",
+                "description": "Update the answer implementation and run its focused test.",
+                "acceptance_criteria": ["The answer integration test passes."]
+            }],
+            "initial_required_checks": [{
+                "kind": "cargo_test",
+                "package": PACKAGE,
+                "integration_test": "answer"
+            }]
+        }),
+    )
+}
+
+fn project_3_executor_response(
+    scenario: Scenario,
+    body: &serde_json::Value,
+    role_run: u8,
+) -> Response<Body> {
+    let history = tool_history(body);
+    let compatibility_scenario = matches!(
+        scenario,
+        Scenario::RequiredAsRequiredSuccess | Scenario::RequiredAsAutoSuccess
+    );
+    if scenario == Scenario::PathEscape {
+        if history.is_empty() {
+            return tool_response(
+                "executor-read-escape",
                 "read_file",
                 serde_json::json!({
                     "path": "../outside.txt",
                     "start_line": 1,
                     "end_line": 10
                 }),
-            ),
-            1 => {
-                assert_latest_tool_status(&body, "failed");
-                final_response("path escape was rejected")
-            }
-            _ => panic!("unexpected path-escape provider request {call}"),
-        },
-        Scenario::RequiredAsRequiredSuccess => {
-            required_compatibility_response(&body, call, "required")
-        }
-        Scenario::RequiredAsAutoSuccess => required_compatibility_response(&body, call, "auto"),
-        Scenario::Success | Scenario::TestFailure | Scenario::ReplaceAfterPass => {
-            scripted_coding_response(&state, &body, call)
-        }
-    }
-}
-
-fn required_compatibility_response(
-    request: &serde_json::Value,
-    call: usize,
-    forced_wire: &str,
-) -> Response<Body> {
-    match call {
-        0 => tool_response(
-            "compat-read-source",
-            "read_file",
-            serde_json::json!({
-                "path": "src/lib.rs",
-                "start_line": 1,
-                "end_line": 20
-            }),
-        ),
-        1 => {
-            let result = latest_tool_payload(request);
-            let digest = result["sha256"]
-                .as_str()
-                .expect("read_file result carries SHA-256");
-            tool_response(
-                "compat-replace-source",
-                "replace_file",
-                serde_json::json!({
-                    "path": "src/lib.rs",
-                    "expected_sha256": digest,
-                    "content": CHANGED_SOURCE
-                }),
-            )
-        }
-        2 => {
-            assert_latest_tool_status(request, "succeeded");
-            assert_eq!(request["tool_choice"], forced_wire);
-            let tools = request["tools"]
-                .as_array()
-                .expect("compatibility request tools array");
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0]["function"]["name"], "cargo_test");
-            tool_response(
-                "compat-test-answer",
-                "cargo_test",
-                serde_json::json!({
-                    "package": PACKAGE,
-                    "test": "answer",
-                    "timeout_ms": 30_000
-                }),
-            )
-        }
-        3 => {
-            assert_latest_tool_status(request, "succeeded");
-            assert_eq!(request["tool_choice"], "auto");
-            final_response("compatibility task finished")
-        }
-        _ => panic!("unexpected compatibility provider request {call}"),
-    }
-}
-
-fn scripted_coding_response(
-    state: &ProviderState,
-    request: &serde_json::Value,
-    call: usize,
-) -> Response<Body> {
-    match call {
-        0 => tool_response(
-            "read-source",
-            "read_file",
-            serde_json::json!({
-                "path": "src/lib.rs",
-                "start_line": 1,
-                "end_line": 20
-            }),
-        ),
-        1 => {
-            let result = latest_tool_payload(request);
-            let digest = result["sha256"]
-                .as_str()
-                .expect("read_file result carries SHA-256");
-            assert!(
-                result["lines"]
-                    .to_string()
-                    .contains("pub fn answer() -> u32 { 41 }")
             );
-            let content = if state.scenario == Scenario::TestFailure {
-                FAILED_SOURCE
-            } else {
-                CHANGED_SOURCE
-            };
-            if state.scenario == Scenario::Success {
-                return tool_batch_response(vec![
-                    (
-                        "replace-source",
-                        "replace_file",
-                        serde_json::json!({
-                            "path": "src/lib.rs",
-                            "expected_sha256": digest,
-                            "content": content
-                        }),
-                    ),
-                    (
-                        "test-answer",
-                        "cargo_test",
-                        serde_json::json!({
-                            "package": PACKAGE,
-                            "test": "answer",
-                            "timeout_ms": 30_000
-                        }),
-                    ),
-                ]);
-            }
-            tool_response(
-                "replace-source",
-                "replace_file",
-                serde_json::json!({
-                    "path": "src/lib.rs",
-                    "expected_sha256": digest,
-                    "content": content
-                }),
-            )
         }
-        2 if state.scenario == Scenario::Success => {
-            assert_tool_status(request, "replace-source", "succeeded");
-            assert_tool_status(request, "test-answer", "succeeded");
-            let assistant = request["messages"]
-                .as_array()
-                .expect("provider messages array")
+        assert_latest_tool_status(body, "failed");
+        return tool_response(
+            "executor-path-blocked",
+            "report_blocked",
+            serde_json::json!({
+                "reason": "unsupported_scope",
+                "summary": "the requested path is outside the isolated worktree"
+            }),
+        );
+    }
+
+    if !history.iter().any(|(_, name)| name == "read_file") {
+        return tool_response(
+            &format!("executor-{role_run}-read"),
+            "read_file",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "start_line": 1,
+                "end_line": 20
+            }),
+        );
+    }
+
+    let replace_count = history
+        .iter()
+        .filter(|(_, name)| name == "replace_file")
+        .count();
+    let test_count = history
+        .iter()
+        .filter(|(_, name)| name == "cargo_test")
+        .count();
+    if replace_count == 0 {
+        let result = latest_tool_payload(body);
+        let digest = result["sha256"]
+            .as_str()
+            .expect("read_file result carries SHA-256");
+        let content = if scenario == Scenario::TestFailure {
+            FAILED_SOURCE
+        } else {
+            CHANGED_SOURCE
+        };
+        return tool_response(
+            "executor-replace-source",
+            "replace_file",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "expected_sha256": digest,
+                "content": content
+            }),
+        );
+    }
+
+    if compatibility_scenario
+        && !history
+            .iter()
+            .any(|(_, name)| name == "update_plan_progress")
+    {
+        return tool_response(
+            "executor-progress",
+            "update_plan_progress",
+            serde_json::json!({
+                "updates": [{"step_id": "step-01", "status": "completed"}]
+            }),
+        );
+    }
+
+    if compatibility_scenario && test_count < replace_count {
+        if request_exposes_only(body, "cargo_test") {
+            return tool_response(
+                &format!("executor-test-{test_count}"),
+                "cargo_test",
+                validation_arguments(body),
+            );
+        }
+        let read_count = history
+            .iter()
+            .filter(|(_, name)| name == "read_file")
+            .count();
+        return tool_response(
+            &format!("executor-compat-read-{read_count}"),
+            "read_file",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "start_line": 1,
+                "end_line": 20
+            }),
+        );
+    }
+
+    if test_count < replace_count {
+        return tool_response(
+            &format!("executor-test-{test_count}"),
+            "cargo_test",
+            validation_arguments(body),
+        );
+    }
+
+    if scenario == Scenario::TestFailure {
+        assert_latest_tool_status(body, "failed");
+        return tool_response(
+            "executor-test-blocked",
+            "report_blocked",
+            serde_json::json!({
+                "reason": "unsupported_scope",
+                "summary": "the focused validation failed"
+            }),
+        );
+    }
+
+    if scenario == Scenario::ReplaceAfterPass && replace_count == 1 {
+        assert_latest_tool_status(body, "succeeded");
+        let digest = latest_successful_sha256_for_tool(body, "replace_file")
+            .expect("post-pass replacement hash");
+        return tool_response(
+            "executor-replace-after-pass",
+            "replace_file",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "expected_sha256": digest,
+                "content": POST_PASS_SOURCE
+            }),
+        );
+    }
+
+    if scenario == Scenario::ReplaceAfterPass && replace_count == 2 {
+        assert_latest_tool_status(body, "failed");
+        return tool_response(
+            "executor-stale-test-blocked",
+            "report_blocked",
+            serde_json::json!({
+                "reason": "unsupported_scope",
+                "summary": "the post-pass mutation invalidated the required test"
+            }),
+        );
+    }
+
+    if role_run == 1
+        && !history
+            .iter()
+            .any(|(_, name)| name == "update_plan_progress")
+    {
+        return tool_response(
+            "executor-progress",
+            "update_plan_progress",
+            serde_json::json!({
+                "updates": [{"step_id": "step-01", "status": "completed"}]
+            }),
+        );
+    }
+
+    tool_response(
+        &format!("executor-{role_run}-submit"),
+        "submit_execution",
+        serde_json::json!({
+            "summary": "the offline change and current required test are complete"
+        }),
+    )
+}
+
+fn project_3_reviewer_response(body: &serde_json::Value, role_run: u8) -> Response<Body> {
+    let history = tool_history(body);
+    if !history
+        .iter()
+        .any(|(_, name)| name == "review_diff_manifest")
+    {
+        let manifest = function_properties(body, "review_diff_manifest");
+        if manifest
+            .get("generation")
+            .and_then(|property| property.get("const"))
+            .is_none()
+        {
+            let read_count = history
                 .iter()
-                .rev()
-                .find(|message| message["role"] == "assistant")
-                .expect("assistant batch message");
-            assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 2);
-            assert_eq!(assistant["tool_calls"][0]["id"], "replace-source");
-            assert_eq!(assistant["tool_calls"][1]["id"], "test-answer");
-            final_response("offline task finished")
-        }
-        2 => {
-            let result = latest_tool_payload(request);
-            let digest = result["sha256"]
-                .as_str()
-                .expect("replace_file result carries SHA-256")
-                .to_owned();
-            *state
-                .replacement_sha256
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(digest);
-            tool_response(
-                "test-answer",
-                "cargo_test",
-                serde_json::json!({
-                    "package": PACKAGE,
-                    "test": "answer",
-                    "timeout_ms": 30_000
-                }),
-            )
-        }
-        3 if state.scenario == Scenario::ReplaceAfterPass => {
-            assert_latest_tool_status(request, "succeeded");
-            let digest = state
-                .replacement_sha256
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .expect("post-pass replacement hash");
-            tool_response(
-                "replace-after-pass",
-                "replace_file",
-                serde_json::json!({
-                    "path": "src/lib.rs",
-                    "expected_sha256": digest,
-                    "content": POST_PASS_SOURCE
-                }),
-            )
-        }
-        3 => {
-            if state.scenario == Scenario::TestFailure {
-                assert_latest_tool_status(request, "failed");
-            } else {
-                assert_latest_tool_status(request, "succeeded");
+                .filter(|(_, name)| name == "read_file")
+                .count();
+            if read_count < 3 {
+                return tool_response(
+                    &format!("reviewer-{role_run}-read-{read_count}"),
+                    "read_file",
+                    serde_json::json!({
+                        "path": "src/lib.rs",
+                        "start_line": 1,
+                        "end_line": 20
+                    }),
+                );
             }
-            final_response("offline task finished")
-        }
-        4 if state.scenario == Scenario::ReplaceAfterPass => {
-            assert_latest_tool_status(request, "succeeded");
-            assert_eq!(
-                request["tool_choice"]["function"]["name"], "cargo_test",
-                "a post-pass replacement must force immediate revalidation"
+            return tool_batch_response(
+                (0..8)
+                    .map(|index| {
+                        (
+                            format!("reviewer-{role_run}-reserved-read-{index}"),
+                            "read_file".to_owned(),
+                            serde_json::json!({
+                                "path": "src/lib.rs",
+                                "start_line": 1,
+                                "end_line": 20
+                            }),
+                        )
+                    })
+                    .collect(),
             );
-            tool_response(
-                "retest-after-pass",
-                "cargo_test",
-                serde_json::json!({
-                    "package": PACKAGE,
-                    "test": "answer",
-                    "timeout_ms": 30_000
-                }),
-            )
         }
-        5 if state.scenario == Scenario::ReplaceAfterPass => {
-            assert_latest_tool_status(request, "failed");
-            final_response("stale test must not prove completion")
-        }
-        _ => panic!("unexpected scripted provider request {call}"),
+        let checkpoint = request_handoff(body)["checkpoint"].clone();
+        return tool_response(
+            &format!("reviewer-{role_run}-manifest"),
+            "review_diff_manifest",
+            serde_json::json!({
+                "generation": checkpoint["generation"],
+                "workspace_digest": checkpoint["workspace_digest"]
+            }),
+        );
     }
+
+    if let Some(arguments) = required_chunk_arguments(body) {
+        return tool_response(
+            &format!("reviewer-{role_run}-chunks-{}", arguments["start_chunk"]),
+            "review_diff_chunks",
+            arguments,
+        );
+    }
+
+    tool_response(
+        &format!("reviewer-{role_run}-approved"),
+        "submit_review",
+        serde_json::json!({
+            "verdict": "approved",
+            "summary": "the current validation and complete diff are approved",
+            "findings": [],
+            "add_required_checks": []
+        }),
+    )
+}
+
+fn tool_history(body: &serde_json::Value) -> Vec<(String, String)> {
+    body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .flat_map(|message| {
+            message["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|call| {
+                    (
+                        call["id"].as_str().expect("tool id").to_owned(),
+                        call["function"]["name"]
+                            .as_str()
+                            .expect("tool name")
+                            .to_owned(),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn validation_arguments(body: &serde_json::Value) -> serde_json::Value {
+    let properties = function_properties(body, "cargo_test");
+    let mut arguments = serde_json::Map::new();
+    if let Some(check_id) = properties
+        .get("check_id")
+        .and_then(|property| property.get("const"))
+    {
+        arguments.insert("check_id".to_owned(), check_id.clone());
+    }
+    arguments.insert(
+        "package".to_owned(),
+        properties
+            .get("package")
+            .and_then(|property| property.get("const"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(PACKAGE)),
+    );
+    arguments.insert(
+        "integration_test".to_owned(),
+        properties
+            .get("integration_test")
+            .and_then(|property| property.get("const"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("answer")),
+    );
+    serde_json::Value::Object(arguments)
+}
+
+fn required_chunk_arguments(body: &serde_json::Value) -> Option<serde_json::Value> {
+    let properties = function_properties_optional(body, "review_diff_chunks")?;
+    Some(serde_json::json!({
+        "generation": properties.get("generation")?.get("const")?.clone(),
+        "workspace_digest": {
+            "algorithm": properties
+                .get("workspace_digest")?
+                .get("properties")?
+                .get("algorithm")?
+                .get("const")?
+                .clone(),
+            "value": properties
+                .get("workspace_digest")?
+                .get("properties")?
+                .get("value")?
+                .get("const")?
+                .clone()
+        },
+        "manifest_sha256": properties.get("manifest_sha256")?.get("const")?.clone(),
+        "start_chunk": properties.get("start_chunk")?.get("const")?.clone(),
+        "count": properties.get("count")?.get("const")?.clone()
+    }))
+}
+
+fn function_properties<'a>(
+    body: &'a serde_json::Value,
+    name: &str,
+) -> &'a serde_json::Map<String, serde_json::Value> {
+    function_properties_optional(body, name)
+        .unwrap_or_else(|| panic!("request does not expose {name}"))
+}
+
+fn function_properties_optional<'a>(
+    body: &'a serde_json::Value,
+    name: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    body["tools"]
+        .as_array()?
+        .iter()
+        .find(|tool| tool["function"]["name"] == name)?
+        .get("function")?
+        .get("parameters")?
+        .get("properties")?
+        .as_object()
+}
+
+fn request_exposes_only(body: &serde_json::Value, name: &str) -> bool {
+    body["tools"].as_array().is_some_and(|tools| {
+        tools.len() == 1 && tools[0]["function"]["name"].as_str() == Some(name)
+    })
+}
+
+fn latest_successful_sha256_for_tool(body: &serde_json::Value, name: &str) -> Option<String> {
+    let history = tool_history(body);
+    let call_id = history
+        .iter()
+        .rev()
+        .find_map(|(id, candidate)| (candidate == name).then_some(id))?;
+    body["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == call_id.as_str())
+        .and_then(|message| message["content"].as_str())
+        .and_then(|content| content.split_once('\n'))
+        .and_then(|(_, payload)| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|payload| payload["sha256"].as_str().map(str::to_owned))
 }
 
 fn latest_tool_content(request: &serde_json::Value) -> &str {
@@ -416,20 +634,6 @@ fn assert_latest_tool_status(request: &serde_json::Value, expected: &str) {
     assert!(
         content.starts_with(&format!("[tool_status={expected};")),
         "expected a {expected} tool result, got: {content}"
-    );
-}
-
-fn assert_tool_status(request: &serde_json::Value, tool_call_id: &str, expected: &str) {
-    let content = request["messages"]
-        .as_array()
-        .expect("provider messages array")
-        .iter()
-        .find(|message| message["role"] == "tool" && message["tool_call_id"] == tool_call_id)
-        .and_then(|message| message["content"].as_str())
-        .expect("matching tool result");
-    assert!(
-        content.starts_with(&format!("[tool_status={expected};")),
-        "expected {tool_call_id} to be {expected}, got: {content}"
     );
 }
 
@@ -468,7 +672,7 @@ fn tool_response(id: &str, name: &str, arguments: serde_json::Value) -> Response
     }))
 }
 
-fn tool_batch_response(calls: Vec<(&str, &str, serde_json::Value)>) -> Response<Body> {
+fn tool_batch_response(calls: Vec<(String, String, serde_json::Value)>) -> Response<Body> {
     let calls = calls
         .into_iter()
         .enumerate()
@@ -669,20 +873,6 @@ impl E2eFixture {
             provider_client,
             attempts,
             Arc::new(SystemWallClock),
-            AgentLimits::try_new(
-                16,
-                if matches!(
-                    scenario,
-                    Scenario::RequiredAsRequiredSuccess | Scenario::RequiredAsAutoSuccess
-                ) {
-                    5
-                } else {
-                    32
-                },
-                4 * 1024 * 1024,
-                512 * 1024,
-            )
-            .expect("valid E2E agent limits"),
             CodingAgentRunnerConfig::try_new(Duration::from_secs(10), Duration::from_millis(10))
                 .expect("valid E2E runner config"),
         ));
@@ -735,7 +925,7 @@ impl E2eFixture {
     }
 
     async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) -> Task {
-        tokio::time::timeout(Duration::from_secs(90), async {
+        tokio::time::timeout(Duration::from_secs(180), async {
             loop {
                 let detail = self
                     .store
@@ -1066,7 +1256,11 @@ async fn offline_success_runs_real_pipeline_and_persisted_event_dto_replay() {
             .collect::<Vec<_>>(),
         "persisted event DTO replay diverged from the task event stream"
     );
-    assert_eq!(fixture.provider.state.calls.load(Ordering::Acquire), 3);
+    assert_eq!(
+        fixture.provider.state.calls.load(Ordering::Acquire),
+        13,
+        "Planner, Executor, and Reviewer must all use the same task-scoped provider ledger"
+    );
 }
 
 #[tokio::test]
@@ -1096,12 +1290,36 @@ async fn compatibility_modes_force_one_visible_cargo_test_without_an_http_retry(
         );
 
         let requests = fixture.provider.state.requests();
+        let forced_validation = requests
+            .iter()
+            .find(|request| {
+                request["tools"].as_array().is_some_and(|tools| {
+                    tools.len() == 1 && tools[0]["function"]["name"] == "cargo_test"
+                })
+            })
+            .expect("one forced current Cargo test request");
+        assert_eq!(
+            forced_validation["tool_choice"],
+            match scenario {
+                Scenario::RequiredAsRequiredSuccess => serde_json::json!("required"),
+                Scenario::RequiredAsAutoSuccess => serde_json::json!("auto"),
+                _ => unreachable!(),
+            }
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request_exposes_only(request, "cargo_test"))
+                .count(),
+            1,
+            "compatibility mode must issue exactly one forced validation request; scenario={scenario:?}"
+        );
         assert_eq!(
             requests.len(),
-            4,
-            "compatibility mode must not add an HTTP retry; scenario={scenario:?}"
+            28,
+            "compatibility mode must not add an HTTP retry to the budget-forced role journey; scenario={scenario:?}"
         );
-        assert_eq!(fixture.provider.state.calls.load(Ordering::Acquire), 4);
+        assert_eq!(fixture.provider.state.calls.load(Ordering::Acquire), 28);
         fixture.assert_isolation_invariants(task.id).await;
     }
 }
@@ -1119,7 +1337,7 @@ async fn real_test_failure_replace_after_pass_and_path_escape_fail_closed() {
         let failed = fixture.wait_for_status(task.id, TaskStatus::Failed).await;
         let failure = failed.failure.expect("failed task has failure");
         assert_eq!(
-            failure.code, "CURRENT_TEST_REQUIRED",
+            failure.code, "EXECUTOR_BLOCKED_UNSUPPORTED_SCOPE",
             "scenario={scenario:?}"
         );
         assert!(!failure.retryable, "scenario={scenario:?}");
@@ -1136,7 +1354,20 @@ async fn real_test_failure_replace_after_pass_and_path_escape_fail_closed() {
             Scenario::ReplaceAfterPass => {
                 assert_eq!(detail.tests.unwrap().status, TestStatus::Failed);
                 let requests = fixture.provider.state.requests();
-                assert_eq!(requests[4]["tool_choice"]["function"]["name"], "cargo_test");
+                assert!(
+                    requests.iter().any(|request| {
+                        let history = tool_history(request);
+                        history
+                            .iter()
+                            .any(|(id, _)| id == "executor-replace-after-pass")
+                            && history
+                                .iter()
+                                .filter(|(_, name)| name == "cargo_test")
+                                .count()
+                                >= 2
+                    }),
+                    "post-pass mutation must be followed by a new failed validation"
+                );
                 assert_eq!(
                     std::fs::read_to_string(
                         fixture
@@ -1154,9 +1385,15 @@ async fn real_test_failure_replace_after_pass_and_path_escape_fail_closed() {
                 );
             }
             Scenario::PathEscape => {
-                assert!(detail.tests.is_none());
+                assert_ne!(
+                    detail
+                        .tests
+                        .expect("cleanup publishes unverified tests")
+                        .status,
+                    TestStatus::Passed
+                );
                 let requests = fixture.provider.state.requests();
-                assert!(latest_tool_content(&requests[1]).contains("COMMAND_NOT_ALLOWED"));
+                assert!(latest_tool_content(&requests[2]).contains("COMMAND_NOT_ALLOWED"));
             }
             _ => unreachable!(),
         }
@@ -1168,9 +1405,13 @@ async fn real_test_failure_replace_after_pass_and_path_escape_fail_closed() {
 async fn disconnect_timeout_and_output_flood_have_stable_bounded_failures() {
     let _guard = E2E_LOCK.lock().await;
     for (scenario, expected, retryable) in [
-        (Scenario::Disconnect, "PROVIDER_TRANSPORT_FAILED", true),
-        (Scenario::Timeout, "PROVIDER_TRANSPORT_FAILED", true),
-        (Scenario::OutputFlood, "PROVIDER_RESPONSE_INVALID", false),
+        (Scenario::Disconnect, "PLANNER_PROVIDER_FAILED", true),
+        (Scenario::Timeout, "PLANNER_PROVIDER_FAILED", true),
+        (
+            Scenario::OutputFlood,
+            "PLANNER_CONTEXT_LIMIT_REACHED",
+            false,
+        ),
     ] {
         let fixture = E2eFixture::new(scenario).await;
         let task = fixture

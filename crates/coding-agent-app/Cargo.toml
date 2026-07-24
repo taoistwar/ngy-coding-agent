@@ -8,7 +8,11 @@ license.workspace = true
 [features]
 default = []
 embedded-web = ["dep:rust-embed"]
-test-support = []
+test-support = [
+    "coding-agent-runtime/test-support",
+    "coding-agent-store/test-support",
+    "dep:sqlx",
+]
 e2e = ["embedded-web", "rust-embed/debug-embed", "test-support"]
 
 [dependencies]
@@ -35,6 +39,7 @@ rfd.workspace = true
 rust-embed = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+sqlx = { workspace = true, optional = true }
 subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -55,5 +60,6 @@ windows-sys.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+coding-agent-store = { path = "../coding-agent-store", features = ["test-support"] }
 sqlx.workspace = true
 tempfile.workspace = true

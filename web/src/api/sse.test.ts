@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { SseMessage } from "./types";
+import type { ReviewEvidence, SseMessage } from "./types";
 import {
   IncrementalSseParser,
   SseClient,
@@ -8,6 +8,7 @@ import {
   computeBackoffDelay,
   type SseClientCallbacks,
   type SseClientState,
+  type SseRecoveryReason,
 } from "./sse";
 
 const encoder = new TextEncoder();
@@ -26,9 +27,14 @@ function taskQueued(id: number): Extract<SseMessage, { kind: "task.queued" }> {
         client_request_id: "00000000-0000-4000-8000-000000000003",
         prompt: "test",
         status: "queued",
+        delivery_readiness: "unreviewed",
         attempt: 1,
         last_event_id: id,
         created_at: "2026-07-15T00:00:00Z",
+        retry_of: null,
+        started_at: null,
+        finished_at: null,
+        failure: null,
       },
     },
   };
@@ -52,12 +58,138 @@ function lifecycleEvent(
     | "interrupted",
 ): unknown {
   const queued = taskQueued(id);
+  const terminal = "2026-07-15T00:00:01Z";
+  const taskByStatus = {
+    queued: {
+      ...queued.payload.task,
+      status: "queued" as const,
+      started_at: null,
+      finished_at: null,
+      failure: null,
+    },
+    running: {
+      ...queued.payload.task,
+      status: "running" as const,
+      started_at: queued.payload.task.created_at,
+      finished_at: null,
+      failure: null,
+    },
+    completed: {
+      ...queued.payload.task,
+      status: "completed" as const,
+      started_at: queued.payload.task.created_at,
+      finished_at: terminal,
+      failure: null,
+    },
+    failed: {
+      ...queued.payload.task,
+      status: "failed" as const,
+      started_at: queued.payload.task.created_at,
+      finished_at: terminal,
+      failure: {
+        code: "EXECUTOR_FAILED",
+        message: "execution failed",
+        retryable: false,
+      },
+    },
+    cancelled: {
+      ...queued.payload.task,
+      status: "cancelled" as const,
+      started_at: queued.payload.task.created_at,
+      finished_at: terminal,
+      failure: null,
+    },
+    interrupted: {
+      ...queued.payload.task,
+      status: "interrupted" as const,
+      started_at: queued.payload.task.created_at,
+      finished_at: terminal,
+      failure: {
+        code: "EXECUTOR_INTERRUPTED",
+        message: "execution interrupted",
+        retryable: true,
+      },
+    },
+  };
   return {
     ...queued,
     kind,
     payload: {
-      task: { ...queued.payload.task, status },
+      task: taskByStatus[status],
     },
+  };
+}
+
+function reviewEvidence(): ReviewEvidence {
+  const workspaceDigest = {
+    algorithm: "workspace_fingerprint_v1" as const,
+    value: "a".repeat(64),
+  };
+  const requiredCheck = {
+    id: "check-cargo-test",
+    kind: "cargo_test" as const,
+    package: null,
+    integration_test: null,
+  };
+  return {
+    round: 1,
+    decision_source: "reviewer",
+    workspace_generation: 3,
+    workspace_digest: workspaceDigest,
+    verdict: "approved",
+    summary: "Approved",
+    findings: [],
+    added_required_checks: [],
+    required_checks: [requiredCheck],
+    check_evidence: [
+      {
+        check_id: requiredCheck.id,
+        actor: "executor",
+        role_run: 1,
+        workspace_generation: 3,
+        workspace_digest: workspaceDigest,
+        status: "passed",
+        duration_ms: 12,
+        summary: "passed",
+        truncated: false,
+      },
+    ],
+    coverage: {
+      generation: 3,
+      workspace_digest: workspaceDigest,
+      manifest_sha256: "b".repeat(64),
+      covered_chunks: [],
+      total_chunks: 0,
+    },
+    created_at: "2026-07-15T00:00:00Z",
+  };
+}
+
+function reviewUpdated(
+  id: number,
+): Extract<SseMessage, { kind: "review.updated" }> {
+  return {
+    id,
+    schema_version: 1,
+    kind: "review.updated",
+    task_id: "00000000-0000-4000-8000-000000000001",
+    created_at: "2026-07-15T00:00:00Z",
+    payload: { review: reviewEvidence() },
+  };
+}
+
+function panelEvent(
+  id: number,
+  kind: "plan.updated" | "activity.appended",
+  payload: unknown,
+): unknown {
+  return {
+    id,
+    schema_version: 1,
+    kind,
+    task_id: "00000000-0000-4000-8000-000000000001",
+    created_at: "2026-07-15T00:00:00Z",
+    payload,
   };
 }
 
@@ -147,6 +279,16 @@ describe("IncrementalSseParser", () => {
 
     expect(() => parser.push(encoder.encode("data: 12345678901\n\n"))).toThrow(
       /frame/i,
+    );
+  });
+
+  it("enforces the default 256 KiB frame cap using UTF-8 bytes", () => {
+    const parser = new IncrementalSseParser();
+
+    expect(() =>
+      parser.push(encoder.encode(`data: ${"🙂".repeat(65_536)}`)),
+    ).toThrowError(
+      expect.objectContaining({ code: "FRAME_TOO_LARGE" }),
     );
   });
 
@@ -307,6 +449,108 @@ describe("SseClient", () => {
       { message: taskQueued(8), persistedId: 8 },
     ]);
     expect(client.lastAppliedId).toBe(8);
+  });
+
+  it("recognizes and projects a self-contained typed review.updated event", async () => {
+    const onMessage = vi.fn();
+    const recover = vi.fn(async () => 8);
+    let client: SseClient;
+    onMessage.mockImplementation(() => client.stop());
+    client = new SseClient({
+      fetch: vi.fn(async () =>
+        eventStream([
+          persistedFrame(8, reviewUpdated(8), "review.updated"),
+        ]),
+      ),
+      callbacks: callbacks({ onMessage, recover }),
+    });
+
+    await client.start(7);
+
+    expect(onMessage).toHaveBeenCalledWith(reviewUpdated(8), {
+      event: "review.updated",
+      persistedId: 8,
+    });
+    expect(client.lastAppliedId).toBe(8);
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "task delivery_readiness",
+      {
+        ...taskQueued(8),
+        payload: {
+          task: {
+            ...taskQueued(8).payload.task,
+            delivery_readiness: undefined,
+          },
+        },
+      },
+      "task.queued",
+    ],
+    [
+      "plan format_version",
+      panelEvent(8, "plan.updated", {
+        plan: {
+          revision: 1,
+          summary: "Implement the request",
+          items: [
+            {
+              id: "step-1",
+              title: "Implement",
+              description: "Implement the requested change",
+              acceptance_criteria: ["The focused tests pass"],
+              status: "running",
+            },
+          ],
+          initial_required_checks: [],
+        },
+      }),
+      "plan.updated",
+    ],
+    [
+      "activity role_run",
+      panelEvent(8, "activity.appended", {
+        entry: {
+          id: "activity-1",
+          level: "info",
+          actor: "executor",
+          message: "working",
+          created_at: "2026-07-15T00:00:00Z",
+        },
+      }),
+      "activity.appended",
+    ],
+    [
+      "review coverage",
+      {
+        ...reviewUpdated(8),
+        payload: {
+          review: {
+            ...reviewEvidence(),
+            coverage: undefined,
+          },
+        },
+      },
+      "review.updated",
+    ],
+  ])("recovers when a known event omits required %s", async (_label, body, event) => {
+    const recover = vi.fn(async () => {
+      client.stop();
+      return 8;
+    });
+    const client = new SseClient({
+      fetch: vi.fn(async () => eventStream([persistedFrame(8, body, event)])),
+      callbacks: callbacks({ recover }),
+    });
+
+    await client.start(7);
+
+    expect(recover).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "MALFORMED_ENVELOPE" }),
+      expect.any(AbortSignal),
+    );
   });
 
   it("ignores a duplicate, diagnoses a supported future kind, advances, then recovers on non-monotonic IDs", async () => {
@@ -828,6 +1072,88 @@ describe("SseClient", () => {
       "/api/events?after=5",
       "/api/events?after=21",
     ]);
+  });
+
+  it("merges an explicit recovery requested during bootstrap backoff and only exits on stop", async () => {
+    let resolveBackoffStarted!: (signal: AbortSignal) => void;
+    const backoffStarted = new Promise<AbortSignal>((resolve) => {
+      resolveBackoffStarted = resolve;
+    });
+    let resolveSecondRecovery!: (value: {
+      reason: SseRecoveryReason;
+      signal: AbortSignal;
+    }) => void;
+    const secondRecovery = new Promise<{
+      reason: SseRecoveryReason;
+      signal: AbortSignal;
+    }>((resolve) => {
+      resolveSecondRecovery = resolve;
+    });
+    const recover = vi
+      .fn<SseClientCallbacks["recover"]>()
+      .mockRejectedValueOnce(new Error("bootstrap offline"))
+      .mockImplementationOnce((reason, signal) => {
+        resolveSecondRecovery({ reason, signal });
+        return new Promise<number>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("bootstrap aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      });
+    const sleep = vi.fn((_delay: number, signal: AbortSignal) => {
+      resolveBackoffStarted(signal);
+      return new Promise<void>((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => reject(new DOMException("backoff aborted", "AbortError")),
+          { once: true },
+        );
+      });
+    });
+    const client = new SseClient({
+      fetch: vi.fn(async () => new Response("not an event stream")),
+      callbacks: callbacks({ recover }),
+      sleep,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+      jitter: () => 0,
+    });
+
+    const running = client.start(5);
+    await backoffStarted;
+    client.requestRecovery({
+      code: "PROJECTION_ERROR",
+      message: "buffered review replay conflicted",
+    });
+
+    const outcome = await Promise.race([
+      secondRecovery.then((value) => ({ kind: "second" as const, value })),
+      running.then(() => ({ kind: "stopped" as const })),
+    ]);
+    expect(outcome.kind).toBe("second");
+    if (outcome.kind !== "second") return;
+    expect(outcome.value.reason.code).toBe("PROJECTION_ERROR");
+    expect(outcome.value.reason.message).toContain(
+      "expected text/event-stream",
+    );
+    expect(outcome.value.reason.message).toContain(
+      "buffered review replay conflicted",
+    );
+    expect(recover).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+
+    let settled = false;
+    void running.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    client.stop();
+    await running;
+    expect(settled).toBe(true);
   });
 
   it("treats a recovery-bootstrap 401 as session expired without retry", async () => {

@@ -6,8 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use coding_agent_domain::{EventCursor, TaskFailure, TaskId};
-use coding_agent_store::{RecoveryOutcome, Store};
+use coding_agent_domain::{EventCursor, EventId, TaskFailure};
+use coding_agent_store::{
+    FinalizeReviewedTaskOutcome, RecordReviewOutcome, RecoveryOutcome, Store,
+};
 use futures_util::FutureExt as _;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -16,9 +18,10 @@ use uuid::Uuid;
 
 use crate::task_manager::{TaskManagerMessage, current_timestamp};
 use crate::{
-    EventDispatcherHandle, MutationGate, NativeMessageSink, PlatformPaths, PrivateFile,
-    QuiesceResult, RunnerEvent, RunnerOutcome, RunnerShutdownHandle, ServiceState,
-    ServiceStateController, StoreWriterHandle, TaskManagerHandle, WallClock,
+    EventDispatcherHandle, FinalizeReviewedTaskRequest, MutationGate, NativeMessageSink,
+    PlatformPaths, PrivateFile, QuiesceResult, RecordReviewRequest, RunnerShutdownHandle,
+    ServiceState, ServiceStateController, StoreWriterError, StoreWriterHandle, TaskManagerHandle,
+    WallClock,
 };
 
 const RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -424,7 +427,7 @@ where
 }
 
 async fn close_pool_until(store: &Store, deadline: Instant) {
-    let close = store.pool().close();
+    let close = store.close();
     tokio::pin!(close);
     tokio::select! {
         biased;
@@ -570,20 +573,14 @@ fn write_shutdown_marker(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingDurableResult {
-    RunnerEvent {
-        task_id: TaskId,
-        event: RunnerEvent,
-    },
-    RunnerTerminal {
-        task_id: TaskId,
-        outcome: RunnerOutcome,
-    },
+    RecordReview(RecordReviewRequest),
+    FinalizeReviewedTask(FinalizeReviewedTaskRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DegradedRecoveryResult {
     pub recovery: RecoveryOutcome,
-    pub discarded_pending_count: usize,
+    pub replayed_pending_count: usize,
     pub ready_generation: u64,
 }
 
@@ -593,6 +590,8 @@ pub enum DegradedCoordinatorError {
     Quiescing,
     #[error("task manager closed before degraded recovery was finalized")]
     ManagerClosed,
+    #[error("typed degraded replay conflicted with durable state")]
+    TypedConflict,
 }
 
 #[derive(Clone)]
@@ -604,8 +603,15 @@ pub struct DegradedCoordinator {
 
 #[async_trait::async_trait]
 trait RecoveryBackend: Send + Sync + 'static {
+    async fn replay(&self, pending: &PendingDurableResult) -> Result<EventId, ReplayError>;
     async fn recover(&self) -> Result<RecoveryOutcome, String>;
     async fn flush(&self, high_watermark: EventCursor) -> Result<(), String>;
+}
+
+#[derive(Debug)]
+enum ReplayError {
+    Retryable(String),
+    Conflict(String),
 }
 
 struct RuntimeRecoveryBackend {
@@ -615,6 +621,33 @@ struct RuntimeRecoveryBackend {
 
 #[async_trait::async_trait]
 impl RecoveryBackend for RuntimeRecoveryBackend {
+    async fn replay(&self, pending: &PendingDurableResult) -> Result<EventId, ReplayError> {
+        match pending {
+            PendingDurableResult::RecordReview(request) => self
+                .writer
+                .record_review(request.clone(), Instant::now() + RECOVERY_WRITE_BUDGET)
+                .await
+                .map_err(classify_replay_error)
+                .map(|receipt| match receipt.value {
+                    RecordReviewOutcome::Applied { event_id, .. }
+                    | RecordReviewOutcome::Existing { event_id, .. } => event_id,
+                }),
+            PendingDurableResult::FinalizeReviewedTask(request) => self
+                .writer
+                .finalize_reviewed_task(request.clone(), Instant::now() + RECOVERY_WRITE_BUDGET)
+                .await
+                .map_err(classify_replay_error)
+                .map(|receipt| match receipt.value {
+                    FinalizeReviewedTaskOutcome::Applied {
+                        terminal_event_id, ..
+                    }
+                    | FinalizeReviewedTaskOutcome::Existing {
+                        terminal_event_id, ..
+                    } => terminal_event_id,
+                }),
+        }
+    }
+
     async fn recover(&self) -> Result<RecoveryOutcome, String> {
         let now = current_timestamp().map_err(str::to_owned)?;
         self.writer
@@ -663,10 +696,57 @@ impl DegradedCoordinator {
         }
     }
 
-    pub async fn run(&self) -> Result<DegradedRecoveryResult, DegradedCoordinatorError> {
+    pub async fn run(
+        &self,
+        pending: Vec<PendingDurableResult>,
+    ) -> Result<DegradedRecoveryResult, DegradedCoordinatorError> {
+        let replayed_pending_count = pending.len();
+        let replay_high_watermark = self.replay_pending(&pending).await?;
         let recovery = self.recover_store().await?;
-        self.flush_recovery(recovery.high_watermark).await?;
-        self.finalize(recovery).await
+        let high_watermark =
+            replay_high_watermark
+                .map(EventId::get)
+                .map_or(recovery.high_watermark, |replayed| {
+                    EventCursor::new(replayed.max(recovery.high_watermark.get()))
+                        .expect("replayed event IDs are positive")
+                });
+        self.flush_recovery(high_watermark).await?;
+        self.finalize(recovery, replayed_pending_count).await
+    }
+
+    async fn replay_pending(
+        &self,
+        pending: &[PendingDurableResult],
+    ) -> Result<Option<EventId>, DegradedCoordinatorError> {
+        let mut high_watermark = None;
+        for request in pending {
+            loop {
+                self.ensure_not_quiescing()?;
+                match self.backend.replay(request).await {
+                    Ok(event_id) => {
+                        high_watermark = Some(
+                            high_watermark
+                                .map_or(event_id, |current: EventId| current.max(event_id)),
+                        );
+                        break;
+                    }
+                    Err(ReplayError::Retryable(error)) => {
+                        tracing::warn!(error = %error, "degraded typed replay attempt failed");
+                        self.wait_to_retry().await?;
+                    }
+                    Err(ReplayError::Conflict(error)) => {
+                        // Application quiescing or manager closure wins a race with an
+                        // in-flight replay error; shutdown must not be converted into a
+                        // new degraded freeze after the replay future returns.
+                        self.ensure_not_quiescing()?;
+                        tracing::error!(error = %error, "degraded typed replay conflicted");
+                        self.freeze_manager(pending.to_vec()).await?;
+                        return Err(DegradedCoordinatorError::TypedConflict);
+                    }
+                }
+            }
+        }
+        Ok(high_watermark)
     }
 
     async fn recover_store(&self) -> Result<RecoveryOutcome, DegradedCoordinatorError> {
@@ -701,18 +781,39 @@ impl DegradedCoordinator {
     async fn finalize(
         &self,
         recovery: RecoveryOutcome,
+        replayed_pending_count: usize,
     ) -> Result<DegradedRecoveryResult, DegradedCoordinatorError> {
         self.ensure_not_quiescing()?;
         let (response, receiver) = oneshot::channel();
         self.manager
             .upgrade()
             .ok_or(DegradedCoordinatorError::ManagerClosed)?
-            .send(TaskManagerMessage::FinalizeDegraded { recovery, response })
+            .send(TaskManagerMessage::FinalizeDegraded {
+                recovery,
+                replayed_pending_count,
+                response,
+            })
             .await
             .map_err(|_| DegradedCoordinatorError::ManagerClosed)?;
         receiver
             .await
             .map_err(|_| DegradedCoordinatorError::ManagerClosed)?
+    }
+
+    async fn freeze_manager(
+        &self,
+        pending: Vec<PendingDurableResult>,
+    ) -> Result<(), DegradedCoordinatorError> {
+        let (response, receiver) = oneshot::channel();
+        self.manager
+            .upgrade()
+            .ok_or(DegradedCoordinatorError::ManagerClosed)?
+            .send(TaskManagerMessage::FreezeDegraded { pending, response })
+            .await
+            .map_err(|_| DegradedCoordinatorError::ManagerClosed)?;
+        receiver
+            .await
+            .map_err(|_| DegradedCoordinatorError::ManagerClosed)
     }
 
     async fn wait_to_retry(&self) -> Result<(), DegradedCoordinatorError> {
@@ -723,6 +824,9 @@ impl DegradedCoordinator {
             .ok_or(DegradedCoordinatorError::ManagerClosed)?;
         if manager.is_closed() {
             return Err(DegradedCoordinatorError::ManagerClosed);
+        }
+        if state.borrow().state == ServiceState::Quiescing {
+            return Err(DegradedCoordinatorError::Quiescing);
         }
         tokio::select! {
             () = tokio::time::sleep(RECOVERY_RETRY_INTERVAL) => Ok(()),
@@ -761,13 +865,22 @@ fn degraded_recovery_failure() -> TaskFailure {
     }
 }
 
+fn classify_replay_error(error: StoreWriterError) -> ReplayError {
+    match error {
+        StoreWriterError::Busy => ReplayError::Retryable("store writer remained busy".to_owned()),
+        StoreWriterError::Closed => ReplayError::Conflict("store writer is closed".to_owned()),
+        StoreWriterError::Store(error) => ReplayError::Conflict(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    use coding_agent_domain::{EventCursor, EventId};
+    use coding_agent_domain::{EventCursor, EventId, RepositoryId, TaskId};
+    use coding_agent_store::StoreError;
     use serde_json::Value;
 
     use super::*;
@@ -1029,6 +1142,9 @@ mod tests {
     }
 
     struct ScriptedBackend {
+        replay: Mutex<VecDeque<Result<EventId, ReplayError>>>,
+        replayed: Mutex<Vec<PendingDurableResult>>,
+        call_order: Mutex<Vec<&'static str>>,
         recover: Mutex<VecDeque<Result<RecoveryOutcome, String>>>,
         flush: Mutex<VecDeque<Result<(), String>>>,
         recover_calls: AtomicUsize,
@@ -1054,7 +1170,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RecoveryBackend for ScriptedBackend {
+        async fn replay(&self, pending: &PendingDurableResult) -> Result<EventId, ReplayError> {
+            self.call_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("replay");
+            self.replayed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(pending.clone());
+            self.replay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .expect("scripted replay result")
+        }
+
         async fn recover(&self) -> Result<RecoveryOutcome, String> {
+            self.call_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("recover");
             let attempt = self.recover_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if attempt == 1
                 && let Some(barrier) = &self.first_recover_barrier
@@ -1070,6 +1206,10 @@ mod tests {
         }
 
         async fn flush(&self, _high_watermark: EventCursor) -> Result<(), String> {
+            self.call_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("flush");
             self.flush_calls.fetch_add(1, Ordering::SeqCst);
             self.flush
                 .lock()
@@ -1085,6 +1225,9 @@ mod tests {
             flush: impl IntoIterator<Item = Result<(), String>>,
         ) -> Self {
             Self {
+                replay: Mutex::new(VecDeque::new()),
+                replayed: Mutex::new(Vec::new()),
+                call_order: Mutex::new(Vec::new()),
                 recover: Mutex::new(recover.into_iter().collect()),
                 flush: Mutex::new(flush.into_iter().collect()),
                 recover_calls: AtomicUsize::new(0),
@@ -1098,12 +1241,37 @@ mod tests {
             self
         }
 
+        fn with_replay(
+            self,
+            replay: impl IntoIterator<Item = Result<EventId, ReplayError>>,
+        ) -> Self {
+            *self
+                .replay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = replay.into_iter().collect();
+            self
+        }
+
         fn recover_calls(&self) -> usize {
             self.recover_calls.load(Ordering::SeqCst)
         }
 
         fn flush_calls(&self) -> usize {
             self.flush_calls.load(Ordering::SeqCst)
+        }
+
+        fn replayed(&self) -> Vec<PendingDurableResult> {
+            self.replayed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn call_order(&self) -> Vec<&'static str> {
+            self.call_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
     }
 
@@ -1118,19 +1286,19 @@ mod tests {
         let (manager, mut messages) = mpsc::channel(8);
         let coordinator =
             DegradedCoordinator::with_backend(backend.clone(), state.clone(), manager.downgrade());
-        let run = tokio::spawn(async move { coordinator.run().await });
+        let run = tokio::spawn(async move { coordinator.run(Vec::new()).await });
 
         wait_for_calls(&backend.flush_calls, 1).await;
         settle().await;
         assert_eq!(backend.recover_calls(), 1);
         tokio::time::advance(RECOVERY_RETRY_INTERVAL + Duration::from_millis(1)).await;
         wait_for_calls(&backend.flush_calls, 2).await;
-        complete_finalization(&mut messages, &state, 2).await;
+        complete_finalization(&mut messages, &state, 0).await;
 
         let result = run.await.unwrap().unwrap();
         assert_eq!(backend.recover_calls(), 1);
         assert_eq!(backend.flush_calls(), 2);
-        assert_eq!(result.discarded_pending_count, 2);
+        assert_eq!(result.replayed_pending_count, 0);
         assert_eq!(result.ready_generation, 2);
     }
 
@@ -1145,7 +1313,7 @@ mod tests {
         let (manager, mut messages) = mpsc::channel(8);
         let coordinator =
             DegradedCoordinator::with_backend(backend.clone(), state.clone(), manager.downgrade());
-        let run = tokio::spawn(async move { coordinator.run().await });
+        let run = tokio::spawn(async move { coordinator.run(Vec::new()).await });
 
         wait_for_calls(&backend.recover_calls, 1).await;
         settle().await;
@@ -1153,11 +1321,193 @@ mod tests {
         tokio::time::advance(RECOVERY_RETRY_INTERVAL + Duration::from_millis(1)).await;
         wait_for_calls(&backend.recover_calls, 2).await;
         wait_for_calls(&backend.flush_calls, 1).await;
-        complete_finalization(&mut messages, &state, 1).await;
+        complete_finalization(&mut messages, &state, 0).await;
 
         run.await.unwrap().unwrap();
         assert_eq!(backend.recover_calls(), 2);
         assert_eq!(backend.flush_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_pending_replays_in_original_order_before_recovery() {
+        let pending = vec![pending_finalize(), pending_finalize()];
+        let backend = Arc::new(
+            ScriptedBackend::new([Ok(recovery())], [Ok(())])
+                .with_replay([Ok(EventId::new(2).unwrap()), Ok(EventId::new(3).unwrap())]),
+        );
+        let state = degraded_state();
+        let (manager, mut messages) = mpsc::channel(8);
+        let coordinator =
+            DegradedCoordinator::with_backend(backend.clone(), state.clone(), manager.downgrade());
+        let expected = pending.clone();
+        let run = tokio::spawn(async move { coordinator.run(pending).await });
+
+        wait_for_calls(&backend.recover_calls, 1).await;
+        complete_finalization(&mut messages, &state, 2).await;
+
+        let result = run.await.unwrap().unwrap();
+        assert_eq!(result.replayed_pending_count, 2);
+        assert_eq!(backend.replayed(), expected);
+        assert_eq!(
+            backend.call_order(),
+            vec!["replay", "replay", "recover", "flush"]
+        );
+    }
+
+    #[test]
+    fn typed_replay_retries_only_store_writer_busy() {
+        assert!(matches!(
+            classify_replay_error(StoreWriterError::Busy),
+            ReplayError::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_replay_error(StoreWriterError::Closed),
+            ReplayError::Conflict(_)
+        ));
+        assert!(matches!(
+            classify_replay_error(StoreWriterError::Store(StoreError::InvariantViolation(
+                "permanent replay failure"
+            ))),
+            ReplayError::Conflict(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_typed_replay_retries_then_succeeds_without_freezing() {
+        let pending = vec![pending_finalize()];
+        let expected = pending.clone();
+        let backend = Arc::new(
+            ScriptedBackend::new([Ok(recovery())], [Ok(())]).with_replay([
+                Err(classify_replay_error(StoreWriterError::Busy)),
+                Ok(EventId::new(2).unwrap()),
+            ]),
+        );
+        let state = degraded_state();
+        let (manager, mut messages) = mpsc::channel(8);
+        let coordinator =
+            DegradedCoordinator::with_backend(backend.clone(), state.clone(), manager.downgrade());
+        let run = tokio::spawn(async move { coordinator.run(pending).await });
+
+        wait_for_replays(&backend, 1).await;
+        settle().await;
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(RECOVERY_RETRY_INTERVAL + Duration::from_millis(1)).await;
+        wait_for_calls(&backend.recover_calls, 1).await;
+        complete_finalization(&mut messages, &state, 1).await;
+
+        let result = run.await.unwrap().unwrap();
+        assert_eq!(result.replayed_pending_count, 1);
+        assert_eq!(
+            backend.replayed(),
+            vec![expected[0].clone(), expected[0].clone()]
+        );
+        assert_eq!(
+            backend.call_order(),
+            vec!["replay", "replay", "recover", "flush"]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_busy_sqlite_replay_error_freezes_and_returns_exact_pending() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory SQLite database");
+        sqlx::query(
+            "CREATE TABLE replay_constraint (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL UNIQUE
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create replay constraint fixture");
+        sqlx::query("INSERT INTO replay_constraint (id, value) VALUES (1, 'duplicate')")
+            .execute(&pool)
+            .await
+            .expect("seed replay constraint fixture");
+        let database_error =
+            sqlx::query("INSERT INTO replay_constraint (id, value) VALUES (2, 'duplicate')")
+                .execute(&pool)
+                .await
+                .expect_err("duplicate value must fail");
+        let database_code = database_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .map(|code| code.into_owned())
+            .expect("SQLite constraint error has a code");
+        assert!(
+            !crate::store_writer::sqlite_code_is_retryable(&database_code),
+            "constraint code {database_code} must not be classified as BUSY/LOCKED"
+        );
+
+        let replay_error = classify_replay_error(StoreWriterError::Store(StoreError::Database(
+            database_error,
+        )));
+        assert!(matches!(
+            &replay_error,
+            ReplayError::Conflict(message) if message.contains("UNIQUE constraint failed")
+        ));
+
+        let pending = vec![pending_finalize()];
+        let expected = pending.clone();
+        let backend = Arc::new(
+            ScriptedBackend::new(std::iter::empty(), std::iter::empty())
+                .with_replay([Err(replay_error)]),
+        );
+        let state = degraded_state();
+        let (manager, mut messages) = mpsc::channel(8);
+        let coordinator =
+            DegradedCoordinator::with_backend(backend.clone(), state.clone(), manager.downgrade());
+        let run = tokio::spawn(async move { coordinator.run(pending).await });
+
+        let TaskManagerMessage::FreezeDegraded {
+            pending: retained,
+            response,
+        } = messages.recv().await.expect("freeze message")
+        else {
+            panic!("non-BUSY database error must freeze degraded recovery");
+        };
+        assert_eq!(retained, expected);
+        response.send(()).unwrap();
+
+        assert_eq!(
+            run.await.unwrap(),
+            Err(DegradedCoordinatorError::TypedConflict)
+        );
+        assert_eq!(backend.replayed(), expected);
+        assert_eq!(backend.recover_calls(), 0);
+        assert_eq!(backend.flush_calls(), 0);
+        assert_eq!(backend.call_order(), vec!["replay"]);
+        assert_eq!(state.current().state, ServiceState::StoreDegraded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiescing_during_busy_typed_replay_backoff_never_freezes() {
+        let backend = Arc::new(
+            ScriptedBackend::new(std::iter::empty(), std::iter::empty())
+                .with_replay([Err(classify_replay_error(StoreWriterError::Busy))]),
+        );
+        let state = degraded_state();
+        let (manager, mut messages) = mpsc::channel(8);
+        let coordinator =
+            DegradedCoordinator::with_backend(backend.clone(), state.clone(), manager.downgrade());
+        let run = tokio::spawn(async move { coordinator.run(vec![pending_finalize()]).await });
+
+        wait_for_replays(&backend, 1).await;
+        settle().await;
+        state.set(ServiceState::Quiescing).unwrap();
+
+        assert_eq!(run.await.unwrap(), Err(DegradedCoordinatorError::Quiescing));
+        assert_eq!(backend.replayed().len(), 1);
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[tokio::test]
@@ -1171,7 +1521,7 @@ mod tests {
         let (manager, mut messages) = mpsc::channel(8);
         let coordinator =
             DegradedCoordinator::with_backend(backend.clone(), state.clone(), manager.downgrade());
-        let run = tokio::spawn(async move { coordinator.run().await });
+        let run = tokio::spawn(async move { coordinator.run(Vec::new()).await });
 
         wait_for_calls(&backend.flush_calls, 1).await;
         settle().await;
@@ -1199,7 +1549,7 @@ mod tests {
         let weak_manager = manager.downgrade();
         let coordinator =
             DegradedCoordinator::with_backend(backend.clone(), state, weak_manager.clone());
-        let run = tokio::spawn(async move { coordinator.run().await });
+        let run = tokio::spawn(async move { coordinator.run(Vec::new()).await });
 
         recover_barrier.wait_until_entered().await;
         assert_eq!(backend.recover_calls(), 1);
@@ -1234,21 +1584,34 @@ mod tests {
         }
     }
 
+    fn pending_finalize() -> PendingDurableResult {
+        PendingDurableResult::FinalizeReviewedTask(FinalizeReviewedTaskRequest {
+            task_id: TaskId::new(),
+            expected_repository_id: RepositoryId::new(),
+            expected_attempt: 1,
+            evidence: crate::fake_runner::approved_evidence(),
+        })
+    }
+
     async fn complete_finalization(
         messages: &mut mpsc::Receiver<TaskManagerMessage>,
         state: &ServiceStateController,
-        discarded_pending_count: usize,
+        expected_replayed_pending_count: usize,
     ) {
-        let TaskManagerMessage::FinalizeDegraded { recovery, response } =
-            messages.recv().await.expect("finalization message")
+        let TaskManagerMessage::FinalizeDegraded {
+            recovery,
+            replayed_pending_count,
+            response,
+        } = messages.recv().await.expect("finalization message")
         else {
             panic!("unexpected task-manager message");
         };
+        assert_eq!(replayed_pending_count, expected_replayed_pending_count);
         let ready = state.set(ServiceState::Ready).unwrap();
         response
             .send(Ok(DegradedRecoveryResult {
                 recovery,
-                discarded_pending_count,
+                replayed_pending_count,
                 ready_generation: ready.generation,
             }))
             .unwrap();
@@ -1262,6 +1625,16 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("call count did not reach {expected}");
+    }
+
+    async fn wait_for_replays(backend: &ScriptedBackend, expected: usize) {
+        for _ in 0..100 {
+            if backend.replayed().len() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("replay count did not reach {expected}");
     }
 
     async fn wait_for_strong_senders(

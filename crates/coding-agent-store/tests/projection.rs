@@ -4,9 +4,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use coding_agent_domain::{
-    ActivityEntry, ActivityLevel, DiffFile, DiffFileStatus, DiffSnapshot, DomainError, EventCursor,
-    PlanItem, PlanItemStatus, PlanSnapshot, TaskEventKind, TaskEventPayload, TaskStatus, TestCase,
-    TestSnapshot, TestStatus,
+    ActivityActor, ActivityEntry, ActivityLevel, DeliveryReadiness, DiffFile, DiffFileStatus,
+    DiffSnapshot, DomainError, EventCursor, PlanItem, PlanItemStatus, PlanSnapshot, TaskEventKind,
+    TaskEventPayload, TaskStatus, TestCase, TestSnapshot, TestStatus,
 };
 use coding_agent_store::{
     AppendEventOutcome, Store, StoreError, TaskTransition, TransitionOutcome,
@@ -42,12 +42,12 @@ async fn task_detail_replays_replacing_snapshots_deduplicated_activity_and_lifec
     .await;
 
     let created_at = support::current_timestamp();
-    let first_activity = ActivityEntry {
-        id: "stable-entry".to_owned(),
-        level: ActivityLevel::Info,
-        message: "first message".to_owned(),
+    let first_activity = ActivityEntry::legacy(
+        "stable-entry",
+        ActivityLevel::Info,
+        "first message",
         created_at,
-    };
+    );
     append(
         &store,
         running.id,
@@ -56,12 +56,12 @@ async fn task_detail_replays_replacing_snapshots_deduplicated_activity_and_lifec
         },
     )
     .await;
-    let final_activity = ActivityEntry {
-        id: "stable-entry".to_owned(),
-        level: ActivityLevel::Warning,
-        message: "replacement message".to_owned(),
+    let final_activity = ActivityEntry::legacy(
+        "stable-entry",
+        ActivityLevel::Warning,
+        "replacement message",
         created_at,
-    };
+    );
     append(
         &store,
         running.id,
@@ -101,12 +101,7 @@ async fn task_detail_replays_replacing_snapshots_deduplicated_activity_and_lifec
         },
     )
     .await;
-    let completed = applied_task(
-        store
-            .transition_with_event(running.id, TaskStatus::Running, TaskTransition::Completed)
-            .await
-            .unwrap(),
-    );
+    let completed = support::historical_completed_task(&store, running).await;
 
     let unrelated = support::queued_task(&store).await;
     let detail = store.task_detail(completed.id).await.unwrap().unwrap();
@@ -130,6 +125,175 @@ async fn task_detail_replays_replacing_snapshots_deduplicated_activity_and_lifec
     assert!(detail.timeline.iter().all(|entry| entry.failure.is_none()));
     assert_eq!(detail.event_cursor, store.latest_event_id().await.unwrap());
     assert_eq!(detail.event_cursor.get(), unrelated.last_event_id.get());
+}
+
+#[tokio::test]
+async fn raw_project_two_plan_activity_and_lifecycle_payloads_replay_with_legacy_defaults() {
+    let store = support::seeded_store().await;
+    let queued = support::queued_task(&store).await;
+    let running = applied_task(
+        store
+            .transition_with_event(queued.id, TaskStatus::Queued, TaskTransition::Running)
+            .await
+            .unwrap(),
+    );
+    let legacy_plan = PlanSnapshot::legacy(
+        7,
+        vec![PlanItem::legacy(
+            "legacy-step",
+            "Project 2 plan item",
+            PlanItemStatus::Running,
+        )],
+    );
+    append(
+        &store,
+        running.id,
+        TaskEventPayload::PlanUpdated {
+            plan: legacy_plan.clone(),
+        },
+    )
+    .await;
+    let activity_created_at =
+        coding_agent_domain::UtcTimestamp::parse_rfc3339("2026-07-23T01:02:03Z").unwrap();
+    let legacy_activity = ActivityEntry::legacy(
+        "legacy-activity",
+        ActivityLevel::Info,
+        "Project 2 activity",
+        activity_created_at,
+    );
+    append(
+        &store,
+        running.id,
+        TaskEventPayload::ActivityAppended {
+            entry: legacy_activity.clone(),
+        },
+    )
+    .await;
+
+    let legacy_plan_json = serde_json::json!({
+        "plan": {
+            "revision": 7,
+            "items": [{
+                "id": "legacy-step",
+                "title": "Project 2 plan item",
+                "status": "running"
+            }]
+        }
+    })
+    .to_string();
+    let updated = sqlx::query(
+        "UPDATE task_events SET payload_json = ? \
+         WHERE task_id = ? AND kind = 'plan.updated'",
+    )
+    .bind(&legacy_plan_json)
+    .bind(running.id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+
+    let legacy_activity_json = serde_json::json!({
+        "entry": {
+            "id": "legacy-activity",
+            "level": "info",
+            "message": "Project 2 activity",
+            "created_at": activity_created_at
+        }
+    })
+    .to_string();
+    let updated = sqlx::query(
+        "UPDATE task_events SET payload_json = ? \
+         WHERE task_id = ? AND kind = 'activity.appended'",
+    )
+    .bind(&legacy_activity_json)
+    .bind(running.id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+
+    let updated = sqlx::query(
+        "UPDATE task_events \
+         SET payload_json = json_remove(payload_json, '$.task.delivery_readiness') \
+         WHERE task_id = ? AND kind IN ('task.queued', 'task.started')",
+    )
+    .bind(running.id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 2);
+
+    let raw_plan: serde_json::Value = serde_json::from_str(&legacy_plan_json).unwrap();
+    assert!(raw_plan["plan"].get("format_version").is_none());
+    assert!(raw_plan["plan"].get("summary").is_none());
+    assert!(raw_plan["plan"].get("initial_required_checks").is_none());
+    assert!(raw_plan["plan"]["items"][0].get("description").is_none());
+    assert!(
+        raw_plan["plan"]["items"][0]
+            .get("acceptance_criteria")
+            .is_none()
+    );
+    let raw_activity: serde_json::Value = serde_json::from_str(&legacy_activity_json).unwrap();
+    assert!(raw_activity["entry"].get("actor").is_none());
+    assert!(raw_activity["entry"].get("role_run").is_none());
+    let raw_lifecycle_payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM task_events \
+         WHERE task_id = ? AND kind IN ('task.queued', 'task.started') ORDER BY id",
+    )
+    .bind(running.id.to_string())
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(raw_lifecycle_payloads.len(), 2);
+    assert!(raw_lifecycle_payloads.iter().all(|payload| {
+        serde_json::from_str::<serde_json::Value>(payload).unwrap()["task"]
+            .get("delivery_readiness")
+            .is_none()
+    }));
+
+    let events = store.events_after(EventCursor::ZERO, 100).await.unwrap();
+    let replayed_plan = events
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            TaskEventPayload::PlanUpdated { plan } => Some(plan),
+            _ => None,
+        })
+        .expect("legacy plan event");
+    assert_eq!(replayed_plan, &legacy_plan);
+    assert_eq!(replayed_plan.format_version(), 0);
+    assert_eq!(replayed_plan.summary(), "");
+    assert!(replayed_plan.initial_required_checks().is_empty());
+    let replayed_activity = events
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            TaskEventPayload::ActivityAppended { entry } => Some(entry),
+            _ => None,
+        })
+        .expect("legacy activity event");
+    assert_eq!(replayed_activity, &legacy_activity);
+    assert_eq!(replayed_activity.actor(), ActivityActor::System);
+    assert_eq!(replayed_activity.role_run(), None);
+    for event in &events.events {
+        match &event.payload {
+            TaskEventPayload::TaskQueued { task } | TaskEventPayload::TaskStarted { task } => {
+                assert_eq!(task.delivery_readiness, DeliveryReadiness::Unreviewed);
+            }
+            _ => {}
+        }
+    }
+
+    let detail = store.task_detail(running.id).await.unwrap().unwrap();
+    assert_eq!(
+        detail.task.delivery_readiness,
+        DeliveryReadiness::Unreviewed
+    );
+    assert_eq!(detail.plan, Some(legacy_plan));
+    assert_eq!(detail.activity, vec![legacy_activity]);
+    assert_eq!(detail.plan.as_ref().unwrap().format_version(), 0);
+    assert_eq!(detail.activity[0].actor(), ActivityActor::System);
+    assert_eq!(detail.activity[0].role_run(), None);
 }
 
 #[tokio::test]
@@ -221,12 +385,12 @@ async fn global_and_task_event_pages_are_ordered_filtered_and_share_a_query_wate
         &store,
         first.id,
         TaskEventPayload::ActivityAppended {
-            entry: ActivityEntry {
-                id: "activity".to_owned(),
-                level: ActivityLevel::Info,
-                message: "message".to_owned(),
-                created_at: support::current_timestamp(),
-            },
+            entry: ActivityEntry::legacy(
+                "activity",
+                ActivityLevel::Info,
+                "message",
+                support::current_timestamp(),
+            ),
         },
     )
     .await;
@@ -513,14 +677,10 @@ fn applied_task(outcome: TransitionOutcome) -> coding_agent_domain::Task {
 }
 
 fn plan(revision: u64, title: &str) -> PlanSnapshot {
-    PlanSnapshot {
+    PlanSnapshot::legacy(
         revision,
-        items: vec![PlanItem {
-            id: "item".to_owned(),
-            title: title.to_owned(),
-            status: PlanItemStatus::Running,
-        }],
-    }
+        vec![PlanItem::legacy("item", title, PlanItemStatus::Running)],
+    )
 }
 
 fn diff(revision: u64) -> DiffSnapshot {

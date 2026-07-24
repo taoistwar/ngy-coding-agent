@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coding_agent_domain::{
-    ActivityEntry, DiffSnapshot, EventId, PlanSnapshot, Repository, Task, TaskEventPayload,
-    TaskFailure, TaskId, TaskStatus, TestSnapshot, UtcTimestamp,
+    ActivityEntry, DiffSnapshot, EventId, NewReviewEvidence, PlanSnapshot, Repository,
+    RepositoryId, ReviewVerdict, Task, TaskEventPayload, TaskFailure, TaskId, TaskStatus,
+    TestSnapshot, UtcTimestamp,
 };
 use coding_agent_store::{
-    AppendEventOutcome, Store, StoreError, TaskTransition, TransitionOutcome,
+    AppendEventOutcome, FinalizeReviewedTaskOutcome, RecordReviewOutcome, Store, StoreError,
+    TaskTransition, TransitionOutcome,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
@@ -18,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 use crate::test_support::{ActorPauseController, ActorPausePoint};
 use crate::{
     DegradedCoordinator, DegradedCoordinatorError, DegradedRecoveryResult, EventDispatcherHandle,
-    PendingDurableResult, ServiceState, ServiceStateController, StoreWriterError,
-    StoreWriterHandle,
+    FinalizeReviewedTaskRequest, PendingDurableResult, RecordReviewRequest, ServiceState,
+    ServiceStateController, StoreWriterError, StoreWriterHandle,
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
@@ -32,7 +34,8 @@ pub trait TaskRunner: Send + Sync + 'static {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnerOutcome {
-    Succeeded,
+    Approved(NewReviewEvidence),
+    Rejected(NewReviewEvidence),
     Cancelled,
     Failed(TaskFailure),
 }
@@ -74,6 +77,8 @@ pub enum RunnerEventError {
 
 pub struct RunnerEventSink {
     task_id: TaskId,
+    repository_id: RepositoryId,
+    attempt: u32,
     sender: mpsc::Sender<TaskManagerMessage>,
 }
 
@@ -86,6 +91,26 @@ impl RunnerEventSink {
                 event,
                 response,
             })
+            .await
+            .map_err(|_| RunnerEventError::ManagerClosed)?;
+        receiver
+            .await
+            .map_err(|_| RunnerEventError::ManagerClosed)?
+    }
+
+    pub async fn record_review(
+        &self,
+        evidence: NewReviewEvidence,
+    ) -> Result<EventId, RunnerEventError> {
+        let request = RecordReviewRequest {
+            task_id: self.task_id,
+            expected_repository_id: self.repository_id,
+            expected_attempt: self.attempt,
+            evidence,
+        };
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(TaskManagerMessage::RecordReview { request, response })
             .await
             .map_err(|_| RunnerEventError::ManagerClosed)?;
         receiver
@@ -285,6 +310,7 @@ impl TaskManagerHandle {
             pending_durable_results: Vec::new(),
             scan_requested: false,
             degraded: false,
+            degraded_recovery_running: false,
             frozen: false,
             shutdown: shutdown.clone(),
             #[cfg(feature = "test-support")]
@@ -350,6 +376,7 @@ impl TaskManagerHandle {
             pending_durable_results: Vec::new(),
             scan_requested: false,
             degraded: false,
+            degraded_recovery_running: false,
             frozen: false,
             shutdown: shutdown.clone(),
             #[cfg(feature = "test-support")]
@@ -421,6 +448,17 @@ impl TaskManagerHandle {
         receiver.await.map_err(|_| TaskManagerError::Closed)?
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn pending_durable_results_for_test(
+        &self,
+    ) -> Result<Vec<PendingDurableResult>, TaskManagerError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(TaskManagerMessage::InspectPendingDurableResults { response })
+            .await?;
+        receiver.await.map_err(|_| TaskManagerError::Closed)
+    }
+
     async fn send(&self, message: TaskManagerMessage) -> Result<(), TaskManagerError> {
         self.sender
             .send(message)
@@ -443,17 +481,30 @@ pub(crate) enum TaskManagerMessage {
         event: RunnerEvent,
         response: oneshot::Sender<Result<EventId, RunnerEventError>>,
     },
+    RecordReview {
+        request: RecordReviewRequest,
+        response: oneshot::Sender<Result<EventId, RunnerEventError>>,
+    },
     RunnerFinished {
         task_id: TaskId,
         outcome: RunnerOutcome,
     },
     FinalizeDegraded {
         recovery: coding_agent_store::RecoveryOutcome,
+        replayed_pending_count: usize,
         response: oneshot::Sender<Result<DegradedRecoveryResult, DegradedCoordinatorError>>,
+    },
+    FreezeDegraded {
+        pending: Vec<PendingDurableResult>,
+        response: oneshot::Sender<()>,
     },
     Quiesce {
         deadline: Instant,
         response: oneshot::Sender<Result<QuiesceResult, TaskManagerError>>,
+    },
+    #[cfg(feature = "test-support")]
+    InspectPendingDurableResults {
+        response: oneshot::Sender<Vec<PendingDurableResult>>,
     },
     #[cfg(test)]
     InstallExitProbe {
@@ -464,6 +515,9 @@ pub(crate) enum TaskManagerMessage {
 
 struct ActiveRunner {
     cancellation: CancellationToken,
+    repository_id: RepositoryId,
+    attempt: u32,
+    user_cancel_requested: bool,
     _permit: OwnedSemaphorePermit,
     done_sender: Option<oneshot::Sender<()>>,
     done_receiver: Option<oneshot::Receiver<()>>,
@@ -483,6 +537,7 @@ struct TaskManager {
     pending_durable_results: Vec<PendingDurableResult>,
     scan_requested: bool,
     degraded: bool,
+    degraded_recovery_running: bool,
     frozen: bool,
     shutdown: Arc<TaskManagerShutdownControl>,
     #[cfg(feature = "test-support")]
@@ -566,16 +621,33 @@ impl TaskManager {
                 let result = self.append_runner_event(task_id, event).await;
                 let _ = response.send(result);
             }
+            TaskManagerMessage::RecordReview { request, response } => {
+                let result = self.record_runner_review(request).await;
+                let _ = response.send(result);
+            }
             TaskManagerMessage::RunnerFinished { task_id, outcome } => {
                 self.finish_runner(task_id, outcome).await;
             }
-            TaskManagerMessage::FinalizeDegraded { recovery, response } => {
-                let result = self.finalize_degraded(recovery);
+            TaskManagerMessage::FinalizeDegraded {
+                recovery,
+                replayed_pending_count,
+                response,
+            } => {
+                let result = self.finalize_degraded(recovery, replayed_pending_count);
                 let _ = response.send(result);
+            }
+            TaskManagerMessage::FreezeDegraded { pending, response } => {
+                self.pending_durable_results = pending;
+                self.freeze_degraded();
+                let _ = response.send(());
             }
             TaskManagerMessage::Quiesce { deadline, response } => {
                 let result = self.quiesce(deadline).await;
                 let _ = response.send(result);
+            }
+            #[cfg(feature = "test-support")]
+            TaskManagerMessage::InspectPendingDurableResults { response } => {
+                let _ = response.send(self.pending_durable_results.clone());
             }
             #[cfg(test)]
             TaskManagerMessage::InstallExitProbe { exited, installed } => {
@@ -630,6 +702,9 @@ impl TaskManager {
                 task.id,
                 ActiveRunner {
                     cancellation: cancellation.clone(),
+                    repository_id: task.repository_id,
+                    attempt: task.attempt,
+                    user_cancel_requested: false,
                     _permit: permit,
                     done_sender: Some(done_sender),
                     done_receiver: Some(done_receiver),
@@ -664,15 +739,7 @@ impl TaskManager {
                 break;
             }
 
-            let claim = self
-                .writer
-                .transition_with_event(
-                    task.id,
-                    TaskStatus::Queued,
-                    TaskTransition::Running,
-                    background_deadline(),
-                )
-                .await;
+            let claim = self.writer.start_task(task.id, background_deadline()).await;
             match claim {
                 Ok(receipt) => match receipt.value {
                     TransitionOutcome::Applied { task, .. } => {
@@ -709,6 +776,8 @@ impl TaskManager {
         sender: mpsc::Sender<TaskManagerMessage>,
     ) {
         let task_id = task.id;
+        let repository_id = task.repository_id;
+        let attempt = task.attempt;
         #[cfg(feature = "test-support")]
         let launch_ordinal = {
             let launch_ordinal = self.next_launch_ordinal;
@@ -721,6 +790,8 @@ impl TaskManager {
         let runner = self.runner.clone();
         let sink = RunnerEventSink {
             task_id,
+            repository_id,
+            attempt,
             sender: sender.clone(),
         };
         let context = RunContext {
@@ -757,12 +828,7 @@ impl TaskManager {
             TaskStatus::Queued => {
                 let receipt = self
                     .writer
-                    .transition_with_event(
-                        task_id,
-                        TaskStatus::Queued,
-                        TaskTransition::Cancelled,
-                        background_deadline(),
-                    )
+                    .cancel_task(task_id, TaskStatus::Queued, background_deadline())
                     .await?;
                 match receipt.value {
                     TransitionOutcome::Applied { task, .. } => {
@@ -789,10 +855,11 @@ impl TaskManager {
             TaskStatus::Running => {
                 let active = self
                     .active
-                    .get(&task.id)
+                    .get_mut(&task.id)
                     .ok_or(TaskManagerError::Invariant(
                         "running task has no active cancellation token",
                     ))?;
+                active.user_cancel_requested = true;
                 active.cancellation.cancel();
                 let task = self.load_task(task.id).await?;
                 Ok(CancelOutcome::Accepted { task })
@@ -816,8 +883,6 @@ impl TaskManager {
             return Err(RunnerEventError::StoreDegraded);
         }
         if self.degraded {
-            self.pending_durable_results
-                .push(PendingDurableResult::RunnerEvent { task_id, event });
             return Err(RunnerEventError::StoreDegraded);
         }
         if self.service_state.current().state != ServiceState::Ready {
@@ -826,10 +891,6 @@ impl TaskManager {
         if !self.active.contains_key(&task_id) {
             return Err(RunnerEventError::TaskNotRunning);
         }
-        let pending = PendingDurableResult::RunnerEvent {
-            task_id,
-            event: event.clone(),
-        };
         let receipt = self
             .writer
             .append_running_event(task_id, event.into_payload(), background_deadline())
@@ -841,60 +902,161 @@ impl TaskManager {
             },
             Err(error) => {
                 tracing::error!(task_id = %task_id, error = %error, "runner event persistence failed");
-                self.enter_degraded(pending);
+                self.enter_degraded(None);
+                Err(RunnerEventError::StoreDegraded)
+            }
+        }
+    }
+
+    async fn record_runner_review(
+        &mut self,
+        request: RecordReviewRequest,
+    ) -> Result<EventId, RunnerEventError> {
+        if self.is_frozen() {
+            return Err(RunnerEventError::StoreDegraded);
+        }
+        let Some(active) = self.active.get(&request.task_id) else {
+            return Err(RunnerEventError::TaskNotRunning);
+        };
+        if active.repository_id != request.expected_repository_id
+            || active.attempt != request.expected_attempt
+            || active.user_cancel_requested
+        {
+            return Err(RunnerEventError::TaskNotRunning);
+        }
+        if self.degraded {
+            self.pending_durable_results
+                .push(PendingDurableResult::RecordReview(request));
+            return Err(RunnerEventError::StoreDegraded);
+        }
+        if self.service_state.current().state != ServiceState::Ready {
+            return Err(RunnerEventError::StoreDegraded);
+        }
+
+        let pending = PendingDurableResult::RecordReview(request.clone());
+        match self
+            .writer
+            .record_review(request, background_deadline())
+            .await
+        {
+            Ok(receipt) => match receipt.value {
+                RecordReviewOutcome::Applied { event_id, .. }
+                | RecordReviewOutcome::Existing { event_id, .. } => Ok(event_id),
+            },
+            Err(error) => {
+                tracing::error!(error = %error, "runner review persistence failed");
+                self.enter_degraded(Some(pending));
                 Err(RunnerEventError::StoreDegraded)
             }
         }
     }
 
     async fn finish_runner(&mut self, task_id: TaskId, outcome: RunnerOutcome) {
-        if !self.active.contains_key(&task_id) {
+        let Some(active) = self.active.get(&task_id) else {
             return;
-        }
+        };
+        let repository_id = active.repository_id;
+        let attempt = active.attempt;
+        let user_cancel_requested = active.user_cancel_requested;
         if self.is_frozen() {
             self.remove_active(task_id);
             return;
         }
         if self.degraded {
-            self.pending_durable_results
-                .push(PendingDurableResult::RunnerTerminal { task_id, outcome });
+            if !user_cancel_requested
+                && let Some(request) =
+                    final_review_request(task_id, repository_id, attempt, &outcome)
+            {
+                self.pending_durable_results
+                    .push(PendingDurableResult::FinalizeReviewedTask(request));
+            }
             self.remove_active(task_id);
+            self.maybe_start_degraded_recovery();
             return;
         }
-        let pending = PendingDurableResult::RunnerTerminal {
-            task_id,
-            outcome: outcome.clone(),
-        };
-        let transition = match outcome {
-            RunnerOutcome::Succeeded => TaskTransition::Completed,
-            RunnerOutcome::Cancelled => TaskTransition::Cancelled,
-            RunnerOutcome::Failed(failure) => TaskTransition::Failed(failure),
-        };
         #[cfg(feature = "test-support")]
         self.pause_actor(ActorPausePoint::ResultBeforeWrite).await;
-        let result = self
-            .writer
-            .transition_with_event(
-                task_id,
-                TaskStatus::Running,
-                transition,
-                background_deadline(),
-            )
-            .await;
+
+        if user_cancel_requested {
+            self.persist_terminal_transition(task_id, TaskTransition::Cancelled)
+                .await;
+        } else if let Some(request) =
+            final_review_request(task_id, repository_id, attempt, &outcome)
+        {
+            let pending = PendingDurableResult::FinalizeReviewedTask(request.clone());
+            match self
+                .writer
+                .finalize_reviewed_task(request, background_deadline())
+                .await
+            {
+                Ok(receipt) => match receipt.value {
+                    FinalizeReviewedTaskOutcome::Applied { .. }
+                    | FinalizeReviewedTaskOutcome::Existing { .. } => {}
+                },
+                Err(error) => {
+                    tracing::error!(
+                        task_id = %task_id,
+                        error = %error,
+                        "reviewed runner result persistence failed"
+                    );
+                    self.enter_degraded(Some(pending));
+                }
+            }
+        } else {
+            let transition = match outcome {
+                RunnerOutcome::Approved(_) | RunnerOutcome::Rejected(_) => {
+                    TaskTransition::Failed(quality_evidence_mismatch_failure())
+                }
+                RunnerOutcome::Cancelled => TaskTransition::Cancelled,
+                RunnerOutcome::Failed(failure) => TaskTransition::Failed(failure),
+            };
+            self.persist_terminal_transition(task_id, transition).await;
+        }
+
+        self.remove_active(task_id);
+        if self.degraded {
+            self.maybe_start_degraded_recovery();
+        } else if self.claims_allowed() {
+            self.scan_requested = true;
+        }
+    }
+
+    async fn persist_terminal_transition(&mut self, task_id: TaskId, transition: TaskTransition) {
+        let result = match transition {
+            TaskTransition::Cancelled => {
+                self.writer
+                    .cancel_task(task_id, TaskStatus::Running, background_deadline())
+                    .await
+            }
+            TaskTransition::Failed(failure) => {
+                self.writer
+                    .fail_task(task_id, failure, background_deadline())
+                    .await
+            }
+            TaskTransition::Running
+            | TaskTransition::Completed
+            | TaskTransition::Interrupted(_) => {
+                unreachable!("runner terminal persistence accepts only cancelled or failed")
+            }
+        };
         match result {
             Ok(receipt) => {
                 if let TransitionOutcome::Conflict { current } = receipt.value {
-                    tracing::debug!(task_id = %task_id, status = ?current.status, "late runner result rejected");
+                    tracing::debug!(
+                        task_id = %task_id,
+                        status = ?current.status,
+                        "late runner result rejected"
+                    );
                 }
             }
             Err(error) => {
-                tracing::error!(task_id = %task_id, error = %error, "runner result persistence failed");
-                self.enter_degraded(pending);
+                tracing::error!(
+                    task_id = %task_id,
+                    error = %error,
+                    "runner result persistence failed"
+                );
+                self.enter_degraded(None);
             }
-        }
-        self.remove_active(task_id);
-        if self.claims_allowed() {
-            self.scan_requested = true;
         }
     }
 
@@ -967,21 +1129,36 @@ impl TaskManager {
         }
     }
 
-    fn enter_degraded(&mut self, pending: PendingDurableResult) {
-        self.pending_durable_results.push(pending);
-        if self.degraded {
+    fn enter_degraded(&mut self, pending: Option<PendingDurableResult>) {
+        if let Some(pending) = pending {
+            self.pending_durable_results.push(pending);
+        }
+        if !self.degraded {
+            self.degraded = true;
+            self.scan_requested = false;
+            let _ = self.service_state.set(ServiceState::StoreDegraded);
+            for active in self.active.values() {
+                active.cancellation.cancel();
+            }
+        }
+        self.maybe_start_degraded_recovery();
+    }
+
+    fn maybe_start_degraded_recovery(&mut self) {
+        if !self.degraded
+            || self.degraded_recovery_running
+            || !self.active.is_empty()
+            || self.is_frozen()
+        {
             return;
         }
-        self.degraded = true;
-        self.scan_requested = false;
-        let _ = self.service_state.set(ServiceState::StoreDegraded);
-        for active in self.active.values() {
-            active.cancellation.cancel();
-        }
+        let pending = std::mem::take(&mut self.pending_durable_results);
+        self.degraded_recovery_running = true;
         let coordinator = self.coordinator.clone();
         tokio::spawn(async move {
-            if let Err(error) = coordinator.run().await
+            if let Err(error) = coordinator.run(pending).await
                 && error != DegradedCoordinatorError::Quiescing
+                && error != DegradedCoordinatorError::TypedConflict
             {
                 tracing::error!(error = %error, "degraded recovery coordinator stopped");
             }
@@ -991,6 +1168,7 @@ impl TaskManager {
     fn finalize_degraded(
         &mut self,
         recovery: coding_agent_store::RecoveryOutcome,
+        replayed_pending_count: usize,
     ) -> Result<DegradedRecoveryResult, DegradedCoordinatorError> {
         if self.is_frozen() || self.service_state.current().state == ServiceState::Quiescing {
             return Err(DegradedCoordinatorError::Quiescing);
@@ -998,13 +1176,16 @@ impl TaskManager {
         if !self.degraded {
             return Err(DegradedCoordinatorError::ManagerClosed);
         }
-        let pending = std::mem::take(&mut self.pending_durable_results);
+        if !self.active.is_empty() || !self.pending_durable_results.is_empty() {
+            self.freeze_degraded();
+            return Err(DegradedCoordinatorError::TypedConflict);
+        }
+        self.degraded_recovery_running = false;
         self.degraded = false;
         self.scan_requested = true;
         let ready = match self.service_state.set(ServiceState::Ready) {
             Ok(ready) => ready,
             Err(_) => {
-                self.pending_durable_results = pending;
                 self.degraded = true;
                 self.scan_requested = false;
                 return Err(DegradedCoordinatorError::Quiescing);
@@ -1012,11 +1193,22 @@ impl TaskManager {
         };
         let result = DegradedRecoveryResult {
             recovery,
-            discarded_pending_count: pending.len(),
+            replayed_pending_count,
             ready_generation: ready.generation,
         };
         let _ = self.degraded_recoveries.send(result.clone());
         Ok(result)
+    }
+
+    fn freeze_degraded(&mut self) {
+        self.frozen = true;
+        self.degraded = true;
+        self.degraded_recovery_running = false;
+        self.scan_requested = false;
+        self.shutdown.freeze_and_cancel();
+        for active in self.active.values() {
+            active.cancellation.cancel();
+        }
     }
 
     fn claims_allowed(&self) -> bool {
@@ -1111,6 +1303,39 @@ fn background_deadline() -> Instant {
     Instant::now() + BACKGROUND_WRITE_BUDGET
 }
 
+fn final_review_request(
+    task_id: TaskId,
+    repository_id: RepositoryId,
+    attempt: u32,
+    outcome: &RunnerOutcome,
+) -> Option<FinalizeReviewedTaskRequest> {
+    let evidence = match outcome {
+        RunnerOutcome::Approved(evidence) if evidence.verdict() == ReviewVerdict::Approved => {
+            evidence.clone()
+        }
+        RunnerOutcome::Rejected(evidence)
+            if evidence.verdict() == ReviewVerdict::ChangesRequested && evidence.round() == 3 =>
+        {
+            evidence.clone()
+        }
+        _ => return None,
+    };
+    Some(FinalizeReviewedTaskRequest {
+        task_id,
+        expected_repository_id: repository_id,
+        expected_attempt: attempt,
+        evidence,
+    })
+}
+
+fn quality_evidence_mismatch_failure() -> TaskFailure {
+    TaskFailure {
+        code: "QUALITY_EVIDENCE_MISMATCH".to_owned(),
+        message: "the final quality evidence did not match the runner outcome".to_owned(),
+        retryable: false,
+    }
+}
+
 fn runner_panicked_failure() -> TaskFailure {
     TaskFailure {
         code: "RUNNER_PANICKED".to_owned(),
@@ -1202,10 +1427,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TaskRunner for ReleaseRunner {
-        async fn run(&self, _context: RunContext, _sink: RunnerEventSink) -> RunnerOutcome {
+        async fn run(&self, _context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+            sink.append(RunnerEvent::PlanUpdated(crate::fake_runner::fake_plan()))
+                .await
+                .expect("release runner persists matching review plan");
             self.started.notify_one();
             self.release.notified().await;
-            RunnerOutcome::Succeeded
+            RunnerOutcome::Approved(crate::fake_runner::approved_evidence())
         }
     }
 
@@ -1444,8 +1672,15 @@ mod tests {
         let cancellation = CancellationToken::new();
         let context = fake_run_context(cancellation.clone());
         let task_id = context.task.id;
+        let repository_id = context.task.repository_id;
+        let attempt = context.task.attempt;
         let (sender, mut receiver) = mpsc::channel(8);
-        let sink = RunnerEventSink { task_id, sender };
+        let sink = RunnerEventSink {
+            task_id,
+            repository_id,
+            attempt,
+            sender,
+        };
         let run = tokio::spawn(async move { FakeTaskRunner::default().run(context, sink).await });
 
         assert!(matches!(
@@ -1460,7 +1695,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(matches!(
             acknowledge_runner_event(&mut receiver, 2).await,
-            RunnerEvent::ActivityAppended(ActivityEntry { id, .. }) if id == "fake-plan-ready"
+            RunnerEvent::ActivityAppended(entry) if entry.id() == "fake-plan-ready"
         ));
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(199)).await;
@@ -1505,6 +1740,7 @@ mod tests {
             repository_id,
             prompt: "direct fake runner test".to_owned(),
             status: TaskStatus::Running,
+            delivery_readiness: coding_agent_domain::DeliveryReadiness::Unreviewed,
             attempt: 1,
             retry_of: None,
             created_at: timestamp,

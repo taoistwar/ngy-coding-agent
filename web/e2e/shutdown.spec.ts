@@ -59,7 +59,7 @@ test("UI quit bounds a runner that ignores cancellation and preserves Interrupte
         (task) => task.status === "running",
         "the cancellation-ignoring runner to enter Running",
       );
-      await expect(page.locator(".task-status-label")).toHaveText("Status: running");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: running");
 
       const cleanExitElapsedMs = await quitThroughUi(page, app, CLEAN_EXIT_BUDGET_MS);
       expect(cleanExitElapsedMs).toBeLessThan(CLEAN_EXIT_BUDGET_MS);
@@ -93,7 +93,7 @@ test("UI quit bounds a runner that ignores cancellation and preserves Interrupte
       await page
         .getByRole("button", { name: `${prompt} Attempt 1`, exact: true })
         .click();
-      await expect(page.locator(".task-status-label")).toHaveText("Status: interrupted");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: interrupted");
       await quitThroughUi(page, app, CLEAN_EXIT_BUDGET_MS);
     },
   );
@@ -149,11 +149,19 @@ test("replays a live completion exactly once after a paused TaskDetail snapshot"
       );
       await publishReleaseSignal(detailReached);
 
-      await expect(page.locator(".task-status-label")).toHaveText("Status: completed");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: completed");
       await expect(
         page.locator(".timeline-panel").getByText("task.completed", { exact: true }),
       ).toHaveCount(1);
-      await expect(page.getByText("Execution completed", { exact: false })).toBeVisible();
+      await expect(
+        page.getByText("Delivery readiness: review approved", { exact: true }),
+      ).toBeVisible();
+      await expect(page.getByText("Synthetic checks passed", { exact: true })).toBeVisible();
+      await expect(
+        page.locator(".review-panel .generation-warning").filter({
+          hasText: "Generation mismatch:",
+        }),
+      ).toHaveCount(0);
       await quitThroughUi(page, app, CLEAN_EXIT_BUDGET_MS);
     },
   );
@@ -362,7 +370,7 @@ test("the quit barrier drains in-flight create and retry before interrupting bot
       await openWorkspace(page, app);
       const csrfToken = await readCsrfToken(context.request, app.origin);
       await page.getByRole("button", { name: `${retryPrompt} Attempt 1`, exact: true }).click();
-      await expect(page.locator(".task-status-label")).toHaveText("Status: failed");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: failed");
 
       const createPrompt = "Create already inside the quit barrier";
       await page.getByLabel("Task description").fill(createPrompt);
@@ -468,7 +476,7 @@ test("the quit barrier interrupts a claim paused after handle registration", asy
         .getByRole("button", { name: `${prompt} Attempt 1`, exact: true })
         .click();
       expect((await readTask(context.request, app.origin, created.id)).status).toBe("queued");
-      await expect(page.locator(".task-status-label")).toHaveText("Status: queued");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: queued");
 
       await quitThroughUiUntilBarrier(page, app);
       const [createdFromResponse] = await Promise.all([
@@ -520,7 +528,7 @@ test("the quit barrier interrupts a claim paused after handle registration", asy
       await page
         .getByRole("button", { name: `${prompt} Attempt 1`, exact: true })
         .click();
-      await expect(page.locator(".task-status-label")).toHaveText("Status: interrupted");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: interrupted");
       await quitThroughUi(page, app, CLEAN_EXIT_BUDGET_MS);
     },
   );
@@ -559,7 +567,7 @@ test("a runner result paused before its write commits before the quit interrupti
       }
       const resultReached = await waitForReachedSignal(app.runtimeDir, resultReleasePath);
       expect((await readTask(context.request, app.origin, created.id)).status).toBe("running");
-      await expect(page.locator(".task-status-label")).toHaveText("Status: running");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: running");
 
       await quitThroughUiUntilBarrier(page, app);
       await releaseActorAndAwaitCleanExit(app, resultReached);
@@ -605,7 +613,7 @@ test("a runner result paused before its write commits before the quit interrupti
       await page
         .getByRole("button", { name: `${prompt} Attempt 1`, exact: true })
         .click();
-      await expect(page.locator(".task-status-label")).toHaveText("Status: completed");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: completed");
       await quitThroughUi(page, app, CLEAN_EXIT_BUDGET_MS);
     },
   );

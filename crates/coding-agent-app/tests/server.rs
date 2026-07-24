@@ -8,15 +8,21 @@ use std::time::Duration;
 
 use axum::body::Body;
 use coding_agent_api::{
-    ApiBackend, AuthContext, CreateResult, CreateTaskRequest, LiveEventItem, RequestSecurity,
-    SessionExchange, SseBackend, build_api_router,
+    ApiBackend, AuthContext, CancelResult, CreateResult, CreateTaskRequest, LiveEventItem,
+    RequestSecurity, SessionExchange, SseBackend, build_api_router,
 };
 use coding_agent_app::{
     ApplicationBackend, EventDispatcherHandle, MutationGate, RepositoryDiscovery, ServiceState,
     ServiceStateController, StoreWriterHandle, TaskManagerHandle,
 };
-use coding_agent_domain::{ClientRequestId, EventCursor, NewTask, TaskStatus};
-use coding_agent_store::{CreateTaskOutcome, TaskTransition, TransitionOutcome};
+use coding_agent_domain::{
+    ClientRequestId, DiffFile, DiffFileStatus, DiffSnapshot, EventCursor, NewTask,
+    TaskEventPayload, TaskId, TaskStatus, TestCase, TestSnapshot, TestStatus,
+};
+use coding_agent_store::{
+    AppendEventOutcome, CreateTaskOutcome, FinalizeReviewedTaskOutcome, RecordReviewOutcome,
+    TaskTransition, TransitionOutcome,
+};
 use futures_util::StreamExt as _;
 use http::header::{CONTENT_TYPE, COOKIE, HOST, ORIGIN};
 use http::{Method, Request, StatusCode};
@@ -258,6 +264,384 @@ fn persisted_sse_ids(wire: &str) -> Vec<i64> {
         .collect()
 }
 
+#[tokio::test]
+async fn task_surfaces_keep_unreviewed_readiness_across_create_list_get_cancel_and_retry() {
+    let fixture = occupied_fixture().await;
+    let security = support::SecurityFixture::production();
+    let backend = application_backend(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let auth = establish_session(&security).await.auth;
+    let created = match backend
+        .create_task(
+            &auth,
+            CreateTaskRequest {
+                client_request_id: ClientRequestId::new(),
+                repository_id: fixture.repository.id,
+                prompt: "exercise every task surface".to_owned(),
+            },
+        )
+        .await
+        .expect("create unreviewed task")
+    {
+        CreateResult::Created(task) => task,
+        CreateResult::Existing(_) => panic!("fresh request must create a task"),
+    };
+    assert_task_readiness(&created, "queued", "unreviewed");
+
+    let bootstrap_task = backend
+        .bootstrap(&auth)
+        .await
+        .expect("load bootstrap")
+        .tasks
+        .into_iter()
+        .find(|task| task.id == created.id)
+        .expect("bootstrap contains created task");
+    assert_task_readiness(&bootstrap_task, "queued", "unreviewed");
+    let listed_task = backend
+        .list_tasks(&auth, Some(fixture.repository.id))
+        .await
+        .expect("list repository tasks")
+        .into_iter()
+        .find(|task| task.id == created.id)
+        .expect("list contains created task");
+    assert_task_readiness(&listed_task, "queued", "unreviewed");
+    let created_id = dto_task_id(&created);
+    let created_detail = backend
+        .task_detail(&auth, created_id)
+        .await
+        .expect("get created task");
+    assert_task_readiness(&created_detail.task, "queued", "unreviewed");
+    assert!(
+        serde_json::to_value(&created_detail).unwrap()["reviews"]
+            .as_array()
+            .expect("task detail reviews is an array")
+            .is_empty()
+    );
+
+    let cancelled = match backend
+        .cancel_task(&auth, created_id)
+        .await
+        .expect("cancel queued task")
+    {
+        CancelResult::Finished(task) => task,
+        CancelResult::Accepted { .. } => panic!("queued cancellation must finish synchronously"),
+    };
+    assert_task_readiness(&cancelled, "cancelled", "unreviewed");
+    let cancelled_detail = backend
+        .task_detail(&auth, created_id)
+        .await
+        .expect("get cancelled task");
+    assert_task_readiness(&cancelled_detail.task, "cancelled", "unreviewed");
+    assert!(
+        serde_json::to_value(&cancelled_detail).unwrap()["reviews"]
+            .as_array()
+            .expect("cancelled detail reviews is an array")
+            .is_empty()
+    );
+
+    let retried = match backend
+        .retry_task(&auth, created_id)
+        .await
+        .expect("retry cancelled task")
+    {
+        CreateResult::Created(task) => task,
+        CreateResult::Existing(_) => panic!("first retry must create a direct child"),
+    };
+    assert_task_readiness(&retried, "queued", "unreviewed");
+    assert_eq!(retried.retry_of, Some(created.id));
+    let retried_id = dto_task_id(&retried);
+    let retried_detail = backend
+        .task_detail(&auth, retried_id)
+        .await
+        .expect("get retried task");
+    assert_task_readiness(&retried_detail.task, "queued", "unreviewed");
+    assert!(
+        serde_json::to_value(&retried_detail).unwrap()["reviews"]
+            .as_array()
+            .expect("retry detail reviews is an array")
+            .is_empty(),
+        "retry must not inherit review evidence"
+    );
+}
+
+#[tokio::test]
+async fn real_review_projection_is_identical_for_detail_rest_recovery_and_live_sse() {
+    let fixture = support::task_manager_fixture(1).await;
+    let security = support::SecurityFixture::production();
+    let backend = application_backend(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let auth = establish_session(&security).await.auth;
+    fixture
+        .dispatcher
+        .flush_to(
+            fixture
+                .store
+                .latest_event_id()
+                .await
+                .expect("load dispatcher baseline"),
+        )
+        .await
+        .expect("flush dispatcher baseline");
+    let mut live = backend.subscribe_live();
+
+    let queued = match fixture
+        .store
+        .create_task(support::new_task(
+            fixture.repository.id,
+            "persist a fully reviewed task",
+        ))
+        .await
+        .expect("create reviewed task")
+    {
+        CreateTaskOutcome::Created { task, .. } | CreateTaskOutcome::Existing { task } => task,
+    };
+    let running = match fixture
+        .store
+        .transition_with_event(queued.id, TaskStatus::Queued, TaskTransition::Running)
+        .await
+        .expect("start reviewed task")
+    {
+        TransitionOutcome::Applied { task, .. } => task,
+        TransitionOutcome::Conflict { .. } => panic!("reviewed task must start"),
+    };
+    match fixture
+        .store
+        .append_running_event(
+            running.id,
+            TaskEventPayload::PlanUpdated {
+                plan: support::fixture_review_plan(),
+            },
+        )
+        .await
+        .expect("persist structured plan")
+    {
+        AppendEventOutcome::Applied { .. } => {}
+        AppendEventOutcome::NotRunning { .. } => panic!("reviewed task must remain running"),
+    }
+    match fixture
+        .store
+        .record_review(
+            running.id,
+            running.repository_id,
+            running.attempt,
+            support::changes_requested_review(1),
+        )
+        .await
+        .expect("persist nonterminal review")
+    {
+        RecordReviewOutcome::Applied { .. } => {}
+        RecordReviewOutcome::Existing { .. } => panic!("first review write must apply"),
+    }
+
+    let intermediate = backend
+        .task_detail(&auth, running.id)
+        .await
+        .expect("load intermediate reviewed detail");
+    assert_task_readiness(&intermediate.task, "running", "unreviewed");
+    let intermediate_json = serde_json::to_value(&intermediate).unwrap();
+    assert_eq!(
+        intermediate_json["reviews"]
+            .as_array()
+            .expect("intermediate reviews array")
+            .len(),
+        1
+    );
+    assert_eq!(intermediate_json["reviews"][0]["round"], 1);
+    assert_eq!(
+        intermediate_json["reviews"][0]["verdict"],
+        "changes_requested"
+    );
+
+    let diff = DiffSnapshot {
+        revision: 2,
+        files: vec![DiffFile {
+            path: "src/lib.rs".to_owned(),
+            status: DiffFileStatus::Modified,
+            patch: "@@ final reviewed patch @@".to_owned(),
+            additions: 1,
+            deletions: 0,
+            truncated: false,
+        }],
+    };
+    match fixture
+        .store
+        .append_running_event(running.id, TaskEventPayload::DiffUpdated { diff })
+        .await
+        .expect("persist final diff")
+    {
+        AppendEventOutcome::Applied { .. } => {}
+        AppendEventOutcome::NotRunning { .. } => panic!("final diff must precede finalization"),
+    }
+    let tests = TestSnapshot {
+        revision: 2,
+        status: TestStatus::Passed,
+        cases: vec![TestCase {
+            id: "fixture-cargo-test".to_owned(),
+            name: "cargo test".to_owned(),
+            status: TestStatus::Passed,
+            duration_ms: 10,
+            summary: "fixture check passed".to_owned(),
+        }],
+    };
+    match fixture
+        .store
+        .append_running_event(running.id, TaskEventPayload::TestUpdated { tests })
+        .await
+        .expect("persist final tests")
+    {
+        AppendEventOutcome::Applied { .. } => {}
+        AppendEventOutcome::NotRunning { .. } => panic!("final tests must precede finalization"),
+    }
+    let terminal_event_id = match fixture
+        .store
+        .finalize_reviewed_task(
+            running.id,
+            running.repository_id,
+            running.attempt,
+            support::approved_review_round(2),
+        )
+        .await
+        .expect("persist final approved review")
+    {
+        FinalizeReviewedTaskOutcome::Applied {
+            terminal_event_id, ..
+        } => terminal_event_id,
+        FinalizeReviewedTaskOutcome::Existing { .. } => {
+            panic!("first final review write must apply")
+        }
+    };
+
+    fixture.dispatcher.wake();
+    fixture
+        .dispatcher
+        .flush_to(EventCursor::new(terminal_event_id.get()).unwrap())
+        .await
+        .expect("publish reviewed task events");
+    let mut live_events = Vec::new();
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(2), live.next())
+            .await
+            .expect("receive every reviewed live event")
+            .expect("live stream remains open")
+        {
+            LiveEventItem::Event(event) => live_events.push(event),
+            LiveEventItem::Lagged => panic!("reviewed fixture must not lag"),
+        }
+    }
+    let rest_events = backend
+        .task_events(&auth, running.id, 0)
+        .await
+        .expect("load reviewed task REST events");
+    let recovery_events = backend
+        .events_between(0, terminal_event_id.get(), usize::MAX)
+        .await
+        .expect("load reviewed SSE recovery range");
+    let live_json = live_events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect::<Vec<_>>();
+    let rest_json = rest_events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect::<Vec<_>>();
+    let recovery_json = recovery_events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(live_json, rest_json);
+    assert_eq!(recovery_json, rest_json);
+    assert_eq!(
+        rest_json
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "task.queued",
+            "task.started",
+            "plan.updated",
+            "review.updated",
+            "diff.updated",
+            "test.updated",
+            "review.updated",
+            "task.completed",
+        ]
+    );
+    assert_eq!(rest_json[6]["payload"]["review"]["round"], 2);
+    assert_eq!(rest_json[6]["payload"]["review"]["verdict"], "approved");
+    assert_eq!(
+        rest_json[6]["payload"]["review"]["summary"],
+        "fixture round 2 approved"
+    );
+    assert_eq!(
+        rest_json[7]["payload"]["task"]["delivery_readiness"],
+        "review_approved"
+    );
+
+    let detail = backend
+        .task_detail(&auth, running.id)
+        .await
+        .expect("load final reviewed detail");
+    assert_task_readiness(&detail.task, "completed", "review_approved");
+    let detail_json = serde_json::to_value(&detail).unwrap();
+    assert_eq!(
+        detail_json["reviews"]
+            .as_array()
+            .expect("final reviews array")
+            .iter()
+            .map(|review| review["round"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(
+        detail_json["reviews"][1], rest_json[6]["payload"]["review"],
+        "TaskDetail and event projection must use the same typed review DTO"
+    );
+    let bootstrap_task = backend
+        .bootstrap(&auth)
+        .await
+        .expect("load reviewed bootstrap")
+        .tasks
+        .into_iter()
+        .find(|task| task.id == detail.task.id)
+        .expect("bootstrap contains reviewed task");
+    assert_task_readiness(&bootstrap_task, "completed", "review_approved");
+    let listed_task = backend
+        .list_tasks(&auth, Some(fixture.repository.id))
+        .await
+        .expect("list reviewed repository tasks")
+        .into_iter()
+        .find(|task| task.id == detail.task.id)
+        .expect("list contains reviewed task");
+    assert_task_readiness(&listed_task, "completed", "review_approved");
+}
+
+fn assert_task_readiness(
+    task: &coding_agent_api::TaskDto,
+    expected_status: &str,
+    expected_readiness: &str,
+) {
+    let task = serde_json::to_value(task).expect("serialize task DTO");
+    assert_eq!(task["status"], expected_status);
+    assert_eq!(task["delivery_readiness"], expected_readiness);
+}
+
+fn dto_task_id(task: &coding_agent_api::TaskDto) -> TaskId {
+    task.id
+        .to_string()
+        .parse()
+        .expect("TaskDto carries a valid task UUID")
+}
+
 async fn occupied_fixture() -> support::TaskManagerFixture {
     let fixture = support::task_manager_fixture(1).await;
     fixture.runner.push_blocking(1);
@@ -363,12 +747,16 @@ async fn concurrent_retry_returns_one_direct_child_with_one_created_response() {
     };
     let terminal = match fixture
         .store
-        .transition_with_event(running.id, TaskStatus::Running, TaskTransition::Completed)
+        .transition_with_event(
+            running.id,
+            TaskStatus::Running,
+            TaskTransition::Failed(support::failure("RETRY_SOURCE_FAILED")),
+        )
         .await
         .unwrap()
     {
         TransitionOutcome::Applied { task, .. } => task,
-        TransitionOutcome::Conflict { .. } => panic!("source must complete"),
+        TransitionOutcome::Conflict { .. } => panic!("source must become retryable"),
     };
 
     let security = support::SecurityFixture::production();

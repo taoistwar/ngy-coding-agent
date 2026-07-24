@@ -21,9 +21,14 @@ function task(
     client_request_id: `request-${id}`,
     prompt: `Implement ${id}`,
     status,
+    delivery_readiness: "unreviewed",
     attempt: 1,
     last_event_id: 10,
     created_at: NOW,
+    retry_of: null,
+    started_at: null,
+    finished_at: null,
+    failure: null,
     ...overrides,
   };
 }
@@ -33,16 +38,51 @@ function detail(value: Task): TaskDetail {
     task: value,
     event_cursor: value.last_event_id,
     plan: {
+      format_version: 1,
       revision: 1,
+      summary: "Implement and verify the request",
       items: [
-        { id: "understand", title: "Understand request", status: "completed" },
-        { id: "implement", title: "Implement change", status: "running" },
-        { id: "verify", title: "Verify result", status: "pending" },
+        {
+          id: "understand",
+          title: "Understand request",
+          description: "Read the request and repository context",
+          acceptance_criteria: ["The requested behavior is understood"],
+          status: "completed",
+        },
+        {
+          id: "implement",
+          title: "Implement change",
+          description: "Apply the scoped code changes",
+          acceptance_criteria: ["The requested behavior is implemented"],
+          status: "running",
+        },
+        {
+          id: "verify",
+          title: "Verify result",
+          description: "Run the focused validation",
+          acceptance_criteria: ["The focused tests pass"],
+          status: "pending",
+        },
       ],
+      initial_required_checks: [],
     },
     activity: [
-      { id: "a-1", level: "info", message: "Workspace prepared", created_at: NOW },
-      { id: "a-2", level: "warning", message: "Using fake runner", created_at: NOW },
+      {
+        id: "a-1",
+        level: "info",
+        actor: "system",
+        role_run: null,
+        message: "Workspace prepared",
+        created_at: NOW,
+      },
+      {
+        id: "a-2",
+        level: "warning",
+        actor: "executor",
+        role_run: 1,
+        message: "Using fake runner",
+        created_at: NOW,
+      },
     ],
     diff: {
       revision: 2,
@@ -79,6 +119,7 @@ function detail(value: Task): TaskDetail {
         failure: { code: "FAKE_FAILURE", message: "Synthetic failure", retryable: true },
       },
     ],
+    reviews: [],
   };
 }
 
@@ -344,6 +385,174 @@ describe("TaskWorkspace", () => {
     ).toBeVisible();
   });
 
+  it("keeps lifecycle and delivery readiness separate and never derives approval from reviews", () => {
+    const completed = task("task-done", "completed", {
+      delivery_readiness: "unreviewed",
+      started_at: NOW,
+      finished_at: NOW,
+    });
+    const value = detail(completed);
+    value.reviews = [
+      {
+        round: 1,
+        decision_source: "reviewer",
+        workspace_generation: 3,
+        workspace_digest: {
+          algorithm: "workspace_fingerprint_v1",
+          value: "a".repeat(64),
+        },
+        verdict: "approved",
+        summary: "The bounded evidence is approved.",
+        findings: [],
+        added_required_checks: [],
+        required_checks: [
+          {
+            id: "workspace-tests",
+            kind: "cargo_test",
+            package: null,
+            integration_test: null,
+          },
+        ],
+        check_evidence: [],
+        coverage: null,
+        created_at: NOW,
+      },
+    ];
+
+    render(<TaskWorkspace {...props(completed, { detail: value })} />);
+
+    expect(screen.getByText("Execution status: completed")).toBeVisible();
+    expect(screen.getByText("Delivery readiness: unreviewed")).toBeVisible();
+    expect(screen.getByText("Execution completed — not reviewed")).toBeVisible();
+    expect(
+      screen.queryByText("Delivery readiness: review approved"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows structured and legacy plans plus explicit role activity labels", () => {
+    const running = task("task-plan", "running");
+    const value = detail(running);
+    value.plan!.initial_required_checks = [
+      {
+        id: "workspace-tests",
+        kind: "cargo_test",
+        package: "coding-agent-app",
+        integration_test: "server",
+      },
+    ];
+    value.activity.push(
+      {
+        id: "a-3",
+        level: "info",
+        actor: "planner",
+        role_run: 1,
+        message: "Plan submitted",
+        created_at: NOW,
+      },
+      {
+        id: "a-4",
+        level: "info",
+        actor: "reviewer",
+        role_run: 2,
+        message: "Review started",
+        created_at: NOW,
+      },
+    );
+
+    const { rerender } = render(
+      <TaskWorkspace {...props(running, { detail: value })} />,
+    );
+
+    expect(screen.getByText("Implement and verify the request")).toBeVisible();
+    expect(screen.getByText("Apply the scoped code changes")).toBeVisible();
+    expect(screen.getByText("The requested behavior is implemented")).toBeVisible();
+    expect(screen.getByText("Initial required checks")).toBeVisible();
+    expect(
+      screen.getByText(/cargo test.*coding-agent-app.*server/i),
+    ).toBeVisible();
+    expect(screen.getByText("System")).toBeVisible();
+    expect(screen.getByText("Executor #1")).toBeVisible();
+    expect(screen.getByText("Planner #1")).toBeVisible();
+    expect(screen.getByText("Reviewer #2")).toBeVisible();
+
+    value.plan = {
+      format_version: 0,
+      revision: 7,
+      summary: "",
+      items: [
+        {
+          id: "legacy",
+          title: "Legacy step",
+          description: "",
+          acceptance_criteria: [],
+          status: "completed",
+        },
+      ],
+      initial_required_checks: [],
+    };
+    rerender(<TaskWorkspace {...props(running, { detail: value })} />);
+    expect(
+      screen.getByText(
+        "Legacy plan: structured summary and acceptance criteria were not recorded.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("orders evidence panels and labels diff and tests with workspace generation", () => {
+    const failed = task("task-panel-order", "failed", {
+      failure: { code: "FAILED", message: "Stopped", retryable: true },
+    });
+    const value = detail(failed);
+    value.reviews = [
+      {
+        round: 1,
+        decision_source: "reviewer",
+        workspace_generation: 2,
+        workspace_digest: {
+          algorithm: "workspace_fingerprint_v1",
+          value: "a".repeat(64),
+        },
+        verdict: "changes_requested",
+        summary: "Changes are required.",
+        findings: [],
+        added_required_checks: [],
+        required_checks: [
+          {
+            id: "workspace-tests",
+            kind: "cargo_test",
+            package: null,
+            integration_test: null,
+          },
+        ],
+        check_evidence: [],
+        coverage: null,
+        created_at: NOW,
+      },
+    ];
+
+    render(<TaskWorkspace {...props(failed, { detail: value })} />);
+
+    const aside = screen.getByRole("complementary", {
+      name: "Results and evidence",
+    });
+    const headings = within(aside)
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    expect(headings).toEqual([
+      "Attempts",
+      "Failure",
+      "Review",
+      "Worktree diff",
+      "Test results",
+      "Lifecycle timeline",
+    ]);
+    expect(within(aside).getByText("Workspace generation 2")).toBeVisible();
+    expect(within(aside).getByText("Workspace generation 3")).toBeVisible();
+    expect(
+      within(aside).queryByRole("button", { name: /merge|approve|override/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("labels completed execution without implying review, delivery, merge, or editing", () => {
     const completed = task("task-done", "completed", {
       started_at: NOW,
@@ -354,9 +563,11 @@ describe("TaskWorkspace", () => {
     expect(screen.getByText("Execution completed — not reviewed")).toBeVisible();
     expect(container).not.toHaveTextContent(/review passed|deliverable|merge|edit code/i);
     expect(
-      screen.getByText("Status: completed", { selector: ".task-status-label" }),
+      screen.getByText("Execution status: completed", {
+        selector: ".task-status-label",
+      }),
     ).toBeVisible();
-    expect(screen.getByText(/Status: completed/i)).toBeVisible();
+    expect(screen.getByText(/Execution status: completed/i)).toBeVisible();
   });
 
   it("marks a bounded worktree patch when its true prefix was truncated", () => {
@@ -502,6 +713,7 @@ describe("TaskWorkspace", () => {
       diff: null,
       tests: null,
       timeline: [],
+      reviews: [],
     };
     render(<TaskWorkspace {...props(running, { detail: empty })} />);
 

@@ -7,9 +7,14 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+coding-agent-domain = { path = "../coding-agent-domain" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+regex.workspace = true
 tokio.workspace = true

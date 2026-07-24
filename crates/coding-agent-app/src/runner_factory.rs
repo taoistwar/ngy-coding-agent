@@ -3,7 +3,6 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use coding_agent_core::AgentLimits;
 use coding_agent_domain::Repository;
 use coding_agent_provider::{ChatCompletionsClient, ClientLimits};
 use coding_agent_runtime::{
@@ -19,8 +18,6 @@ use crate::{
 };
 
 const PRODUCTION_CONCURRENCY: NonZeroU32 = NonZeroU32::new(1).unwrap();
-const PRODUCTION_MAX_MODEL_STEPS: u32 = 20;
-const PRODUCTION_MAX_TOOL_CALLS: u32 = 32;
 const ARTIFACT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Capabilities made available only after private paths are prepared, the
@@ -253,13 +250,11 @@ impl StartupRunnerFactory for ProductionStartupRunnerFactory {
             provisioners,
             runtimes,
         ));
-        let limits = production_agent_limits();
         let runner = Arc::new(CodingAgentRunner::new(
             context.writer().clone(),
             provider,
             attempts,
             context.wall_clock(),
-            limits,
             CodingAgentRunnerConfig::default(),
         ));
         Ok(StartupRunnerSelection::new(runner, PRODUCTION_CONCURRENCY))
@@ -274,16 +269,6 @@ fn production_process_limits() -> ProcessLimits {
         Duration::from_secs(5),
     )
     .expect("constant production process limits are valid")
-}
-
-fn production_agent_limits() -> AgentLimits {
-    AgentLimits::try_new(
-        PRODUCTION_MAX_MODEL_STEPS,
-        PRODUCTION_MAX_TOOL_CALLS,
-        8 * 1024 * 1024,
-        256 * 1024,
-    )
-    .expect("constant production agent limits are valid")
 }
 
 impl FixedStartupRunnerFactory {
@@ -313,9 +298,8 @@ mod tests {
     use coding_agent_store::Store;
 
     use super::{
-        PRODUCTION_CONCURRENCY, PRODUCTION_MAX_MODEL_STEPS, PRODUCTION_MAX_TOOL_CALLS,
-        ProductionStartupRunnerFactory, StartupRunnerContext, StartupRunnerFactory,
-        StartupRunnerFactoryError, StartupRunnerSelection, production_agent_limits,
+        PRODUCTION_CONCURRENCY, ProductionStartupRunnerFactory, StartupRunnerContext,
+        StartupRunnerFactory, StartupRunnerFactoryError, StartupRunnerSelection,
     };
     use crate::{
         EventDispatcherHandle, FakeTaskRunner, PlatformPaths, PrivateFile, StoreWriterHandle,
@@ -340,16 +324,6 @@ mod tests {
         assert_eq!(selection.concurrency(), concurrency);
         let _ = selection.runner();
         assert_eq!(PRODUCTION_CONCURRENCY.get(), 1);
-    }
-
-    #[test]
-    fn production_agent_budget_allows_bounded_multi_call_planning() {
-        let limits = production_agent_limits();
-
-        assert_eq!(limits.max_model_steps(), PRODUCTION_MAX_MODEL_STEPS);
-        assert_eq!(limits.max_tool_calls(), PRODUCTION_MAX_TOOL_CALLS);
-        assert_eq!(limits.max_model_steps(), 20);
-        assert_eq!(limits.max_tool_calls(), 32);
     }
 
     #[tokio::test]

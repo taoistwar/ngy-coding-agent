@@ -4,27 +4,29 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use coding_agent_core::{
-    ActivityEvent, ActivityLevel as CoreActivityLevel, AgentEvent, AgentEventSink, AgentInput,
-    AgentLimits, AgentLoop, AgentOutcome, AgentRuntime, ContextRedactor, DiffEvent,
-    DiffFileStatus as CoreDiffFileStatus, ModelProvider, PlanItemStatus as CorePlanItemStatus,
-    RuntimeError, TestStatus as CoreTestStatus,
+    AgentRuntime, ContextRedactor, DiffEvent, DiffFileStatus as CoreDiffFileStatus,
+    DurableCheckpointAck, DurableEventAck, DurableRoleEvent, FinalizationGuard,
+    FinalizationGuardError, MultiRoleInput, MultiRoleOrchestrator, MultiRoleOutcome,
+    PreparedModelProvider, RepositoryCheckCatalog, RequiredCheckLedger, Role, RoleEngineFactory,
+    RoleEvent, RoleEventSink, RuntimeError, TerminalSnapshot, WorkspaceCheckpoint,
+    WorkspaceFingerprint, project_test_snapshot, project_unverified_test_snapshot,
 };
 use coding_agent_domain::{
-    ActivityEntry, ActivityLevel, CanonicalPath, DiffFile, DiffFileStatus, DiffSnapshot, PlanItem,
-    PlanItemStatus, PlanSnapshot, Repository, TaskFailure, TestCase, TestSnapshot, TestStatus,
+    ActivityActor, ActivityEntry, ActivityLevel, CanonicalPath, DiffFile, DiffFileStatus,
+    DiffSnapshot, EventId, Repository, RequiredCheckSelector, TaskFailure, TestSnapshot,
     UtcTimestamp,
 };
 use coding_agent_provider::ChatCompletionsClient;
 use coding_agent_runtime::{
-    ProvisionedWorktree, RuntimeSession, RuntimeSessionLimits, ToolchainPaths,
-    WorktreeArtifactState, WorktreeError, WorktreeIdentity, WorktreeProvisioner,
-    WorktreeReservation,
+    ATTEMPT_IDENTITY_MISMATCH, ProvisionedWorktree, RoleScopedEngineFactory, RuntimeSession,
+    RuntimeSessionLimits, ToolchainPaths, WorktreeArtifactState, WorktreeError, WorktreeIdentity,
+    WorktreeProvisioner, WorktreeReservation,
 };
 use coding_agent_store::{
     AttemptArtifactIdentity, AttemptArtifactState, ReserveAttemptArtifact, StoreError,
 };
 use tokio::sync::Mutex;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -178,15 +180,69 @@ impl CodingAttemptProvisionError {
     }
 }
 
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+pub trait TestTaskRuntimeSession: Send + Sync + 'static {
+    fn create_role_engine_factory(
+        &self,
+        provider: Arc<dyn PreparedModelProvider>,
+        events: Arc<dyn RoleEventSink>,
+        redactor: Arc<dyn ContextRedactor>,
+    ) -> Arc<dyn RoleEngineFactory>;
+
+    fn finalization_guard(&self) -> Arc<dyn FinalizationGuard>;
+
+    async fn workspace_fingerprint(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<WorkspaceFingerprint, RuntimeError>;
+
+    async fn required_check_selectors(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<RequiredCheckSelector>, RuntimeError>;
+
+    async fn terminal_snapshot(
+        &self,
+        revision: u64,
+        cancellation: CancellationToken,
+    ) -> Result<TerminalSnapshot, RuntimeError>;
+}
+
+#[derive(Clone)]
+enum TaskAgentRuntimeBackend {
+    Production(Arc<RuntimeSession>),
+    #[cfg(feature = "test-support")]
+    Test(Arc<dyn TestTaskRuntimeSession>),
+}
+
 #[derive(Clone)]
 pub struct TaskAgentRuntime {
-    runtime: Arc<dyn AgentRuntime>,
+    backend: TaskAgentRuntimeBackend,
     repository_context: String,
 }
 
 impl TaskAgentRuntime {
     pub fn try_new(
-        runtime: Arc<dyn AgentRuntime>,
+        runtime: Arc<RuntimeSession>,
+        repository_context: impl Into<String>,
+    ) -> Result<Self, CodingAttemptError> {
+        Self::try_from_backend(
+            TaskAgentRuntimeBackend::Production(runtime),
+            repository_context,
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn try_for_test(
+        runtime: Arc<dyn TestTaskRuntimeSession>,
+        repository_context: impl Into<String>,
+    ) -> Result<Self, CodingAttemptError> {
+        Self::try_from_backend(TaskAgentRuntimeBackend::Test(runtime), repository_context)
+    }
+
+    fn try_from_backend(
+        backend: TaskAgentRuntimeBackend,
         repository_context: impl Into<String>,
     ) -> Result<Self, CodingAttemptError> {
         let repository_context = repository_context.into();
@@ -199,17 +255,143 @@ impl TaskAgentRuntime {
             return Err(CodingAttemptError::new("REPOSITORY_CONTEXT_INVALID", false));
         }
         Ok(Self {
-            runtime,
+            backend,
             repository_context,
         })
     }
 
-    pub fn runtime(&self) -> Arc<dyn AgentRuntime> {
-        Arc::clone(&self.runtime)
-    }
-
     pub fn repository_context(&self) -> &str {
         &self.repository_context
+    }
+
+    fn create_role_engine_factory(
+        &self,
+        provider: Arc<dyn PreparedModelProvider>,
+        events: Arc<dyn RoleEventSink>,
+        redactor: Arc<dyn ContextRedactor>,
+    ) -> Arc<dyn RoleEngineFactory> {
+        match &self.backend {
+            TaskAgentRuntimeBackend::Production(runtime) => Arc::new(RoleScopedEngineFactory::new(
+                provider,
+                Arc::clone(runtime),
+                events,
+                redactor,
+            )),
+            #[cfg(feature = "test-support")]
+            TaskAgentRuntimeBackend::Test(runtime) => {
+                runtime.create_role_engine_factory(provider, events, redactor)
+            }
+        }
+    }
+
+    fn finalization_guard(&self) -> Arc<dyn FinalizationGuard> {
+        match &self.backend {
+            TaskAgentRuntimeBackend::Production(runtime) => Arc::new(RuntimeFinalizationGuard {
+                runtime: Arc::clone(runtime),
+            }),
+            #[cfg(feature = "test-support")]
+            TaskAgentRuntimeBackend::Test(runtime) => runtime.finalization_guard(),
+        }
+    }
+
+    async fn workspace_fingerprint(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<WorkspaceFingerprint, RuntimeError> {
+        match &self.backend {
+            TaskAgentRuntimeBackend::Production(runtime) => {
+                runtime.workspace_fingerprint(cancellation).await
+            }
+            #[cfg(feature = "test-support")]
+            TaskAgentRuntimeBackend::Test(runtime) => {
+                runtime.workspace_fingerprint(cancellation).await
+            }
+        }
+    }
+
+    async fn required_check_selectors(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<RequiredCheckSelector>, RuntimeError> {
+        match &self.backend {
+            TaskAgentRuntimeBackend::Production(runtime) => {
+                runtime.required_check_selectors(cancellation).await
+            }
+            #[cfg(feature = "test-support")]
+            TaskAgentRuntimeBackend::Test(runtime) => {
+                runtime.required_check_selectors(cancellation).await
+            }
+        }
+    }
+
+    async fn terminal_snapshot(
+        &self,
+        revision: u64,
+        cancellation: CancellationToken,
+    ) -> Result<TerminalSnapshot, RuntimeError> {
+        match &self.backend {
+            TaskAgentRuntimeBackend::Production(runtime) => {
+                runtime.terminal_snapshot(revision, cancellation).await
+            }
+            #[cfg(feature = "test-support")]
+            TaskAgentRuntimeBackend::Test(runtime) => {
+                runtime.terminal_snapshot(revision, cancellation).await
+            }
+        }
+    }
+}
+
+struct RuntimeFinalizationGuard {
+    runtime: Arc<RuntimeSession>,
+}
+
+#[async_trait::async_trait]
+impl FinalizationGuard for RuntimeFinalizationGuard {
+    async fn verify_finalization(
+        &self,
+        expected_fingerprint: WorkspaceFingerprint,
+        cancellation: CancellationToken,
+    ) -> Result<(), FinalizationGuardError> {
+        if cancellation.is_cancelled() {
+            return Err(FinalizationGuardError::Runtime(cancelled_runtime_error()));
+        }
+        let identity_before = self.runtime.verify_attempt_identity();
+        if cancellation.is_cancelled() {
+            return Err(FinalizationGuardError::Runtime(cancelled_runtime_error()));
+        }
+        map_finalization_identity(identity_before)?;
+
+        let fingerprint_result = self
+            .runtime
+            .workspace_fingerprint(cancellation.clone())
+            .await;
+        if cancellation.is_cancelled() {
+            return Err(FinalizationGuardError::Runtime(cancelled_runtime_error()));
+        }
+        let actual_fingerprint = fingerprint_result.map_err(FinalizationGuardError::Runtime)?;
+
+        let identity_after = self.runtime.verify_attempt_identity();
+        if cancellation.is_cancelled() {
+            return Err(FinalizationGuardError::Runtime(cancelled_runtime_error()));
+        }
+        map_finalization_identity(identity_after)?;
+
+        if actual_fingerprint != expected_fingerprint {
+            return Err(FinalizationGuardError::WorkspaceMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn map_finalization_identity(
+    result: Result<(), RuntimeError>,
+) -> Result<(), FinalizationGuardError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.code == ATTEMPT_IDENTITY_MISMATCH => {
+            Err(FinalizationGuardError::IdentityMismatch)
+        }
+        Err(error) => Err(FinalizationGuardError::Runtime(error)),
     }
 }
 
@@ -461,16 +643,19 @@ fn worktree_attempt_error(error: &WorktreeError) -> CodingAttemptError {
 }
 
 pub struct TaskModelSession {
-    provider: Arc<dyn ModelProvider>,
+    provider: Arc<dyn PreparedModelProvider>,
     redactor: Arc<dyn ContextRedactor>,
 }
 
 impl TaskModelSession {
-    pub fn new(provider: Arc<dyn ModelProvider>, redactor: Arc<dyn ContextRedactor>) -> Self {
+    pub fn new(
+        provider: Arc<dyn PreparedModelProvider>,
+        redactor: Arc<dyn ContextRedactor>,
+    ) -> Self {
         Self { provider, redactor }
     }
 
-    pub fn provider(&self) -> Arc<dyn ModelProvider> {
+    pub fn provider(&self) -> Arc<dyn PreparedModelProvider> {
         Arc::clone(&self.provider)
     }
 
@@ -499,7 +684,6 @@ pub struct CodingAgentRunner {
     providers: Arc<dyn TaskModelProviderFactory>,
     attempts: Arc<dyn CodingAgentAttemptFactory>,
     clock: Arc<dyn WallClock>,
-    limits: AgentLimits,
     config: CodingAgentRunnerConfig,
 }
 
@@ -509,7 +693,6 @@ impl CodingAgentRunner {
         providers: Arc<dyn TaskModelProviderFactory>,
         attempts: Arc<dyn CodingAgentAttemptFactory>,
         clock: Arc<dyn WallClock>,
-        limits: AgentLimits,
         config: CodingAgentRunnerConfig,
     ) -> Self {
         Self {
@@ -517,7 +700,6 @@ impl CodingAgentRunner {
             providers,
             attempts,
             clock,
-            limits,
             config,
         }
     }
@@ -590,23 +772,122 @@ impl CodingAgentRunner {
         let Some(task_runtime) = task_runtime else {
             return outcome_for_attempt_error(cause, &context.cancellation);
         };
-        let events = AppAgentEventSink::new(
+        let projection_cancellation = CancellationToken::new();
+        let events = AppRoleEventSink::new(
             sink,
             Arc::clone(&self.clock),
             context.task.started_at.unwrap_or(context.task.created_at),
             self.config.diff_debounce(),
-            context.cancellation.child_token(),
+            context.task.id.to_string(),
+            projection_cancellation.clone(),
         );
-        let terminal_diff = task_runtime
-            .runtime()
-            .terminal_snapshot(0, CancellationToken::new())
+        let capture_cancellation = CancellationToken::new();
+        let terminal_snapshot = match timeout(
+            self.config.artifact_write_timeout(),
+            task_runtime.terminal_snapshot(0, capture_cancellation.clone()),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                capture_cancellation.cancel();
+                None
+            }
+        };
+        if let Some(snapshot) = terminal_snapshot
+            && timeout(
+                self.config.artifact_write_timeout(),
+                events.emit(
+                    RoleEvent::Diff(snapshot.diff),
+                    projection_cancellation.clone(),
+                ),
+            )
             .await
-            .ok()
-            .map(|snapshot| snapshot.diff);
-        if events.finish(terminal_diff).await.is_err() {
+            .is_err()
+        {
+            projection_cancellation.cancel();
+        }
+        if events.finish().await.is_err() {
             return event_failure_outcome(&context.cancellation);
         }
         outcome_for_attempt_error(cause, &context.cancellation)
+    }
+
+    async fn cleanup_terminal_events(
+        &self,
+        runtime: &TaskAgentRuntime,
+        events: &Arc<AppRoleEventSink>,
+        checkpoint: &mut WorkspaceCheckpoint,
+        required_checks: Option<&RequiredCheckLedger>,
+    ) -> Result<(), RuntimeError> {
+        let capture_cancellation = CancellationToken::new();
+        let terminal_snapshot = match timeout(
+            self.config.artifact_write_timeout(),
+            runtime.terminal_snapshot(checkpoint.generation(), capture_cancellation.clone()),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                capture_cancellation.cancel();
+                None
+            }
+        };
+        let projection_cancellation = CancellationToken::new();
+
+        let terminal_verified = if let Some(mut snapshot) = terminal_snapshot {
+            if checkpoint.observe_stable(snapshot.fingerprint).is_ok() {
+                snapshot.diff.revision = checkpoint.generation();
+                self.emit_cleanup_event(
+                    events,
+                    RoleEvent::Diff(snapshot.diff),
+                    projection_cancellation.clone(),
+                )
+                .await?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if let Some(required_checks) = required_checks {
+            let tests = if terminal_verified {
+                project_test_snapshot(required_checks, checkpoint)
+            } else {
+                project_unverified_test_snapshot(required_checks, checkpoint.generation())
+            };
+            self.emit_cleanup_event(events, RoleEvent::Tests(tests), projection_cancellation)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn emit_cleanup_event(
+        &self,
+        events: &Arc<AppRoleEventSink>,
+        event: RoleEvent,
+        cancellation: CancellationToken,
+    ) -> Result<(), RuntimeError> {
+        match timeout(
+            self.config.artifact_write_timeout(),
+            events.emit(event, cancellation.clone()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                cancellation.cancel();
+                Err(RuntimeError::new(
+                    EVENT_SINK_REJECTED,
+                    EVENT_SINK_MESSAGE,
+                    true,
+                ))
+            }
+        }
     }
 }
 
@@ -695,70 +976,101 @@ impl TaskRunner for CodingAgentRunner {
         }
 
         let loop_cancellation = context.cancellation.child_token();
-        let events = AppAgentEventSink::new(
+        let events = AppRoleEventSink::new(
             sink,
             Arc::clone(&self.clock),
             context.task.started_at.unwrap_or(context.task.created_at),
             self.config.diff_debounce(),
+            context.task.id.to_string(),
             loop_cancellation.clone(),
         );
         if events
-            .emit(AgentEvent::Activity(ActivityEvent {
-                level: CoreActivityLevel::Info,
-                message: "Prepared isolated worktree".to_owned(),
-            }))
+            .emit_system_activity("Prepared isolated worktree")
             .await
             .is_err()
         {
             return event_failure_outcome(&context.cancellation);
         }
 
-        let task_runtime = match attempt.runtime(CancellationToken::new()).await {
+        let task_runtime = match attempt.runtime(loop_cancellation.clone()).await {
             Ok(runtime) => runtime,
             Err(error) => return outcome_for_attempt_error(error, &context.cancellation),
         };
-        let model_session = self.providers.start_task();
+        let initial_fingerprint = match task_runtime
+            .workspace_fingerprint(loop_cancellation.clone())
+            .await
+        {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                let _ = events.finish().await;
+                return outcome_for_runtime_error(error, &context.cancellation);
+            }
+        };
+        let repository_check_catalog = match task_runtime
+            .required_check_selectors(loop_cancellation.clone())
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let _ = events.finish().await;
+                return outcome_for_runtime_error(error, &context.cancellation);
+            }
+        };
         let repository_context = format!(
             "{ISOLATION_CONTEXT}\n\n{}",
             task_runtime.repository_context()
         );
-        let agent = AgentLoop::new(
+        let checkpoint = WorkspaceCheckpoint::new(initial_fingerprint);
+        let model_session = self.providers.start_task();
+        let role_events: Arc<dyn RoleEventSink> = events.clone();
+        let engine_factory = task_runtime.create_role_engine_factory(
             model_session.provider(),
-            task_runtime.runtime(),
-            events.clone(),
+            role_events,
             model_session.redactor(),
-            self.limits,
         );
-        let outcome = agent
+        let orchestrator =
+            MultiRoleOrchestrator::new(engine_factory, task_runtime.finalization_guard());
+        let report = orchestrator
             .run(
-                AgentInput::new(context.task.prompt, repository_context),
+                MultiRoleInput {
+                    task_prompt: &context.task.prompt,
+                    repository_context: &repository_context,
+                    checkpoint,
+                    repository_check_catalog: &repository_check_catalog,
+                },
                 loop_cancellation,
             )
             .await;
-        let terminal_diff = match &outcome {
-            AgentOutcome::Completed(completion) => Some(completion.terminal_snapshot.diff.clone()),
-            AgentOutcome::Failed(failure) => failure
-                .terminal_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.diff.clone()),
-            AgentOutcome::Cancelled(cancellation) => cancellation
-                .terminal_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.diff.clone()),
-        };
-        if events.finish(terminal_diff).await.is_err() {
+        let (outcome, mut final_checkpoint, required_checks) = report.into_parts();
+        if matches!(
+            outcome,
+            MultiRoleOutcome::Failed(_) | MultiRoleOutcome::Cancelled
+        ) && self
+            .cleanup_terminal_events(
+                &task_runtime,
+                &events,
+                &mut final_checkpoint,
+                required_checks.as_ref(),
+            )
+            .await
+            .is_err()
+        {
+            let _ = events.finish().await;
             return event_failure_outcome(&context.cancellation);
         }
-        if context.cancellation.is_cancelled() {
-            return RunnerOutcome::Cancelled;
+        if events.finish().await.is_err() {
+            return event_failure_outcome(&context.cancellation);
         }
 
         match outcome {
-            AgentOutcome::Completed(_) => RunnerOutcome::Succeeded,
-            AgentOutcome::Cancelled(_) => RunnerOutcome::Cancelled,
-            AgentOutcome::Failed(failure) => {
-                RunnerOutcome::Failed(stable_failure(&failure.code, failure.retryable))
+            MultiRoleOutcome::Approved(decision) => {
+                RunnerOutcome::Approved(decision.evidence().clone())
             }
+            MultiRoleOutcome::Rejected { decision, .. } => {
+                RunnerOutcome::Rejected(decision.evidence().clone())
+            }
+            MultiRoleOutcome::Cancelled => RunnerOutcome::Cancelled,
+            MultiRoleOutcome::Failed(failure) => RunnerOutcome::Failed(failure.failure().clone()),
         }
     }
 }
@@ -824,68 +1136,64 @@ fn stable_failure(code: &str, retryable: bool) -> TaskFailure {
 struct EventProjection {
     clock: Arc<dyn WallClock>,
     fallback_time: UtcTimestamp,
+    activity_id_scope: String,
     next_activity_id: AtomicU64,
 }
 
 impl EventProjection {
-    fn new(clock: Arc<dyn WallClock>, fallback_time: UtcTimestamp) -> Self {
+    fn new(
+        clock: Arc<dyn WallClock>,
+        fallback_time: UtcTimestamp,
+        activity_id_scope: String,
+    ) -> Self {
         Self {
             clock,
             fallback_time,
+            activity_id_scope,
             next_activity_id: AtomicU64::new(1),
         }
     }
 
-    fn map(&self, event: AgentEvent) -> RunnerEvent {
-        match event {
-            AgentEvent::Plan(plan) => RunnerEvent::PlanUpdated(PlanSnapshot {
-                revision: plan.revision,
-                items: plan
-                    .items
-                    .into_iter()
-                    .map(|item| PlanItem {
-                        id: item.id,
-                        title: item.title,
-                        status: match item.status {
-                            CorePlanItemStatus::Pending => PlanItemStatus::Pending,
-                            CorePlanItemStatus::Running => PlanItemStatus::Running,
-                            CorePlanItemStatus::Completed => PlanItemStatus::Completed,
-                        },
-                    })
-                    .collect(),
-            }),
-            AgentEvent::Activity(activity) => {
-                let ordinal = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
-                let created_at =
-                    UtcTimestamp::new(self.clock.now_utc()).unwrap_or(self.fallback_time);
-                RunnerEvent::ActivityAppended(ActivityEntry {
-                    id: format!("coding-agent-{ordinal}"),
-                    level: match activity.level {
-                        CoreActivityLevel::Info => ActivityLevel::Info,
-                        CoreActivityLevel::Warning => ActivityLevel::Warning,
-                        CoreActivityLevel::Error => ActivityLevel::Error,
-                    },
-                    message: activity.message,
-                    created_at,
-                })
-            }
-            AgentEvent::Diff(diff) => RunnerEvent::DiffUpdated(map_diff(diff)),
-            AgentEvent::Tests(tests) => RunnerEvent::TestUpdated(TestSnapshot {
-                revision: tests.revision,
-                status: map_test_status(tests.status),
-                cases: tests
-                    .cases
-                    .into_iter()
-                    .map(|case| TestCase {
-                        id: case.id,
-                        name: case.name,
-                        status: map_test_status(case.status),
-                        duration_ms: case.duration_ms.unwrap_or(0),
-                        summary: case.summary,
-                    })
-                    .collect(),
-            }),
-        }
+    fn system_activity(&self, message: impl Into<String>) -> Result<RunnerEvent, RuntimeError> {
+        self.activity(ActivityActor::System, None, message)
+    }
+
+    fn role_activity(
+        &self,
+        activity: coding_agent_core::RoleActivityEvent,
+    ) -> Result<RunnerEvent, RuntimeError> {
+        let actor = match activity.role() {
+            Role::Planner => ActivityActor::Planner,
+            Role::Executor => ActivityActor::Executor,
+            Role::Reviewer => ActivityActor::Reviewer,
+        };
+        self.activity(actor, Some(activity.role_run()), activity.message())
+    }
+
+    fn activity(
+        &self,
+        actor: ActivityActor,
+        role_run: Option<u32>,
+        message: impl Into<String>,
+    ) -> Result<RunnerEvent, RuntimeError> {
+        let ordinal = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
+        let created_at = UtcTimestamp::new(self.clock.now_utc()).unwrap_or(self.fallback_time);
+        let entry = ActivityEntry::try_new(
+            format!("coding-agent-{}-{ordinal}", self.activity_id_scope),
+            ActivityLevel::Info,
+            actor,
+            role_run,
+            message,
+            created_at,
+        )
+        .map_err(|_| {
+            RuntimeError::new(
+                "ACTIVITY_EVENT_INVALID",
+                "the role activity could not be projected",
+                false,
+            )
+        })?;
+        Ok(RunnerEvent::ActivityAppended(entry))
     }
 }
 
@@ -911,27 +1219,31 @@ fn map_diff(diff: DiffEvent) -> DiffSnapshot {
     }
 }
 
-const fn map_test_status(status: CoreTestStatus) -> TestStatus {
-    match status {
-        CoreTestStatus::Queued => TestStatus::Queued,
-        CoreTestStatus::Running => TestStatus::Running,
-        CoreTestStatus::Passed => TestStatus::Passed,
-        CoreTestStatus::Failed => TestStatus::Failed,
-        CoreTestStatus::Cancelled => TestStatus::Cancelled,
-    }
+#[derive(Debug, Clone)]
+struct PersistedDiff {
+    event: DiffEvent,
+    sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedTests {
+    snapshot: TestSnapshot,
+    sequence: u64,
 }
 
 #[derive(Default)]
 struct EventState {
     pending_diff: Option<DiffEvent>,
-    last_diff: Option<DiffEvent>,
-    generation: u64,
+    last_diff: Option<PersistedDiff>,
+    last_tests: Option<PersistedTests>,
+    last_checkpoint: Option<DurableCheckpointAck>,
+    debounce_epoch: u64,
     timer_armed: bool,
     closed: bool,
     failure: Option<RunnerEventError>,
 }
 
-struct AppAgentEventSink {
+struct AppRoleEventSink {
     sink: Arc<RunnerEventSink>,
     projection: EventProjection,
     debounce: Duration,
@@ -941,17 +1253,18 @@ struct AppAgentEventSink {
     self_weak: Weak<Self>,
 }
 
-impl AppAgentEventSink {
+impl AppRoleEventSink {
     fn new(
         sink: RunnerEventSink,
         clock: Arc<dyn WallClock>,
         fallback_time: UtcTimestamp,
         debounce: Duration,
+        activity_id_scope: String,
         loop_cancellation: CancellationToken,
     ) -> Arc<Self> {
         Arc::new_cyclic(|self_weak| Self {
             sink: Arc::new(sink),
-            projection: EventProjection::new(clock, fallback_time),
+            projection: EventProjection::new(clock, fallback_time, activity_id_scope),
             debounce,
             loop_cancellation,
             state: Mutex::new(EventState::default()),
@@ -960,8 +1273,22 @@ impl AppAgentEventSink {
         })
     }
 
-    async fn queue_diff(&self, diff: DiffEvent) -> Result<(), RuntimeError> {
-        let generation = {
+    async fn emit_system_activity(&self, message: &str) -> Result<(), RuntimeError> {
+        let _delivery = self.delivery.lock().await;
+        self.ensure_open().await?;
+        let event = self.projection.system_activity(message)?;
+        self.deliver_runner_event(event, &self.loop_cancellation)
+            .await?;
+        ensure_not_cancelled(&self.loop_cancellation)
+    }
+
+    async fn queue_diff(
+        &self,
+        diff: DiffEvent,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RuntimeError> {
+        ensure_not_cancelled(cancellation)?;
+        let debounce_epoch = {
             let mut state = self.state.lock().await;
             if let Some(error) = state.failure {
                 return Err(runtime_sink_error(error));
@@ -970,32 +1297,33 @@ impl AppAgentEventSink {
                 return Err(runtime_sink_error(RunnerEventError::TaskNotRunning));
             }
             state.pending_diff = Some(diff);
+            state.last_checkpoint = None;
             if state.timer_armed {
                 return Ok(());
             }
             state.timer_armed = true;
-            state.generation = state.generation.wrapping_add(1);
-            state.generation
+            state.debounce_epoch = state.debounce_epoch.wrapping_add(1);
+            state.debounce_epoch
         };
         let delay = self.debounce;
         let weak = self.self_weak.clone();
         tokio::spawn(async move {
             sleep(delay).await;
             if let Some(events) = weak.upgrade() {
-                events.flush_generation(generation).await;
+                events.flush_debounce_epoch(debounce_epoch).await;
             }
         });
         Ok(())
     }
 
-    async fn flush_generation(&self, generation: u64) {
+    async fn flush_debounce_epoch(&self, debounce_epoch: u64) {
         let _delivery = self.delivery.lock().await;
         let diff = {
             let mut state = self.state.lock().await;
             if state.closed
                 || state.failure.is_some()
                 || !state.timer_armed
-                || state.generation != generation
+                || state.debounce_epoch != debounce_epoch
             {
                 return;
             }
@@ -1003,20 +1331,106 @@ impl AppAgentEventSink {
             state.pending_diff.take()
         };
         if let Some(diff) = diff {
-            self.deliver_diff(diff).await;
+            let cancellation = self.loop_cancellation.clone();
+            if let Err(error) = self.deliver_diff(diff, &cancellation).await
+                && error.code != COMMAND_CANCELLED
+            {
+                self.loop_cancellation.cancel();
+            }
         }
     }
 
-    async fn deliver_diff(&self, diff: DiffEvent) {
-        if let Err(error) = self
-            .sink
-            .append(RunnerEvent::DiffUpdated(map_diff(diff.clone())))
-            .await
-        {
-            self.record_failure(error).await;
-            return;
+    async fn ensure_open(&self) -> Result<(), RuntimeError> {
+        let state = self.state.lock().await;
+        if let Some(error) = state.failure {
+            return Err(runtime_sink_error(error));
         }
-        self.state.lock().await.last_diff = Some(diff);
+        if state.closed {
+            return Err(runtime_sink_error(RunnerEventError::TaskNotRunning));
+        }
+        Ok(())
+    }
+
+    async fn deliver_runner_event(
+        &self,
+        event: RunnerEvent,
+        cancellation: &CancellationToken,
+    ) -> Result<u64, RuntimeError> {
+        ensure_not_cancelled(cancellation)?;
+        let event_id = match self.sink.append(event).await {
+            Ok(event_id) => event_id,
+            Err(error) => {
+                self.record_failure(error).await;
+                return Err(runtime_sink_error(error));
+            }
+        };
+        let sequence = event_sequence(event_id)?;
+        ensure_not_cancelled(cancellation)?;
+        Ok(sequence)
+    }
+
+    async fn deliver_diff(
+        &self,
+        diff: DiffEvent,
+        cancellation: &CancellationToken,
+    ) -> Result<u64, RuntimeError> {
+        if let Some(persisted) = self.state.lock().await.last_diff.as_ref()
+            && persisted.event == diff
+        {
+            return Ok(persisted.sequence);
+        }
+        let sequence = self
+            .deliver_runner_event(
+                RunnerEvent::DiffUpdated(map_diff(diff.clone())),
+                cancellation,
+            )
+            .await?;
+        self.state.lock().await.last_diff = Some(PersistedDiff {
+            event: diff,
+            sequence,
+        });
+        Ok(sequence)
+    }
+
+    async fn flush_pending_diff(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<u64>, RuntimeError> {
+        let diff = {
+            let mut state = self.state.lock().await;
+            state.timer_armed = false;
+            state.debounce_epoch = state.debounce_epoch.wrapping_add(1);
+            state.pending_diff.take()
+        };
+        match diff {
+            Some(diff) => self.deliver_diff(diff, cancellation).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn deliver_tests(
+        &self,
+        snapshot: TestSnapshot,
+        cancellation: &CancellationToken,
+    ) -> Result<u64, RuntimeError> {
+        self.flush_pending_diff(cancellation).await?;
+        if let Some(persisted) = self.state.lock().await.last_tests.as_ref()
+            && persisted.snapshot == snapshot
+        {
+            return Ok(persisted.sequence);
+        }
+        let sequence = self
+            .deliver_runner_event(RunnerEvent::TestUpdated(snapshot.clone()), cancellation)
+            .await?;
+        let mut state = self.state.lock().await;
+        if state
+            .last_checkpoint
+            .is_some_and(|ack| ack.generation() != snapshot.revision)
+        {
+            state.last_checkpoint = None;
+        }
+        state.last_tests = Some(PersistedTests { snapshot, sequence });
+        Ok(sequence)
     }
 
     async fn record_failure(&self, error: RunnerEventError) {
@@ -1025,61 +1439,167 @@ impl AppAgentEventSink {
         self.loop_cancellation.cancel();
     }
 
-    async fn deliver(&self, event: AgentEvent) -> Result<(), RuntimeError> {
-        let _delivery = self.delivery.lock().await;
-        {
-            let state = self.state.lock().await;
-            if let Some(error) = state.failure {
-                return Err(runtime_sink_error(error));
-            }
-            if state.closed {
-                return Err(runtime_sink_error(RunnerEventError::TaskNotRunning));
-            }
-        }
-        if let Err(error) = self.sink.append(self.projection.map(event)).await {
-            self.record_failure(error).await;
-            return Err(runtime_sink_error(error));
-        }
-        Ok(())
-    }
-
-    async fn finish(&self, terminal_diff: Option<DiffEvent>) -> Result<(), RuntimeError> {
+    async fn finish(&self) -> Result<(), RuntimeError> {
         let _delivery = self.delivery.lock().await;
         let diff = {
             let mut state = self.state.lock().await;
             state.closed = true;
             state.timer_armed = false;
-            state.generation = state.generation.wrapping_add(1);
+            state.debounce_epoch = state.debounce_epoch.wrapping_add(1);
             if let Some(error) = state.failure {
                 return Err(runtime_sink_error(error));
             }
-            terminal_diff.or_else(|| state.pending_diff.take())
+            state.pending_diff.take()
         };
         if let Some(diff) = diff {
-            let duplicate = self.state.lock().await.last_diff.as_ref() == Some(&diff);
-            if !duplicate {
-                if let Err(error) = self
-                    .sink
-                    .append(RunnerEvent::DiffUpdated(map_diff(diff.clone())))
-                    .await
-                {
-                    self.record_failure(error).await;
-                    return Err(runtime_sink_error(error));
-                }
-                self.state.lock().await.last_diff = Some(diff);
-            }
+            self.deliver_diff(diff, &CancellationToken::new()).await?;
         }
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
-impl AgentEventSink for AppAgentEventSink {
-    async fn emit(&self, event: AgentEvent) -> Result<(), RuntimeError> {
+impl RoleEventSink for AppRoleEventSink {
+    async fn emit(
+        &self,
+        event: RoleEvent,
+        cancellation: CancellationToken,
+    ) -> Result<(), RuntimeError> {
         match event {
-            AgentEvent::Diff(diff) => self.queue_diff(diff).await,
-            other => self.deliver(other).await,
+            RoleEvent::Diff(diff) => self.queue_diff(diff, &cancellation).await,
+            RoleEvent::Activity(activity) => {
+                let _delivery = self.delivery.lock().await;
+                self.ensure_open().await?;
+                let event = self.projection.role_activity(activity)?;
+                self.deliver_runner_event(event, &cancellation).await?;
+                Ok(())
+            }
+            RoleEvent::Tests(tests) => {
+                let _delivery = self.delivery.lock().await;
+                self.ensure_open().await?;
+                self.deliver_tests(tests, &cancellation).await?;
+                Ok(())
+            }
         }
+    }
+
+    async fn emit_durable(
+        &self,
+        event: DurableRoleEvent,
+        cancellation: CancellationToken,
+    ) -> Result<DurableEventAck, RuntimeError> {
+        let _delivery = self.delivery.lock().await;
+        self.ensure_open().await?;
+        ensure_not_cancelled(&cancellation)?;
+        let sequence = match event {
+            DurableRoleEvent::StructuredPlan(plan) | DurableRoleEvent::PlanUpdated(plan) => {
+                self.deliver_runner_event(RunnerEvent::PlanUpdated(plan), &cancellation)
+                    .await?
+            }
+            DurableRoleEvent::IntermediateReview {
+                evidence,
+                after_checkpoint_sequence,
+            } => {
+                let generation = evidence.workspace_generation();
+                let barrier_matches = self.state.lock().await.last_checkpoint.is_some_and(|ack| {
+                    ack.sequence() == after_checkpoint_sequence && ack.generation() == generation
+                });
+                if !barrier_matches {
+                    return Err(RuntimeError::new(
+                        "DURABLE_CHECKPOINT_MISMATCH",
+                        "review evidence did not follow its durable checkpoint barrier",
+                        false,
+                    ));
+                }
+                let event_id = match self.sink.record_review(evidence).await {
+                    Ok(event_id) => event_id,
+                    Err(error) => {
+                        self.record_failure(error).await;
+                        return Err(runtime_sink_error(error));
+                    }
+                };
+                let sequence = event_sequence(event_id)?;
+                if sequence <= after_checkpoint_sequence {
+                    return Err(RuntimeError::new(
+                        "DURABLE_EVENT_ORDER_INVALID",
+                        "review evidence did not advance the durable event sequence",
+                        false,
+                    ));
+                }
+                ensure_not_cancelled(&cancellation)?;
+                sequence
+            }
+        };
+        DurableEventAck::try_new(sequence)
+    }
+
+    async fn flush_checkpoint(
+        &self,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<DurableCheckpointAck, RuntimeError> {
+        let _delivery = self.delivery.lock().await;
+        self.ensure_open().await?;
+        ensure_not_cancelled(&cancellation)?;
+        self.flush_pending_diff(&cancellation).await?;
+        let (diff_sequence, test_sequence) = {
+            let state = self.state.lock().await;
+            let diff_sequence = state
+                .last_diff
+                .as_ref()
+                .filter(|persisted| persisted.event.revision == generation)
+                .map(|persisted| persisted.sequence);
+            let test_sequence = state
+                .last_tests
+                .as_ref()
+                .filter(|persisted| persisted.snapshot.revision == generation)
+                .map(|persisted| persisted.sequence);
+            (diff_sequence, test_sequence)
+        };
+        let (Some(diff_sequence), Some(test_sequence)) = (diff_sequence, test_sequence) else {
+            return Err(RuntimeError::new(
+                "DURABLE_CHECKPOINT_INCOMPLETE",
+                "the current diff and test projections were not both durable",
+                false,
+            ));
+        };
+        let ack = DurableCheckpointAck::try_new(diff_sequence.max(test_sequence), generation)?;
+        self.state.lock().await.last_checkpoint = Some(ack);
+        ensure_not_cancelled(&cancellation)?;
+        Ok(ack)
+    }
+}
+
+fn event_sequence(event_id: EventId) -> Result<u64, RuntimeError> {
+    u64::try_from(event_id.get()).map_err(|_| {
+        RuntimeError::new(
+            "DURABLE_EVENT_ORDER_INVALID",
+            "the durable event sequence was outside its valid range",
+            false,
+        )
+    })
+}
+
+fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), RuntimeError> {
+    if cancellation.is_cancelled() {
+        Err(cancelled_runtime_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn cancelled_runtime_error() -> RuntimeError {
+    RuntimeError::new(COMMAND_CANCELLED, "the coding task was cancelled", false)
+}
+
+fn outcome_for_runtime_error(
+    error: RuntimeError,
+    cancellation: &CancellationToken,
+) -> RunnerOutcome {
+    if cancellation.is_cancelled() || error.code == COMMAND_CANCELLED {
+        RunnerOutcome::Cancelled
+    } else {
+        RunnerOutcome::Failed(stable_failure(&error.code, error.retryable))
     }
 }
 
@@ -1096,15 +1616,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use coding_agent_core::{
-        AgentEvent, DiffEvent, DiffFile as CoreDiffFile, DiffFileStatus as CoreDiffFileStatus,
-        PlanEvent, PlanItem as CorePlanItem, PlanItemStatus as CorePlanItemStatus,
-        TestCase as CoreTestCase, TestEvent, TestStatus as CoreTestStatus,
-    };
-    use coding_agent_domain::{DiffFileStatus, PlanItemStatus, TestStatus, UtcTimestamp};
+    use coding_agent_core::{Role, RoleActivityEvent};
+    use coding_agent_domain::{ActivityActor, UtcTimestamp};
 
     use super::{CodingAgentRunnerConfig, EventProjection};
-    use crate::WallClock;
+    use crate::{RunnerEvent, WallClock};
 
     struct FixedClock;
 
@@ -1130,54 +1646,26 @@ mod tests {
     }
 
     #[test]
-    fn neutral_events_map_without_losing_diff_or_test_metadata() {
-        let projection = EventProjection::new(Arc::new(FixedClock), timestamp());
-        let plan = projection.map(AgentEvent::Plan(PlanEvent {
-            revision: 4,
-            items: vec![CorePlanItem {
-                id: "inspect".to_owned(),
-                title: "Inspect".to_owned(),
-                status: CorePlanItemStatus::Completed,
-            }],
-        }));
-        let crate::RunnerEvent::PlanUpdated(plan) = plan else {
-            panic!("map plan event")
+    fn role_activity_projection_preserves_actor_run_and_global_id_scope() {
+        let projection =
+            EventProjection::new(Arc::new(FixedClock), timestamp(), "task-7".to_owned());
+        let RunnerEvent::ActivityAppended(first) = projection
+            .role_activity(RoleActivityEvent::try_new(Role::Planner, 1, "planned").unwrap())
+            .unwrap()
+        else {
+            panic!("project role activity")
         };
-        assert_eq!(plan.items[0].status, PlanItemStatus::Completed);
-
-        let diff = projection.map(AgentEvent::Diff(DiffEvent {
-            revision: 5,
-            files: vec![CoreDiffFile {
-                path: "src/lib.rs".to_owned(),
-                status: CoreDiffFileStatus::Modified,
-                patch: "+change".to_owned(),
-                additions: 1,
-                deletions: 0,
-                truncated: true,
-            }],
-        }));
-        let crate::RunnerEvent::DiffUpdated(diff) = diff else {
-            panic!("map diff event")
+        let RunnerEvent::ActivityAppended(second) = projection
+            .role_activity(RoleActivityEvent::try_new(Role::Reviewer, 2, "reviewed").unwrap())
+            .unwrap()
+        else {
+            panic!("project role activity")
         };
-        assert_eq!(diff.files[0].status, DiffFileStatus::Modified);
-        assert!(diff.files[0].truncated);
-        assert_eq!(diff.files[0].patch, "+change");
-
-        let tests = projection.map(AgentEvent::Tests(TestEvent {
-            revision: 6,
-            status: CoreTestStatus::Running,
-            cases: vec![CoreTestCase {
-                id: "test".to_owned(),
-                name: "test".to_owned(),
-                status: CoreTestStatus::Running,
-                duration_ms: None,
-                summary: "running".to_owned(),
-            }],
-        }));
-        let crate::RunnerEvent::TestUpdated(tests) = tests else {
-            panic!("map tests event")
-        };
-        assert_eq!(tests.status, TestStatus::Running);
-        assert_eq!(tests.cases[0].duration_ms, 0);
+        assert_eq!(first.actor(), ActivityActor::Planner);
+        assert_eq!(first.role_run(), Some(1));
+        assert_eq!(first.id(), "coding-agent-task-7-1");
+        assert_eq!(second.actor(), ActivityActor::Reviewer);
+        assert_eq!(second.role_run(), Some(2));
+        assert_eq!(second.id(), "coding-agent-task-7-2");
     }
 }

@@ -13,14 +13,16 @@ use axum::http::header::{
 use axum::http::{HeaderMap, Request, Response, StatusCode};
 use axum::routing::{any, post};
 use coding_agent_core::{
-    ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelToolChoice, ProviderError,
-    ToolCall, ToolCallBatch, ToolRequest,
+    ActionRequest, AllowedActions, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
+    ModelToolChoice, PreparedModelProvider, ProviderError, Role, RoleLoopError,
+    RuntimeActionRequest, ToolCall, ToolCallBatch, ToolRequest,
 };
 use coding_agent_provider::{
     ChatCompletionsClient, ChatCompletionsProvider, ClientLimits, ClientLimitsError,
     PROVIDER_CANCELLED, PROVIDER_RATE_LIMITED, PROVIDER_REDIRECT_REJECTED,
     PROVIDER_REQUEST_BYTE_LIMIT_REACHED, PROVIDER_RESPONSE_FINISH_UNSUPPORTED,
-    PROVIDER_RESPONSE_INVALID, PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED,
+    PROVIDER_RESPONSE_INVALID, PROVIDER_RESPONSE_ROLE_ACTION_NOT_ALLOWED,
+    PROVIDER_RESPONSE_ROLE_OUTPUT_INVALID, PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED,
     PROVIDER_TASK_BYTE_LIMIT_REACHED, PROVIDER_TRANSPORT_FAILED, PROVIDER_UNAUTHORIZED,
     PROVIDER_UNAVAILABLE, ProviderConfig, encode_chat_completions_request,
 };
@@ -38,6 +40,18 @@ fn request_fixture() -> ModelRequest {
             ModelMessage::system("bounded policy"),
             ModelMessage::user("known-private-prompt"),
         ],
+        allowed_actions: AllowedActions::legacy(),
+        tool_choice: ModelToolChoice::Auto,
+    }
+}
+
+fn executor_request_fixture() -> ModelRequest {
+    ModelRequest {
+        messages: vec![
+            ModelMessage::system("executor policy"),
+            ModelMessage::user("bounded executor input"),
+        ],
+        allowed_actions: AllowedActions::for_role(Role::Executor),
         tool_choice: ModelToolChoice::Auto,
     }
 }
@@ -52,6 +66,28 @@ fn final_response(content: &str) -> Vec<u8> {
             "index": 0,
             "message": {"role": "assistant", "content": content},
             "finish_reason": "stop"
+        }]
+    }))
+    .unwrap()
+}
+
+fn role_tool_response(name: &str, arguments: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "role-call",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": serde_json::to_string(&arguments).unwrap()
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
         }]
     }))
     .unwrap()
@@ -228,6 +264,86 @@ async fn capture_success(
         .unwrap()
 }
 
+#[tokio::test]
+async fn prepared_exchange_exposes_only_exact_lengths_and_sends_the_prepared_bytes_once() {
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(capture_success))
+            .with_state(sender),
+    )
+    .await;
+    let task_provider = provider(&server, test_limits());
+    let role_view: Arc<dyn PreparedModelProvider> = Arc::new(task_provider.clone());
+    let request = request_fixture();
+    let expected_request = encode_chat_completions_request("coding-model", &request).unwrap();
+
+    {
+        let rejected_by_core_budget = task_provider.prepare(request.clone()).unwrap();
+        assert_eq!(
+            rejected_by_core_budget.encoded_len(),
+            expected_request.len()
+        );
+        assert_eq!(
+            rejected_by_core_budget.maximum_response_bytes(),
+            test_limits().max_response_bytes()
+        );
+    }
+    assert_eq!(task_provider.task_provider_bytes(), 0);
+    assert!(
+        receiver.try_recv().is_err(),
+        "dropping a prepared request after core budget rejection must not contact the provider"
+    );
+
+    let prepared = role_view.prepare(request).unwrap();
+    let raw = prepared.send(CancellationToken::new()).await.unwrap();
+    let expected_response = final_response("done");
+    assert_eq!(raw.encoded_len(), expected_response.len());
+    let captured = receiver
+        .recv()
+        .await
+        .expect("one prepared request was sent");
+    assert_eq!(captured.body.as_ref(), expected_request.as_slice());
+    assert_eq!(
+        task_provider.task_provider_bytes(),
+        expected_request.len() + expected_response.len()
+    );
+    assert_eq!(
+        raw.decode().unwrap(),
+        ModelResponse::Final {
+            content: "done".to_owned()
+        }
+    );
+}
+
+#[tokio::test]
+async fn cancellation_after_preflight_charges_the_prepared_request_without_provider_contact() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(counted_success))
+            .with_state(hits.clone()),
+    )
+    .await;
+    let provider = provider(&server, test_limits());
+    let request = request_fixture();
+    let request_bytes = encode_chat_completions_request("coding-model", &request)
+        .unwrap()
+        .len();
+    let prepared = provider.prepare(request).unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = match prepared.send(cancellation).await {
+        Ok(_) => panic!("a cancelled prepared request must not return a response"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, PROVIDER_CANCELLED);
+    assert_eq!(provider.task_provider_bytes(), request_bytes);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
 async fn fixed_final_success() -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
@@ -267,6 +383,73 @@ async fn complete_with_body(
     provider(&server, test_limits())
         .complete(request, CancellationToken::new())
         .await
+}
+
+async fn decode_prepared_executor_response(body: Vec<u8>) -> Result<ModelResponse, ProviderError> {
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(fixed_body_success))
+            .with_state(Bytes::from(body)),
+    )
+    .await;
+    let task_provider = provider(&server, test_limits());
+    let prepared = task_provider.prepare(executor_request_fixture())?;
+    let raw = prepared.send(CancellationToken::new()).await?;
+    raw.decode()
+}
+
+#[tokio::test]
+async fn prepared_executor_decode_preserves_role_failure_classification_for_core() {
+    for (body, provider_code, executor_code) in [
+        (
+            final_response("ordinary final"),
+            PROVIDER_RESPONSE_ROLE_OUTPUT_INVALID,
+            "EXECUTOR_INVALID_OUTPUT",
+        ),
+        (
+            serde_json::to_vec(&serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": []
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }))
+            .unwrap(),
+            PROVIDER_RESPONSE_ROLE_OUTPUT_INVALID,
+            "EXECUTOR_INVALID_OUTPUT",
+        ),
+        (
+            role_tool_response("submit_execution", serde_json::json!({})),
+            PROVIDER_RESPONSE_ROLE_OUTPUT_INVALID,
+            "EXECUTOR_INVALID_OUTPUT",
+        ),
+        (
+            role_tool_response("submit_plan", serde_json::json!({})),
+            PROVIDER_RESPONSE_ROLE_ACTION_NOT_ALLOWED,
+            "EXECUTOR_ACTION_NOT_ALLOWED",
+        ),
+        (
+            role_tool_response("read_file", serde_json::json!({})),
+            PROVIDER_RESPONSE_ROLE_ACTION_NOT_ALLOWED,
+            "EXECUTOR_ACTION_NOT_ALLOWED",
+        ),
+        (
+            b"{malformed".to_vec(),
+            PROVIDER_RESPONSE_INVALID,
+            "EXECUTOR_PROVIDER_FAILED",
+        ),
+    ] {
+        let error = decode_prepared_executor_response(body).await.unwrap_err();
+        assert_eq!(error.code, provider_code);
+        assert_eq!(
+            RoleLoopError::Provider(error).executor_failure_code(),
+            Some(executor_code)
+        );
+    }
 }
 
 #[tokio::test]
@@ -378,7 +561,15 @@ async fn client_enforces_none_and_required_cargo_test_response_contracts() {
             .complete(required_request, CancellationToken::new())
             .await,
         Ok(ModelResponse::ToolCalls(ToolCallBatch { calls, .. }))
-            if matches!(calls.as_slice(), [ToolCall { request: ToolRequest::CargoTest { .. }, .. }])
+            if matches!(
+                calls.as_slice(),
+                [ToolCall {
+                    request: ActionRequest::Runtime(
+                        RuntimeActionRequest::Tool(ToolRequest::CargoTest { .. })
+                    ),
+                    ..
+                }]
+            )
     ));
 
     let mut none_request = request_fixture();
@@ -422,7 +613,15 @@ async fn required_as_required_uses_one_request_with_only_cargo_test_and_keeps_lo
     assert!(matches!(
         response,
         ModelResponse::ToolCalls(ToolCallBatch { calls, .. })
-            if matches!(calls.as_slice(), [ToolCall { request: ToolRequest::CargoTest { .. }, .. }])
+            if matches!(
+                calls.as_slice(),
+                [ToolCall {
+                    request: ActionRequest::Runtime(
+                        RuntimeActionRequest::Tool(ToolRequest::CargoTest { .. })
+                    ),
+                    ..
+                }]
+            )
     ));
 
     let captured = receiver
@@ -479,7 +678,15 @@ async fn required_as_auto_uses_one_request_with_only_cargo_test_and_keeps_logica
     assert!(matches!(
         response,
         ModelResponse::ToolCalls(ToolCallBatch { calls, .. })
-            if matches!(calls.as_slice(), [ToolCall { request: ToolRequest::CargoTest { .. }, .. }])
+            if matches!(
+                calls.as_slice(),
+                [ToolCall {
+                    request: ActionRequest::Runtime(
+                        RuntimeActionRequest::Tool(ToolRequest::CargoTest { .. })
+                    ),
+                    ..
+                }]
+            )
     ));
 
     let captured = receiver
@@ -825,6 +1032,25 @@ async fn status_failures_are_static_secret_safe_and_retryable_only_when_transien
     }
 }
 
+#[tokio::test]
+async fn non_success_body_is_chargeable_before_static_status_error_is_decoded() {
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(status_response))
+            .with_state(StatusCode::UNAUTHORIZED),
+    )
+    .await;
+    let provider = provider(&server, test_limits());
+    let prepared = provider.prepare(request_fixture()).unwrap();
+    let raw = prepared.send(CancellationToken::new()).await.unwrap();
+    let response_bytes = br#"{"error":"known-secret-upstream-body"}"#.len();
+
+    assert_eq!(raw.encoded_len(), response_bytes);
+    let error = raw.decode().unwrap_err();
+    assert_eq!(error.code, PROVIDER_UNAUTHORIZED);
+    assert!(!format!("{error:?}").contains("known-secret-upstream-body"));
+}
+
 #[test]
 fn every_client_limit_is_nonzero() {
     let valid = test_limits();
@@ -910,6 +1136,10 @@ async fn total_request_timeout_maps_to_a_retryable_transport_failure() {
         .unwrap_err();
     assert_eq!(error.code, PROVIDER_TRANSPORT_FAILED);
     assert!(error.retryable);
+    assert_eq!(
+        RoleLoopError::Provider(error).executor_failure_code(),
+        Some("EXECUTOR_PROVIDER_FAILED")
+    );
 }
 
 async fn disconnected_response(State(hits): State<Arc<AtomicUsize>>) -> Response<Body> {
@@ -977,6 +1207,31 @@ async fn malformed_json_is_fatal_but_keeps_safe_request_metadata() {
     );
 }
 
+#[tokio::test]
+async fn malformed_body_is_available_for_exact_charge_before_decode_rejects_it() {
+    let server =
+        MockServer::spawn(Router::new().route("/v1/chat/completions", post(malformed_response)))
+            .await;
+    let provider = provider(&server, test_limits());
+    let request = request_fixture();
+    let request_bytes = encode_chat_completions_request("coding-model", &request)
+        .unwrap()
+        .len();
+    let malformed_bytes = b"{known-secret-malformed".len();
+
+    let prepared = provider.prepare(request).unwrap();
+    let raw = prepared.send(CancellationToken::new()).await.unwrap();
+    assert_eq!(raw.encoded_len(), malformed_bytes);
+    assert_eq!(
+        provider.task_provider_bytes(),
+        request_bytes + malformed_bytes
+    );
+
+    let error = raw.decode().unwrap_err();
+    assert_eq!(error.code, PROVIDER_RESPONSE_INVALID);
+    assert!(!format!("{error:?}").contains("known-secret-malformed"));
+}
+
 async fn length_declared_oversized_response() -> Response<Body> {
     Response::builder()
         .header(CONTENT_TYPE, "application/json")
@@ -1019,6 +1274,31 @@ async fn declared_and_no_length_bodies_stop_at_the_streaming_response_cap() {
     }
 }
 
+#[tokio::test]
+async fn streaming_overflow_reports_the_exact_received_prefix_before_decode_failure() {
+    let server =
+        MockServer::spawn(Router::new().route("/v1/chat/completions", post(chunk_flood_response)))
+            .await;
+    let limits = ClientLimits::try_new(
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        256 * 1024,
+        63,
+        1024 * 1024,
+    )
+    .unwrap();
+    let provider = provider(&server, limits);
+    let prepared = provider.prepare(request_fixture()).unwrap();
+    let raw = prepared.send(CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        raw.encoded_len(),
+        64,
+        "the fourth 16-byte chunk is observed before the hard cap stops the stream"
+    );
+    assert_eq!(raw.decode().unwrap_err().code, PROVIDER_RESPONSE_INVALID);
+}
+
 async fn encoded_response(
     State(sender): State<mpsc::UnboundedSender<HeaderMap>>,
     request: Request<Body>,
@@ -1031,6 +1311,29 @@ async fn encoded_response(
             0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
         ])))
         .unwrap()
+}
+
+async fn wrong_content_type_response() -> Response<Body> {
+    Response::builder()
+        .header(CONTENT_TYPE, "text/plain")
+        .body(Body::from("known-secret-wrong-content-type"))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn unsupported_content_type_body_is_chargeable_but_never_exposed() {
+    let server = MockServer::spawn(
+        Router::new().route("/v1/chat/completions", post(wrong_content_type_response)),
+    )
+    .await;
+    let provider = provider(&server, test_limits());
+    let prepared = provider.prepare(request_fixture()).unwrap();
+    let raw = prepared.send(CancellationToken::new()).await.unwrap();
+
+    assert_eq!(raw.encoded_len(), "known-secret-wrong-content-type".len());
+    let error = raw.decode().unwrap_err();
+    assert_eq!(error.code, PROVIDER_RESPONSE_INVALID);
+    assert!(!format!("{error:?}").contains("known-secret-wrong-content-type"));
 }
 
 #[tokio::test]
@@ -1177,6 +1480,47 @@ async fn cumulative_task_bytes_include_requests_and_responses_and_fail_before_ne
 }
 
 #[tokio::test]
+async fn clones_for_multiple_role_loops_share_one_task_provider_byte_ledger() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(counted_success))
+            .with_state(hits.clone()),
+    )
+    .await;
+    let request = request_fixture();
+    let request_bytes = encode_chat_completions_request("coding-model", &request)
+        .unwrap()
+        .len();
+    let response_bytes = final_response("done").len();
+    let exchange_bytes = request_bytes + response_bytes;
+    let limits = ClientLimits::try_new(
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        request_bytes,
+        64 * 1024,
+        exchange_bytes * 2,
+    )
+    .unwrap();
+    let shared_task = provider(&server, limits);
+    let planner_view = shared_task.clone();
+    let reviewer_view = shared_task.clone();
+
+    planner_view
+        .complete(request.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(reviewer_view.task_provider_bytes(), exchange_bytes);
+    reviewer_view
+        .complete(request, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(planner_view.task_provider_bytes(), exchange_bytes * 2);
+    assert_eq!(shared_task.task_provider_bytes(), exchange_bytes * 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn separate_task_sessions_have_independent_cumulative_budgets() {
     let hits = Arc::new(AtomicUsize::new(0));
     let server = MockServer::spawn(
@@ -1217,6 +1561,27 @@ async fn separate_task_sessions_have_independent_cumulative_budgets() {
         .unwrap();
     assert_eq!(second.task_provider_bytes(), request_bytes + response_bytes);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn prepared_request_owns_and_charges_only_its_originating_task_session() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(counted_success))
+            .with_state(hits.clone()),
+    )
+    .await;
+    let client = client(&server, test_limits());
+    let first_task = client.start_task();
+    let second_task = client.start_task();
+    let prepared = first_task.prepare(request_fixture()).unwrap();
+
+    let raw = prepared.send(CancellationToken::new()).await.unwrap();
+    assert!(first_task.task_provider_bytes() > 0);
+    assert_eq!(second_task.task_provider_bytes(), 0);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(matches!(raw.decode().unwrap(), ModelResponse::Final { .. }));
 }
 
 async fn wait_for_cancellation(State(started): State<Arc<Notify>>) -> Response<Body> {
@@ -1289,6 +1654,41 @@ async fn cancellation_wins_while_reading_a_response_body_stream() {
     assert!(!error.retryable);
 }
 
+#[tokio::test]
+async fn cancellation_after_receiving_body_returns_chargeable_raw_prefix() {
+    let started = Arc::new(Notify::new());
+    let server = MockServer::spawn(
+        Router::new()
+            .route("/v1/chat/completions", post(partial_body_then_stall))
+            .with_state(started.clone()),
+    )
+    .await;
+    let provider = provider(&server, test_limits());
+    let request = request_fixture();
+    let request_bytes = encode_chat_completions_request("coding-model", &request)
+        .unwrap()
+        .len();
+    let prepared = provider.prepare(request).unwrap();
+    let cancellation = CancellationToken::new();
+    let completion = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move { prepared.send(cancellation).await }
+    });
+
+    started.notified().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while provider.task_provider_bytes() == request_bytes {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first response prefix is charged before cancellation");
+    cancellation.cancel();
+    let raw = completion.await.unwrap().unwrap();
+    assert_eq!(raw.encoded_len(), b"{\"choices\":[".len());
+    assert_eq!(raw.decode().unwrap_err().code, PROVIDER_CANCELLED);
+}
+
 async fn secret_request_id() -> Response<Body> {
     Response::builder()
         .header(CONTENT_TYPE, "application/json")
@@ -1315,7 +1715,7 @@ async fn request_id_metadata_is_bounded_and_redacted_before_exposure() {
             calls: vec![
                 ToolCall {
                     id: "safe-first".to_owned(),
-                    request: ToolRequest::GitStatus,
+                    request: ToolRequest::GitStatus.into(),
                 },
                 ToolCall {
                     id: "private-second".to_owned(),
@@ -1324,7 +1724,8 @@ async fn request_id_metadata_is_bounded_and_redacted_before_exposure() {
                         path: ".".to_owned(),
                         glob: None,
                         limit: 10,
-                    },
+                    }
+                    .into(),
                 },
             ],
         }));
@@ -1370,7 +1771,7 @@ async fn reasoning_history_is_part_of_request_metadata_redaction() {
             reasoning_content: Some("known-reasoning-metadata-secret".to_owned()),
             calls: vec![ToolCall {
                 id: "reasoning-call".to_owned(),
-                request: ToolRequest::GitStatus,
+                request: ToolRequest::GitStatus.into(),
             }],
         }));
     request

@@ -11,6 +11,18 @@ import type {
   TaskDetail,
   TaskEvent,
 } from "./types";
+import {
+  ValidationError,
+  validateBootstrapResponse,
+  validateCancellationResponse,
+  validateQuitResponse,
+  validateRepository,
+  validateRepositoryList,
+  validateTask,
+  validateTaskDetail,
+  validateTaskEventList,
+  validateTaskList,
+} from "./validation";
 
 export interface LocationLike {
   readonly hash: string;
@@ -83,6 +95,8 @@ interface RequestOptions {
   signal?: AbortSignal;
 }
 
+type ResponseValidator<T> = (value: unknown) => T;
+
 const API_JSON_HEADERS = {
   accept: "application/json",
   "content-type": "application/json",
@@ -142,31 +156,47 @@ export class ApiClient {
   }
 
   async bootstrap(signal?: AbortSignal): Promise<BootstrapResponse> {
-    const bootstrap = await this.#request<BootstrapResponse>("/api/bootstrap", {
-      ...(signal === undefined ? {} : { signal }),
-    });
+    const bootstrap = await this.#request<BootstrapResponse>(
+      "/api/bootstrap",
+      {
+        ...(signal === undefined ? {} : { signal }),
+      },
+      validateBootstrapResponse,
+    );
     this.#csrfToken = bootstrap.csrf_token;
     return bootstrap;
   }
 
   listRepositories(): Promise<Repository[]> {
-    return this.#request<Repository[]>("/api/repositories");
+    return this.#request<Repository[]>(
+      "/api/repositories",
+      {},
+      validateRepositoryList,
+    );
   }
 
   addRepository(path: string): Promise<Repository> {
     const body: AddRepositoryRequest = { path };
-    return this.#request<Repository>("/api/repositories", {
-      method: "POST",
-      mutation: true,
-      body,
-    });
+    return this.#request<Repository>(
+      "/api/repositories",
+      {
+        method: "POST",
+        mutation: true,
+        body,
+      },
+      validateRepository,
+    );
   }
 
   async pickRepository(): Promise<Repository | null> {
-    return this.#request<Repository | null>("/api/repositories/pick", {
-      method: "POST",
-      mutation: true,
-    });
+    return this.#request<Repository | null>(
+      "/api/repositories/pick",
+      {
+        method: "POST",
+        mutation: true,
+      },
+      (value) => (value === null ? null : validateRepository(value)),
+    );
   }
 
   listTasks(repositoryId?: string): Promise<Task[]> {
@@ -174,15 +204,23 @@ export class ApiClient {
       repositoryId === undefined
         ? ""
         : `?${new URLSearchParams({ repository_id: repositoryId }).toString()}`;
-    return this.#request<Task[]>(`/api/tasks${query}`);
+    return this.#request<Task[]>(
+      `/api/tasks${query}`,
+      {},
+      validateTaskList,
+    );
   }
 
   createTask(request: CreateTaskRequest): Promise<Task> {
-    return this.#request<Task>("/api/tasks", {
-      method: "POST",
-      mutation: true,
-      body: request,
-    });
+    return this.#request<Task>(
+      "/api/tasks",
+      {
+        method: "POST",
+        mutation: true,
+        body: request,
+      },
+      validateTask,
+    );
   }
 
   newCreateTask(repositoryId: string, prompt: string): CreateTaskCommand {
@@ -199,13 +237,18 @@ export class ApiClient {
   }
 
   taskDetail(taskId: string): Promise<TaskDetail> {
-    return this.#request<TaskDetail>(`/api/tasks/${encodeURIComponent(taskId)}`);
+    return this.#request<TaskDetail>(
+      `/api/tasks/${encodeURIComponent(taskId)}`,
+      {},
+      validateTaskDetail,
+    );
   }
 
   async cancelTask(taskId: string): Promise<CancellationAcceptedResponse> {
     const response = await this.#request<Task | CancellationAcceptedResponse>(
       `/api/tasks/${encodeURIComponent(taskId)}/cancel`,
       { method: "POST", mutation: true },
+      validateCancellationResponse,
     );
     return isCancellationAccepted(response)
       ? response
@@ -213,27 +256,41 @@ export class ApiClient {
   }
 
   retryTask(taskId: string): Promise<Task> {
-    return this.#request<Task>(`/api/tasks/${encodeURIComponent(taskId)}/retry`, {
-      method: "POST",
-      mutation: true,
-    });
+    return this.#request<Task>(
+      `/api/tasks/${encodeURIComponent(taskId)}/retry`,
+      {
+        method: "POST",
+        mutation: true,
+      },
+      validateTask,
+    );
   }
 
   taskEvents(taskId: string, after?: number): Promise<TaskEvent[]> {
     const query = after === undefined ? "" : `?${new URLSearchParams({ after: String(after) })}`;
     return this.#request<TaskEvent[]>(
       `/api/tasks/${encodeURIComponent(taskId)}/events${query}`,
+      {},
+      validateTaskEventList,
     );
   }
 
   quit(): Promise<QuitResponse> {
-    return this.#request<QuitResponse>("/api/app/quit", {
-      method: "POST",
-      mutation: true,
-    });
+    return this.#request<QuitResponse>(
+      "/api/app/quit",
+      {
+        method: "POST",
+        mutation: true,
+      },
+      validateQuitResponse,
+    );
   }
 
-  async #request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async #request<T>(
+    path: string,
+    options: RequestOptions = {},
+    validate?: ResponseValidator<T>,
+  ): Promise<T> {
     if (this.#sessionExpired !== null) {
       throw this.#sessionExpired;
     }
@@ -282,7 +339,26 @@ export class ApiClient {
       return null as T;
     }
 
-    return (await decodeJson(response)) as T;
+    const value = await decodeJson(response);
+    if (validate === undefined) {
+      return value as T;
+    }
+    try {
+      return validate(value);
+    } catch (cause) {
+      if (!(cause instanceof ValidationError)) {
+        throw cause;
+      }
+      throw new ApiError(
+        response.status,
+        "INVALID_RESPONSE",
+        "the server response violated the API contract",
+        false,
+        response.headers.get("x-request-id"),
+        { path: cause.path },
+        { cause },
+      );
+    }
   }
 
   async #responseError(response: Response): Promise<ApiError> {

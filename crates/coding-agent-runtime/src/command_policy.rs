@@ -430,7 +430,7 @@ impl ValidatedCommand {
         executable: Arc<PinnedExecutable>,
         working_directory: Arc<ExecutionDirectory>,
         environment: ChildEnvironment,
-        package: &str,
+        package: Option<&str>,
         test: Option<&str>,
         timeout: Duration,
     ) -> Result<Self, CommandPolicyError> {
@@ -441,7 +441,10 @@ impl ValidatedCommand {
             OsString::from("--no-fail-fast"),
             OsString::from("--message-format=json-render-diagnostics"),
         ];
-        append_package_selection(&mut arguments, Some(package))?;
+        if test.is_some() && package.is_none() {
+            return Err(CommandPolicyError::InvalidCargoSelection);
+        }
+        append_package_selection(&mut arguments, package)?;
         if let Some(test) = test {
             if !is_safe_cargo_selector(test) {
                 return Err(CommandPolicyError::InvalidCargoSelection);
@@ -909,12 +912,7 @@ fn git_hooks_path_configuration() -> &'static str {
 }
 
 pub(crate) fn is_safe_cargo_selector(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (1..=128).contains(&bytes.len())
-        && matches!(bytes[0], b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_')
-        && bytes
-            .iter()
-            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+    coding_agent_core::is_valid_cargo_selector(value)
 }
 
 fn validate_worktree_branch_name(value: &str) -> Result<(), CommandPolicyError> {
@@ -1499,12 +1497,30 @@ mod tests {
                 "safe-package",
             ]
         );
+        let workspace_check = ValidatedCommand::cargo_check(
+            Arc::clone(&executable),
+            Arc::clone(&directory),
+            ChildEnvironment::default(),
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(
+            arguments(&workspace_check),
+            [
+                "check",
+                "--offline",
+                "--color=never",
+                "--message-format=json-render-diagnostics",
+                "--workspace",
+            ]
+        );
 
         let test = ValidatedCommand::cargo_test(
             Arc::clone(&executable),
             Arc::clone(&directory),
             ChildEnvironment::default(),
-            "safe-package",
+            Some("safe-package"),
             Some("integration_test"),
             Duration::from_secs(10),
         )
@@ -1523,6 +1539,37 @@ mod tests {
                 "integration_test",
             ]
         );
+        let workspace_test = ValidatedCommand::cargo_test(
+            Arc::clone(&executable),
+            Arc::clone(&directory),
+            ChildEnvironment::default(),
+            None,
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(
+            arguments(&workspace_test),
+            [
+                "test",
+                "--offline",
+                "--color=never",
+                "--no-fail-fast",
+                "--message-format=json-render-diagnostics",
+                "--workspace",
+            ]
+        );
+        assert!(matches!(
+            ValidatedCommand::cargo_test(
+                Arc::clone(&executable),
+                Arc::clone(&directory),
+                ChildEnvironment::default(),
+                None,
+                Some("integration_test"),
+                Duration::from_secs(10),
+            ),
+            Err(CommandPolicyError::InvalidCargoSelection)
+        ));
 
         for invalid in [
             "",
@@ -1548,7 +1595,7 @@ mod tests {
                 executable,
                 directory,
                 ChildEnvironment::default(),
-                "safe-package",
+                Some("safe-package"),
                 Some("--manifest-path"),
                 Duration::from_secs(10),
             ),

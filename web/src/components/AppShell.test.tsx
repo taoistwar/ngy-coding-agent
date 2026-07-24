@@ -54,9 +54,14 @@ function task(
     client_request_id: `client-${id}`,
     prompt: `Prompt ${id}`,
     status,
+    delivery_readiness: "unreviewed",
     attempt: 1,
     last_event_id: 1,
     created_at: createdAt,
+    retry_of: null,
+    started_at: null,
+    finished_at: null,
+    failure: null,
   };
 }
 
@@ -69,6 +74,7 @@ function detail(value: Task): TaskDetail {
     diff: null,
     tests: null,
     timeline: [],
+    reviews: [],
   };
 }
 
@@ -176,6 +182,40 @@ describe("Sidebar", () => {
 
     await user.click(screen.getByRole("button", { name: /Older repository/ }));
     expect(onSelectRepository).toHaveBeenCalledWith("repo-old");
+  });
+
+  it("shows lifecycle and delivery readiness as separate task badges", () => {
+    const approved: Task = {
+      ...task("approved", "repo-new", LATER, "completed"),
+      delivery_readiness: "review_approved",
+    };
+    const rejected: Task = {
+      ...task("rejected", "repo-new", EARLIER, "failed"),
+      delivery_readiness: "review_rejected",
+    };
+
+    render(
+      <Sidebar
+        repositories={[repository("repo-new")]}
+        tasks={[approved, rejected]}
+        selectedRepositoryId="repo-new"
+        selectedTaskId={approved.id}
+        onSelectRepository={vi.fn()}
+        onSelectTask={vi.fn()}
+        onAddRepository={vi.fn()}
+        onPickRepository={vi.fn()}
+        onRetry={vi.fn()}
+      />,
+    );
+
+    const approvedItem = screen.getByText("Prompt approved").closest("li");
+    const rejectedItem = screen.getByText("Prompt rejected").closest("li");
+    expect(approvedItem).not.toBeNull();
+    expect(rejectedItem).not.toBeNull();
+    expect(within(approvedItem!).getByText("Completed")).toBeVisible();
+    expect(within(approvedItem!).getByText("Review approved")).toBeVisible();
+    expect(within(rejectedItem!).getByText("Failed")).toBeVisible();
+    expect(within(rejectedItem!).getByText("Review rejected")).toBeVisible();
   });
 
   it("supports direct path registration, the native picker, retry, and empty states", async () => {

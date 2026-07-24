@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use coding_agent_core::RequiredCheckSelector;
+
 #[cfg(all(windows, target_env = "msvc"))]
 use find_msvc_tools::{Env, EnvGetter, find_tool_with_env};
 
@@ -55,6 +57,47 @@ impl CargoCatalog {
             context.push('\n');
         }
         context
+    }
+
+    /// Canonical Project 3 check selectors derived only from validated Cargo
+    /// metadata. Workspace-wide selectors come first, followed by package and
+    /// integration-test selectors in deterministic catalog order.
+    pub fn required_check_selectors(&self) -> Result<Vec<RequiredCheckSelector>, CargoToolError> {
+        let mut selectors = Vec::with_capacity(
+            2 + self
+                .packages
+                .iter()
+                .map(|package| 2 + package.integration_tests.len())
+                .sum::<usize>(),
+        );
+        selectors.push(
+            RequiredCheckSelector::try_cargo_check(None)
+                .map_err(|_| CargoToolError::MetadataInvalid)?,
+        );
+        selectors.push(
+            RequiredCheckSelector::try_cargo_test(None, None)
+                .map_err(|_| CargoToolError::MetadataInvalid)?,
+        );
+        for package in &self.packages {
+            selectors.push(
+                RequiredCheckSelector::try_cargo_check(Some(package.name.clone()))
+                    .map_err(|_| CargoToolError::MetadataInvalid)?,
+            );
+            selectors.push(
+                RequiredCheckSelector::try_cargo_test(Some(package.name.clone()), None)
+                    .map_err(|_| CargoToolError::MetadataInvalid)?,
+            );
+            for integration_test in &package.integration_tests {
+                selectors.push(
+                    RequiredCheckSelector::try_cargo_test(
+                        Some(package.name.clone()),
+                        Some(integration_test.clone()),
+                    )
+                    .map_err(|_| CargoToolError::MetadataInvalid)?,
+                );
+            }
+        }
+        Ok(selectors)
     }
 
     fn package(&self, name: &str) -> Option<&CargoPackage> {
@@ -340,7 +383,9 @@ impl CargoTools {
                 CommandPolicyError::InvalidTimeout,
             ));
         }
-        let package = package.ok_or(CargoToolError::PackageRequired)?;
+        if test.is_some() && package.is_none() {
+            return Err(CargoToolError::PackageRequired);
+        }
         let started = Instant::now();
         let catalog = self
             .catalog_with_timeout(
@@ -349,7 +394,9 @@ impl CargoTools {
                 MetadataAccess::Normal,
             )
             .await?;
-        validate_test_selection(&catalog, package, test)?;
+        if let Some(package) = package {
+            validate_test_selection(&catalog, package, test)?;
+        }
         let remaining = remaining_timeout(started, timeout)?;
         let command = ValidatedCommand::cargo_test(
             self.cargo.clone(),
@@ -912,7 +959,7 @@ pub enum CargoToolError {
     CommandPolicy(#[source] CommandPolicyError),
     #[error("the selected package is not in the trusted Cargo catalog")]
     UnknownPackage,
-    #[error("Cargo test requires an exact package selector")]
+    #[error("Cargo integration test requires an exact package selector")]
     PackageRequired,
     #[error("the selected integration test is not in the trusted Cargo catalog")]
     UnknownIntegrationTest,

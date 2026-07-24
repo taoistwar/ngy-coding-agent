@@ -60,6 +60,7 @@ test("keeps a Running task alive across reload, page close, and a fresh reopen",
             target: "runner_next",
           },
         ],
+        legacy_v2_seed: { kind: "none" },
         marker_write_failure: false,
       };
     },
@@ -92,8 +93,16 @@ test("keeps a Running task alive across reload, page close, and a fresh reopen",
       await expectSelectedStatus(reopenedPage, "completed");
 
       const eventKinds = await taskEventKinds(context.request, app.origin, created.id);
-      expect(eventKinds).toEqual(["task.queued", "task.started", "task.completed"]);
-      for (const kind of eventKinds) {
+      expect(eventKinds).toEqual([
+        "task.queued",
+        "task.started",
+        "plan.updated",
+        "diff.updated",
+        "test.updated",
+        "review.updated",
+        "task.completed",
+      ]);
+      for (const kind of eventKinds.filter((value) => value.startsWith("task."))) {
         await expect(
           reopenedPage.locator(".timeline-panel").getByText(kind, { exact: true }),
         ).toHaveCount(1);
@@ -125,6 +134,7 @@ test("renders STORE_BUSY and reuses one create UUID for an explicit successful r
     ],
     actor_pauses: [],
     virtual_release_signals: [],
+    legacy_v2_seed: { kind: "none" },
     marker_write_failure: false,
   };
 
@@ -210,6 +220,7 @@ test("replays the same create UUID after the first response is lost post-commit"
             target: "store_writer_after_commit_before_wake",
           },
         ],
+        legacy_v2_seed: { kind: "none" },
         marker_write_failure: false,
       };
     },
@@ -466,7 +477,7 @@ async function selectTask(page: Page, prompt: string): Promise<void> {
 }
 
 async function expectSelectedStatus(page: Page, status: TaskStatus): Promise<void> {
-  await expect(page.locator(".task-status-label")).toHaveText(`Status: ${status}`);
+  await expect(page.locator(".task-status-label")).toHaveText(`Execution status: ${status}`);
 }
 
 async function assertProcessIsConnected(page: Page, app: LocalApp): Promise<void> {

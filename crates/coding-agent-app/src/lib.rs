@@ -40,6 +40,8 @@ pub use coding_agent_provider::{
     ApiKey, MAX_PROVIDER_CONFIG_BYTES, PROVIDER_CONFIG_INVALID, ProviderConfig,
     ProviderConfigError, ProviderConfigErrorReason, RedactedText, SecretRedactor,
 };
+#[cfg(feature = "test-support")]
+pub use coding_agent_runner::TestTaskRuntimeSession;
 pub use coding_agent_runner::{
     AttemptArtifactObservation, AttemptReservation, CodingAgentAttempt, CodingAgentAttemptFactory,
     CodingAgentRunner, CodingAgentRunnerConfig, CodingAgentRunnerConfigError, CodingAttemptError,
@@ -88,7 +90,10 @@ pub use single_instance::{
     run_degraded_shutdown_warning_if_requested,
 };
 pub use static_assets::StaticAssetService;
-pub use store_writer::{EventWake, StoreWriterError, StoreWriterHandle, WriteReceipt};
+pub use store_writer::{
+    EventWake, FinalizeReviewedTaskRequest, RecordReviewRequest, StoreWriterError,
+    StoreWriterHandle, WriteReceipt,
+};
 #[cfg(feature = "test-support")]
 pub use store_writer::{
     StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterOperationKind,
@@ -100,8 +105,8 @@ pub use task_manager::{
 };
 #[cfg(feature = "test-support")]
 pub use test_support::{
-    ActorPausePoint, ProcessTestConfig, ProcessTestConfigError, ProcessTestEnvironment,
-    TEST_APP_DATA_ENV, TEST_BROWSER_PROBE_FILE, TEST_PICKER_PROBE_FILE, TEST_RUNTIME_ENV,
-    TEST_SCENARIO_ENV, TEST_STARTUP_RECOVERY_PROBE_FILE, VirtualReleaseSignal,
+    ActorPausePoint, LegacyV2Seed, ProcessTestConfig, ProcessTestConfigError,
+    ProcessTestEnvironment, TEST_APP_DATA_ENV, TEST_BROWSER_PROBE_FILE, TEST_PICKER_PROBE_FILE,
+    TEST_RUNTIME_ENV, TEST_SCENARIO_ENV, TEST_STARTUP_RECOVERY_PROBE_FILE, VirtualReleaseSignal,
     VirtualReleaseTarget,
 };

@@ -45,6 +45,9 @@ type AppProcess = ChildProcessByStdio<null, Readable, Readable>;
 
 export type FakeScenario =
   | "success"
+  | "multi_role_approved"
+  | "multi_role_rework_approved"
+  | "multi_role_rejected"
   | "blocking"
   | "ignores_cancellation"
   | "failure"
@@ -66,6 +69,11 @@ export type StoreWriterOperation =
   | "cancel_task"
   | "interrupt_task"
   | "append_running_event"
+  | "record_review"
+  | "finalize_reviewed_task"
+  | "reserve_attempt_artifact"
+  | "mark_attempt_artifact_ready"
+  | "mark_attempt_artifact_inconsistent"
   | "recover_incomplete";
 
 export type ActorPausePoint =
@@ -101,6 +109,14 @@ export type VirtualReleaseTarget =
   | "actor_bootstrap_before_sse"
   | "actor_bootstrap_cursor_ahead";
 
+export type LegacyV2Seed =
+  | { kind: "none" }
+  | {
+      kind: "completed_task";
+      repository_path: string;
+      task_prompt: string;
+    };
+
 export interface ProcessScenario {
   fake_scenarios: FakeScenario[];
   store_writer_faults: Array<{
@@ -114,6 +130,7 @@ export interface ProcessScenario {
     path: string;
     target: VirtualReleaseTarget;
   }>;
+  legacy_v2_seed: LegacyV2Seed;
   marker_write_failure: boolean;
 }
 
@@ -149,6 +166,7 @@ export const successScenario = (): ProcessScenario => ({
   store_writer_faults: [],
   actor_pauses: [],
   virtual_release_signals: [],
+  legacy_v2_seed: { kind: "none" },
   marker_write_failure: false,
 });
 

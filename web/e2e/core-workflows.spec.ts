@@ -59,6 +59,7 @@ test("keeps four tasks running, cancels the queued fifth, and starts only the si
             target: "runner_next",
           },
         ],
+        legacy_v2_seed: { kind: "none" },
         marker_write_failure: false,
       };
     },
@@ -149,6 +150,7 @@ test("isolates failure and panic across retries and keeps old attempts read-only
     store_writer_faults: [],
     actor_pauses: [],
     virtual_release_signals: [],
+    legacy_v2_seed: { kind: "none" },
     marker_write_failure: false,
   };
 
@@ -166,7 +168,9 @@ test("isolates failure and panic across retries and keeps old attempts read-only
 
     const third = await retrySelectedTaskThroughUi(page, app, second.id);
     await expectSelectedStatus(page, "completed");
-    await expect(page.getByText("Execution completed", { exact: false })).toBeVisible();
+    await expect(
+      page.getByText("Delivery readiness: review approved", { exact: true }),
+    ).toBeVisible();
 
     await expect(page.getByRole("button", { name: /Attempt 1.*failed/iu })).toBeVisible();
     await expect(page.getByRole("button", { name: /Attempt 2.*failed/iu })).toBeVisible();
@@ -283,7 +287,7 @@ async function selectTask(page: Page, prompt: string): Promise<void> {
 }
 
 async function expectSelectedStatus(page: Page, status: TaskStatus): Promise<void> {
-  await expect(page.locator(".task-status-label")).toHaveText(`Status: ${status}`, {
+  await expect(page.locator(".task-status-label")).toHaveText(`Execution status: ${status}`, {
     timeout: 20_000,
   });
 }

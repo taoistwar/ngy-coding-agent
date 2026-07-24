@@ -10,8 +10,8 @@ use coding_agent_api::{
     StreamResetControl, TaskEventDto, UtcTimestampDto, api_openapi,
 };
 use coding_agent_domain::{
-    CanonicalPath, EventId, PlanItem, PlanItemStatus, PlanSnapshot, TaskEvent, TaskEventPayload,
-    TaskId, UtcTimestamp,
+    ActivityEntry, ActivityLevel, CanonicalPath, EventId, PlanItem, PlanItemStatus, PlanSnapshot,
+    TaskEvent, TaskEventPayload, TaskId, UtcTimestamp,
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -56,13 +56,13 @@ fn schema_accepts_null(schema: &Value) -> bool {
 }
 
 #[test]
-fn task_event_schema_is_a_discriminated_union_of_ten_flat_envelopes() {
+fn task_event_schema_is_a_discriminated_union_of_eleven_flat_envelopes() {
     let value = openapi_value();
     let schema = &value["components"]["schemas"]["TaskEventDto"];
 
     assert_eq!(schema["discriminator"]["propertyName"], "kind");
     let variants = schema["oneOf"].as_array().expect("oneOf must be present");
-    assert_eq!(variants.len(), 10);
+    assert_eq!(variants.len(), 11);
     assert_eq!(
         variants
             .iter()
@@ -80,6 +80,7 @@ fn task_event_schema_is_a_discriminated_union_of_ten_flat_envelopes() {
             "ActivityAppendedEventDto",
             "DiffUpdatedEventDto",
             "PlanUpdatedEventDto",
+            "ReviewUpdatedEventDto",
             "TaskCancelledEventDto",
             "TaskCompletedEventDto",
             "TaskFailedEventDto",
@@ -105,6 +106,7 @@ fn task_event_discriminator_explicitly_maps_every_dotted_kind_to_its_envelope() 
             "activity.appended": "#/components/schemas/ActivityAppendedEventDto",
             "diff.updated": "#/components/schemas/DiffUpdatedEventDto",
             "test.updated": "#/components/schemas/TestUpdatedEventDto",
+            "review.updated": "#/components/schemas/ReviewUpdatedEventDto",
             "task.completed": "#/components/schemas/TaskCompletedEventDto",
             "task.failed": "#/components/schemas/TaskFailedEventDto",
             "task.cancelled": "#/components/schemas/TaskCancelledEventDto",
@@ -125,6 +127,7 @@ fn event_kind_component_literals_match_runtime_discriminators() {
         ("ActivityAppendedKind", "activity.appended"),
         ("DiffUpdatedKind", "diff.updated"),
         ("TestUpdatedKind", "test.updated"),
+        ("ReviewUpdatedKind", "review.updated"),
         ("TaskCompletedKind", "task.completed"),
         ("TaskFailedKind", "task.failed"),
         ("TaskCancelledKind", "task.cancelled"),
@@ -154,6 +157,12 @@ fn openapi_contains_every_approved_top_level_component_and_no_task_12_paths() {
         "RepositoryDto",
         "TaskDto",
         "TaskDetailDto",
+        "RequiredCheckDto",
+        "CheckEvidenceDto",
+        "ReviewFindingDto",
+        "ReviewCoverageDto",
+        "ReviewEvidenceDto",
+        "ReviewUpdatedEventDto",
         "TaskEventDto",
         "BootstrapResponse",
         "StreamResetControl",
@@ -181,6 +190,7 @@ fn task_and_detail_components_have_exact_required_and_nullable_shapes() {
         "repository_id",
         "prompt",
         "status",
+        "delivery_readiness",
         "attempt",
         "retry_of",
         "created_at",
@@ -202,6 +212,7 @@ fn task_and_detail_components_have_exact_required_and_nullable_shapes() {
             "activity",
             "diff",
             "tests",
+            "reviews",
             "timeline",
             "event_cursor",
         ])
@@ -209,10 +220,310 @@ fn task_and_detail_components_have_exact_required_and_nullable_shapes() {
     assert!(schema_accepts_null(&detail["properties"]["plan"]));
     assert!(schema_accepts_null(&detail["properties"]["diff"]));
     assert!(schema_accepts_null(&detail["properties"]["tests"]));
-    for array in ["activity", "timeline"] {
+    for array in ["activity", "reviews", "timeline"] {
         assert_eq!(detail["properties"][array]["type"], "array");
         assert!(string_set(&detail["required"]).contains(array));
     }
+}
+
+#[test]
+fn readiness_plan_and_activity_extensions_are_required_and_legacy_safe() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+
+    assert_eq!(
+        schemas["DeliveryReadinessDto"]["enum"],
+        json!(["unreviewed", "review_approved", "review_rejected"])
+    );
+
+    let plan = &schemas["PlanSnapshotDto"];
+    assert_eq!(
+        property_set(plan),
+        set(&[
+            "format_version",
+            "revision",
+            "summary",
+            "items",
+            "initial_required_checks",
+        ])
+    );
+    assert_eq!(string_set(&plan["required"]), property_set(plan));
+    assert_eq!(plan["properties"]["format_version"]["minimum"], 0);
+    assert_eq!(plan["properties"]["format_version"]["maximum"], 1);
+    assert_eq!(
+        plan["properties"]["revision"]["maximum"],
+        9_007_199_254_740_991_u64
+    );
+    assert_eq!(plan["properties"]["summary"]["maxLength"], 4096);
+    assert_eq!(plan["properties"]["items"]["maxItems"], 32);
+    assert_eq!(
+        plan["properties"]["initial_required_checks"]["maxItems"],
+        16
+    );
+
+    let item = &schemas["PlanItemDto"];
+    assert_eq!(
+        property_set(item),
+        set(&[
+            "id",
+            "title",
+            "description",
+            "acceptance_criteria",
+            "status",
+        ])
+    );
+    assert_eq!(string_set(&item["required"]), property_set(item));
+    assert_eq!(item["properties"]["title"]["maxLength"], 256);
+    assert_eq!(item["properties"]["description"]["maxLength"], 4096);
+    assert_eq!(item["properties"]["acceptance_criteria"]["maxItems"], 8);
+
+    let activity = &schemas["ActivityEntryDto"];
+    assert_eq!(
+        property_set(activity),
+        set(&["id", "level", "actor", "role_run", "message", "created_at"])
+    );
+    assert_eq!(string_set(&activity["required"]), property_set(activity));
+    assert_eq!(
+        schemas["ActivityActorDto"]["enum"],
+        json!(["system", "planner", "executor", "reviewer"])
+    );
+    assert!(schema_accepts_null(&activity["properties"]["role_run"]));
+    assert_eq!(activity["properties"]["role_run"]["minimum"], 1);
+    assert_eq!(
+        activity["properties"]["role_run"]["maximum"],
+        9_007_199_254_740_991_u64
+    );
+}
+
+#[test]
+fn required_check_schema_is_an_exact_typed_discriminated_union() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+    let required_check = &schemas["RequiredCheckDto"];
+
+    assert_eq!(required_check["discriminator"]["propertyName"], "kind");
+    assert_eq!(
+        required_check["discriminator"]["mapping"],
+        json!({
+            "cargo_check": "#/components/schemas/CargoCheckDto",
+            "cargo_test": "#/components/schemas/CargoTestDto",
+        })
+    );
+    assert_eq!(
+        required_check["oneOf"],
+        json!([
+            {"$ref": "#/components/schemas/CargoCheckDto"},
+            {"$ref": "#/components/schemas/CargoTestDto"},
+        ])
+    );
+
+    let cargo_check = &schemas["CargoCheckDto"];
+    assert_eq!(property_set(cargo_check), set(&["id", "kind", "package"]));
+    assert_eq!(
+        string_set(&cargo_check["required"]),
+        property_set(cargo_check)
+    );
+    assert!(
+        cargo_check["properties"]
+            .as_object()
+            .unwrap()
+            .get("integration_test")
+            .is_none()
+    );
+    assert!(schema_accepts_null(&cargo_check["properties"]["package"]));
+
+    let cargo_test = &schemas["CargoTestDto"];
+    assert_eq!(
+        property_set(cargo_test),
+        set(&["id", "kind", "package", "integration_test"])
+    );
+    assert_eq!(
+        string_set(&cargo_test["required"]),
+        property_set(cargo_test)
+    );
+    for nullable in ["package", "integration_test"] {
+        let selector = &cargo_test["properties"][nullable];
+        assert!(schema_accepts_null(selector));
+        assert_eq!(selector["minLength"], 1);
+        assert_eq!(selector["maxLength"], 128);
+        assert_eq!(selector["pattern"], "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$");
+    }
+}
+
+#[test]
+fn review_check_and_coverage_components_lock_exact_shapes_bounds_and_nullability() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+    let max_safe = json!(9_007_199_254_740_991_u64);
+
+    let digest = &schemas["WorkspaceDigestDto"];
+    assert_eq!(
+        string_set(&digest["required"]),
+        set(&["algorithm", "value"])
+    );
+    assert_eq!(
+        schemas["WorkspaceDigestAlgorithmDto"]["enum"],
+        json!(["workspace_fingerprint_v1"])
+    );
+    assert_eq!(digest["properties"]["value"]["minLength"], 64);
+    assert_eq!(digest["properties"]["value"]["maxLength"], 64);
+    assert_eq!(digest["properties"]["value"]["pattern"], "^[0-9a-f]{64}$");
+
+    let check = &schemas["CheckEvidenceDto"];
+    assert_eq!(
+        property_set(check),
+        set(&[
+            "check_id",
+            "actor",
+            "role_run",
+            "workspace_generation",
+            "workspace_digest",
+            "status",
+            "duration_ms",
+            "summary",
+            "truncated",
+        ])
+    );
+    assert_eq!(string_set(&check["required"]), property_set(check));
+    assert_eq!(
+        schemas["CheckActorDto"]["enum"],
+        json!(["executor", "reviewer"])
+    );
+    assert_eq!(
+        schemas["CheckEvidenceStatusDto"]["enum"],
+        json!(["passed", "failed", "cancelled"])
+    );
+    assert_eq!(check["properties"]["role_run"]["minimum"], 1);
+    assert_eq!(
+        check["properties"]["workspace_generation"]["maximum"],
+        max_safe
+    );
+    assert_eq!(check["properties"]["duration_ms"]["maximum"], max_safe);
+    assert_eq!(check["properties"]["summary"]["minLength"], 1);
+    assert_eq!(check["properties"]["summary"]["maxLength"], 2048);
+
+    let finding = &schemas["ReviewFindingDto"];
+    assert_eq!(
+        property_set(finding),
+        set(&["id", "severity", "message", "path", "line"])
+    );
+    assert_eq!(string_set(&finding["required"]), property_set(finding));
+    assert!(schema_accepts_null(&finding["properties"]["path"]));
+    assert!(schema_accepts_null(&finding["properties"]["line"]));
+    assert_eq!(finding["properties"]["line"]["minimum"], 1);
+    assert_eq!(finding["properties"]["line"]["maximum"], max_safe);
+    assert_eq!(finding["properties"]["message"]["maxLength"], 2048);
+
+    let coverage = &schemas["ReviewCoverageDto"];
+    assert_eq!(
+        property_set(coverage),
+        set(&[
+            "generation",
+            "workspace_digest",
+            "manifest_sha256",
+            "covered_chunks",
+            "total_chunks",
+        ])
+    );
+    assert_eq!(string_set(&coverage["required"]), property_set(coverage));
+    assert_eq!(coverage["properties"]["generation"]["maximum"], max_safe);
+    assert_eq!(coverage["properties"]["manifest_sha256"]["minLength"], 64);
+    assert_eq!(
+        coverage["properties"]["manifest_sha256"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+    assert_eq!(coverage["properties"]["covered_chunks"]["maxItems"], 8);
+    assert_eq!(
+        coverage["properties"]["covered_chunks"]["items"]["$ref"],
+        "#/components/schemas/ReviewChunkIndexDto"
+    );
+    assert_eq!(schemas["ReviewChunkIndexDto"]["minimum"], 0);
+    assert_eq!(schemas["ReviewChunkIndexDto"]["maximum"], 7);
+    assert_eq!(coverage["properties"]["total_chunks"]["minimum"], 0);
+    assert_eq!(coverage["properties"]["total_chunks"]["maximum"], 8);
+
+    let review = &schemas["ReviewEvidenceDto"];
+    assert_eq!(
+        property_set(review),
+        set(&[
+            "round",
+            "decision_source",
+            "workspace_generation",
+            "workspace_digest",
+            "verdict",
+            "summary",
+            "findings",
+            "added_required_checks",
+            "required_checks",
+            "check_evidence",
+            "coverage",
+            "created_at",
+        ])
+    );
+    assert_eq!(string_set(&review["required"]), property_set(review));
+    assert_eq!(review["properties"]["round"]["minimum"], 1);
+    assert_eq!(review["properties"]["round"]["maximum"], 3);
+    assert_eq!(
+        review["properties"]["workspace_generation"]["maximum"],
+        max_safe
+    );
+    assert_eq!(review["properties"]["summary"]["minLength"], 1);
+    assert_eq!(review["properties"]["summary"]["maxLength"], 4096);
+    assert_eq!(review["properties"]["findings"]["maxItems"], 32);
+    assert_eq!(
+        review["properties"]["added_required_checks"]["maxItems"],
+        16
+    );
+    assert_eq!(review["properties"]["required_checks"]["minItems"], 1);
+    assert_eq!(review["properties"]["required_checks"]["maxItems"], 16);
+    assert_eq!(review["properties"]["check_evidence"]["maxItems"], 16);
+    assert!(schema_accepts_null(&review["properties"]["coverage"]));
+    assert_eq!(
+        schemas["ReviewDecisionSourceDto"]["enum"],
+        json!(["reviewer", "system"])
+    );
+    assert_eq!(
+        schemas["ReviewVerdictDto"]["enum"],
+        json!(["approved", "changes_requested"])
+    );
+    assert_eq!(
+        schemas["FindingSeverityDto"]["enum"],
+        json!(["blocking", "advisory"])
+    );
+}
+
+#[test]
+fn review_updated_payload_is_typed_and_task_event_kind_is_exactly_eleven() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+    let payload = &schemas["ReviewUpdatedPayloadDto"];
+
+    assert_eq!(property_set(payload), set(&["review"]));
+    assert_eq!(string_set(&payload["required"]), set(&["review"]));
+    assert_eq!(
+        payload["properties"]["review"]["$ref"],
+        "#/components/schemas/ReviewEvidenceDto"
+    );
+    assert_eq!(
+        schemas["ReviewUpdatedEventDto"]["properties"]["payload"]["$ref"],
+        "#/components/schemas/ReviewUpdatedPayloadDto"
+    );
+    assert_eq!(
+        string_set(&schemas["TaskEventKindDto"]["enum"]),
+        set(&[
+            "task.queued",
+            "task.started",
+            "plan.updated",
+            "activity.appended",
+            "diff.updated",
+            "test.updated",
+            "review.updated",
+            "task.completed",
+            "task.failed",
+            "task.cancelled",
+            "task.interrupted",
+        ])
+    );
 }
 
 #[test]
@@ -260,14 +571,14 @@ fn event_json_is_a_flat_typed_wire_frame() {
         EventId::new(17).unwrap(),
         TaskId::new(),
         TaskEventPayload::PlanUpdated {
-            plan: PlanSnapshot {
-                revision: 3,
-                items: vec![PlanItem {
-                    id: "compile".to_owned(),
-                    title: "Compile the API".to_owned(),
-                    status: PlanItemStatus::Running,
-                }],
-            },
+            plan: PlanSnapshot::legacy(
+                3,
+                vec![PlanItem::legacy(
+                    "compile",
+                    "Compile the API",
+                    PlanItemStatus::Running,
+                )],
+            ),
         },
         timestamp,
     );
@@ -292,11 +603,39 @@ fn event_json_is_a_flat_typed_wire_frame() {
     assert_eq!(value["id"], 17);
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["kind"], "plan.updated");
+    assert_eq!(value["payload"]["plan"]["format_version"], 0);
     assert_eq!(value["payload"]["plan"]["revision"], 3);
+    assert_eq!(value["payload"]["plan"]["summary"], "");
+    assert_eq!(
+        value["payload"]["plan"]["initial_required_checks"],
+        json!([])
+    );
     assert_eq!(value["payload"]["plan"]["items"][0]["status"], "running");
+    assert_eq!(value["payload"]["plan"]["items"][0]["description"], "");
+    assert_eq!(
+        value["payload"]["plan"]["items"][0]["acceptance_criteria"],
+        json!([])
+    );
     assert!(value["payload"].get("id").is_none());
     assert!(value["payload"].get("kind").is_none());
     assert_eq!(value["created_at"], "2026-07-15T01:02:03.000000000Z");
+}
+
+#[test]
+fn legacy_activity_is_projected_with_required_system_actor_and_null_role_run() {
+    let timestamp = UtcTimestamp::parse_rfc3339("2026-07-15T01:02:03Z").unwrap();
+    let event = TaskEvent::new(
+        EventId::new(18).unwrap(),
+        TaskId::new(),
+        TaskEventPayload::ActivityAppended {
+            entry: ActivityEntry::legacy("legacy-activity", ActivityLevel::Info, "safe", timestamp),
+        },
+        timestamp,
+    );
+
+    let value = serde_json::to_value(TaskEventDto::from(event)).unwrap();
+    assert_eq!(value["payload"]["entry"]["actor"], "system");
+    assert_eq!(value["payload"]["entry"]["role_run"], Value::Null);
 }
 
 #[test]

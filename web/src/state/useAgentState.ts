@@ -13,7 +13,11 @@ import type {
   TaskEvent,
 } from "../api/types";
 import { initialAgentState, type AgentConnectionState, type AgentState } from "./model";
-import { agentReducer } from "./reducer";
+import {
+  agentReducer,
+  inspectEventProjection,
+  type AgentAction,
+} from "./reducer";
 
 export interface AgentApiAdapter {
   initialize(): Promise<BootstrapResponse>;
@@ -34,7 +38,7 @@ export interface AgentStreamCallbacks {
     state: BootstrapResponse["service_state"],
     generation: number,
   ): void;
-  onBootstrap(bootstrap: BootstrapResponse): void;
+  onBootstrap(bootstrap: BootstrapResponse): number;
   onConnectionState(connection: AgentConnectionState, reason?: string): void;
   onSessionExpired(): void;
 }
@@ -42,6 +46,7 @@ export interface AgentStreamCallbacks {
 export interface AgentStreamAdapter {
   start(cursor: number): void | Promise<void>;
   stop(): void;
+  requestRecovery(reason: string): void;
 }
 
 export interface UseAgentStateDependencies {
@@ -110,6 +115,29 @@ function isSessionExpired(error: unknown): boolean {
   );
 }
 
+class ReviewProjectionProtocolError extends Error {
+  constructor(reason: string) {
+    super(`review projection conflict: ${reason}`);
+    this.name = "ReviewProjectionProtocolError";
+  }
+}
+
+function appendRecoveryEvent(events: TaskEvent[], event: TaskEvent): TaskEvent[] {
+  return events.some((candidate) => candidate.id === event.id)
+    ? events
+    : [...events, event];
+}
+
+function recoveryCursor(
+  bootstrap: BootstrapResponse,
+  bufferedEvents: TaskEvent[],
+): number {
+  return bufferedEvents.reduce(
+    (cursor, event) => Math.max(cursor, event.id),
+    bootstrap.latest_event_id,
+  );
+}
+
 function projectSseState(
   state: SseClientState,
   callbacks: AgentStreamCallbacks,
@@ -147,8 +175,8 @@ export function createSseAgentStreamFactory(
   options: Omit<SseClientOptions, "callbacks"> = {},
 ): (callbacks: AgentStreamCallbacks) => AgentStreamAdapter {
   const schemaVersion = options.schemaVersion ?? 1;
-  return (callbacks) =>
-    new SseClient({
+  return (callbacks) => {
+    const client = new SseClient({
       ...options,
       callbacks: {
         onMessage: (message) => {
@@ -174,34 +202,81 @@ export function createSseAgentStreamFactory(
           if (signal.aborted) {
             throw new DOMException("bootstrap recovery aborted", "AbortError");
           }
-          callbacks.onBootstrap(bootstrap);
-          return bootstrap.latest_event_id;
+          return callbacks.onBootstrap(bootstrap);
         },
       },
     });
+    return {
+      start: (cursor) => client.start(cursor),
+      stop: () => client.stop(),
+      requestRecovery: (reason) =>
+        client.requestRecovery({
+          code: "PROJECTION_ERROR",
+          message: reason,
+        }),
+    };
+  };
 }
 
 export function useAgentState(
   dependencies: UseAgentStateDependencies,
 ): UseAgentStateResult {
   const [state, dispatch] = useReducer(agentReducer, initialAgentState);
+  const stateRef = useRef(state);
   const dependenciesRef = useRef(dependencies);
   const streamRef = useRef<AgentStreamAdapter | null>(null);
   const mountedRef = useRef(true);
+  const projectionRecoveryRef = useRef<{
+    active: boolean;
+    bufferedEvents: TaskEvent[];
+  }>({ active: false, bufferedEvents: [] });
+  stateRef.current = state;
   dependenciesRef.current = dependencies;
+
+  const dispatchStreamAction = useCallback((action: AgentAction): AgentState => {
+    const next = agentReducer(stateRef.current, action);
+    stateRef.current = next;
+    dispatch(action);
+    return next;
+  }, []);
+
+  const requestTransportRecovery = useCallback((next: AgentState) => {
+    const snapshotRecovery = next.snapshotRecovery;
+    const recovery = projectionRecoveryRef.current;
+    if (snapshotRecovery === null || recovery.active) {
+      return;
+    }
+    const stream = streamRef.current;
+    if (stream === null) {
+      return;
+    }
+
+    recovery.active = true;
+    recovery.bufferedEvents = [...next.recoveryBuffer];
+    try {
+      stream.requestRecovery(snapshotRecovery.reason);
+    } catch {
+      recovery.active = false;
+      recovery.bufferedEvents = [];
+    }
+  }, []);
 
   const expireSession = useCallback(() => {
     const stream = streamRef.current;
     streamRef.current = null;
+    projectionRecoveryRef.current = {
+      active: false,
+      bufferedEvents: [],
+    };
     try {
       stream?.stop();
     } catch {
       // Session expiry still wins if transport cleanup itself fails.
     }
     if (mountedRef.current) {
-      dispatch({ type: "session.expired" });
+      dispatchStreamAction({ type: "session.expired" });
     }
-  }, []);
+  }, [dispatchStreamAction]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -220,21 +295,91 @@ export function useAgentState(
         if (disposed) {
           return;
         }
-        dispatch({ type: "bootstrap.received", bootstrap });
+        dispatchStreamAction({ type: "bootstrap.received", bootstrap });
         stream = createStream({
-          onTaskEvent: (event) => dispatch({ type: "event.received", event }),
+          onTaskEvent: (event) => {
+            const recovery = projectionRecoveryRef.current;
+            const pendingSnapshotRecovery =
+              stateRef.current.snapshotRecovery;
+            if (!recovery.active && pendingSnapshotRecovery !== null) {
+              recovery.active = true;
+              recovery.bufferedEvents = [
+                ...stateRef.current.recoveryBuffer,
+              ];
+            }
+            if (recovery.active) {
+              recovery.bufferedEvents = appendRecoveryEvent(
+                recovery.bufferedEvents,
+                event,
+              );
+              dispatchStreamAction({ type: "event.received", event });
+              throw new ReviewProjectionProtocolError(
+                stateRef.current.snapshotRecovery?.reason ??
+                  "review_projection_recovery_pending",
+              );
+            }
+
+            const conflict = inspectEventProjection(stateRef.current, event);
+            if (conflict !== null) {
+              recovery.active = true;
+              recovery.bufferedEvents = [event];
+              dispatchStreamAction({
+                type: "event.conflicted",
+                event: event as Extract<
+                  TaskEvent,
+                  { kind: "review.updated" }
+                >,
+                reason: conflict.reason,
+              });
+              throw new ReviewProjectionProtocolError(conflict.reason);
+            }
+            dispatchStreamAction({ type: "event.received", event });
+          },
           onUnknownEvent: (id, kind, schemaVersion) =>
-            dispatch({ type: "event.unknown", id, kind, schemaVersion }),
+            dispatchStreamAction({
+              type: "event.unknown",
+              id,
+              kind,
+              schemaVersion,
+            }),
           onServiceState: (serviceState, generation) =>
-            dispatch({
+            dispatchStreamAction({
               type: "service.received",
               state: serviceState,
               generation,
             }),
-          onBootstrap: (nextBootstrap) =>
-            dispatch({ type: "bootstrap.received", bootstrap: nextBootstrap }),
+          onBootstrap: (nextBootstrap) => {
+            const recovery = projectionRecoveryRef.current;
+            if (!recovery.active) {
+              dispatchStreamAction({
+                type: "bootstrap.received",
+                bootstrap: nextBootstrap,
+              });
+              return nextBootstrap.latest_event_id;
+            }
+
+            const bufferedEvents = recovery.bufferedEvents;
+            const cursor = recoveryCursor(nextBootstrap, bufferedEvents);
+            const recovered = dispatchStreamAction({
+              type: "recovery.received",
+              bootstrap: nextBootstrap,
+              bufferedEvents,
+            });
+            if (
+              recovered.snapshotRecovery !== null ||
+              recovered.appliedEventId !== cursor
+            ) {
+              throw new ReviewProjectionProtocolError(
+                recovered.snapshotRecovery?.reason ??
+                  "snapshot_recovery_projection_failed",
+              );
+            }
+            recovery.active = false;
+            recovery.bufferedEvents = [];
+            return cursor;
+          },
           onConnectionState: (connection, reason) =>
-            dispatch({
+            dispatchStreamAction({
               type: "connection.changed",
               connection,
               reason: reason ?? null,
@@ -286,12 +431,16 @@ export function useAgentState(
     return () => {
       disposed = true;
       mountedRef.current = false;
+      projectionRecoveryRef.current = {
+        active: false,
+        bufferedEvents: [],
+      };
       if (streamRef.current === stream) {
         streamRef.current = null;
         stream?.stop();
       }
     };
-  }, [expireSession]);
+  }, [dispatchStreamAction, expireSession]);
 
   useEffect(() => {
     if (state.selectedTaskId === null || !state.detailLoading) {
@@ -304,14 +453,20 @@ export function useAgentState(
       .taskDetail(taskId)
       .then((detail) => {
         if (!disposed) {
-          dispatch({ type: "detail.received", taskId, generation, detail });
+          const next = dispatchStreamAction({
+            type: "detail.received",
+            taskId,
+            generation,
+            detail,
+          });
+          requestTransportRecovery(next);
         }
       })
       .catch((error: unknown) => {
         if (isSessionExpired(error) && mountedRef.current) {
           expireSession();
         } else if (!disposed) {
-          dispatch({
+          dispatchStreamAction({
             type: "detail.failed",
             taskId,
             generation,
@@ -326,11 +481,18 @@ export function useAgentState(
     state.detailLoading,
     state.selectedTaskId,
     state.selectionGeneration,
+    dispatchStreamAction,
+    expireSession,
+    requestTransportRecovery,
   ]);
 
+  useEffect(() => {
+    requestTransportRecovery(state);
+  }, [requestTransportRecovery, state]);
+
   const selectTask = useCallback((taskId: string) => {
-    dispatch({ type: "task.selected", taskId });
-  }, []);
+    dispatchStreamAction({ type: "task.selected", taskId });
+  }, [dispatchStreamAction]);
 
   const addRepository = useCallback(
     async (path: string): Promise<Repository> => {

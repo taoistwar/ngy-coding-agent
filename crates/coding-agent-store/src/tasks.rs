@@ -1,6 +1,6 @@
 use coding_agent_domain::{
-    ClientRequestId, DomainError, EventCursor, EventId, NewTask, Task, TaskEventKind,
-    TaskEventPayload, TaskFailure, TaskId, TaskStatus, UtcTimestamp,
+    ClientRequestId, DeliveryReadiness, DomainError, EventCursor, EventId, NewTask, Task,
+    TaskEventKind, TaskEventPayload, TaskFailure, TaskId, TaskStatus, UtcTimestamp,
 };
 use sqlx::{SqliteConnection, Transaction};
 use time::OffsetDateTime;
@@ -19,6 +19,7 @@ pub(crate) type TaskRecord = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
     Option<String>,
 );
 
@@ -193,6 +194,11 @@ impl Store {
                 to: next,
             });
         }
+        if matches!(transition, TaskTransition::Completed) {
+            return Err(StoreError::InvariantViolation(
+                "completed tasks require reviewed finalization",
+            ));
+        }
 
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = current_timestamp()?;
@@ -213,8 +219,12 @@ impl Store {
                 .execute(&mut *transaction)
                 .await?
             }
-            TaskTransition::Completed
-            | TaskTransition::Failed(_)
+            TaskTransition::Completed => {
+                return Err(StoreError::InvariantViolation(
+                    "completed tasks require reviewed finalization",
+                ));
+            }
+            TaskTransition::Failed(_)
             | TaskTransition::Cancelled
             | TaskTransition::Interrupted(_) => {
                 sqlx::query(
@@ -355,9 +365,12 @@ pub(crate) async fn load_task(
     task_id: TaskId,
 ) -> Result<Option<Task>, StoreError> {
     let record: Option<TaskRecord> = sqlx::query_as(
-        "SELECT id, client_request_id, repository_id, prompt, status, attempt, retry_of, \
-                created_at, started_at, finished_at, last_event_id, failure_json \
-         FROM tasks WHERE id = ?",
+        "SELECT t.id, t.client_request_id, t.repository_id, t.prompt, t.status, t.attempt, \
+                t.retry_of, t.created_at, t.started_at, t.finished_at, t.last_event_id, \
+                t.failure_json, d.readiness \
+         FROM tasks t \
+         LEFT JOIN task_delivery_state d ON d.task_id = t.id \
+         WHERE t.id = ?",
     )
     .bind(task_id.to_string())
     .fetch_optional(connection)
@@ -380,6 +393,7 @@ pub(crate) fn task_from_record(record: TaskRecord) -> Result<Task, StoreError> {
         repository_id: record.2.parse()?,
         prompt: record.3,
         status: parse_status(&record.4)?,
+        delivery_readiness: parse_delivery_readiness(record.12.as_deref())?,
         attempt,
         retry_of: record
             .6
@@ -423,6 +437,17 @@ pub(crate) fn parse_status(value: &str) -> Result<TaskStatus, StoreError> {
     }
 }
 
+pub(crate) fn parse_delivery_readiness(
+    value: Option<&str>,
+) -> Result<DeliveryReadiness, StoreError> {
+    match value {
+        None => Ok(DeliveryReadiness::Unreviewed),
+        Some("review_approved") => Ok(DeliveryReadiness::ReviewApproved),
+        Some("review_rejected") => Ok(DeliveryReadiness::ReviewRejected),
+        Some(value) => Err(StoreError::InvalidDeliveryReadiness(value.to_owned())),
+    }
+}
+
 pub(crate) const fn event_kind_text(kind: TaskEventKind) -> &'static str {
     match kind {
         TaskEventKind::TaskQueued => "task.queued",
@@ -431,6 +456,7 @@ pub(crate) const fn event_kind_text(kind: TaskEventKind) -> &'static str {
         TaskEventKind::ActivityAppended => "activity.appended",
         TaskEventKind::DiffUpdated => "diff.updated",
         TaskEventKind::TestUpdated => "test.updated",
+        TaskEventKind::ReviewUpdated => "review.updated",
         TaskEventKind::TaskCompleted => "task.completed",
         TaskEventKind::TaskFailed => "task.failed",
         TaskEventKind::TaskCancelled => "task.cancelled",
@@ -446,6 +472,7 @@ pub(crate) fn parse_event_kind(value: &str) -> Result<TaskEventKind, StoreError>
         "activity.appended" => Ok(TaskEventKind::ActivityAppended),
         "diff.updated" => Ok(TaskEventKind::DiffUpdated),
         "test.updated" => Ok(TaskEventKind::TestUpdated),
+        "review.updated" => Ok(TaskEventKind::ReviewUpdated),
         "task.completed" => Ok(TaskEventKind::TaskCompleted),
         "task.failed" => Ok(TaskEventKind::TaskFailed),
         "task.cancelled" => Ok(TaskEventKind::TaskCancelled),
@@ -466,6 +493,11 @@ pub(crate) fn payload_json(payload: &TaskEventPayload) -> Result<String, StoreEr
         TaskEventPayload::ActivityAppended { entry } => serde_json::json!({ "entry": entry }),
         TaskEventPayload::DiffUpdated { diff } => serde_json::json!({ "diff": diff }),
         TaskEventPayload::TestUpdated { tests } => serde_json::json!({ "tests": tests }),
+        TaskEventPayload::ReviewUpdated { .. } => {
+            return Err(StoreError::InvariantViolation(
+                "review events require the typed evidence writer",
+            ));
+        }
     };
     Ok(serde_json::to_string(&value)?)
 }
@@ -484,9 +516,12 @@ async fn load_task_by_client_request(
     client_request_id: ClientRequestId,
 ) -> Result<Option<Task>, StoreError> {
     let record: Option<TaskRecord> = sqlx::query_as(
-        "SELECT id, client_request_id, repository_id, prompt, status, attempt, retry_of, \
-                created_at, started_at, finished_at, last_event_id, failure_json \
-         FROM tasks WHERE client_request_id = ?",
+        "SELECT t.id, t.client_request_id, t.repository_id, t.prompt, t.status, t.attempt, \
+                t.retry_of, t.created_at, t.started_at, t.finished_at, t.last_event_id, \
+                t.failure_json, d.readiness \
+         FROM tasks t \
+         LEFT JOIN task_delivery_state d ON d.task_id = t.id \
+         WHERE t.client_request_id = ?",
     )
     .bind(client_request_id.to_string())
     .fetch_optional(&mut **transaction)
@@ -499,9 +534,12 @@ async fn load_retry_child(
     source_id: TaskId,
 ) -> Result<Option<Task>, StoreError> {
     let record: Option<TaskRecord> = sqlx::query_as(
-        "SELECT id, client_request_id, repository_id, prompt, status, attempt, retry_of, \
-                created_at, started_at, finished_at, last_event_id, failure_json \
-         FROM tasks WHERE retry_of = ?",
+        "SELECT t.id, t.client_request_id, t.repository_id, t.prompt, t.status, t.attempt, \
+                t.retry_of, t.created_at, t.started_at, t.finished_at, t.last_event_id, \
+                t.failure_json, d.readiness \
+         FROM tasks t \
+         LEFT JOIN task_delivery_state d ON d.task_id = t.id \
+         WHERE t.retry_of = ?",
     )
     .bind(source_id.to_string())
     .fetch_optional(&mut **transaction)
@@ -509,7 +547,7 @@ async fn load_retry_child(
     record.map(task_from_record).transpose()
 }
 
-async fn append_lifecycle_event(
+pub(crate) async fn append_lifecycle_event(
     transaction: &mut Transaction<'_, sqlx::Sqlite>,
     task_id: TaskId,
     kind: TaskEventKind,
@@ -543,7 +581,7 @@ async fn append_lifecycle_event(
     Ok((task, event_id))
 }
 
-async fn insert_event(
+pub(crate) async fn insert_event(
     transaction: &mut Transaction<'_, sqlx::Sqlite>,
     task_id: TaskId,
     kind: TaskEventKind,
@@ -574,7 +612,8 @@ fn lifecycle_payload(kind: TaskEventKind, task: Task) -> Result<TaskEventPayload
         TaskEventKind::PlanUpdated
         | TaskEventKind::ActivityAppended
         | TaskEventKind::DiffUpdated
-        | TaskEventKind::TestUpdated => Err(StoreError::InvariantViolation(
+        | TaskEventKind::TestUpdated
+        | TaskEventKind::ReviewUpdated => Err(StoreError::InvariantViolation(
             "panel event passed to lifecycle payload builder",
         )),
     }
@@ -591,7 +630,7 @@ const fn lifecycle_kind(status: TaskStatus) -> TaskEventKind {
     }
 }
 
-fn ensure_exactly_one(rows: u64, message: &'static str) -> Result<(), StoreError> {
+pub(crate) fn ensure_exactly_one(rows: u64, message: &'static str) -> Result<(), StoreError> {
     if rows == 1 {
         Ok(())
     } else {
@@ -599,6 +638,6 @@ fn ensure_exactly_one(rows: u64, message: &'static str) -> Result<(), StoreError
     }
 }
 
-fn current_timestamp() -> Result<UtcTimestamp, StoreError> {
+pub(crate) fn current_timestamp() -> Result<UtcTimestamp, StoreError> {
     Ok(UtcTimestamp::new(OffsetDateTime::now_utc())?)
 }

@@ -468,7 +468,7 @@ async fn failed_forced_test_allows_repair_then_retests_new_revision_and_forces_f
     assert_eq!(
         requests
             .iter()
-            .map(|request| request.tool_choice)
+            .map(|request| request.tool_choice.clone())
             .collect::<Vec<_>>(),
         [
             ModelToolChoice::Auto,
@@ -496,7 +496,7 @@ async fn a_repaired_revision_is_retested_immediately_even_when_budgets_remain_hi
         calls: (0..25)
             .map(|index| ToolCall {
                 id: format!("inspect-{index}"),
-                request: ToolRequest::GitStatus,
+                request: ToolRequest::GitStatus.into(),
             })
             .collect(),
     });
@@ -550,7 +550,7 @@ async fn a_repaired_revision_is_retested_immediately_even_when_budgets_remain_hi
             .lock()
             .unwrap()
             .iter()
-            .map(|request| request.tool_choice)
+            .map(|request| request.tool_choice.clone())
             .collect::<Vec<_>>(),
         [
             ModelToolChoice::Auto,
@@ -603,7 +603,7 @@ async fn repair_batch_cannot_consume_the_retest_tool_reserve() {
             .lock()
             .unwrap()
             .iter()
-            .map(|request| request.tool_choice)
+            .map(|request| request.tool_choice.clone())
             .collect::<Vec<_>>(),
         [ModelToolChoice::Auto, ModelToolChoice::Auto]
     );
@@ -680,7 +680,7 @@ async fn final_response_with_tools_remaining_keeps_auto_even_on_the_last_model_s
             .lock()
             .unwrap()
             .iter()
-            .map(|request| request.tool_choice)
+            .map(|request| request.tool_choice.clone())
             .collect::<Vec<_>>(),
         [ModelToolChoice::RequiredCargoTest, ModelToolChoice::Auto]
     );
@@ -1380,7 +1380,7 @@ async fn test_or_external_fingerprint_change_invalidates_pass() {
             .lock()
             .unwrap()
             .iter()
-            .map(|request| request.tool_choice)
+            .map(|request| request.tool_choice.clone())
             .collect::<Vec<_>>(),
         [
             ModelToolChoice::Auto,
@@ -1508,7 +1508,7 @@ fn tool_call_with_reasoning(id: &str, reasoning: &str, request: ToolRequest) -> 
         reasoning_content: Some(reasoning.to_owned()),
         calls: vec![ToolCall {
             id: id.to_owned(),
-            request,
+            request: request.into(),
         }],
     })
 }
@@ -1524,7 +1524,7 @@ fn tool_calls<const N: usize>(
             .into_iter()
             .map(|(id, request)| ToolCall {
                 id: id.to_owned(),
-                request,
+                request: request.into(),
             })
             .collect(),
     })

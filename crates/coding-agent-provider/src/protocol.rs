@@ -1,16 +1,18 @@
 use std::collections::BTreeSet;
 
 use coding_agent_core::{
-    ModelMessage, ModelRequest, ModelResponse, ModelToolChoice, ProviderError, ToolCall,
-    ToolCallBatch, ToolRequest,
+    ActionRequest, AllowedActions, ControlKind, ModelMessage, ModelRequest, ModelResponse,
+    ModelToolChoice, ProviderError, RequiredAction, RequiredCheckKind, RuntimeActionRequest,
+    ToolCall, ToolCallBatch, canonical_tool_result_wire_value,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, error::Category, json};
 
 use crate::config::{ProviderThinkingMode, ProviderToolChoiceCompatibility};
 use crate::error::{
-    invalid_request, invalid_response, rejected_response_reasoning, tool_choice_violated,
-    unsupported_response_finish, unsupported_response_schema,
+    invalid_request, invalid_response, invalid_role_output, rejected_response_reasoning,
+    role_action_not_allowed, tool_choice_violated, unsupported_response_finish,
+    unsupported_response_schema,
 };
 
 pub fn encode_chat_completions_request(
@@ -25,6 +27,14 @@ pub fn encode_chat_completions_request(
     )
 }
 
+pub fn encode_chat_completions_request_with_compatibility(
+    model: &str,
+    request: &ModelRequest,
+    compatibility: ProviderToolChoiceCompatibility,
+) -> Result<Vec<u8>, ProviderError> {
+    encode_chat_completions_request_with_options(model, request, None, compatibility)
+}
+
 pub(crate) fn encode_chat_completions_request_with_options(
     model: &str,
     request: &ModelRequest,
@@ -35,6 +45,7 @@ pub(crate) fn encode_chat_completions_request_with_options(
         return Err(invalid_request("The provider model is invalid."));
     }
 
+    validate_model_request_contract(request)?;
     validate_tool_call_round_trips(&request.messages)?;
     let messages = request
         .messages
@@ -44,8 +55,8 @@ pub(crate) fn encode_chat_completions_request_with_options(
     let wire = ChatCompletionsRequestWire {
         model,
         messages,
-        tools: tool_definitions_for_request(request.tool_choice, tool_choice_compatibility),
-        tool_choice: encode_tool_choice(request.tool_choice, tool_choice_compatibility),
+        tools: tool_definitions_for_request(request, tool_choice_compatibility),
+        tool_choice: encode_tool_choice(&request.tool_choice, tool_choice_compatibility),
         thinking: thinking_mode.map(|mode| ThinkingWire {
             kind: mode.request_value(),
         }),
@@ -56,6 +67,39 @@ pub(crate) fn encode_chat_completions_request_with_options(
         .map_err(|_| invalid_request("The provider request could not be encoded."))
 }
 
+fn validate_model_request_contract(request: &ModelRequest) -> Result<(), ProviderError> {
+    match &request.tool_choice {
+        ModelToolChoice::Required(required)
+            if !request.allowed_actions.allows_required(required) =>
+        {
+            return Err(invalid_request(
+                "The required provider action is not allowed by this request.",
+            ));
+        }
+        ModelToolChoice::RequiredCargoTest if !request.allowed_actions.is_legacy() => {
+            return Err(invalid_request(
+                "The legacy required action is not allowed by this request.",
+            ));
+        }
+        _ => {}
+    }
+    if request.messages.iter().any(|message| {
+        matches!(
+            message,
+            ModelMessage::AssistantToolCalls(batch)
+                if batch
+                    .calls
+                    .iter()
+                    .any(|call| !request.allowed_actions.allows_action(&call.request))
+        )
+    }) {
+        return Err(invalid_request(
+            "The provider transcript contains an action outside the request capability set.",
+        ));
+    }
+    Ok(())
+}
+
 pub fn decode_chat_completions_response(
     encoded: &[u8],
     max_response_bytes: usize,
@@ -63,7 +107,22 @@ pub fn decode_chat_completions_response(
     decode_chat_completions_response_with_tool_choice(
         encoded,
         max_response_bytes,
-        ModelToolChoice::Auto,
+        &AllowedActions::legacy(),
+        &ModelToolChoice::Auto,
+        None,
+    )
+}
+
+pub fn decode_chat_completions_response_for_request(
+    encoded: &[u8],
+    max_response_bytes: usize,
+    request: &ModelRequest,
+) -> Result<ModelResponse, ProviderError> {
+    decode_chat_completions_response_with_tool_choice(
+        encoded,
+        max_response_bytes,
+        &request.allowed_actions,
+        &request.tool_choice,
         None,
     )
 }
@@ -71,7 +130,8 @@ pub fn decode_chat_completions_response(
 pub(crate) fn decode_chat_completions_response_with_tool_choice(
     encoded: &[u8],
     max_response_bytes: usize,
-    tool_choice: ModelToolChoice,
+    allowed_actions: &AllowedActions,
+    tool_choice: &ModelToolChoice,
     thinking_mode: Option<ProviderThinkingMode>,
 ) -> Result<ModelResponse, ProviderError> {
     if encoded.len() > max_response_bytes {
@@ -120,17 +180,55 @@ pub(crate) fn decode_chat_completions_response_with_tool_choice(
         return Err(rejected_response_reasoning());
     }
     let has_tool_calls = !choice.message.tool_calls.is_empty();
+    if allowed_actions.role().is_some() && !has_tool_calls {
+        return Err(invalid_role_output());
+    }
     match tool_choice {
         ModelToolChoice::Auto => {}
-        ModelToolChoice::None if has_tool_calls => return Err(tool_choice_violated()),
+        ModelToolChoice::None if has_tool_calls => {
+            return Err(action_contract_violated(allowed_actions));
+        }
         ModelToolChoice::None => {}
+        ModelToolChoice::Required(RequiredAction::TerminalOrBlocked(normal_terminal))
+            if choice.message.tool_calls.len() != 1
+                || !matches!(
+                    choice.message.tool_calls[0].function.name.as_str(),
+                    name if name == normal_terminal.name() || name == "report_blocked"
+                ) =>
+        {
+            return Err(action_contract_violated(allowed_actions));
+        }
+        ModelToolChoice::Required(RequiredAction::TerminalOrBlocked(_)) => {}
+        ModelToolChoice::Required(
+            required @ (RequiredAction::ReviewDiffManifestOrTerminal { .. }
+            | RequiredAction::ReviewDiffChunksOrTerminal { .. }),
+        ) if choice.message.tool_calls.len() != 1
+            || !matches!(
+                choice.message.tool_calls[0].function.name.as_str(),
+                name if name == required.action_name()
+                    || name == "submit_review"
+                    || name == "report_blocked"
+            ) =>
+        {
+            return Err(action_contract_violated(allowed_actions));
+        }
+        ModelToolChoice::Required(
+            RequiredAction::ReviewDiffManifestOrTerminal { .. }
+            | RequiredAction::ReviewDiffChunksOrTerminal { .. },
+        ) => {}
+        ModelToolChoice::Required(required)
+            if choice.message.tool_calls.len() != 1
+                || choice.message.tool_calls[0].function.name != required.action_name() =>
+        {
+            return Err(action_contract_violated(allowed_actions));
+        }
         ModelToolChoice::RequiredCargoTest
             if choice.message.tool_calls.len() != 1
                 || choice.message.tool_calls[0].function.name != "cargo_test" =>
         {
-            return Err(tool_choice_violated());
+            return Err(action_contract_violated(allowed_actions));
         }
-        ModelToolChoice::RequiredCargoTest => {}
+        ModelToolChoice::Required(_) | ModelToolChoice::RequiredCargoTest => {}
     }
     if has_tool_calls {
         let assistant_content = choice.message.content;
@@ -155,18 +253,27 @@ pub(crate) fn decode_chat_completions_response_with_tool_choice(
                         "The provider tool call envelope is invalid.",
                     ));
                 }
-                let request = decode_tool_request(&call.function.name, &call.function.arguments)?;
+                let request = decode_action_request(
+                    allowed_actions,
+                    &call.function.name,
+                    &call.function.arguments,
+                )?;
                 Ok(ToolCall {
                     id: call.id,
                     request,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(ModelResponse::ToolCalls(ToolCallBatch {
+        validate_decoded_action_batch(allowed_actions, tool_choice, &calls)?;
+        let decoded = ModelResponse::ToolCalls(ToolCallBatch {
             assistant_content,
             reasoning_content,
             calls,
-        }));
+        });
+        if !tool_choice.permits(&decoded) {
+            return Err(action_contract_violated(allowed_actions));
+        }
+        return Ok(decoded);
     }
 
     if choice.finish_reason.as_deref() != Some("stop") {
@@ -181,7 +288,83 @@ pub(crate) fn decode_chat_completions_response_with_tool_choice(
             "The provider final response content is invalid.",
         ));
     }
-    Ok(ModelResponse::Final { content })
+    let decoded = ModelResponse::Final { content };
+    if allowed_actions.role().is_some() {
+        return Err(invalid_role_output());
+    }
+    if !tool_choice.permits(&decoded) {
+        return Err(tool_choice_violated());
+    }
+    Ok(decoded)
+}
+
+fn validate_decoded_action_batch(
+    allowed_actions: &AllowedActions,
+    tool_choice: &ModelToolChoice,
+    calls: &[ToolCall],
+) -> Result<(), ProviderError> {
+    if calls.is_empty()
+        || calls
+            .iter()
+            .any(|call| !allowed_actions.allows_action(&call.request))
+        || (calls
+            .iter()
+            .any(|call| matches!(call.request, ActionRequest::Control(_)))
+            && calls.len() != 1)
+    {
+        return Err(action_contract_violated(allowed_actions));
+    }
+    match tool_choice {
+        ModelToolChoice::Required(
+            RequiredAction::ReviewDiffManifestOrTerminal { .. }
+            | RequiredAction::ReviewDiffChunksOrTerminal { .. },
+        ) if matches!(
+            calls,
+            [ToolCall {
+                request: ActionRequest::Control(
+                    coding_agent_core::ControlRequest::SubmitReview(submission)
+                ),
+                ..
+            }] if submission.is_approved()
+        ) =>
+        {
+            Err(invalid_role_output())
+        }
+        ModelToolChoice::Required(required)
+            if calls.len() != 1 || !required.matches(&calls[0].request) =>
+        {
+            Err(action_contract_violated(allowed_actions))
+        }
+        ModelToolChoice::RequiredCargoTest
+            if calls.len() != 1 || !RequiredAction::LegacyCargoTest.matches(&calls[0].request) =>
+        {
+            Err(action_contract_violated(allowed_actions))
+        }
+        ModelToolChoice::Auto
+            if calls.iter().any(|call| {
+                matches!(
+                    call.request,
+                    ActionRequest::Runtime(
+                        RuntimeActionRequest::Validation { .. }
+                            | RuntimeActionRequest::ReviewDiffManifest { .. }
+                            | RuntimeActionRequest::ReviewDiffChunks { .. }
+                    )
+                )
+            }) =>
+        {
+            Err(action_contract_violated(allowed_actions))
+        }
+        ModelToolChoice::None => Err(action_contract_violated(allowed_actions)),
+        _ => Ok(()),
+    }
+}
+
+fn action_contract_violated(allowed_actions: &AllowedActions) -> ProviderError {
+    if allowed_actions.role().is_some() {
+        role_action_not_allowed()
+    } else {
+        tool_choice_violated()
+    }
 }
 
 fn validate_tool_call_round_trips(messages: &[ModelMessage]) -> Result<(), ProviderError> {
@@ -249,21 +432,52 @@ struct ChatCompletionsRequestWire<'a> {
 }
 
 fn encode_tool_choice(
-    choice: ModelToolChoice,
+    choice: &ModelToolChoice,
     compatibility: ProviderToolChoiceCompatibility,
 ) -> Value {
     match (choice, compatibility) {
         (
-            ModelToolChoice::RequiredCargoTest,
+            ModelToolChoice::Required(
+                RequiredAction::TerminalOrBlocked(_)
+                | RequiredAction::ReviewDiffManifestOrTerminal { .. }
+                | RequiredAction::ReviewDiffChunksOrTerminal { .. },
+            ),
+            ProviderToolChoiceCompatibility::RequiredAsAuto,
+        ) => json!("auto"),
+        (
+            ModelToolChoice::Required(
+                RequiredAction::TerminalOrBlocked(_)
+                | RequiredAction::ReviewDiffManifestOrTerminal { .. }
+                | RequiredAction::ReviewDiffChunksOrTerminal { .. },
+            ),
+            ProviderToolChoiceCompatibility::Strict
+            | ProviderToolChoiceCompatibility::RequiredAsRequired,
+        ) => {
+            // A normal terminal and report_blocked are both valid uses of the
+            // one reserved convergence call. No named strict choice can
+            // express this two-schema union, so strict and required
+            // compatibility use the standard exactly-one required choice.
+            // RequiredAsAuto retains its configured wire behavior; core still
+            // revalidates exactly one returned typed control in every mode.
+            json!("required")
+        }
+        (
+            ModelToolChoice::Required(_) | ModelToolChoice::RequiredCargoTest,
             ProviderToolChoiceCompatibility::RequiredAsRequired,
         ) => {
             json!("required")
         }
-        (ModelToolChoice::RequiredCargoTest, ProviderToolChoiceCompatibility::RequiredAsAuto) => {
+        (
+            ModelToolChoice::Required(_) | ModelToolChoice::RequiredCargoTest,
+            ProviderToolChoiceCompatibility::RequiredAsAuto,
+        ) => {
             json!("auto")
         }
         (ModelToolChoice::Auto, _) => json!("auto"),
         (ModelToolChoice::None, _) => json!("none"),
+        (ModelToolChoice::Required(required), _) => {
+            json!({"type": "function", "function": {"name": required.action_name()}})
+        }
         (ModelToolChoice::RequiredCargoTest, _) => {
             json!({"type": "function", "function": {"name": "cargo_test"}})
         }
@@ -295,10 +509,18 @@ fn encode_message(message: &ModelMessage) -> Result<Value, ProviderError> {
                     {
                         return Err(invalid_request("The provider tool call ID is invalid."));
                     }
-                    let (name, arguments) = encode_tool_request(&call.request);
-                    let arguments = serde_json::to_string(&arguments).map_err(|_| {
-                        invalid_request("The provider tool call arguments could not be encoded.")
-                    })?;
+                    let name = call.request.name();
+                    let arguments =
+                        String::from_utf8(call.request.canonical_arguments().map_err(|_| {
+                            invalid_request(
+                                "The provider tool call arguments could not be encoded.",
+                            )
+                        })?)
+                        .map_err(|_| {
+                            invalid_request(
+                                "The provider tool call arguments could not be encoded.",
+                            )
+                        })?;
                     Ok(json!({
                         "id": call.id,
                         "type": "function",
@@ -319,200 +541,42 @@ fn encode_message(message: &ModelMessage) -> Result<Value, ProviderError> {
         ModelMessage::ToolResult {
             tool_call_id,
             content,
-        } => {
-            if tool_call_id.is_empty()
-                || tool_call_id.len() > 256
-                || tool_call_id.chars().any(char::is_control)
-            {
-                return Err(invalid_request("The provider tool result ID is invalid."));
-            }
-            Ok(json!({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": content,
-            }))
-        }
+        } => canonical_tool_result_wire_value(tool_call_id, content)
+            .map_err(|_| invalid_request("The provider tool result ID is invalid.")),
     }
 }
 
-fn encode_tool_request(request: &ToolRequest) -> (&'static str, Value) {
-    match request {
-        ToolRequest::ListFiles { path, depth, limit } => (
-            "list_files",
-            json!({"path": path, "depth": depth, "limit": limit}),
-        ),
-        ToolRequest::ReadFile {
-            path,
-            start_line,
-            end_line,
-        } => (
-            "read_file",
-            json!({"path": path, "start_line": start_line, "end_line": end_line}),
-        ),
-        ToolRequest::SearchText {
-            query,
-            path,
-            glob,
-            limit,
-        } => (
-            "search_text",
-            json!({"query": query, "path": path, "glob": glob, "limit": limit}),
-        ),
-        ToolRequest::ReplaceFile {
-            path,
-            expected_sha256,
-            content,
-        } => (
-            "replace_file",
-            json!({
-                "path": path,
-                "expected_sha256": expected_sha256,
-                "content": content
-            }),
-        ),
-        ToolRequest::CargoCheck {
-            package,
-            timeout_ms,
-        } => (
-            "cargo_check",
-            json!({"package": package, "timeout_ms": timeout_ms}),
-        ),
-        ToolRequest::CargoTest {
-            package,
-            test,
-            timeout_ms,
-        } => (
-            "cargo_test",
-            json!({"package": package, "test": test, "timeout_ms": timeout_ms}),
-        ),
-        ToolRequest::GitStatus => ("git_status", json!({})),
-        ToolRequest::GitDiff => ("git_diff", json!({})),
-    }
+fn decode_action_request(
+    allowed_actions: &AllowedActions,
+    name: &str,
+    arguments: &str,
+) -> Result<ActionRequest, ProviderError> {
+    let decoded = match allowed_actions.role() {
+        Some(role) => ActionRequest::decode(role, name, arguments),
+        None => ActionRequest::decode_legacy(name, arguments),
+    };
+    decoded.map_err(|_| {
+        if is_allowed_role_terminal(allowed_actions, name) {
+            invalid_role_output()
+        } else if allowed_actions.role().is_some() {
+            role_action_not_allowed()
+        } else {
+            invalid_response("The provider tool call arguments are invalid.")
+        }
+    })
 }
 
-fn decode_tool_request(name: &str, arguments: &str) -> Result<ToolRequest, ProviderError> {
-    fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T, ProviderError> {
-        serde_json::from_str(arguments)
-            .map_err(|_| invalid_response("The provider tool call arguments are invalid."))
-    }
-
-    match name {
-        "list_files" => {
-            let args: ListFilesArguments = parse(arguments)?;
-            Ok(ToolRequest::ListFiles {
-                path: args.path,
-                depth: args.depth,
-                limit: args.limit,
-            })
-        }
-        "read_file" => {
-            let args: ReadFileArguments = parse(arguments)?;
-            Ok(ToolRequest::ReadFile {
-                path: args.path,
-                start_line: args.start_line,
-                end_line: args.end_line,
-            })
-        }
-        "search_text" => {
-            let args: SearchTextArguments = parse(arguments)?;
-            Ok(ToolRequest::SearchText {
-                query: args.query,
-                path: args.path,
-                glob: args.glob,
-                limit: args.limit,
-            })
-        }
-        "replace_file" => {
-            let args: ReplaceFileArguments = parse(arguments)?;
-            Ok(ToolRequest::ReplaceFile {
-                path: args.path,
-                expected_sha256: args.expected_sha256,
-                content: args.content,
-            })
-        }
-        "cargo_check" => {
-            let args: CargoCheckArguments = parse(arguments)?;
-            Ok(ToolRequest::CargoCheck {
-                package: args.package,
-                timeout_ms: args.timeout_ms,
-            })
-        }
-        "cargo_test" => {
-            let args: CargoTestArguments = parse(arguments)?;
-            Ok(ToolRequest::CargoTest {
-                package: args.package,
-                test: args.test,
-                timeout_ms: args.timeout_ms,
-            })
-        }
-        "git_status" => {
-            let _: EmptyArguments = parse(arguments)?;
-            Ok(ToolRequest::GitStatus)
-        }
-        "git_diff" => {
-            let _: EmptyArguments = parse(arguments)?;
-            Ok(ToolRequest::GitDiff)
-        }
-        _ => Err(invalid_response("The provider requested an unknown tool.")),
-    }
+fn is_allowed_role_terminal(allowed_actions: &AllowedActions, name: &str) -> bool {
+    allowed_actions.allows_name(name)
+        && [
+            ControlKind::SubmitPlan,
+            ControlKind::SubmitExecution,
+            ControlKind::SubmitReview,
+            ControlKind::ReportBlocked,
+        ]
+        .into_iter()
+        .any(|kind| kind.name() == name)
 }
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ListFilesArguments {
-    path: String,
-    depth: u32,
-    limit: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadFileArguments {
-    path: String,
-    start_line: u64,
-    end_line: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SearchTextArguments {
-    query: String,
-    path: String,
-    #[serde(default)]
-    glob: Option<String>,
-    limit: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReplaceFileArguments {
-    path: String,
-    #[serde(default)]
-    expected_sha256: Option<String>,
-    content: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CargoCheckArguments {
-    #[serde(default)]
-    package: Option<String>,
-    timeout_ms: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CargoTestArguments {
-    #[serde(default)]
-    package: Option<String>,
-    #[serde(default)]
-    test: Option<String>,
-    timeout_ms: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyArguments {}
 
 #[allow(dead_code)]
 #[derive(Deserialize)]
@@ -585,26 +649,42 @@ struct FunctionCallWire {
 }
 
 fn tool_definitions_for_request(
-    choice: ModelToolChoice,
-    compatibility: ProviderToolChoiceCompatibility,
+    request: &ModelRequest,
+    _compatibility: ProviderToolChoiceCompatibility,
 ) -> Vec<Value> {
-    if matches!(
-        (choice, compatibility),
-        (
-            ModelToolChoice::RequiredCargoTest,
-            ProviderToolChoiceCompatibility::RequiredAsRequired
-                | ProviderToolChoiceCompatibility::RequiredAsAuto
-        )
-    ) {
-        vec![cargo_test_tool_definition()]
-    } else {
-        tool_definitions()
+    match &request.tool_choice {
+        ModelToolChoice::Required(RequiredAction::TerminalOrBlocked(normal_terminal)) => vec![
+            role_action_definition(normal_terminal.name()),
+            role_action_definition("report_blocked"),
+        ],
+        ModelToolChoice::Required(
+            required @ (RequiredAction::ReviewDiffManifestOrTerminal { .. }
+            | RequiredAction::ReviewDiffChunksOrTerminal { .. }),
+        ) => vec![
+            required_action_definition(required),
+            early_reviewer_submission_definition(),
+            role_action_definition("report_blocked"),
+        ],
+        ModelToolChoice::Required(required) => vec![required_action_definition(required)],
+        ModelToolChoice::RequiredCargoTest => vec![legacy_action_definition("cargo_test")],
+        ModelToolChoice::Auto | ModelToolChoice::None => request
+            .allowed_actions
+            .names()
+            .into_iter()
+            .map(|name| {
+                if request.allowed_actions.is_legacy() {
+                    legacy_action_definition(name)
+                } else {
+                    role_action_definition(name)
+                }
+            })
+            .collect(),
     }
 }
 
-fn tool_definitions() -> Vec<Value> {
-    vec![
-        function_tool(
+fn legacy_action_definition(name: &str) -> Value {
+    match name {
+        "list_files" => function_tool(
             "list_files",
             "List repository files below a relative path.",
             json!({
@@ -614,7 +694,7 @@ fn tool_definitions() -> Vec<Value> {
             }),
             &["path", "depth", "limit"],
         ),
-        function_tool(
+        "read_file" => function_tool(
             "read_file",
             "Read an inclusive line range from a UTF-8 repository file.",
             json!({
@@ -624,7 +704,7 @@ fn tool_definitions() -> Vec<Value> {
             }),
             &["path", "start_line", "end_line"],
         ),
-        function_tool(
+        "search_text" => function_tool(
             "search_text",
             "Search repository text below a relative path.",
             json!({
@@ -635,7 +715,7 @@ fn tool_definitions() -> Vec<Value> {
             }),
             &["query", "path", "limit"],
         ),
-        function_tool(
+        "replace_file" => function_tool(
             "replace_file",
             "Atomically replace a UTF-8 repository file.",
             json!({
@@ -645,7 +725,7 @@ fn tool_definitions() -> Vec<Value> {
             }),
             &["path", "content"],
         ),
-        function_tool(
+        "cargo_check" => function_tool(
             "cargo_check",
             "Run the bounded typed Cargo check operation.",
             json!({
@@ -654,37 +734,349 @@ fn tool_definitions() -> Vec<Value> {
             }),
             &["timeout_ms"],
         ),
-        cargo_test_tool_definition(),
-        function_tool(
+        "cargo_test" => function_tool(
+            "cargo_test",
+            "Run the bounded typed Cargo test operation.",
+            json!({
+                "package": {"type": ["string", "null"]},
+                "test": {"type": ["string", "null"]},
+                "timeout_ms": {"type": "integer", "minimum": 1}
+            }),
+            &["timeout_ms"],
+        ),
+        "git_status" => function_tool(
             "git_status",
             "Read the sanitized repository status.",
             json!({}),
             &[],
         ),
-        function_tool(
+        "git_diff" => function_tool(
             "git_diff",
             "Read the bounded sanitized repository diff.",
             json!({}),
             &[],
         ),
-    ]
+        _ => unreachable!("legacy action set is closed"),
+    }
 }
 
-fn cargo_test_tool_definition() -> Value {
-    function_tool(
-        "cargo_test",
-        "Run the bounded typed Cargo test operation.",
-        json!({
-            "package": {"type": ["string", "null"]},
-            "test": {"type": ["string", "null"]},
-            "timeout_ms": {"type": "integer", "minimum": 1}
-        }),
-        &["timeout_ms"],
-    )
+fn role_action_definition(name: &str) -> Value {
+    match name {
+        "list_files" | "read_file" | "search_text" | "replace_file" | "git_status" | "git_diff" => {
+            legacy_action_definition(name)
+        }
+        "cargo_check" => function_tool(
+            "cargo_check",
+            "Run a canonical Cargo check selector.",
+            json!({"package": nullable_selector_schema()}),
+            &["package"],
+        ),
+        "cargo_test" => function_tool(
+            "cargo_test",
+            "Run a canonical Cargo test selector.",
+            json!({
+                "package": nullable_selector_schema(),
+                "integration_test": nullable_selector_schema()
+            }),
+            &["package", "integration_test"],
+        ),
+        "review_diff_manifest" => function_tool(
+            "review_diff_manifest",
+            "Read the authoritative manifest for the current review checkpoint.",
+            json!({
+                "generation": generation_schema(),
+                "workspace_digest": digest_schema(None)
+            }),
+            &["generation", "workspace_digest"],
+        ),
+        "review_diff_chunks" => function_tool(
+            "review_diff_chunks",
+            "Read one exact contiguous authoritative diff chunk range.",
+            json!({
+                "generation": generation_schema(),
+                "workspace_digest": digest_schema(None),
+                "manifest_sha256": lower_hex_schema(),
+                "start_chunk": {"type": "integer", "minimum": 0, "maximum": 7},
+                "count": {"type": "integer", "minimum": 1, "maximum": 2}
+            }),
+            &[
+                "generation",
+                "workspace_digest",
+                "manifest_sha256",
+                "start_chunk",
+                "count",
+            ],
+        ),
+        "submit_plan" => function_tool(
+            "submit_plan",
+            "Submit the complete structured plan.",
+            json!({
+                "summary": bounded_string_schema(4_096, false),
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": bounded_string_schema(256, true),
+                            "description": bounded_string_schema(4_096, false),
+                            "acceptance_criteria": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 8,
+                                "items": bounded_string_schema(1_024, true)
+                            }
+                        },
+                        "required": ["title", "description", "acceptance_criteria"],
+                        "additionalProperties": false
+                    }
+                },
+                "initial_required_checks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "items": check_selector_schema()
+                }
+            }),
+            &["summary", "steps", "initial_required_checks"],
+        ),
+        "submit_execution" => function_tool(
+            "submit_execution",
+            "Submit the bounded execution summary.",
+            json!({"summary": bounded_string_schema(4_096, false)}),
+            &["summary"],
+        ),
+        "submit_review" => function_tool(
+            "submit_review",
+            "Submit one structured review verdict.",
+            json!({
+                "verdict": {"type": "string", "enum": ["approved", "changes_requested"]},
+                "summary": bounded_string_schema(4_096, true),
+                "findings": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "severity": {"type": "string", "enum": ["blocking", "advisory"]},
+                            "message": bounded_string_schema(2_048, true),
+                            "path": {"type": ["string", "null"], "maxLength": 4_096},
+                            "line": {"type": ["integer", "null"], "minimum": 1, "maximum": 9_007_199_254_740_991_u64}
+                        },
+                        "required": ["severity", "message", "path", "line"],
+                        "additionalProperties": false
+                    }
+                },
+                "add_required_checks": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": check_selector_schema()
+                }
+            }),
+            &["verdict", "summary", "findings", "add_required_checks"],
+        ),
+        "report_blocked" => function_tool(
+            "report_blocked",
+            "End the current role with one controlled blocked reason.",
+            json!({
+                "reason": {
+                    "type": "string",
+                    "enum": [
+                        "missing_required_context",
+                        "conflicting_user_requirements",
+                        "requires_goal_change",
+                        "unsupported_scope"
+                    ]
+                },
+                "summary": bounded_string_schema(4_096, false)
+            }),
+            &["reason", "summary"],
+        ),
+        "update_plan_progress" => function_tool(
+            "update_plan_progress",
+            "Atomically advance statuses of existing plan steps.",
+            json!({
+                "updates": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step_id": bounded_string_schema(256, true),
+                            "status": {"type": "string", "enum": ["running", "completed"]}
+                        },
+                        "required": ["step_id", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            &["updates"],
+        ),
+        _ => unreachable!("role action set is closed"),
+    }
+}
+
+fn required_action_definition(required: &RequiredAction) -> Value {
+    match required {
+        RequiredAction::LegacyCargoTest => legacy_action_definition("cargo_test"),
+        RequiredAction::Validation(check) => match check.selector().kind() {
+            RequiredCheckKind::CargoCheck => function_tool(
+                "cargo_check",
+                "Run the exact required Cargo check.",
+                json!({
+                    "check_id": {"const": check.id()},
+                    "package": {"const": check.package()}
+                }),
+                &["check_id", "package"],
+            ),
+            RequiredCheckKind::CargoTest => function_tool(
+                "cargo_test",
+                "Run the exact required Cargo test.",
+                json!({
+                    "check_id": {"const": check.id()},
+                    "package": {"const": check.package()},
+                    "integration_test": {"const": check.integration_test()}
+                }),
+                &["check_id", "package", "integration_test"],
+            ),
+        },
+        RequiredAction::ReviewDiffManifest {
+            generation,
+            workspace_digest,
+        }
+        | RequiredAction::ReviewDiffManifestOrTerminal {
+            generation,
+            workspace_digest,
+        } => function_tool(
+            "review_diff_manifest",
+            "Read the exact required review diff manifest.",
+            json!({
+                "generation": {"const": generation},
+                "workspace_digest": digest_schema(Some(workspace_digest.value()))
+            }),
+            &["generation", "workspace_digest"],
+        ),
+        RequiredAction::ReviewDiffChunks {
+            generation,
+            workspace_digest,
+            manifest_sha256,
+            start_chunk,
+            count,
+        }
+        | RequiredAction::ReviewDiffChunksOrTerminal {
+            generation,
+            workspace_digest,
+            manifest_sha256,
+            start_chunk,
+            count,
+        } => function_tool(
+            "review_diff_chunks",
+            "Read the exact required review diff chunk range.",
+            json!({
+                "generation": {"const": generation},
+                "workspace_digest": digest_schema(Some(workspace_digest.value())),
+                "manifest_sha256": {"const": manifest_sha256},
+                "start_chunk": {"const": start_chunk},
+                "count": {"const": count}
+            }),
+            &[
+                "generation",
+                "workspace_digest",
+                "manifest_sha256",
+                "start_chunk",
+                "count",
+            ],
+        ),
+        RequiredAction::Terminal(kind) | RequiredAction::TerminalOrBlocked(kind) => {
+            role_action_definition(kind.name())
+        }
+    }
+}
+
+fn early_reviewer_submission_definition() -> Value {
+    let mut definition = role_action_definition("submit_review");
+    definition["function"]["parameters"]["properties"]["verdict"] =
+        json!({"const": "changes_requested"});
+    definition
+}
+
+fn bounded_string_schema(max: usize, non_empty: bool) -> Value {
+    let mut schema = json!({"type": "string", "maxLength": max});
+    if non_empty {
+        schema["minLength"] = json!(1);
+    }
+    schema
+}
+
+fn nullable_selector_schema() -> Value {
+    json!({
+        "type": ["string", "null"],
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]*$"
+    })
+}
+
+fn generation_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9_007_199_254_740_991_u64
+    })
+}
+
+fn lower_hex_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 64,
+        "maxLength": 64,
+        "pattern": "^[0-9a-f]{64}$"
+    })
+}
+
+fn digest_schema(exact_value: Option<&str>) -> Value {
+    let value_schema = exact_value.map_or_else(lower_hex_schema, |value| json!({"const": value}));
+    json!({
+        "type": "object",
+        "properties": {
+            "algorithm": {"const": "workspace_fingerprint_v1"},
+            "value": value_schema
+        },
+        "required": ["algorithm", "value"],
+        "additionalProperties": false
+    })
+}
+
+fn check_selector_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "cargo_check"},
+                    "package": nullable_selector_schema()
+                },
+                "required": ["kind", "package"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "cargo_test"},
+                    "package": nullable_selector_schema(),
+                    "integration_test": nullable_selector_schema()
+                },
+                "required": ["kind", "package", "integration_test"],
+                "additionalProperties": false
+            }
+        ]
+    })
 }
 
 fn function_tool(
-    name: &'static str,
+    name: &str,
     description: &'static str,
     properties: Value,
     required: &[&str],
@@ -714,7 +1106,8 @@ mod tests {
         let decoded = decode_chat_completions_response_with_tool_choice(
             response,
             response.len(),
-            ModelToolChoice::Auto,
+            &AllowedActions::legacy(),
+            &ModelToolChoice::Auto,
             Some(ProviderThinkingMode::Enabled),
         )
         .expect("enabled thinking accepts reasoning state");
@@ -730,6 +1123,7 @@ mod tests {
                     ModelMessage::AssistantToolCalls(batch),
                     ModelMessage::tool_result("call-1", "clean"),
                 ],
+                allowed_actions: AllowedActions::legacy(),
                 tool_choice: ModelToolChoice::Auto,
             },
             Some(ProviderThinkingMode::Enabled),
@@ -752,7 +1146,8 @@ mod tests {
                 "coding-model",
                 &ModelRequest {
                     messages: vec![ModelMessage::user("finish safely")],
-                    tool_choice: choice,
+                    allowed_actions: AllowedActions::legacy(),
+                    tool_choice: choice.clone(),
                 },
                 None,
                 ProviderToolChoiceCompatibility::RequiredAsRequired,
@@ -780,7 +1175,8 @@ mod tests {
                 "coding-model",
                 &ModelRequest {
                     messages: vec![ModelMessage::user("finish safely")],
-                    tool_choice: choice,
+                    allowed_actions: AllowedActions::legacy(),
+                    tool_choice: choice.clone(),
                 },
                 Some(ProviderThinkingMode::Enabled),
                 ProviderToolChoiceCompatibility::RequiredAsAuto,
@@ -792,7 +1188,9 @@ mod tests {
                 body["tool_choice"],
                 match choice {
                     ModelToolChoice::None => json!("none"),
-                    ModelToolChoice::Auto | ModelToolChoice::RequiredCargoTest => json!("auto"),
+                    ModelToolChoice::Auto
+                    | ModelToolChoice::Required(_)
+                    | ModelToolChoice::RequiredCargoTest => json!("auto"),
                 }
             );
             assert_eq!(body["thinking"]["type"], "enabled");

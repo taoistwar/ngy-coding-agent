@@ -45,6 +45,14 @@ export interface EphemeralCommands {
   cancelByTaskId: Record<string, CancelCommandState>;
 }
 
+export interface SnapshotRecoveryState {
+  conflictEventId: number;
+  reason:
+    | "review_payload_conflict"
+    | "review_history_conflict"
+    | "review_task_conflict";
+}
+
 export interface AgentState {
   repositoriesById: Record<string, Repository>;
   repositoryOrder: string[];
@@ -55,7 +63,10 @@ export interface AgentState {
   selectionGeneration: number;
   detailLoading: boolean;
   detailError: string | null;
+  detailStale: boolean;
   liveBufferByTaskId: Record<string, TaskEvent[]>;
+  snapshotRecovery: SnapshotRecoveryState | null;
+  recoveryBuffer: TaskEvent[];
   appliedEventId: number;
   serviceState: BootstrapResponse["service_state"] | null;
   serviceGeneration: number;
@@ -75,7 +86,10 @@ export const initialAgentState: AgentState = {
   selectionGeneration: 0,
   detailLoading: false,
   detailError: null,
+  detailStale: false,
   liveBufferByTaskId: {},
+  snapshotRecovery: null,
+  recoveryBuffer: [],
   appliedEventId: 0,
   serviceState: null,
   serviceGeneration: 0,

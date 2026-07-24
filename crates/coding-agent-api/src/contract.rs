@@ -2,14 +2,17 @@ use std::fmt;
 use std::path::PathBuf;
 
 use coding_agent_domain::{
-    ActivityEntry, ActivityLevel, CanonicalPath, ClientRequestId, DiffFile, DiffFileStatus,
-    DiffSnapshot, PlanItem, PlanItemStatus, PlanSnapshot, Repository, RepositoryId, Task,
-    TaskEvent, TaskEventKind, TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestCase,
-    TestSnapshot, TestStatus, TimelineEntry, UtcTimestamp,
+    ActivityActor, ActivityEntry, ActivityLevel, CanonicalPath, CheckActor, CheckEvidence,
+    CheckEvidenceStatus, ClientRequestId, DeliveryReadiness, DiffFile, DiffFileStatus,
+    DiffSnapshot, FindingSeverity, PlanItem, PlanItemStatus, PlanSnapshot, Repository,
+    RepositoryId, RequiredCheck, RequiredCheckKind, ReviewCoverageEvidence, ReviewDecisionSource,
+    ReviewEvidence, ReviewFinding, ReviewVerdict, Task, TaskEvent, TaskEventKind, TaskEventPayload,
+    TaskFailure, TaskId, TaskStatus, TestCase, TestSnapshot, TestStatus, TimelineEntry,
+    UtcTimestamp, WorkspaceDigest,
 };
 use serde::Serialize;
 use utoipa::openapi::Ref;
-use utoipa::openapi::schema::{Discriminator, OneOfBuilder, Schema};
+use utoipa::openapi::schema::{Discriminator, ObjectBuilder, OneOfBuilder, Schema, Type};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -112,6 +115,24 @@ impl From<TaskStatus> for TaskStatusDto {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryReadinessDto {
+    Unreviewed,
+    ReviewApproved,
+    ReviewRejected,
+}
+
+impl From<DeliveryReadiness> for DeliveryReadinessDto {
+    fn from(value: DeliveryReadiness) -> Self {
+        match value {
+            DeliveryReadiness::Unreviewed => Self::Unreviewed,
+            DeliveryReadiness::ReviewApproved => Self::ReviewApproved,
+            DeliveryReadiness::ReviewRejected => Self::ReviewRejected,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct TaskFailureDto {
     pub code: String,
@@ -136,6 +157,7 @@ pub struct TaskDto {
     pub repository_id: uuid::Uuid,
     pub prompt: String,
     pub status: TaskStatusDto,
+    pub delivery_readiness: DeliveryReadinessDto,
     pub attempt: u32,
     pub retry_of: Option<uuid::Uuid>,
     pub created_at: UtcTimestampDto,
@@ -153,6 +175,7 @@ impl From<Task> for TaskDto {
             repository_id: value.repository_id.as_uuid(),
             prompt: value.prompt,
             status: value.status.into(),
+            delivery_readiness: value.delivery_readiness.into(),
             attempt: value.attempt,
             retry_of: value.retry_of.map(TaskId::as_uuid),
             created_at: value.created_at.into(),
@@ -166,15 +189,31 @@ impl From<Task> for TaskDto {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct PlanSnapshotDto {
+    #[schema(minimum = 0, maximum = 1)]
+    pub format_version: u8,
+    #[schema(maximum = 9_007_199_254_740_991_u64)]
     pub revision: u64,
+    #[schema(max_length = 4096)]
+    pub summary: String,
+    #[schema(max_items = 32)]
     pub items: Vec<PlanItemDto>,
+    #[schema(max_items = 16)]
+    pub initial_required_checks: Vec<RequiredCheckDto>,
 }
 
 impl From<PlanSnapshot> for PlanSnapshotDto {
     fn from(value: PlanSnapshot) -> Self {
+        let (format_version, revision, summary, items, initial_required_checks) =
+            value.into_parts();
         Self {
-            revision: value.revision,
-            items: value.items.into_iter().map(Into::into).collect(),
+            format_version,
+            revision,
+            summary,
+            items: items.into_iter().map(Into::into).collect(),
+            initial_required_checks: initial_required_checks
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -182,16 +221,24 @@ impl From<PlanSnapshot> for PlanSnapshotDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct PlanItemDto {
     pub id: String,
+    #[schema(max_length = 256)]
     pub title: String,
+    #[schema(max_length = 4096)]
+    pub description: String,
+    #[schema(max_items = 8)]
+    pub acceptance_criteria: Vec<String>,
     pub status: PlanItemStatusDto,
 }
 
 impl From<PlanItem> for PlanItemDto {
     fn from(value: PlanItem) -> Self {
+        let (id, title, description, acceptance_criteria, status) = value.into_parts();
         Self {
-            id: value.id,
-            title: value.title,
-            status: value.status.into(),
+            id,
+            title,
+            description,
+            acceptance_criteria,
+            status: status.into(),
         }
     }
 }
@@ -218,17 +265,28 @@ impl From<PlanItemStatus> for PlanItemStatusDto {
 pub struct ActivityEntryDto {
     pub id: String,
     pub level: ActivityLevelDto,
+    pub actor: ActivityActorDto,
+    #[schema(
+        required = true,
+        nullable = true,
+        minimum = 1,
+        maximum = 9_007_199_254_740_991_u64
+    )]
+    pub role_run: Option<u32>,
     pub message: String,
     pub created_at: UtcTimestampDto,
 }
 
 impl From<ActivityEntry> for ActivityEntryDto {
     fn from(value: ActivityEntry) -> Self {
+        let (id, level, actor, role_run, message, created_at) = value.into_parts();
         Self {
-            id: value.id,
-            level: value.level.into(),
-            message: value.message,
-            created_at: value.created_at.into(),
+            id,
+            level: level.into(),
+            actor: actor.into(),
+            role_run,
+            message,
+            created_at: created_at.into(),
         }
     }
 }
@@ -247,6 +305,26 @@ impl From<ActivityLevel> for ActivityLevelDto {
             ActivityLevel::Info => Self::Info,
             ActivityLevel::Warning => Self::Warning,
             ActivityLevel::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityActorDto {
+    System,
+    Planner,
+    Executor,
+    Reviewer,
+}
+
+impl From<ActivityActor> for ActivityActorDto {
+    fn from(value: ActivityActor) -> Self {
+        match value {
+            ActivityActor::System => Self::System,
+            ActivityActor::Planner => Self::Planner,
+            ActivityActor::Executor => Self::Executor,
+            ActivityActor::Reviewer => Self::Reviewer,
         }
     }
 }
@@ -368,6 +446,375 @@ impl From<TestStatus> for TestStatusDto {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+pub enum WorkspaceDigestAlgorithmDto {
+    #[serde(rename = "workspace_fingerprint_v1")]
+    #[schema(rename = "workspace_fingerprint_v1")]
+    WorkspaceFingerprintV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct WorkspaceDigestDto {
+    pub algorithm: WorkspaceDigestAlgorithmDto,
+    #[schema(min_length = 64, max_length = 64, pattern = "^[0-9a-f]{64}$")]
+    pub value: String,
+}
+
+impl From<&WorkspaceDigest> for WorkspaceDigestDto {
+    fn from(value: &WorkspaceDigest) -> Self {
+        Self {
+            algorithm: WorkspaceDigestAlgorithmDto::WorkspaceFingerprintV1,
+            value: value.value().to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+pub enum CargoCheckKind {
+    #[serde(rename = "cargo_check")]
+    #[schema(rename = "cargo_check")]
+    CargoCheck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+pub enum CargoTestKind {
+    #[serde(rename = "cargo_test")]
+    #[schema(rename = "cargo_test")]
+    CargoTest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct CargoCheckDto {
+    #[schema(min_length = 1)]
+    pub id: String,
+    pub kind: CargoCheckKind,
+    #[schema(
+        required = true,
+        nullable = true,
+        min_length = 1,
+        max_length = 128,
+        pattern = "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$"
+    )]
+    pub package: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct CargoTestDto {
+    #[schema(min_length = 1)]
+    pub id: String,
+    pub kind: CargoTestKind,
+    #[schema(
+        required = true,
+        nullable = true,
+        min_length = 1,
+        max_length = 128,
+        pattern = "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$"
+    )]
+    pub package: Option<String>,
+    #[schema(
+        required = true,
+        nullable = true,
+        min_length = 1,
+        max_length = 128,
+        pattern = "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$"
+    )]
+    pub integration_test: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum RequiredCheckDto {
+    CargoCheck(CargoCheckDto),
+    CargoTest(CargoTestDto),
+}
+
+impl PartialSchema for RequiredCheckDto {
+    fn schema() -> utoipa::openapi::RefOr<Schema> {
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name("CargoCheckDto"))
+            .item(Ref::from_schema_name("CargoTestDto"))
+            .discriminator(Some(Discriminator::with_mapping(
+                "kind",
+                [
+                    ("cargo_check", "#/components/schemas/CargoCheckDto"),
+                    ("cargo_test", "#/components/schemas/CargoTestDto"),
+                ],
+            )))
+            .into()
+    }
+}
+
+impl ToSchema for RequiredCheckDto {}
+
+impl From<&RequiredCheck> for RequiredCheckDto {
+    fn from(value: &RequiredCheck) -> Self {
+        match value.selector().kind() {
+            RequiredCheckKind::CargoCheck => Self::CargoCheck(CargoCheckDto {
+                id: value.id().to_owned(),
+                kind: CargoCheckKind::CargoCheck,
+                package: value.package().map(str::to_owned),
+            }),
+            RequiredCheckKind::CargoTest => Self::CargoTest(CargoTestDto {
+                id: value.id().to_owned(),
+                kind: CargoTestKind::CargoTest,
+                package: value.package().map(str::to_owned),
+                integration_test: value.integration_test().map(str::to_owned),
+            }),
+        }
+    }
+}
+
+impl From<RequiredCheck> for RequiredCheckDto {
+    fn from(value: RequiredCheck) -> Self {
+        Self::from(&value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckActorDto {
+    Executor,
+    Reviewer,
+}
+
+impl From<CheckActor> for CheckActorDto {
+    fn from(value: CheckActor) -> Self {
+        match value {
+            CheckActor::Executor => Self::Executor,
+            CheckActor::Reviewer => Self::Reviewer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckEvidenceStatusDto {
+    Passed,
+    Failed,
+    Cancelled,
+}
+
+impl From<CheckEvidenceStatus> for CheckEvidenceStatusDto {
+    fn from(value: CheckEvidenceStatus) -> Self {
+        match value {
+            CheckEvidenceStatus::Passed => Self::Passed,
+            CheckEvidenceStatus::Failed => Self::Failed,
+            CheckEvidenceStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct CheckEvidenceDto {
+    #[schema(min_length = 1)]
+    pub check_id: String,
+    pub actor: CheckActorDto,
+    #[schema(minimum = 1, maximum = 9_007_199_254_740_991_u64)]
+    pub role_run: u32,
+    #[schema(maximum = 9_007_199_254_740_991_u64)]
+    pub workspace_generation: u64,
+    pub workspace_digest: WorkspaceDigestDto,
+    pub status: CheckEvidenceStatusDto,
+    #[schema(maximum = 9_007_199_254_740_991_u64)]
+    pub duration_ms: u64,
+    #[schema(min_length = 1, max_length = 2048)]
+    pub summary: String,
+    pub truncated: bool,
+}
+
+impl From<&CheckEvidence> for CheckEvidenceDto {
+    fn from(value: &CheckEvidence) -> Self {
+        Self {
+            check_id: value.check_id().to_owned(),
+            actor: value.actor().into(),
+            role_run: value.role_run(),
+            workspace_generation: value.workspace_generation(),
+            workspace_digest: value.workspace_digest().into(),
+            status: value.status().into(),
+            duration_ms: value.duration_ms(),
+            summary: value.summary().to_owned(),
+            truncated: value.truncated(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverityDto {
+    Blocking,
+    Advisory,
+}
+
+impl From<FindingSeverity> for FindingSeverityDto {
+    fn from(value: FindingSeverity) -> Self {
+        match value {
+            FindingSeverity::Blocking => Self::Blocking,
+            FindingSeverity::Advisory => Self::Advisory,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ReviewFindingDto {
+    #[schema(pattern = "^review-[1-3]-finding-([1-9]|[12][0-9]|3[0-2])$")]
+    pub id: String,
+    pub severity: FindingSeverityDto,
+    #[schema(min_length = 1, max_length = 2048)]
+    pub message: String,
+    #[schema(required = true, nullable = true, min_length = 1, max_length = 4096)]
+    pub path: Option<String>,
+    #[schema(
+        required = true,
+        nullable = true,
+        minimum = 1,
+        maximum = 9_007_199_254_740_991_u64
+    )]
+    pub line: Option<u64>,
+}
+
+impl From<&ReviewFinding> for ReviewFindingDto {
+    fn from(value: &ReviewFinding) -> Self {
+        Self {
+            id: value.id().to_owned(),
+            severity: value.severity().into(),
+            message: value.message().to_owned(),
+            path: value.path().map(str::to_owned),
+            line: value.line(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ReviewChunkIndexDto(u8);
+
+impl PartialSchema for ReviewChunkIndexDto {
+    fn schema() -> utoipa::openapi::RefOr<Schema> {
+        ObjectBuilder::new()
+            .schema_type(Type::Integer)
+            .minimum(Some(0))
+            .maximum(Some(7))
+            .into()
+    }
+}
+
+impl ToSchema for ReviewChunkIndexDto {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ReviewCoverageDto {
+    #[schema(maximum = 9_007_199_254_740_991_u64)]
+    pub generation: u64,
+    pub workspace_digest: WorkspaceDigestDto,
+    #[schema(min_length = 64, max_length = 64, pattern = "^[0-9a-f]{64}$")]
+    pub manifest_sha256: String,
+    #[schema(max_items = 8)]
+    pub covered_chunks: Vec<ReviewChunkIndexDto>,
+    #[schema(maximum = 8)]
+    pub total_chunks: u8,
+}
+
+impl From<&ReviewCoverageEvidence> for ReviewCoverageDto {
+    fn from(value: &ReviewCoverageEvidence) -> Self {
+        Self {
+            generation: value.generation(),
+            workspace_digest: value.workspace_digest().into(),
+            manifest_sha256: value.manifest_sha256().to_owned(),
+            covered_chunks: value
+                .covered_chunks()
+                .iter()
+                .copied()
+                .map(ReviewChunkIndexDto)
+                .collect(),
+            total_chunks: value.total_chunks(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDecisionSourceDto {
+    Reviewer,
+    System,
+}
+
+impl From<ReviewDecisionSource> for ReviewDecisionSourceDto {
+    fn from(value: ReviewDecisionSource) -> Self {
+        match value {
+            ReviewDecisionSource::Reviewer => Self::Reviewer,
+            ReviewDecisionSource::System => Self::System,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdictDto {
+    Approved,
+    ChangesRequested,
+}
+
+impl From<ReviewVerdict> for ReviewVerdictDto {
+    fn from(value: ReviewVerdict) -> Self {
+        match value {
+            ReviewVerdict::Approved => Self::Approved,
+            ReviewVerdict::ChangesRequested => Self::ChangesRequested,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ReviewEvidenceDto {
+    #[schema(minimum = 1, maximum = 3)]
+    pub round: u8,
+    pub decision_source: ReviewDecisionSourceDto,
+    #[schema(maximum = 9_007_199_254_740_991_u64)]
+    pub workspace_generation: u64,
+    pub workspace_digest: WorkspaceDigestDto,
+    pub verdict: ReviewVerdictDto,
+    #[schema(min_length = 1, max_length = 4096)]
+    pub summary: String,
+    #[schema(max_items = 32)]
+    pub findings: Vec<ReviewFindingDto>,
+    #[schema(max_items = 16)]
+    pub added_required_checks: Vec<RequiredCheckDto>,
+    #[schema(min_items = 1, max_items = 16)]
+    pub required_checks: Vec<RequiredCheckDto>,
+    #[schema(max_items = 16)]
+    pub check_evidence: Vec<CheckEvidenceDto>,
+    #[schema(required = true, nullable = true)]
+    pub coverage: Option<ReviewCoverageDto>,
+    pub created_at: UtcTimestampDto,
+}
+
+impl From<&ReviewEvidence> for ReviewEvidenceDto {
+    fn from(value: &ReviewEvidence) -> Self {
+        Self {
+            round: value.round(),
+            decision_source: value.decision_source().into(),
+            workspace_generation: value.workspace_generation(),
+            workspace_digest: value.workspace_digest().into(),
+            verdict: value.verdict().into(),
+            summary: value.summary().to_owned(),
+            findings: value.findings().iter().map(Into::into).collect(),
+            added_required_checks: value
+                .added_required_checks()
+                .iter()
+                .map(Into::into)
+                .collect(),
+            required_checks: value.required_checks().iter().map(Into::into).collect(),
+            check_evidence: value.check_evidence().iter().map(Into::into).collect(),
+            coverage: value.coverage().map(Into::into),
+            created_at: value.created_at().into(),
+        }
+    }
+}
+
+impl From<ReviewEvidence> for ReviewEvidenceDto {
+    fn from(value: ReviewEvidence) -> Self {
+        Self::from(&value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub enum TaskEventKindDto {
     #[serde(rename = "task.queued")]
     TaskQueued,
@@ -381,6 +828,8 @@ pub enum TaskEventKindDto {
     DiffUpdated,
     #[serde(rename = "test.updated")]
     TestUpdated,
+    #[serde(rename = "review.updated")]
+    ReviewUpdated,
     #[serde(rename = "task.completed")]
     TaskCompleted,
     #[serde(rename = "task.failed")]
@@ -400,6 +849,7 @@ impl From<TaskEventKind> for TaskEventKindDto {
             TaskEventKind::ActivityAppended => Self::ActivityAppended,
             TaskEventKind::DiffUpdated => Self::DiffUpdated,
             TaskEventKind::TestUpdated => Self::TestUpdated,
+            TaskEventKind::ReviewUpdated => Self::ReviewUpdated,
             TaskEventKind::TaskCompleted => Self::TaskCompleted,
             TaskEventKind::TaskFailed => Self::TaskFailed,
             TaskEventKind::TaskCancelled => Self::TaskCancelled,
@@ -439,6 +889,8 @@ pub struct TaskDetailDto {
     pub diff: Option<DiffSnapshotDto>,
     #[schema(nullable = true)]
     pub tests: Option<TestSnapshotDto>,
+    #[schema(max_items = 3)]
+    pub reviews: Vec<ReviewEvidenceDto>,
     pub timeline: Vec<TimelineEntryDto>,
     pub event_cursor: i64,
 }
@@ -468,6 +920,11 @@ pub struct TestUpdatedPayloadDto {
     pub tests: TestSnapshotDto,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ReviewUpdatedPayloadDto {
+    pub review: ReviewEvidenceDto,
+}
+
 macro_rules! event_kind {
     ($name:ident, $variant:ident, $wire:literal) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -485,6 +942,7 @@ event_kind!(PlanUpdatedKind, PlanUpdated, "plan.updated");
 event_kind!(ActivityAppendedKind, ActivityAppended, "activity.appended");
 event_kind!(DiffUpdatedKind, DiffUpdated, "diff.updated");
 event_kind!(TestUpdatedKind, TestUpdated, "test.updated");
+event_kind!(ReviewUpdatedKind, ReviewUpdated, "review.updated");
 event_kind!(TaskCompletedKind, TaskCompleted, "task.completed");
 event_kind!(TaskFailedKind, TaskFailed, "task.failed");
 event_kind!(TaskCancelledKind, TaskCancelled, "task.cancelled");
@@ -519,6 +977,11 @@ event_envelope!(
 event_envelope!(DiffUpdatedEventDto, DiffUpdatedKind, DiffUpdatedPayloadDto);
 event_envelope!(TestUpdatedEventDto, TestUpdatedKind, TestUpdatedPayloadDto);
 event_envelope!(
+    ReviewUpdatedEventDto,
+    ReviewUpdatedKind,
+    ReviewUpdatedPayloadDto
+);
+event_envelope!(
     TaskCompletedEventDto,
     TaskCompletedKind,
     TaskLifecyclePayloadDto
@@ -544,6 +1007,7 @@ pub enum TaskEventDto {
     ActivityAppended(ActivityAppendedEventDto),
     DiffUpdated(DiffUpdatedEventDto),
     TestUpdated(TestUpdatedEventDto),
+    ReviewUpdated(ReviewUpdatedEventDto),
     TaskCompleted(TaskCompletedEventDto),
     TaskFailed(TaskFailedEventDto),
     TaskCancelled(TaskCancelledEventDto),
@@ -559,6 +1023,7 @@ impl TaskEventDto {
             Self::ActivityAppended(event) => event.id,
             Self::DiffUpdated(event) => event.id,
             Self::TestUpdated(event) => event.id,
+            Self::ReviewUpdated(event) => event.id,
             Self::TaskCompleted(event) => event.id,
             Self::TaskFailed(event) => event.id,
             Self::TaskCancelled(event) => event.id,
@@ -574,6 +1039,7 @@ impl TaskEventDto {
             Self::ActivityAppended(_) => "activity.appended",
             Self::DiffUpdated(_) => "diff.updated",
             Self::TestUpdated(_) => "test.updated",
+            Self::ReviewUpdated(_) => "review.updated",
             Self::TaskCompleted(_) => "task.completed",
             Self::TaskFailed(_) => "task.failed",
             Self::TaskCancelled(_) => "task.cancelled",
@@ -591,6 +1057,7 @@ impl PartialSchema for TaskEventDto {
             .item(Ref::from_schema_name("ActivityAppendedEventDto"))
             .item(Ref::from_schema_name("DiffUpdatedEventDto"))
             .item(Ref::from_schema_name("TestUpdatedEventDto"))
+            .item(Ref::from_schema_name("ReviewUpdatedEventDto"))
             .item(Ref::from_schema_name("TaskCompletedEventDto"))
             .item(Ref::from_schema_name("TaskFailedEventDto"))
             .item(Ref::from_schema_name("TaskCancelledEventDto"))
@@ -607,6 +1074,10 @@ impl PartialSchema for TaskEventDto {
                     ),
                     ("diff.updated", "#/components/schemas/DiffUpdatedEventDto"),
                     ("test.updated", "#/components/schemas/TestUpdatedEventDto"),
+                    (
+                        "review.updated",
+                        "#/components/schemas/ReviewUpdatedEventDto",
+                    ),
                     (
                         "task.completed",
                         "#/components/schemas/TaskCompletedEventDto",
@@ -690,6 +1161,18 @@ impl From<TaskEvent> for TaskEventDto {
                 },
                 created_at,
             }),
+            TaskEventPayload::ReviewUpdated { review } => {
+                Self::ReviewUpdated(ReviewUpdatedEventDto {
+                    id,
+                    schema_version,
+                    task_id,
+                    kind: ReviewUpdatedKind::ReviewUpdated,
+                    payload: ReviewUpdatedPayloadDto {
+                        review: review.into(),
+                    },
+                    created_at,
+                })
+            }
             TaskEventPayload::TaskCompleted { task } => {
                 Self::TaskCompleted(TaskCompletedEventDto {
                     id,
@@ -863,6 +1346,7 @@ impl QuitResponse {
     CreateTaskRequest,
     RepositoryDto,
     TaskStatusDto,
+    DeliveryReadinessDto,
     TaskFailureDto,
     TaskDto,
     PlanSnapshotDto,
@@ -870,12 +1354,30 @@ impl QuitResponse {
     PlanItemStatusDto,
     ActivityEntryDto,
     ActivityLevelDto,
+    ActivityActorDto,
     DiffSnapshotDto,
     DiffFileDto,
     DiffFileStatusDto,
     TestSnapshotDto,
     TestCaseDto,
     TestStatusDto,
+    WorkspaceDigestAlgorithmDto,
+    WorkspaceDigestDto,
+    CargoCheckKind,
+    CargoTestKind,
+    CargoCheckDto,
+    CargoTestDto,
+    RequiredCheckDto,
+    CheckActorDto,
+    CheckEvidenceStatusDto,
+    CheckEvidenceDto,
+    FindingSeverityDto,
+    ReviewFindingDto,
+    ReviewChunkIndexDto,
+    ReviewCoverageDto,
+    ReviewDecisionSourceDto,
+    ReviewVerdictDto,
+    ReviewEvidenceDto,
     TaskEventKindDto,
     TimelineEntryDto,
     TaskDetailDto,
@@ -884,12 +1386,14 @@ impl QuitResponse {
     ActivityAppendedPayloadDto,
     DiffUpdatedPayloadDto,
     TestUpdatedPayloadDto,
+    ReviewUpdatedPayloadDto,
     TaskQueuedKind,
     TaskStartedKind,
     PlanUpdatedKind,
     ActivityAppendedKind,
     DiffUpdatedKind,
     TestUpdatedKind,
+    ReviewUpdatedKind,
     TaskCompletedKind,
     TaskFailedKind,
     TaskCancelledKind,
@@ -900,6 +1404,7 @@ impl QuitResponse {
     ActivityAppendedEventDto,
     DiffUpdatedEventDto,
     TestUpdatedEventDto,
+    ReviewUpdatedEventDto,
     TaskCompletedEventDto,
     TaskFailedEventDto,
     TaskCancelledEventDto,

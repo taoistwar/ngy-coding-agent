@@ -39,6 +39,7 @@ test("adds two real repositories, reuses one identity, and switches the composer
     store_writer_faults: [],
     actor_pauses: [],
     virtual_release_signals: [],
+    legacy_v2_seed: { kind: "none" },
     marker_write_failure: false,
   };
 
@@ -51,17 +52,17 @@ test("adds two real repositories, reuses one identity, and switches the composer
 
     const repositoryA = await addRepositoryThroughUi(page, app, repositoryAPath, 201);
     expect(repositoryA.display_name).toBe("fixture-repository");
-    await expectSelectedRepository(page, repositoryA.selected_path);
+    await expectSelectedRepository(page, repositoryA);
 
     const repositoryB = await addRepositoryThroughUi(page, app, repositoryBPath, 201);
     expect(repositoryB.display_name).toBe("fixture-repository-b");
     expect(repositoryB.id).not.toBe(repositoryA.id);
-    await expectSelectedRepository(page, repositoryB.selected_path);
+    await expectSelectedRepository(page, repositoryB);
 
     const reusedA = await addRepositoryThroughUi(page, app, repositoryAPath, 200);
     expect(reusedA.id).toBe(repositoryA.id);
     expect(reusedA.selected_path).toBe(repositoryA.selected_path);
-    await expectSelectedRepository(page, repositoryA.selected_path);
+    await expectSelectedRepository(page, repositoryA);
 
     const persistedRepositories = await listRepositories(context.request, app.origin);
     expect(persistedRepositories).toHaveLength(2);
@@ -75,8 +76,8 @@ test("adds two real repositories, reuses one identity, and switches the composer
     expect(taskA.repository_id).toBe(repositoryA.id);
     await waitForTaskStatus(context.request, app.origin, taskA.id, "completed");
 
-    await repositoryButton(page, repositoryB.selected_path).click();
-    await expectSelectedRepository(page, repositoryB.selected_path);
+    await repositoryButton(page, repositoryB).click();
+    await expectSelectedRepository(page, repositoryB);
     await expect(page.getByLabel("Task description")).toBeEnabled();
     await expect(page.getByRole("button", { name: `${promptA} Attempt 1`, exact: true }))
       .toHaveCount(0);
@@ -86,15 +87,15 @@ test("adds two real repositories, reuses one identity, and switches the composer
     expect(taskB.repository_id).toBe(repositoryB.id);
     await waitForTaskStatus(context.request, app.origin, taskB.id, "completed");
 
-    await repositoryButton(page, repositoryA.selected_path).click();
-    await expectSelectedRepository(page, repositoryA.selected_path);
+    await repositoryButton(page, repositoryA).click();
+    await expectSelectedRepository(page, repositoryA);
     await expect(page.getByRole("button", { name: `${promptA} Attempt 1`, exact: true }))
       .toBeVisible();
     await expect(page.getByRole("button", { name: `${promptB} Attempt 1`, exact: true }))
       .toHaveCount(0);
 
-    await repositoryButton(page, repositoryB.selected_path).click();
-    await expectSelectedRepository(page, repositoryB.selected_path);
+    await repositoryButton(page, repositoryB).click();
+    await expectSelectedRepository(page, repositoryB);
     await expect(page.getByRole("button", { name: `${promptB} Attempt 1`, exact: true }))
       .toBeVisible();
     await expect(page.getByRole("button", { name: `${promptA} Attempt 1`, exact: true }))
@@ -206,14 +207,14 @@ async function waitForTaskStatus(
   }
 }
 
-function repositoryButton(page: Page, repositoryPath: string): Locator {
+function repositoryButton(page: Page, repository: RepositoryView): Locator {
   return page.locator("button.repository-button").filter({
-    has: page.getByText(repositoryPath, { exact: true }),
+    has: page.getByText(repository.display_name, { exact: true }),
   });
 }
 
-async function expectSelectedRepository(page: Page, repositoryPath: string): Promise<void> {
-  const selected = repositoryButton(page, repositoryPath);
+async function expectSelectedRepository(page: Page, repository: RepositoryView): Promise<void> {
+  const selected = repositoryButton(page, repository);
   await expect(selected).toHaveAttribute("aria-current", "page");
   await expect(page.locator('button.repository-button[aria-current="page"]')).toHaveCount(1);
 }

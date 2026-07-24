@@ -2,12 +2,16 @@ use std::path::PathBuf;
 
 use coding_agent_domain::{
     ActivityEntry, CanonicalPath, DiffSnapshot, EventCursor, EventId, PlanSnapshot, Repository,
-    Task, TaskEvent, TaskEventKind, TaskEventPayload, TaskFailure, TaskId, TaskStatus,
-    TestSnapshot, TimelineEntry, UtcTimestamp,
+    ReviewEvidence, Task, TaskEvent, TaskEventKind, TaskEventPayload, TaskFailure, TaskId,
+    TaskStatus, TestSnapshot, TimelineEntry, UtcTimestamp,
 };
 use serde_json::Value;
 use sqlx::SqliteConnection;
 
+use crate::reviews::{
+    load_review_by_event, load_reviews_for_task, validate_task_event_cursor,
+    validate_task_review_aggregate,
+};
 use crate::tasks::{
     TaskRecord, latest_event_cursor, load_task, parse_event_kind, task_from_record,
 };
@@ -30,6 +34,7 @@ pub struct TaskDetail {
     pub activity: Vec<ActivityEntry>,
     pub diff: Option<DiffSnapshot>,
     pub tests: Option<TestSnapshot>,
+    pub reviews: Vec<ReviewEvidence>,
     pub timeline: Vec<TimelineEntry>,
     pub event_cursor: EventCursor,
 }
@@ -57,10 +62,12 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
 
         let task_records: Vec<TaskRecord> = sqlx::query_as(
-            "SELECT id, client_request_id, repository_id, prompt, status, attempt, retry_of, \
-                    created_at, started_at, finished_at, last_event_id, failure_json \
-             FROM tasks \
-             ORDER BY created_at DESC, id",
+            "SELECT t.id, t.client_request_id, t.repository_id, t.prompt, t.status, t.attempt, \
+                    t.retry_of, t.created_at, t.started_at, t.finished_at, t.last_event_id, \
+                    t.failure_json, d.readiness \
+             FROM tasks t \
+             LEFT JOIN task_delivery_state d ON d.task_id = t.id \
+             ORDER BY t.created_at DESC, t.id",
         )
         .fetch_all(&mut *transaction)
         .await?;
@@ -68,6 +75,10 @@ impl Store {
             .into_iter()
             .map(task_from_record)
             .collect::<Result<Vec<_>, _>>()?;
+        for task in &tasks {
+            let reviews = load_reviews_for_task(&mut transaction, task.id).await?;
+            validate_task_review_aggregate(&mut transaction, task, &reviews).await?;
+        }
         let latest_event_id = latest_event_cursor(&mut transaction).await?;
         transaction.commit().await?;
 
@@ -85,10 +96,18 @@ impl Store {
             return Ok(None);
         };
         let events = load_events(&mut transaction, Some(task_id), EventCursor::ZERO, None).await?;
+        let reviews = load_reviews_for_task(&mut transaction, task_id).await?;
+        validate_task_event_cursor(&mut transaction, &task).await?;
+        validate_task_review_aggregate(&mut transaction, &task, &reviews).await?;
         let event_cursor = latest_event_cursor(&mut transaction).await?;
         transaction.commit().await?;
 
-        Ok(Some(project_task_detail(task, events, event_cursor)))
+        Ok(Some(project_task_detail(
+            task,
+            events,
+            reviews,
+            event_cursor,
+        )?))
     }
 
     pub async fn events_after(
@@ -149,7 +168,7 @@ async fn load_events(
                  FROM task_events WHERE id > ? ORDER BY id",
             )
             .bind(after.get())
-            .fetch_all(connection)
+            .fetch_all(&mut *connection)
             .await?
         }
         (Some(task_id), None) => {
@@ -159,7 +178,7 @@ async fn load_events(
             )
             .bind(task_id.to_string())
             .bind(after.get())
-            .fetch_all(connection)
+            .fetch_all(&mut *connection)
             .await?
         }
         (None, Some((high_watermark, limit))) => {
@@ -170,7 +189,7 @@ async fn load_events(
             .bind(after.get())
             .bind(high_watermark.get())
             .bind(limit_as_i64(limit))
-            .fetch_all(connection)
+            .fetch_all(&mut *connection)
             .await?
         }
         (Some(task_id), Some((high_watermark, limit))) => {
@@ -184,14 +203,21 @@ async fn load_events(
             .bind(after.get())
             .bind(high_watermark.get())
             .bind(limit_as_i64(limit))
-            .fetch_all(connection)
+            .fetch_all(&mut *connection)
             .await?
         }
     };
-    records.into_iter().map(event_from_record).collect()
+    let mut events = Vec::with_capacity(records.len());
+    for record in records {
+        events.push(event_from_record(connection, record).await?);
+    }
+    Ok(events)
 }
 
-fn event_from_record(record: EventRecord) -> Result<TaskEvent, StoreError> {
+async fn event_from_record(
+    connection: &mut SqliteConnection,
+    record: EventRecord,
+) -> Result<TaskEvent, StoreError> {
     let schema_version =
         u16::try_from(record.1).map_err(|_| StoreError::InvalidEventSchemaVersion(record.1))?;
     if schema_version != 1 {
@@ -200,15 +226,37 @@ fn event_from_record(record: EventRecord) -> Result<TaskEvent, StoreError> {
     let event_id = EventId::new(record.0)?;
     let task_id = record.2.parse().map_err(StoreError::InvalidTaskId)?;
     let kind = parse_event_kind(&record.3)?;
-    let payload_value: Value = serde_json::from_str(&record.4)?;
-    let payload = payload_from_value(kind, &payload_value, task_id, event_id)?;
-    Ok(TaskEvent {
+    let created_at = UtcTimestamp::parse_rfc3339(&record.5)?;
+    let payload = if kind == TaskEventKind::ReviewUpdated {
+        if record.4 != r#"{"evidence_ref":true}"# {
+            return Err(StoreError::InvariantViolation(
+                "review event does not contain the exact evidence marker",
+            ));
+        }
+        let review = load_review_by_event(connection, task_id, event_id).await?;
+        if review.created_at() != created_at {
+            return Err(StoreError::InvariantViolation(
+                "review event and evidence timestamps do not match",
+            ));
+        }
+        TaskEventPayload::ReviewUpdated { review }
+    } else {
+        let payload_value: Value = serde_json::from_str(&record.4)?;
+        payload_from_value(kind, &payload_value, task_id, event_id)?
+    };
+    let event = TaskEvent {
         id: event_id,
         schema_version,
         task_id,
         payload,
-        created_at: UtcTimestamp::parse_rfc3339(&record.5)?,
-    })
+        created_at,
+    };
+    if kind == TaskEventKind::ReviewUpdated && serde_json::to_vec(&event)?.len() > 192 * 1024 {
+        return Err(StoreError::InvariantViolation(
+            "review event exceeds the wire encoding limit",
+        ));
+    }
+    Ok(event)
 }
 
 fn payload_from_value(
@@ -236,6 +284,9 @@ fn payload_from_value(
         TaskEventKind::TestUpdated => Ok(TaskEventPayload::TestUpdated {
             tests: serde_json::from_value(payload_field(payload, "tests"))?,
         }),
+        TaskEventKind::ReviewUpdated => Err(StoreError::InvariantViolation(
+            "review event must be loaded from typed evidence",
+        )),
         TaskEventKind::TaskCompleted => Ok(TaskEventPayload::TaskCompleted {
             task: lifecycle_task(payload, task_id, event_id, TaskStatus::Completed)?,
         }),
@@ -284,14 +335,28 @@ fn payload_field(payload: &Value, field: &str) -> Value {
 fn project_task_detail(
     task: Task,
     events: Vec<TaskEvent>,
+    reviews: Vec<ReviewEvidence>,
     event_cursor: EventCursor,
-) -> TaskDetail {
+) -> Result<TaskDetail, StoreError> {
+    let event_reviews = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            TaskEventPayload::ReviewUpdated { review } => Some(review.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if event_reviews != reviews {
+        return Err(StoreError::InvariantViolation(
+            "review event projection does not match typed evidence",
+        ));
+    }
     let mut detail = TaskDetail {
         task,
         plan: None,
         activity: Vec::new(),
         diff: None,
         tests: None,
+        reviews,
         timeline: Vec::new(),
         event_cursor,
     };
@@ -303,13 +368,14 @@ fn project_task_detail(
                 if detail
                     .activity
                     .iter()
-                    .all(|existing| existing.id != entry.id)
+                    .all(|existing| existing.id() != entry.id())
                 {
                     detail.activity.push(entry.clone());
                 }
             }
             TaskEventPayload::DiffUpdated { diff } => detail.diff = Some(diff.clone()),
             TaskEventPayload::TestUpdated { tests } => detail.tests = Some(tests.clone()),
+            TaskEventPayload::ReviewUpdated { .. } => {}
             TaskEventPayload::TaskQueued { task }
             | TaskEventPayload::TaskStarted { task }
             | TaskEventPayload::TaskCompleted { task }
@@ -322,7 +388,7 @@ fn project_task_detail(
             }
         }
     }
-    detail
+    Ok(detail)
 }
 
 fn timeline_entry(event: &TaskEvent, task_failure: Option<TaskFailure>) -> TimelineEntry {
@@ -335,6 +401,7 @@ fn timeline_entry(event: &TaskEvent, task_failure: Option<TaskFailure>) -> Timel
         | TaskEventKind::ActivityAppended
         | TaskEventKind::DiffUpdated
         | TaskEventKind::TestUpdated
+        | TaskEventKind::ReviewUpdated
         | TaskEventKind::TaskCompleted
         | TaskEventKind::TaskCancelled => None,
     };
@@ -358,7 +425,8 @@ const fn timeline_label(kind: TaskEventKind) -> &'static str {
         TaskEventKind::PlanUpdated
         | TaskEventKind::ActivityAppended
         | TaskEventKind::DiffUpdated
-        | TaskEventKind::TestUpdated => "",
+        | TaskEventKind::TestUpdated
+        | TaskEventKind::ReviewUpdated => "",
     }
 }
 

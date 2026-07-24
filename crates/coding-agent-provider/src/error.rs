@@ -1,4 +1,7 @@
 use coding_agent_core::ProviderError;
+pub use coding_agent_core::{
+    PROVIDER_RESPONSE_ROLE_ACTION_NOT_ALLOWED, PROVIDER_RESPONSE_ROLE_OUTPUT_INVALID,
+};
 
 pub const PROVIDER_CONFIG_INVALID: &str = "PROVIDER_CONFIG_INVALID";
 pub const PROVIDER_UNAUTHORIZED: &str = "PROVIDER_UNAUTHORIZED";
@@ -98,6 +101,22 @@ pub(crate) fn tool_choice_violated() -> ProviderError {
     safe_error(
         PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED,
         "The provider response did not honor the requested tool choice.",
+        false,
+    )
+}
+
+pub(crate) fn invalid_role_output() -> ProviderError {
+    safe_error(
+        PROVIDER_RESPONSE_ROLE_OUTPUT_INVALID,
+        "The provider returned ordinary output where a role action was required.",
+        false,
+    )
+}
+
+pub(crate) fn role_action_not_allowed() -> ProviderError {
+    safe_error(
+        PROVIDER_RESPONSE_ROLE_ACTION_NOT_ALLOWED,
+        "The provider returned an action that is not allowed in the current role state.",
         false,
     )
 }

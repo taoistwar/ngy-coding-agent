@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use coding_agent_domain::{
-    CanonicalPath, ClientRequestId, NewRepository, NewTask, Repository, RepositoryId, Task,
-    TaskFailure, TaskStatus, UtcTimestamp,
+    CanonicalPath, ClientRequestId, EventId, NewRepository, NewTask, Repository, RepositoryId,
+    Task, TaskFailure, TaskStatus, UtcTimestamp,
 };
 use coding_agent_store::{RegisterRepositoryOutcome, Store, TaskTransition, TransitionOutcome};
 use sqlx::sqlite::SqliteConnectOptions;
@@ -89,12 +89,11 @@ pub async fn running_task(store: &Store) -> Task {
 }
 
 pub async fn terminal_task(store: &Store, status: TaskStatus) -> Task {
+    if status == TaskStatus::Completed {
+        return historical_completed_task(store, running_task(store).await).await;
+    }
     let (task, expected, transition) = match status {
-        TaskStatus::Completed => (
-            running_task(store).await,
-            TaskStatus::Running,
-            TaskTransition::Completed,
-        ),
+        TaskStatus::Completed => unreachable!("completed handled above"),
         TaskStatus::Failed => (
             running_task(store).await,
             TaskStatus::Running,
@@ -121,6 +120,78 @@ pub async fn terminal_task(store: &Store, status: TaskStatus) -> Task {
         TransitionOutcome::Applied { task, .. } => task,
         TransitionOutcome::Conflict { .. } => panic!("fixture terminal transition must apply"),
     }
+}
+
+/// Builds a legacy `Completed + Unreviewed` row without reopening the removed
+/// production completion path.
+pub async fn historical_completed_task(store: &Store, mut task: Task) -> Task {
+    assert_eq!(task.status, TaskStatus::Running);
+    let now = current_timestamp();
+    let mut transaction = store.pool().begin().await.unwrap();
+    sqlx::query("DROP TRIGGER tasks_reviewed_terminal_on_update")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let inserted = sqlx::query(
+        "INSERT INTO task_events (schema_version, task_id, kind, payload_json, created_at) \
+         VALUES (1, ?, 'task.completed', '{}', ?)",
+    )
+    .bind(task.id.to_string())
+    .bind(now.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let event_id = EventId::new(inserted.last_insert_rowid()).unwrap();
+    task.status = TaskStatus::Completed;
+    task.finished_at = Some(now);
+    task.last_event_id = event_id;
+    task.failure = None;
+    task = Task::try_from_stored(task).unwrap();
+    sqlx::query(
+        "UPDATE tasks SET status = 'completed', finished_at = ?, failure_json = NULL, \
+             last_event_id = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(now.to_string())
+    .bind(event_id.get())
+    .bind(task.id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER tasks_reviewed_terminal_on_update
+         BEFORE UPDATE OF status, failure_json ON tasks
+         WHEN (
+                 NEW.status = 'completed'
+                 AND OLD.status != 'completed'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM task_delivery_state d
+                     WHERE d.task_id = NEW.id AND d.readiness = 'review_approved'
+                 )
+             ) OR (
+                 NEW.status = 'failed'
+                 AND json_valid(NEW.failure_json)
+                 AND json_extract(NEW.failure_json, '$.code') = 'REVIEW_REJECTED'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM task_delivery_state d
+                     WHERE d.task_id = NEW.id AND d.readiness = 'review_rejected'
+                 )
+             )
+         BEGIN
+             SELECT RAISE(ABORT, 'reviewed terminal tasks require finalization');
+         END;",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let payload = serde_json::to_string(&serde_json::json!({ "task": &task })).unwrap();
+    sqlx::query("UPDATE task_events SET payload_json = ? WHERE id = ?")
+        .bind(payload)
+        .bind(event_id.get())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    task
 }
 
 pub fn failure(code: &str) -> TaskFailure {

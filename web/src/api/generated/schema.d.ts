@@ -184,6 +184,8 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @enum {string} */
+        ActivityActorDto: "system" | "planner" | "executor" | "reviewer";
         ActivityAppendedEventDto: {
             created_at: components["schemas"]["UtcTimestampDto"];
             /** Format: int64 */
@@ -205,10 +207,13 @@ export interface components {
             entry: components["schemas"]["ActivityEntryDto"];
         };
         ActivityEntryDto: {
+            actor: components["schemas"]["ActivityActorDto"];
             created_at: components["schemas"]["UtcTimestampDto"];
             id: string;
             level: components["schemas"]["ActivityLevelDto"];
             message: string;
+            /** Format: int32 */
+            role_run: number | null;
         };
         /** @enum {string} */
         ActivityLevelDto: "info" | "warning" | "error";
@@ -242,6 +247,47 @@ export interface components {
             task: components["schemas"]["TaskDto"];
         };
         CanonicalPathDto: string;
+        CargoCheckDto: {
+            id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "cargo_check";
+            package: string | null;
+        };
+        /** @enum {string} */
+        CargoCheckKind: "cargo_check";
+        CargoTestDto: {
+            id: string;
+            integration_test: string | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "cargo_test";
+            package: string | null;
+        };
+        /** @enum {string} */
+        CargoTestKind: "cargo_test";
+        /** @enum {string} */
+        CheckActorDto: "executor" | "reviewer";
+        CheckEvidenceDto: {
+            actor: components["schemas"]["CheckActorDto"];
+            check_id: string;
+            /** Format: int64 */
+            duration_ms: number;
+            /** Format: int32 */
+            role_run: number;
+            status: components["schemas"]["CheckEvidenceStatusDto"];
+            summary: string;
+            truncated: boolean;
+            workspace_digest: components["schemas"]["WorkspaceDigestDto"];
+            /** Format: int64 */
+            workspace_generation: number;
+        };
+        /** @enum {string} */
+        CheckEvidenceStatusDto: "passed" | "failed" | "cancelled";
         CreateTaskRequest: {
             /** Format: uuid */
             client_request_id: string;
@@ -249,6 +295,8 @@ export interface components {
             /** Format: uuid */
             repository_id: string;
         };
+        /** @enum {string} */
+        DeliveryReadinessDto: "unreviewed" | "review_approved" | "review_rejected";
         DiffFileDto: {
             /** Format: int64 */
             additions: number;
@@ -286,7 +334,11 @@ export interface components {
         DiffUpdatedPayloadDto: {
             diff: components["schemas"]["DiffSnapshotDto"];
         };
+        /** @enum {string} */
+        FindingSeverityDto: "blocking" | "advisory";
         PlanItemDto: {
+            acceptance_criteria: string[];
+            description: string;
             id: string;
             status: components["schemas"]["PlanItemStatusDto"];
             title: string;
@@ -294,9 +346,13 @@ export interface components {
         /** @enum {string} */
         PlanItemStatusDto: "pending" | "running" | "completed";
         PlanSnapshotDto: {
+            /** Format: int32 */
+            format_version: number;
+            initial_required_checks: components["schemas"]["RequiredCheckDto"][];
             items: components["schemas"]["PlanItemDto"][];
             /** Format: int64 */
             revision: number;
+            summary: string;
         };
         PlanUpdatedEventDto: {
             created_at: components["schemas"]["UtcTimestampDto"];
@@ -333,6 +389,65 @@ export interface components {
             last_opened_at: components["schemas"]["UtcTimestampDto"];
             selected_path: components["schemas"]["CanonicalPathDto"];
         };
+        RequiredCheckDto: components["schemas"]["CargoCheckDto"] | components["schemas"]["CargoTestDto"];
+        ReviewChunkIndexDto: number;
+        ReviewCoverageDto: {
+            covered_chunks: components["schemas"]["ReviewChunkIndexDto"][];
+            /** Format: int64 */
+            generation: number;
+            manifest_sha256: string;
+            /** Format: int32 */
+            total_chunks: number;
+            workspace_digest: components["schemas"]["WorkspaceDigestDto"];
+        };
+        /** @enum {string} */
+        ReviewDecisionSourceDto: "reviewer" | "system";
+        ReviewEvidenceDto: {
+            added_required_checks: components["schemas"]["RequiredCheckDto"][];
+            check_evidence: components["schemas"]["CheckEvidenceDto"][];
+            coverage: null | components["schemas"]["ReviewCoverageDto"];
+            created_at: components["schemas"]["UtcTimestampDto"];
+            decision_source: components["schemas"]["ReviewDecisionSourceDto"];
+            findings: components["schemas"]["ReviewFindingDto"][];
+            required_checks: components["schemas"]["RequiredCheckDto"][];
+            /** Format: int32 */
+            round: number;
+            summary: string;
+            verdict: components["schemas"]["ReviewVerdictDto"];
+            workspace_digest: components["schemas"]["WorkspaceDigestDto"];
+            /** Format: int64 */
+            workspace_generation: number;
+        };
+        ReviewFindingDto: {
+            id: string;
+            /** Format: int64 */
+            line: number | null;
+            message: string;
+            path: string | null;
+            severity: components["schemas"]["FindingSeverityDto"];
+        };
+        ReviewUpdatedEventDto: {
+            created_at: components["schemas"]["UtcTimestampDto"];
+            /** Format: int64 */
+            id: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "review.updated";
+            payload: components["schemas"]["ReviewUpdatedPayloadDto"];
+            /** Format: int32 */
+            schema_version: number;
+            /** Format: uuid */
+            task_id: string;
+        };
+        /** @enum {string} */
+        ReviewUpdatedKind: "review.updated";
+        ReviewUpdatedPayloadDto: {
+            review: components["schemas"]["ReviewEvidenceDto"];
+        };
+        /** @enum {string} */
+        ReviewVerdictDto: "approved" | "changes_requested";
         ServiceStateControl: {
             /** Format: int64 */
             generation: number;
@@ -398,6 +513,7 @@ export interface components {
             /** Format: int64 */
             event_cursor: number;
             plan?: null | components["schemas"]["PlanSnapshotDto"];
+            reviews: components["schemas"]["ReviewEvidenceDto"][];
             task: components["schemas"]["TaskDto"];
             tests?: null | components["schemas"]["TestSnapshotDto"];
             timeline: components["schemas"]["TimelineEntryDto"][];
@@ -408,6 +524,7 @@ export interface components {
             /** Format: uuid */
             client_request_id: string;
             created_at: components["schemas"]["UtcTimestampDto"];
+            delivery_readiness: components["schemas"]["DeliveryReadinessDto"];
             failure?: null | components["schemas"]["TaskFailureDto"];
             finished_at?: null | components["schemas"]["UtcTimestampDto"];
             /** Format: uuid */
@@ -422,9 +539,9 @@ export interface components {
             started_at?: null | components["schemas"]["UtcTimestampDto"];
             status: components["schemas"]["TaskStatusDto"];
         };
-        TaskEventDto: components["schemas"]["TaskQueuedEventDto"] | components["schemas"]["TaskStartedEventDto"] | components["schemas"]["PlanUpdatedEventDto"] | components["schemas"]["ActivityAppendedEventDto"] | components["schemas"]["DiffUpdatedEventDto"] | components["schemas"]["TestUpdatedEventDto"] | components["schemas"]["TaskCompletedEventDto"] | components["schemas"]["TaskFailedEventDto"] | components["schemas"]["TaskCancelledEventDto"] | components["schemas"]["TaskInterruptedEventDto"];
+        TaskEventDto: components["schemas"]["TaskQueuedEventDto"] | components["schemas"]["TaskStartedEventDto"] | components["schemas"]["PlanUpdatedEventDto"] | components["schemas"]["ActivityAppendedEventDto"] | components["schemas"]["DiffUpdatedEventDto"] | components["schemas"]["TestUpdatedEventDto"] | components["schemas"]["ReviewUpdatedEventDto"] | components["schemas"]["TaskCompletedEventDto"] | components["schemas"]["TaskFailedEventDto"] | components["schemas"]["TaskCancelledEventDto"] | components["schemas"]["TaskInterruptedEventDto"];
         /** @enum {string} */
-        TaskEventKindDto: "task.queued" | "task.started" | "plan.updated" | "activity.appended" | "diff.updated" | "test.updated" | "task.completed" | "task.failed" | "task.cancelled" | "task.interrupted";
+        TaskEventKindDto: "task.queued" | "task.started" | "plan.updated" | "activity.appended" | "diff.updated" | "test.updated" | "review.updated" | "task.completed" | "task.failed" | "task.cancelled" | "task.interrupted";
         TaskFailedEventDto: {
             created_at: components["schemas"]["UtcTimestampDto"];
             /** Format: int64 */
@@ -549,6 +666,12 @@ export interface components {
         };
         /** Format: date-time */
         UtcTimestampDto: string;
+        /** @enum {string} */
+        WorkspaceDigestAlgorithmDto: "workspace_fingerprint_v1";
+        WorkspaceDigestDto: {
+            algorithm: components["schemas"]["WorkspaceDigestAlgorithmDto"];
+            value: string;
+        };
     };
     responses: never;
     parameters: never;

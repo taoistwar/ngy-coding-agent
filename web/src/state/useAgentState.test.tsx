@@ -4,7 +4,9 @@ import { describe, expect, it, vi } from "vitest";
 import type {
   BootstrapResponse,
   CancellationAcceptedResponse,
+  PlanSnapshot,
   Repository,
+  ReviewEvidence,
   Task,
   TaskDetail,
   TaskEvent,
@@ -17,6 +19,7 @@ import {
 } from "./useAgentState";
 
 const NOW = "2026-07-15T00:00:00Z";
+const STREAM_REVIEW_TASK_ID = "00000000-0000-4000-8000-000000000001";
 
 function repository(id = "repo-1"): Repository {
   return {
@@ -37,9 +40,14 @@ function task(id: string, status: Task["status"] = "running", cursor = 10): Task
     client_request_id: `request-${id}`,
     prompt: id,
     status,
+    delivery_readiness: "unreviewed",
     attempt: 1,
     last_event_id: cursor,
     created_at: NOW,
+    retry_of: null,
+    started_at: null,
+    finished_at: null,
+    failure: null,
   };
 }
 
@@ -65,6 +73,141 @@ function detail(id: string, cursor = 10): TaskDetail {
     diff: null,
     tests: null,
     timeline: [],
+    reviews: [],
+  };
+}
+
+function reviewPlan(): PlanSnapshot {
+  return {
+    format_version: 1,
+    revision: 1,
+    summary: "Implement and verify the requested change.",
+    items: [
+      {
+        id: "plan-item-1",
+        title: "Implement",
+        description: "Implement the requested change.",
+        acceptance_criteria: ["The required test passes."],
+        status: "running",
+      },
+    ],
+    initial_required_checks: [
+      {
+        id: "check-cargo-test",
+        kind: "cargo_test",
+        package: null,
+        integration_test: null,
+      },
+    ],
+  };
+}
+
+function reviewEvidence(
+  round: number,
+  verdict: ReviewEvidence["verdict"] = "approved",
+): ReviewEvidence {
+  const workspaceDigest = {
+    algorithm: "workspace_fingerprint_v1" as const,
+    value: "a".repeat(64),
+  };
+  const requiredCheck = {
+    id: "check-cargo-test",
+    kind: "cargo_test" as const,
+    package: null,
+    integration_test: null,
+  };
+  return {
+    round,
+    decision_source: "reviewer",
+    workspace_generation: round,
+    workspace_digest: workspaceDigest,
+    verdict,
+    summary:
+      verdict === "approved"
+        ? `Approved in round ${round}`
+        : "A blocking issue remains.",
+    findings:
+      verdict === "approved"
+        ? []
+        : [
+            {
+              id: `review-${round}-finding-1`,
+              severity: "blocking",
+              message: "Fix the blocking issue.",
+              path: "src/lib.rs",
+              line: 7,
+            },
+          ],
+    added_required_checks: [],
+    required_checks: [requiredCheck],
+    check_evidence: [
+      {
+        check_id: requiredCheck.id,
+        actor: "executor",
+        role_run: round,
+        workspace_generation: round,
+        workspace_digest: workspaceDigest,
+        status: verdict === "approved" ? "passed" : "failed",
+        duration_ms: 12,
+        summary: verdict === "approved" ? "passed" : "failed",
+        truncated: false,
+      },
+    ],
+    coverage: {
+      generation: round,
+      workspace_digest: workspaceDigest,
+      manifest_sha256: "b".repeat(64),
+      covered_chunks: [],
+      total_chunks: 0,
+    },
+    created_at: NOW,
+  };
+}
+
+function detailWithReviews(
+  id: string,
+  reviews: ReviewEvidence[],
+  cursor = 10,
+): TaskDetail {
+  return {
+    ...detail(id, cursor),
+    plan: reviewPlan(),
+    reviews,
+  };
+}
+
+function reviewEvent(
+  id: number,
+  taskId: string,
+  review: ReviewEvidence,
+): Extract<TaskEvent, { kind: "review.updated" }> {
+  return {
+    id,
+    schema_version: 1,
+    task_id: taskId,
+    kind: "review.updated",
+    created_at: NOW,
+    payload: { review },
+  };
+}
+
+function activityEvent(id: number, taskId: string): TaskEvent {
+  return {
+    id,
+    schema_version: 1,
+    task_id: taskId,
+    kind: "activity.appended",
+    created_at: NOW,
+    payload: {
+      entry: {
+        id: `activity-${id}`,
+        level: "info",
+        actor: "system",
+        role_run: null,
+        message: "Later buffered event.",
+        created_at: NOW,
+      },
+    },
   };
 }
 
@@ -93,6 +236,7 @@ function fixture(detailImpl: (taskId: string) => Promise<TaskDetail>) {
   let callbacks: AgentStreamCallbacks | undefined;
   const start = vi.fn<(_: number) => void>();
   const stop = vi.fn();
+  const requestRecovery = vi.fn<(_: string) => void>();
   const initialize = vi.fn(async () => bootstrap());
   const bootstrapRequest = vi.fn<
     (signal?: AbortSignal) => Promise<BootstrapResponse>
@@ -130,7 +274,7 @@ function fixture(detailImpl: (taskId: string) => Promise<TaskDetail>) {
     },
     createStream: (receivedCallbacks) => {
       callbacks = receivedCallbacks;
-      return { start, stop };
+      return { start, stop, requestRecovery };
     },
   };
   return {
@@ -143,6 +287,7 @@ function fixture(detailImpl: (taskId: string) => Promise<TaskDetail>) {
     },
     start,
     stop,
+    requestRecovery,
     initialize,
     bootstrapRequest,
     taskDetail,
@@ -209,6 +354,195 @@ describe("useAgentState", () => {
     expect(result.current.state.selectedDetail?.task.status).toBe("completed");
     expect(result.current.state.selectedDetail?.event_cursor).toBe(11);
     expect(result.current.state.tasksById["task-2"]?.status).toBe("completed");
+  });
+
+  it("detects a same-tick review conflict synchronously before committing its cursor", async () => {
+    const pendingDetail = deferred<TaskDetail>();
+    const first = reviewEvidence(1, "changes_requested");
+    const testFixture = fixture(() => pendingDetail.promise);
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    act(() => result.current.selectTask("task-1"));
+    await waitFor(() => expect(testFixture.taskDetail).toHaveBeenCalledTimes(1));
+
+    let thrown: unknown;
+    await act(async () => {
+      pendingDetail.resolve(detailWithReviews("task-1", [first]));
+      await Promise.resolve();
+      try {
+        testFixture.callbacks.onTaskEvent(
+          reviewEvent(11, "task-1", {
+            ...structuredClone(first),
+            summary: "Conflicting review payload.",
+          }),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(thrown).toEqual(
+      expect.objectContaining({ name: "ReviewProjectionProtocolError" }),
+    );
+    expect(result.current.state.appliedEventId).toBe(10);
+    expect(result.current.state.snapshotRecovery).toEqual({
+      conflictEventId: 11,
+      reason: "review_payload_conflict",
+    });
+    expect(result.current.state.selectedDetail?.reviews).toEqual([first]);
+  });
+
+  it("resumes recovery from the bootstrap watermark plus only later buffered events", async () => {
+    const first = reviewEvidence(1, "changes_requested");
+    const testFixture = fixture(async (taskId) =>
+      detailWithReviews(taskId, [first]),
+    );
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    act(() => result.current.selectTask("task-1"));
+    await waitFor(() =>
+      expect(result.current.state.selectedDetail?.reviews).toEqual([first]),
+    );
+
+    act(() => {
+      expect(() =>
+        testFixture.callbacks.onTaskEvent(
+          reviewEvent(11, "task-1", {
+            ...structuredClone(first),
+            summary: "Conflicting review payload.",
+          }),
+        ),
+      ).toThrow(/review projection conflict/);
+      expect(() =>
+        testFixture.callbacks.onTaskEvent(activityEvent(12, "task-1")),
+      ).toThrow(/review projection conflict/);
+    });
+
+    let resumeCursor: number | undefined;
+    act(() => {
+      resumeCursor = testFixture.callbacks.onBootstrap({
+        ...bootstrap(),
+        latest_event_id: 11,
+        tasks: [task("task-1", "running", 11), task("task-2")],
+      });
+    });
+
+    expect(resumeCursor).toBe(12);
+    expect(result.current.state.appliedEventId).toBe(12);
+    expect(result.current.state.snapshotRecovery).toBeNull();
+    expect(result.current.state.recoveryBuffer).toEqual([]);
+    expect(
+      result.current.state.liveBufferByTaskId["task-1"]?.map(({ id }) => id),
+    ).toEqual([12]);
+    expect(testFixture.start).toHaveBeenCalledTimes(1);
+    expect(testFixture.start.mock.calls).toEqual([[10]]);
+  });
+
+  it("keeps an incomplete detail stale after refetch failure and retries on reselection", async () => {
+    const first = reviewEvidence(1, "changes_requested");
+    const second = reviewEvidence(2);
+    const testFixture = fixture(
+      vi
+        .fn<(_: string) => Promise<TaskDetail>>()
+        .mockResolvedValueOnce(detailWithReviews("task-1", []))
+        .mockRejectedValueOnce(new Error("detail refetch failed"))
+        .mockResolvedValueOnce(detailWithReviews("task-1", [first, second], 11)),
+    );
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    act(() => result.current.selectTask("task-1"));
+    await waitFor(() => expect(result.current.state.selectedDetail).not.toBeNull());
+
+    act(() => {
+      testFixture.callbacks.onTaskEvent(reviewEvent(11, "task-1", second));
+    });
+
+    expect(result.current.state.appliedEventId).toBe(11);
+    expect(result.current.state.detailStale).toBe(true);
+    await waitFor(() => {
+      expect(testFixture.taskDetail).toHaveBeenCalledTimes(2);
+      expect(result.current.state.detailError).toBe("detail refetch failed");
+    });
+    expect(result.current.state.detailStale).toBe(true);
+    expect(result.current.state.detailLoading).toBe(false);
+
+    act(() => result.current.selectTask("task-1"));
+    await waitFor(() =>
+      expect(result.current.state.selectedDetail?.reviews.map(({ round }) => round))
+        .toEqual([1, 2]),
+    );
+    expect(testFixture.taskDetail).toHaveBeenCalledTimes(3);
+    expect(result.current.state.detailStale).toBe(false);
+    expect(result.current.state.appliedEventId).toBe(11);
+  });
+
+  it("actively bridges a buffered-review conflict into transport recovery before another cursor can commit", async () => {
+    const first = reviewEvidence(1, "changes_requested");
+    const authoritativeSecond = reviewEvidence(2, "changes_requested");
+    const second = {
+      ...structuredClone(authoritativeSecond),
+      required_checks: [
+        ...authoritativeSecond.required_checks,
+        {
+          id: "unexpected-check",
+          kind: "cargo_check" as const,
+          package: null,
+        },
+      ],
+      added_required_checks: [],
+    };
+    const testFixture = fixture(
+      vi
+        .fn<(_: string) => Promise<TaskDetail>>()
+        .mockResolvedValueOnce(detailWithReviews("task-1", []))
+        .mockResolvedValueOnce(detailWithReviews("task-1", [first], 10))
+        .mockResolvedValueOnce(
+          detailWithReviews("task-1", [first, authoritativeSecond], 12),
+        ),
+    );
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    act(() => result.current.selectTask("task-1"));
+    await waitFor(() => expect(result.current.state.selectedDetail).not.toBeNull());
+
+    act(() => {
+      testFixture.callbacks.onTaskEvent(reviewEvent(11, "task-1", second));
+    });
+    expect(result.current.state.appliedEventId).toBe(11);
+
+    await waitFor(() => {
+      expect(testFixture.taskDetail).toHaveBeenCalledTimes(2);
+      expect(result.current.state.snapshotRecovery).toEqual({
+        conflictEventId: 11,
+        reason: "review_history_conflict",
+      });
+    });
+    expect(testFixture.requestRecovery).toHaveBeenCalledWith(
+      "review_history_conflict",
+    );
+
+    expect(() =>
+      testFixture.callbacks.onTaskEvent(activityEvent(12, "task-1")),
+    ).toThrow(/review projection conflict/);
+    expect(result.current.state.appliedEventId).toBe(11);
+
+    let resumeCursor: number | undefined;
+    act(() => {
+      resumeCursor = testFixture.callbacks.onBootstrap({
+        ...bootstrap(),
+        latest_event_id: 12,
+        tasks: [task("task-1", "running", 12), task("task-2")],
+      });
+    });
+
+    expect(resumeCursor).toBe(12);
+    expect(result.current.state.snapshotRecovery).toBeNull();
+    expect(result.current.state.appliedEventId).toBe(12);
+    await waitFor(() => expect(testFixture.taskDetail).toHaveBeenCalledTimes(3));
   });
 
   it("does not let a slower old detail response replace the current selection", async () => {
@@ -425,6 +759,270 @@ describe("useAgentState", () => {
       expect(testFixture.stop).toHaveBeenCalledTimes(1);
     },
   );
+
+  it("keeps a projection recovery cursor uncommitted across bootstrap failure and retries from the recovered watermark", async () => {
+    const first = reviewEvidence(1, "changes_requested");
+    const conflict = reviewEvent(11, STREAM_REVIEW_TASK_ID, {
+      ...structuredClone(first),
+      summary: "Conflicting review payload.",
+    });
+    const firstResponse = deferred<Response>();
+    const recoveryDelay = deferred<void>();
+    const reconnectDelay = deferred<void>();
+    const pendingFetch = deferred<Response>();
+    const fetchMock = vi
+      .fn<typeof globalThis.fetch>()
+      .mockImplementationOnce(async () => firstResponse.promise)
+      .mockImplementationOnce((_input, init) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () =>
+            pendingFetch.reject(
+              new DOMException("stream request aborted", "AbortError"),
+            ),
+          { once: true },
+        );
+        return pendingFetch.promise;
+      });
+    const sleep = vi
+      .fn<(_: number, __: AbortSignal) => Promise<void>>()
+      .mockImplementationOnce(async () => recoveryDelay.promise)
+      .mockImplementationOnce(async () => reconnectDelay.promise);
+    const testFixture = fixture(async (taskId) =>
+      detailWithReviews(taskId, [first]),
+    );
+    testFixture.initialize.mockResolvedValueOnce({
+      ...bootstrap(),
+      tasks: [task(STREAM_REVIEW_TASK_ID)],
+    });
+    testFixture.bootstrapRequest
+      .mockReset()
+      .mockRejectedValueOnce(new Error("bootstrap temporarily unavailable"))
+      .mockResolvedValueOnce({
+        ...bootstrap(),
+        latest_event_id: 11,
+        tasks: [task(STREAM_REVIEW_TASK_ID, "running", 11)],
+      });
+    testFixture.dependencies.createStream = createSseAgentStreamFactory(
+      testFixture.dependencies.api,
+      {
+        fetch: fetchMock,
+        sleep,
+        baseDelayMs: 1,
+        maxDelayMs: 1,
+        jitter: () => 0,
+      },
+    );
+    const { result, unmount } = renderHook(() =>
+      useAgentState(testFixture.dependencies),
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.selectTask(STREAM_REVIEW_TASK_ID));
+    await waitFor(() =>
+      expect(result.current.state.selectedDetail?.reviews).toEqual([first]),
+    );
+
+    act(() => {
+      firstResponse.resolve(
+        new Response(
+          `id: 11\nevent: review.updated\ndata: ${JSON.stringify(conflict)}\n\n`,
+          {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+          },
+        ),
+      );
+    });
+
+    await waitFor(() => {
+      expect(testFixture.bootstrapRequest).toHaveBeenCalledTimes(1);
+      expect(result.current.state.connection).toBe("unavailable");
+    });
+    expect(result.current.state.appliedEventId).toBe(10);
+    expect(result.current.state.snapshotRecovery?.conflictEventId).toBe(11);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    act(() => recoveryDelay.resolve());
+    await waitFor(() => {
+      expect(testFixture.bootstrapRequest).toHaveBeenCalledTimes(2);
+      expect(result.current.state.appliedEventId).toBe(11);
+      expect(result.current.state.snapshotRecovery).toBeNull();
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    act(() => reconnectDelay.resolve());
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain("after=11");
+
+    unmount();
+    await act(async () => Promise.resolve());
+  });
+
+  it("retries bootstrap when an active transport recovery is requested by buffered detail replay", async () => {
+    const first = reviewEvidence(1, "changes_requested");
+    const authoritativeSecond = reviewEvidence(2, "changes_requested");
+    const conflictingSecond = {
+      ...structuredClone(authoritativeSecond),
+      required_checks: [
+        ...authoritativeSecond.required_checks,
+        {
+          id: "unexpected-check",
+          kind: "cargo_check" as const,
+          package: null,
+        },
+      ],
+      added_required_checks: [],
+    };
+    const streamTask = (lastEventId: number): Task => ({
+      ...task(STREAM_REVIEW_TASK_ID, "running", lastEventId),
+      repository_id: "22222222-2222-4222-8222-222222222222",
+      client_request_id: "33333333-3333-4333-8333-333333333333",
+      started_at: NOW,
+    });
+    const streamDetail = (
+      reviews: ReviewEvidence[],
+      cursor: number,
+    ): TaskDetail => ({
+      ...detailWithReviews(STREAM_REVIEW_TASK_ID, reviews, cursor),
+      task: streamTask(cursor),
+    });
+    const recoveryDelay = deferred<void>();
+    const reconnectDelay = deferred<void>();
+    const firstResponse = deferred<Response>();
+    const pendingFetch = deferred<Response>();
+    let firstSignal: AbortSignal | null = null;
+    const fetchMock = vi
+      .fn<typeof globalThis.fetch>()
+      .mockImplementationOnce((_input, init) => {
+        firstSignal = init?.signal ?? null;
+        return firstResponse.promise;
+      })
+      .mockImplementationOnce((_input, init) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () =>
+            pendingFetch.reject(
+              new DOMException("stream request aborted", "AbortError"),
+            ),
+          { once: true },
+        );
+        return pendingFetch.promise;
+      });
+    const sleep = vi
+      .fn<(_: number, __: AbortSignal) => Promise<void>>()
+      .mockImplementationOnce(async () => recoveryDelay.promise)
+      .mockImplementationOnce(async () => reconnectDelay.promise);
+    const details = vi
+      .fn<(_: string) => Promise<TaskDetail>>()
+      .mockResolvedValueOnce(streamDetail([], 10))
+      .mockResolvedValueOnce(streamDetail([first], 10))
+      .mockResolvedValueOnce(
+        streamDetail([first, authoritativeSecond], 11),
+      );
+    const testFixture = fixture(details);
+    testFixture.initialize.mockResolvedValueOnce({
+      ...bootstrap(),
+      tasks: [streamTask(10)],
+    });
+    testFixture.bootstrapRequest
+      .mockReset()
+      .mockRejectedValueOnce(new Error("bootstrap temporarily unavailable"))
+      .mockResolvedValueOnce({
+        ...bootstrap(),
+        latest_event_id: 11,
+        tasks: [streamTask(11)],
+      });
+    testFixture.dependencies.createStream = createSseAgentStreamFactory(
+      testFixture.dependencies.api,
+      {
+        fetch: fetchMock,
+        sleep,
+        baseDelayMs: 1,
+        maxDelayMs: 1,
+        jitter: () => 0,
+      },
+    );
+    const { result, unmount } = renderHook(() =>
+      useAgentState(testFixture.dependencies),
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.selectTask(STREAM_REVIEW_TASK_ID));
+    await waitFor(() => expect(result.current.state.selectedDetail).not.toBeNull());
+
+    const conflict = reviewEvent(
+      11,
+      STREAM_REVIEW_TASK_ID,
+      conflictingSecond,
+    );
+    let frameSent = false;
+    act(() => {
+      const signal = firstSignal;
+      firstResponse.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              signal?.addEventListener(
+                "abort",
+                () => {
+                  try {
+                    controller.error(
+                      new DOMException("stream request aborted", "AbortError"),
+                    );
+                  } catch {
+                    // The reader may already have released the stream.
+                  }
+                },
+                { once: true },
+              );
+            },
+            pull(controller) {
+              if (frameSent) {
+                return;
+              }
+              frameSent = true;
+              controller.enqueue(
+                new TextEncoder().encode(
+                  `id: 11\nevent: review.updated\ndata: ${JSON.stringify(conflict)}\n\n`,
+                ),
+              );
+            },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+          },
+        ),
+      );
+    });
+
+    await waitFor(() => {
+      expect(testFixture.taskDetail).toHaveBeenCalledTimes(2);
+      expect(testFixture.bootstrapRequest).toHaveBeenCalledTimes(1);
+      expect(result.current.state.connection).toBe("unavailable");
+    });
+    expect(result.current.state.appliedEventId).toBe(11);
+    expect(result.current.state.snapshotRecovery).toEqual({
+      conflictEventId: 11,
+      reason: "review_history_conflict",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    act(() => recoveryDelay.resolve());
+    await waitFor(() => {
+      expect(testFixture.bootstrapRequest).toHaveBeenCalledTimes(2);
+      expect(result.current.state.snapshotRecovery).toBeNull();
+      expect(result.current.state.appliedEventId).toBe(11);
+    });
+
+    act(() => reconnectDelay.resolve());
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain("after=11");
+
+    unmount();
+    await act(async () => Promise.resolve());
+  });
 
   it("passes recovery AbortSignal and suppresses bootstrap projection after abort", async () => {
     const testFixture = fixture(async (taskId) => detail(taskId));

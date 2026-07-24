@@ -380,6 +380,11 @@ name = "coding-agent-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "coding-agent-domain",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -439,6 +444,8 @@ name = "coding-agent-store"
 version = "0.1.0"
 dependencies = [
  "coding-agent-domain",
+ "coding-agent-store",
+ "serde",
  "serde_json",
  "sqlx",
  "tempfile",

@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
+use sqlx::Connection as _;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+use tokio::sync::OnceCell;
 
 #[cfg(windows)]
 use crate::PrivateFile;
@@ -22,8 +25,9 @@ use crate::platform::{create_private_directory, harden_private_file};
 use crate::{
     BrowserLaunchError, BrowserOpener, FakeRunnerConfig, FakeScenario, FixedStartupRunnerFactory,
     NativeMessageSink, PlatformPaths, ScriptedFakeRunner, StartupDependencies, StartupPaths,
-    StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterTestController,
+    StoreFactory, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterTestController,
 };
+use coding_agent_store::{Store, StoreError};
 
 pub const TEST_APP_DATA_ENV: &str = "CODING_AGENT_TEST_APP_DATA_DIR";
 pub const TEST_RUNTIME_ENV: &str = "CODING_AGENT_TEST_RUNTIME_DIR";
@@ -130,12 +134,23 @@ impl VirtualReleaseTarget {
 /// All fields are required deliberately. Callers must state empty arrays and
 /// `false` explicitly so an old harness cannot silently ignore a new control.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LegacyV2Seed {
+    None,
+    CompletedTask {
+        repository_path: PathBuf,
+        task_prompt: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessTestConfig {
     pub fake_scenarios: Vec<FakeScenario>,
     pub store_writer_faults: Vec<StoreWriterFaultSpec>,
     pub actor_pauses: Vec<ActorPausePoint>,
     pub virtual_release_signals: Vec<VirtualReleaseSignal>,
+    pub legacy_v2_seed: LegacyV2Seed,
     pub marker_write_failure: bool,
 }
 
@@ -186,6 +201,30 @@ impl ProcessTestConfig {
     }
 
     fn validate(&self) -> Result<(), ProcessTestConfigError> {
+        if let LegacyV2Seed::CompletedTask {
+            repository_path,
+            task_prompt,
+        } = &self.legacy_v2_seed
+        {
+            validate_absolute("legacy v2 repository", repository_path)?;
+            let metadata = fs::symlink_metadata(repository_path).map_err(|source| {
+                ProcessTestConfigError::Io {
+                    action: "inspect legacy v2 repository",
+                    path: repository_path.clone(),
+                    source,
+                }
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(ProcessTestConfigError::InvalidLegacyV2Repository(
+                    repository_path.clone(),
+                ));
+            }
+            let prompt = task_prompt.trim();
+            if prompt.is_empty() || prompt.chars().count() > 50_000 {
+                return Err(ProcessTestConfigError::InvalidLegacyV2Prompt);
+            }
+        }
+
         let mut configured_store_pauses = HashSet::new();
         for fault in &self.store_writer_faults {
             if fault.count == 0 {
@@ -366,6 +405,12 @@ impl ProcessTestEnvironment {
         self,
         mut dependencies: StartupDependencies,
     ) -> Result<StartupDependencies, ProcessTestConfigError> {
+        dependencies.stores = Arc::new(ProcessTestStoreFactory {
+            inner: dependencies.stores.clone(),
+            database_path: self.paths.database_path.clone(),
+            seed: self.config.legacy_v2_seed.clone(),
+            seeded: OnceCell::new(),
+        });
         let writer_controller = Arc::new(
             StoreWriterTestController::try_new(self.config.store_writer_faults.clone())
                 .map_err(|error| ProcessTestConfigError::InvalidWriterFault(error.to_string()))?,
@@ -408,6 +453,164 @@ impl ProcessTestEnvironment {
         }));
         Ok(dependencies)
     }
+}
+
+struct ProcessTestStoreFactory {
+    inner: Arc<dyn StoreFactory>,
+    database_path: PathBuf,
+    seed: LegacyV2Seed,
+    seeded: OnceCell<()>,
+}
+
+#[async_trait::async_trait]
+impl StoreFactory for ProcessTestStoreFactory {
+    async fn open(&self, path: &Path) -> Result<Store, StoreError> {
+        if !matches!(self.seed, LegacyV2Seed::None) {
+            self.seeded
+                .get_or_try_init(|| async {
+                    if path != self.database_path {
+                        return Err(StoreError::InvariantViolation(
+                            "legacy v2 process seed database path mismatch",
+                        ));
+                    }
+                    seed_legacy_v2_database(path, &self.seed).await
+                })
+                .await?;
+        }
+        self.inner.open(path).await
+    }
+}
+
+async fn seed_legacy_v2_database(path: &Path, seed: &LegacyV2Seed) -> Result<(), StoreError> {
+    let LegacyV2Seed::CompletedTask {
+        repository_path,
+        task_prompt,
+    } = seed
+    else {
+        return Ok(());
+    };
+    let repository_path = fs::canonicalize(repository_path)
+        .map_err(|source| StoreError::Database(sqlx::Error::Io(source)))?;
+    let repository_path = repository_path
+        .to_str()
+        .ok_or(StoreError::InvariantViolation(
+            "legacy v2 process seed repository path is not Unicode",
+        ))?;
+    let mut connection = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .foreign_keys(true),
+    )
+    .await?;
+
+    sqlx::raw_sql(include_str!(
+        "../../coding-agent-store/migrations/0001_initial.sql"
+    ))
+    .execute(&mut connection)
+    .await?;
+    sqlx::query("INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)")
+        .bind("2026-07-23T00:00:00.000000000Z")
+        .execute(&mut connection)
+        .await?;
+    sqlx::raw_sql(include_str!(
+        "../../coding-agent-store/migrations/0002_task_attempt_artifacts.sql"
+    ))
+    .execute(&mut connection)
+    .await?;
+    sqlx::query("INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)")
+        .bind("2026-07-23T00:00:01.000000000Z")
+        .execute(&mut connection)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO repositories (
+             id, selected_path, display_name, git_root, cargo_workspace_root,
+             git_identity_key, cargo_identity_key, created_at, last_opened_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("11111111-1111-4111-8111-111111111111")
+    .bind(repository_path)
+    .bind("Legacy v2 repository")
+    .bind(repository_path)
+    .bind(repository_path)
+    .bind("legacy-v2-git-identity")
+    .bind("legacy-v2-cargo-identity")
+    .bind("2026-07-23T00:00:00.000000000Z")
+    .bind("2026-07-23T00:00:00.000000000Z")
+    .execute(&mut connection)
+    .await?;
+    sqlx::query(
+        "INSERT INTO tasks (
+             id, client_request_id, repository_id, prompt, status, attempt,
+             retry_of, created_at, started_at, finished_at, last_event_id,
+             failure_json
+         ) VALUES (?, ?, ?, ?, 'completed', 1, NULL, ?, ?, ?, 41, NULL)",
+    )
+    .bind("22222222-2222-4222-8222-222222222222")
+    .bind("33333333-3333-4333-8333-333333333333")
+    .bind("11111111-1111-4111-8111-111111111111")
+    .bind(task_prompt.trim())
+    .bind("2026-07-23T00:00:00.000000000Z")
+    .bind("2026-07-23T00:00:01.000000000Z")
+    .bind("2026-07-23T00:00:02.000000000Z")
+    .execute(&mut connection)
+    .await?;
+    sqlx::query(
+        "INSERT INTO task_events (
+             id, schema_version, task_id, kind, payload_json, created_at
+         ) VALUES (40, 1, ?, 'plan.updated', ?, ?)",
+    )
+    .bind("22222222-2222-4222-8222-222222222222")
+    .bind(
+        r#"{"plan":{"revision":7,"items":[{"id":"legacy-step","title":"Legacy execution","status":"completed"}]}}"#,
+    )
+    .bind("2026-07-23T00:00:01.000000000Z")
+    .execute(&mut connection)
+    .await?;
+    let completed_payload = serde_json::to_string(&serde_json::json!({
+        "task": {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "client_request_id": "33333333-3333-4333-8333-333333333333",
+            "repository_id": "11111111-1111-4111-8111-111111111111",
+            "prompt": task_prompt.trim(),
+            "status": "completed",
+            "attempt": 1,
+            "retry_of": null,
+            "created_at": "2026-07-23T00:00:00.000000000Z",
+            "started_at": "2026-07-23T00:00:01.000000000Z",
+            "finished_at": "2026-07-23T00:00:02.000000000Z",
+            "last_event_id": 41,
+            "failure": null
+        }
+    }))?;
+    sqlx::query(
+        "INSERT INTO task_events (
+             id, schema_version, task_id, kind, payload_json, created_at
+         ) VALUES (41, 1, ?, 'task.completed', ?, ?)",
+    )
+    .bind("22222222-2222-4222-8222-222222222222")
+    .bind(completed_payload)
+    .bind("2026-07-23T00:00:02.000000000Z")
+    .execute(&mut connection)
+    .await?;
+    sqlx::query(
+        "INSERT INTO task_attempt_artifacts (
+             task_id, repository_id, attempt, base_commit, branch_name,
+             worktree_path, state, failure_code, created_at, updated_at
+         ) VALUES (?, ?, 1, ?, ?, ?, 'ready', NULL, ?, ?)",
+    )
+    .bind("22222222-2222-4222-8222-222222222222")
+    .bind("11111111-1111-4111-8111-111111111111")
+    .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .bind("codex/legacy-v2-completed")
+    .bind(repository_path)
+    .bind("2026-07-23T00:00:00.000000000Z")
+    .bind("2026-07-23T00:00:00.000000000Z")
+    .execute(&mut connection)
+    .await?;
+    connection.close().await?;
+    Ok(())
 }
 
 pub(crate) struct ProcessTestRuntime {
@@ -671,6 +874,10 @@ pub enum ProcessTestConfigError {
     InvalidScenarioSize { actual: u64, maximum: u64 },
     #[error("scenario JSON is invalid: {0}")]
     InvalidJson(#[source] serde_json::Error),
+    #[error("legacy v2 repository path is not a real directory: {0}")]
+    InvalidLegacyV2Repository(PathBuf),
+    #[error("legacy v2 completed task prompt is invalid")]
+    InvalidLegacyV2Prompt,
     #[error("StoreWriter fault count must be positive")]
     InvalidFaultCount,
     #[error("StoreWriter process pause {point:?} must have count 1, got {count}")]
@@ -1421,9 +1628,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ActorPauseController, ActorPausePoint, ProcessSignalDirectory, ProcessTestConfig,
-        ProcessTestConfigError, StoreWriterFaultPoint, StoreWriterFaultSpec, VirtualReleaseSignal,
-        VirtualReleaseTarget, wait_for_virtual_signal,
+        ActorPauseController, ActorPausePoint, LegacyV2Seed, ProcessSignalDirectory,
+        ProcessTestConfig, ProcessTestConfigError, StoreWriterFaultPoint, StoreWriterFaultSpec,
+        VirtualReleaseSignal, VirtualReleaseTarget, wait_for_virtual_signal,
     };
     use crate::StoreWriterOperationKind;
 
@@ -1576,6 +1783,7 @@ mod tests {
             store_writer_faults: vec![pause.clone()],
             actor_pauses: Vec::new(),
             virtual_release_signals: Vec::new(),
+            legacy_v2_seed: LegacyV2Seed::None,
             marker_write_failure: false,
         };
 

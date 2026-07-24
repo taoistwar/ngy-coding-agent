@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use coding_agent_core::{DiffEvent, DiffFile, DiffFileStatus};
+use coding_agent_core::{DiffEvent, DiffFile, DiffFileStatus, ReviewDiffInputFile};
 use tokio_util::sync::CancellationToken;
 
 use crate::command_policy::{
@@ -110,6 +110,32 @@ impl DiffCollector {
         revision: u64,
         cancellation: CancellationToken,
     ) -> Result<DiffEvent, DiffError> {
+        let files = self.collect_complete(cancellation).await?;
+        Ok(DiffEvent {
+            revision,
+            files: files.into_iter().map(|file| file.event).collect(),
+        })
+    }
+
+    /// Collects the same authoritative snapshot used by [`Self::collect`] but
+    /// preserves raw Git paths and full patch bytes until review-safety checks
+    /// have completed. Display-oriented `DiffEvent` data is never reverse
+    /// parsed into coverage authority.
+    pub(crate) async fn collect_review_inputs(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<ReviewDiffInputFile>, DiffError> {
+        self.collect_complete(cancellation)
+            .await?
+            .into_iter()
+            .map(CollectedDiffFile::into_review_input)
+            .collect()
+    }
+
+    async fn collect_complete(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<CollectedDiffFile>, DiffError> {
         let initial_status = self.read_status(cancellation.clone()).await?;
         let changes = parse_porcelain_v2(&initial_status, self.limits.max_files)?;
         let mut total_untracked_bytes = 0u64;
@@ -155,7 +181,7 @@ impl DiffCollector {
             return Err(DiffError::WorkspaceChanged);
         }
 
-        Ok(DiffEvent { revision, files })
+        Ok(files)
     }
 
     async fn read_status(&self, cancellation: CancellationToken) -> Result<Vec<u8>, DiffError> {
@@ -180,7 +206,7 @@ impl DiffCollector {
         change: &ChangedPath,
         status: DiffFileStatus,
         cancellation: CancellationToken,
-    ) -> Result<DiffFile, DiffError> {
+    ) -> Result<CollectedDiffFile, DiffError> {
         let os_path = change.path.to_os_string()?;
         let count_command = ValidatedCommand::git_diff_numstat_path(
             Arc::clone(&self.git),
@@ -205,15 +231,21 @@ impl DiffCollector {
                 "diff --git a/{0} b/{0}\nBinary change omitted\n",
                 display_path
             );
-            let (patch, _) =
-                bounded_patch(metadata.into_bytes(), false, self.limits.max_patch_bytes);
-            return Ok(DiffFile {
-                path: display_path,
-                status,
-                patch,
-                additions: 0,
-                deletions: 0,
-                truncated: true,
+            let patch_bytes = metadata.into_bytes();
+            let (patch, _) = bounded_patch(patch_bytes.clone(), false, self.limits.max_patch_bytes);
+            return Ok(CollectedDiffFile {
+                event: DiffFile {
+                    path: display_path,
+                    status,
+                    patch,
+                    additions: 0,
+                    deletions: 0,
+                    truncated: true,
+                },
+                raw_path: change.path.raw().to_vec(),
+                patch_bytes,
+                binary: true,
+                patch_complete: false,
             });
         }
 
@@ -243,16 +275,26 @@ impl DiffCollector {
         } else {
             retained_output(&patch_result.stdout)
         };
-        let (patch, truncated) =
-            bounded_patch(retained, source_truncated, self.limits.max_patch_bytes);
+        let patch_complete = !source_truncated && retained.len() <= self.limits.max_patch_bytes;
+        let (patch, truncated) = bounded_patch(
+            retained.clone(),
+            source_truncated,
+            self.limits.max_patch_bytes,
+        );
 
-        Ok(DiffFile {
-            path: display_path,
-            status,
-            patch,
-            additions: counts.additions,
-            deletions: counts.deletions,
-            truncated,
+        Ok(CollectedDiffFile {
+            event: DiffFile {
+                path: display_path,
+                status,
+                patch,
+                additions: counts.additions,
+                deletions: counts.deletions,
+                truncated,
+            },
+            raw_path: change.path.raw().to_vec(),
+            patch_bytes: retained,
+            binary: false,
+            patch_complete,
         })
     }
 
@@ -315,16 +357,22 @@ impl DiffCollector {
                 "diff --git a/{0} b/{0}\nnew file mode {1}\nBinary file b/{0} omitted\n",
                 display_path, mode
             );
-            let (patch, _) =
-                bounded_patch(metadata.into_bytes(), false, self.limits.max_patch_bytes);
+            let patch_bytes = metadata.into_bytes();
+            let (patch, _) = bounded_patch(patch_bytes.clone(), false, self.limits.max_patch_bytes);
             return Ok(CollectedUntracked {
-                file: DiffFile {
-                    path: display_path,
-                    status: DiffFileStatus::Added,
-                    patch,
-                    additions: 0,
-                    deletions: 0,
-                    truncated: true,
+                file: CollectedDiffFile {
+                    event: DiffFile {
+                        path: display_path,
+                        status: DiffFileStatus::Added,
+                        patch,
+                        additions: 0,
+                        deletions: 0,
+                        truncated: true,
+                    },
+                    raw_path: change.path.raw().to_vec(),
+                    patch_bytes,
+                    binary: true,
+                    patch_complete: false,
                 },
                 read_lease,
             });
@@ -333,16 +381,24 @@ impl DiffCollector {
         let text = std::str::from_utf8(&content).expect("binary classification validated UTF-8");
         let additions = logical_line_count(text);
         let full_patch = synthesize_added_patch(&display_path, mode, text, additions);
+        let patch_bytes = full_patch.into_bytes();
+        let patch_complete = patch_bytes.len() <= self.limits.max_patch_bytes;
         let (patch, truncated) =
-            bounded_patch(full_patch.into_bytes(), false, self.limits.max_patch_bytes);
+            bounded_patch(patch_bytes.clone(), false, self.limits.max_patch_bytes);
         Ok(CollectedUntracked {
-            file: DiffFile {
-                path: display_path,
-                status: DiffFileStatus::Added,
-                patch,
-                additions,
-                deletions: 0,
-                truncated,
+            file: CollectedDiffFile {
+                event: DiffFile {
+                    path: display_path,
+                    status: DiffFileStatus::Added,
+                    patch,
+                    additions,
+                    deletions: 0,
+                    truncated,
+                },
+                raw_path: change.path.raw().to_vec(),
+                patch_bytes,
+                binary: false,
+                patch_complete,
             },
             read_lease,
         })
@@ -350,8 +406,38 @@ impl DiffCollector {
 }
 
 struct CollectedUntracked {
-    file: DiffFile,
+    file: CollectedDiffFile,
     read_lease: Option<File>,
+}
+
+struct CollectedDiffFile {
+    event: DiffFile,
+    raw_path: Vec<u8>,
+    patch_bytes: Vec<u8>,
+    binary: bool,
+    patch_complete: bool,
+}
+
+impl CollectedDiffFile {
+    fn into_review_input(self) -> Result<ReviewDiffInputFile, DiffError> {
+        if self.binary {
+            return Err(DiffError::ReviewBinary);
+        }
+        if !self.patch_complete || self.event.truncated {
+            return Err(DiffError::ReviewPatchIncomplete);
+        }
+        let path = String::from_utf8(self.raw_path).map_err(|_| DiffError::ReviewPathNotUtf8)?;
+        let patch =
+            String::from_utf8(self.patch_bytes).map_err(|_| DiffError::ReviewPatchNotUtf8)?;
+        ReviewDiffInputFile::try_new(
+            path,
+            self.event.status,
+            self.event.additions,
+            self.event.deletions,
+            patch,
+        )
+        .map_err(|_| DiffError::ReviewTypedLimit)
+    }
 }
 
 fn platform_environment(path: &Path) -> Result<PlatformEnvironment, DiffError> {
@@ -907,6 +993,16 @@ pub enum DiffError {
     UntrackedRead(#[source] io::Error),
     #[error("the worktree changed while its diff was being collected")]
     WorkspaceChanged,
+    #[error("a binary diff cannot be represented as authoritative review coverage")]
+    ReviewBinary,
+    #[error("a review diff path is not valid UTF-8")]
+    ReviewPathNotUtf8,
+    #[error("a review diff patch is not valid UTF-8")]
+    ReviewPatchNotUtf8,
+    #[error("a review diff patch was truncated or incompletely retained")]
+    ReviewPatchIncomplete,
+    #[error("a review diff input exceeds its typed coverage bounds")]
+    ReviewTypedLimit,
 }
 
 impl DiffError {
@@ -932,6 +1028,11 @@ impl DiffError {
                 "DIFF_TOO_LARGE"
             }
             Self::WorkspaceChanged => "WORKTREE_CHANGED_DURING_DIFF",
+            Self::ReviewBinary
+            | Self::ReviewPathNotUtf8
+            | Self::ReviewPatchNotUtf8
+            | Self::ReviewPatchIncomplete
+            | Self::ReviewTypedLimit => "REVIEW_DIFF_COVERAGE_LIMIT",
         }
     }
 }

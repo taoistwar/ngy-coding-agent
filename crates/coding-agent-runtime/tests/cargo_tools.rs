@@ -5,6 +5,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use coding_agent_core::RequiredCheckKind;
 use coding_agent_runtime::{
     CargoRunStatus, CargoToolLimits, CargoTools, ExecutionDirectory, ProcessLimits,
     discover_toolchain,
@@ -72,6 +73,19 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
         catalog.packages()[0].integration_tests(),
         &["passing".to_owned(), "slow".to_owned()]
     );
+    let selectors = catalog.required_check_selectors().unwrap();
+    assert!(selectors.iter().any(|selector| {
+        selector.kind() == RequiredCheckKind::CargoCheck && selector.package().is_none()
+    }));
+    assert!(selectors.iter().any(|selector| {
+        selector.kind() == RequiredCheckKind::CargoTest
+            && selector.package().is_none()
+            && selector.integration_test().is_none()
+    }));
+    assert!(selectors.iter().any(|selector| {
+        selector.package() == Some("typed_fixture")
+            && selector.integration_test() == Some("passing")
+    }));
 
     let check = tools
         .check(
@@ -93,6 +107,28 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
         .await
         .unwrap();
     assert_eq!(passing.status, CargoRunStatus::Passed, "{passing:?}");
+
+    let package_required = tools
+        .test(
+            None,
+            Some("passing"),
+            Duration::from_secs(10),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(package_required.code(), "COMMAND_NOT_ALLOWED");
+
+    let workspace_test = tools
+        .test(
+            None,
+            None,
+            Duration::from_secs(10),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(workspace_test.status, CargoRunStatus::TimedOut);
 
     std::fs::write(
         tests.join("passing.rs"),

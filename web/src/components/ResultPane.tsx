@@ -1,10 +1,18 @@
-import type { DiffSnapshot, Task, TestSnapshot, TimelineEntry } from "../api/types";
+import type {
+  DiffSnapshot,
+  ReviewEvidence,
+  Task,
+  TestSnapshot,
+  TimelineEntry,
+} from "../api/types";
 import { ErrorBoundary } from "./ErrorBoundary";
+import { ReviewPane } from "./ReviewPane";
 
 export interface ResultPaneProps {
   task: Task;
   diff: DiffSnapshot | null;
   tests: TestSnapshot | null;
+  reviews: ReviewEvidence[];
   timeline: TimelineEntry[];
   boundaryResetKey: string | number;
 }
@@ -28,7 +36,9 @@ function DiffPanel({ diff }: { diff: DiffSnapshot | null }) {
     <section className="evidence-panel diff-panel" aria-labelledby="diff-heading">
       <div className="panel-heading-row">
         <h3 id="diff-heading">Worktree diff</h3>
-        {diff !== null ? <span>Revision {diff.revision}</span> : null}
+        {diff !== null ? (
+          <span>Workspace generation {diff.revision}</span>
+        ) : null}
       </div>
       {diff === null || diff.files.length === 0 ? (
         <p className="empty-state">No worktree diff is available yet.</p>
@@ -63,11 +73,14 @@ function TestsPanel({ tests }: { tests: TestSnapshot | null }) {
       <div className="panel-heading-row">
         <h3 id="tests-heading">Test results</h3>
         {tests !== null ? (
-          <span className={`status-${tests.status}`}>
-            <span className="status-glyph" aria-hidden="true">
-              {TEST_GLYPH[tests.status]}
-            </span>{" "}
-            {tests.status}
+          <span className="panel-heading-meta">
+            <span>Workspace generation {tests.revision}</span>
+            <span className={`status-${tests.status}`}>
+              <span className="status-glyph" aria-hidden="true">
+                {TEST_GLYPH[tests.status]}
+              </span>{" "}
+              {tests.status}
+            </span>
           </span>
         ) : null}
       </div>
@@ -130,6 +143,7 @@ export function ResultPane({
   task,
   diff,
   tests,
+  reviews,
   timeline,
   boundaryResetKey,
 }: ResultPaneProps) {
@@ -145,6 +159,12 @@ export function ResultPane({
           <p>{task.failure.retryable ? "Retry is allowed." : "Retry is not advised."}</p>
         </section>
       ) : null}
+      <ErrorBoundary
+        fallback={<p role="alert">Review unavailable</p>}
+        resetKey={boundaryResetKey}
+      >
+        <ReviewPane task={task} reviews={reviews} diff={diff} tests={tests} />
+      </ErrorBoundary>
       <ErrorBoundary
         fallback={<p role="alert">Diff unavailable</p>}
         resetKey={boundaryResetKey}

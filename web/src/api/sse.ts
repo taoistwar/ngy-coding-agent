@@ -1,4 +1,5 @@
-import type { SseMessage, Task, TaskEvent } from "./types";
+import type { SseMessage } from "./types";
+import { ValidationError, validateTaskEvent } from "./validation";
 
 const DEFAULT_ENDPOINT = "/api/events";
 const DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
@@ -13,6 +14,7 @@ const TASK_EVENT_KINDS = new Set([
   "activity.appended",
   "diff.updated",
   "test.updated",
+  "review.updated",
   "task.completed",
   "task.failed",
   "task.cancelled",
@@ -367,6 +369,7 @@ export class SseClient {
   #stopped = true;
   #running = false;
   #activeController: AbortController | undefined;
+  #requestedRecovery: SseRecoveryReason | undefined;
 
   constructor(options: SseClientOptions) {
     this.#callbacks = options.callbacks;
@@ -406,6 +409,7 @@ export class SseClient {
     assertCursor(cursor);
     this.#running = true;
     this.#stopped = false;
+    this.#requestedRecovery = undefined;
     this.#lastAppliedId = cursor;
 
     try {
@@ -419,18 +423,52 @@ export class SseClient {
 
   stop(): void {
     this.#stopped = true;
+    this.#requestedRecovery = undefined;
     this.#activeController?.abort();
+  }
+
+  requestRecovery(reason: SseRecoveryReason): void {
+    if (this.#stopped || !this.#running) {
+      return;
+    }
+    this.#requestedRecovery ??= reason;
+    this.#activeController?.abort();
+  }
+
+  #takeRequestedRecovery(): SseRecoveryReason | undefined {
+    const requested = this.#requestedRecovery;
+    this.#requestedRecovery = undefined;
+    return requested;
   }
 
   async #run(): Promise<void> {
     let failureStreak = 0;
 
     while (!this.#stopped) {
-      this.#callbacks.onState({
-        kind: "connecting",
-        cursor: this.#lastAppliedId,
-      });
-      const exit = await this.#openOnce();
+      let exit: ConnectionExit;
+      const requestedBeforeOpen = this.#takeRequestedRecovery();
+      if (requestedBeforeOpen !== undefined) {
+        exit = {
+          kind: "protocol",
+          reason: requestedBeforeOpen,
+          cursorAdvanced: false,
+        };
+      } else {
+        this.#callbacks.onState({
+          kind: "connecting",
+          cursor: this.#lastAppliedId,
+        });
+        const cursorBeforeOpen = this.#lastAppliedId;
+        exit = await this.#openOnce();
+        const requestedAfterOpen = this.#takeRequestedRecovery();
+        if (requestedAfterOpen !== undefined && !this.#stopped) {
+          exit = {
+            kind: "protocol",
+            reason: requestedAfterOpen,
+            cursorAdvanced: this.#lastAppliedId > cursorBeforeOpen,
+          };
+        }
+      }
 
       if (exit.kind === "stopped") {
         break;
@@ -475,6 +513,9 @@ export class SseClient {
           reason: "protocol-recovered",
         });
         if (!(await this.#wait(delayMs))) {
+          if (!this.#stopped && this.#requestedRecovery !== undefined) {
+            continue;
+          }
           break;
         }
         continue;
@@ -495,6 +536,9 @@ export class SseClient {
         reason: exit.reason,
       });
       if (!(await this.#wait(delayMs))) {
+        if (!this.#stopped && this.#requestedRecovery !== undefined) {
+          continue;
+        }
         break;
       }
     }
@@ -721,20 +765,50 @@ export class SseClient {
   async #recover(
     reason: SseRecoveryReason,
   ): Promise<"recovered" | "session-expired" | "stopped"> {
+    let activeReason = reason;
     this.#callbacks.onState({
       kind: "recovering",
       cursor: this.#lastAppliedId,
-      reason,
+      reason: activeReason,
     });
     let attempt = 0;
 
     while (!this.#stopped) {
+      const requestedBeforeAttempt = this.#takeRequestedRecovery();
+      if (requestedBeforeAttempt !== undefined) {
+        activeReason = mergeRecoveryReasons(
+          activeReason,
+          requestedBeforeAttempt,
+        );
+        this.#callbacks.onState({
+          kind: "recovering",
+          cursor: this.#lastAppliedId,
+          reason: activeReason,
+        });
+      }
+
       const controller = new AbortController();
       this.#activeController = controller;
       try {
-        const cursor = await this.#callbacks.recover(reason, controller.signal);
+        const cursor = await this.#callbacks.recover(
+          activeReason,
+          controller.signal,
+        );
         if (this.#stopped) {
           return "stopped";
+        }
+        const requestedDuringAttempt = this.#takeRequestedRecovery();
+        if (requestedDuringAttempt !== undefined) {
+          activeReason = mergeRecoveryReasons(
+            activeReason,
+            requestedDuringAttempt,
+          );
+          this.#callbacks.onState({
+            kind: "recovering",
+            cursor: this.#lastAppliedId,
+            reason: activeReason,
+          });
+          continue;
         }
         assertCursor(cursor);
         this.#lastAppliedId = cursor;
@@ -745,6 +819,19 @@ export class SseClient {
         }
         if (isSessionExpiredError(error)) {
           return "session-expired";
+        }
+        const requestedDuringAttempt = this.#takeRequestedRecovery();
+        if (requestedDuringAttempt !== undefined) {
+          activeReason = mergeRecoveryReasons(
+            activeReason,
+            requestedDuringAttempt,
+          );
+          this.#callbacks.onState({
+            kind: "recovering",
+            cursor: this.#lastAppliedId,
+            reason: activeReason,
+          });
+          continue;
         }
         const delayMs = computeBackoffDelay(
           attempt,
@@ -757,10 +844,26 @@ export class SseClient {
           kind: "unavailable",
           attempt,
           delayMs,
-          reason,
+          reason: activeReason,
           error,
         });
         if (!(await this.#wait(delayMs))) {
+          if (this.#stopped) {
+            return "stopped";
+          }
+          const requestedDuringBackoff = this.#takeRequestedRecovery();
+          if (requestedDuringBackoff !== undefined) {
+            activeReason = mergeRecoveryReasons(
+              activeReason,
+              requestedDuringBackoff,
+            );
+            this.#callbacks.onState({
+              kind: "recovering",
+              cursor: this.#lastAppliedId,
+              reason: activeReason,
+            });
+            continue;
+          }
           return "stopped";
         }
       } finally {
@@ -914,20 +1017,22 @@ function decodeFrame(frame: SseFrame, schemaVersion: number): DecodedFrame {
     };
   }
 
-  if (
-    typeof value.task_id !== "string" ||
-    value.task_id.length === 0 ||
-    typeof value.created_at !== "string" ||
-    !isKnownTaskEvent(value)
-  ) {
+  let taskEvent;
+  try {
+    taskEvent = validateTaskEvent(value);
+  } catch (error) {
+    if (!(error instanceof ValidationError)) {
+      throw error;
+    }
     throw new SseProtocolError(
       "MALFORMED_ENVELOPE",
       `persisted ${value.kind} envelope was malformed`,
+      { cause: error },
     );
   }
   return {
     kind: "message",
-    message: value,
+    message: taskEvent,
     persistedId: frameId,
   };
 }
@@ -942,179 +1047,6 @@ function isServiceStateMessage(
     isNonNegativeSafeInteger(value.generation) &&
     isServiceState(value.state)
   );
-}
-
-function isKnownTaskEvent(value: unknown): value is TaskEvent {
-  if (
-    !isRecord(value) ||
-    !isPositiveSafeInteger(value.id) ||
-    !isPositiveSafeInteger(value.schema_version) ||
-    typeof value.task_id !== "string" ||
-    typeof value.created_at !== "string" ||
-    !isRecord(value.payload)
-  ) {
-    return false;
-  }
-
-  switch (value.kind) {
-    case "task.queued":
-      return isConsistentLifecycleTask(value, "queued");
-    case "task.started":
-      return isConsistentLifecycleTask(value, "running");
-    case "task.completed":
-      return isConsistentLifecycleTask(value, "completed");
-    case "task.failed":
-      return isConsistentLifecycleTask(value, "failed");
-    case "task.cancelled":
-      return isConsistentLifecycleTask(value, "cancelled");
-    case "task.interrupted":
-      return isConsistentLifecycleTask(value, "interrupted");
-    case "plan.updated":
-      return isPlanSnapshot(value.payload.plan);
-    case "activity.appended":
-      return isActivityEntry(value.payload.entry);
-    case "diff.updated":
-      return isDiffSnapshot(value.payload.diff);
-    case "test.updated":
-      return isTestSnapshot(value.payload.tests);
-    default:
-      return false;
-  }
-}
-
-function isConsistentLifecycleTask(
-  event: Record<string, unknown>,
-  expectedStatus: Task["status"],
-): boolean {
-  if (!isRecord(event.payload) || !isTask(event.payload.task)) {
-    return false;
-  }
-  return (
-    event.payload.task.id === event.task_id &&
-    event.payload.task.status === expectedStatus &&
-    event.payload.task.last_event_id === event.id
-  );
-}
-
-function isTask(value: unknown): value is Task {
-  if (!isRecord(value)) {
-    return false;
-  }
-  return (
-    typeof value.id === "string" &&
-    typeof value.repository_id === "string" &&
-    typeof value.client_request_id === "string" &&
-    typeof value.prompt === "string" &&
-    isTaskStatus(value.status) &&
-    isNonNegativeSafeInteger(value.attempt) &&
-    isNonNegativeSafeInteger(value.last_event_id) &&
-    typeof value.created_at === "string" &&
-    isOptionalNullableString(value.started_at) &&
-    isOptionalNullableString(value.finished_at) &&
-    isOptionalNullableString(value.retry_of) &&
-    (value.failure === undefined ||
-      value.failure === null ||
-      isTaskFailure(value.failure))
-  );
-}
-
-function isTaskFailure(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    typeof value.code === "string" &&
-    typeof value.message === "string" &&
-    typeof value.retryable === "boolean"
-  );
-}
-
-function isPlanSnapshot(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    isNonNegativeSafeInteger(value.revision) &&
-    Array.isArray(value.items) &&
-    value.items.every(
-      (item) =>
-        isRecord(item) &&
-        typeof item.id === "string" &&
-        typeof item.title === "string" &&
-        (item.status === "pending" ||
-          item.status === "running" ||
-          item.status === "completed"),
-    )
-  );
-}
-
-function isActivityEntry(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    typeof value.id === "string" &&
-    typeof value.created_at === "string" &&
-    typeof value.message === "string" &&
-    (value.level === "info" || value.level === "warning" || value.level === "error")
-  );
-}
-
-function isDiffSnapshot(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    isNonNegativeSafeInteger(value.revision) &&
-    Array.isArray(value.files) &&
-    value.files.every(
-      (file) =>
-        isRecord(file) &&
-        typeof file.path === "string" &&
-        typeof file.patch === "string" &&
-        isNonNegativeSafeInteger(file.additions) &&
-        isNonNegativeSafeInteger(file.deletions) &&
-        typeof file.truncated === "boolean" &&
-        (file.status === "added" ||
-          file.status === "modified" ||
-          file.status === "deleted"),
-    )
-  );
-}
-
-function isTestSnapshot(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    isNonNegativeSafeInteger(value.revision) &&
-    isTestStatus(value.status) &&
-    Array.isArray(value.cases) &&
-    value.cases.every(
-      (testCase) =>
-        isRecord(testCase) &&
-        typeof testCase.id === "string" &&
-        typeof testCase.name === "string" &&
-        typeof testCase.summary === "string" &&
-        isNonNegativeSafeInteger(testCase.duration_ms) &&
-        isTestStatus(testCase.status),
-    )
-  );
-}
-
-function isTaskStatus(value: unknown): boolean {
-  return (
-    value === "queued" ||
-    value === "running" ||
-    value === "completed" ||
-    value === "failed" ||
-    value === "cancelled" ||
-    value === "interrupted"
-  );
-}
-
-function isTestStatus(value: unknown): boolean {
-  return (
-    value === "queued" ||
-    value === "running" ||
-    value === "passed" ||
-    value === "failed" ||
-    value === "cancelled"
-  );
-}
-
-function isOptionalNullableString(value: unknown): boolean {
-  return value === undefined || value === null || typeof value === "string";
 }
 
 function parsePersistedId(value: string | undefined): number {
@@ -1198,6 +1130,24 @@ function isSessionExpiredError(error: unknown): boolean {
     isRecord(error) &&
     (error.status === 401 || error.name === "SessionExpiredError")
   );
+}
+
+function mergeRecoveryReasons(
+  current: SseRecoveryReason,
+  requested: SseRecoveryReason,
+): SseRecoveryReason {
+  if (
+    current.code === requested.code &&
+    current.message === requested.message
+  ) {
+    return current;
+  }
+  return {
+    code: requested.code,
+    message:
+      `${current.code}: ${current.message}; ` +
+      `${requested.code}: ${requested.message}`,
+  };
 }
 
 function withCursor(endpoint: string, cursor: number): string {

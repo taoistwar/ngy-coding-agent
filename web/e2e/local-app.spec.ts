@@ -99,7 +99,7 @@ test("adds a real repository, completes a task, and reopens the persisted worksp
     const completionWaitStartedAt = Date.now();
     await page.getByRole("button", { name: "Create task" }).click();
     try {
-      await expect(page.getByText("Status: completed", { exact: true })).toBeVisible({
+      await expect(page.getByText("Execution status: completed", { exact: true })).toBeVisible({
         timeout: 30_000,
       });
     } catch (error) {
@@ -120,10 +120,17 @@ test("adds a real repository, completes a task, and reopens the persisted worksp
         ...(error instanceof Error ? { cause: error } : {}),
       });
     }
-    await expect(page.getByText("Execution completed — not reviewed", { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("Delivery readiness: review approved", { exact: true }),
+    ).toBeVisible();
     await expect(page.getByText("Prepare deterministic plan", { exact: true })).toBeVisible();
     await expect(page.getByText("Generated synthetic diff", { exact: true })).toBeVisible();
     await expect(page.getByText("Synthetic checks passed", { exact: true })).toBeVisible();
+    await expect(
+      page.locator(".review-panel .generation-warning").filter({
+        hasText: "Generation mismatch:",
+      }),
+    ).toHaveCount(0);
     expect(firstTraffic.violations).toEqual([]);
 
     await page.close();
@@ -139,7 +146,7 @@ test("adds a real repository, completes a task, and reopens the persisted worksp
       .getByRole("button", { name: `${TASK_PROMPT} Attempt 1`, exact: true })
       .click();
     await expect(
-      reopenedPage.getByText("Execution completed — not reviewed", { exact: true }),
+      reopenedPage.getByText("Delivery readiness: review approved", { exact: true }),
     ).toBeVisible();
     await expect(reopenedPage.getByText("Synthetic checks passed", { exact: true })).toBeVisible();
     expect(reopenedTraffic.violations).toEqual([]);

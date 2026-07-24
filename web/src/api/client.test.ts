@@ -6,7 +6,7 @@ import {
   SessionExpiredError,
   type ApiClientOptions,
 } from "./client";
-import type { BootstrapResponse, Task } from "./types";
+import type { BootstrapResponse, Task, TaskDetail } from "./types";
 
 const BOOTSTRAP: BootstrapResponse = {
   csrf_token: "csrf-from-bootstrap",
@@ -32,6 +32,18 @@ const TASK: Task = {
   retry_of: null,
   started_at: null,
   status: "queued",
+  delivery_readiness: "unreviewed",
+};
+
+const TASK_DETAIL: TaskDetail = {
+  task: TASK,
+  plan: null,
+  activity: [],
+  diff: null,
+  tests: null,
+  reviews: [],
+  timeline: [],
+  event_cursor: TASK.last_event_id,
 };
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
@@ -239,6 +251,7 @@ describe("ApiClient REST commands", () => {
       calls.push({ input, ...(init === undefined ? {} : { init }) });
       if (calls.length === 1) return jsonResponse(BOOTSTRAP);
       if (input === "/api/repositories/pick") return new Response(null, { status: 204 });
+      if (input === "/api/tasks/task%2Fid") return jsonResponse(TASK_DETAIL);
       return jsonResponse(TASK);
     });
     const client = new ApiClient(clientOptions(fetch));
@@ -280,6 +293,34 @@ describe("ApiClient REST commands", () => {
     expect(calls.every(({ input }) => typeof input === "string" && input.startsWith("/"))).toBe(
       true,
     );
+  });
+
+  it("rejects a TaskDetail response that violates the exact runtime contract", async () => {
+    let callCount = 0;
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => {
+      callCount += 1;
+      return callCount === 1
+        ? jsonResponse(BOOTSTRAP)
+        : jsonResponse(
+            { ...TASK_DETAIL, extra: "not in the wire contract" },
+            {
+              headers: {
+                "content-type": "application/json",
+                "x-request-id": "request-invalid-detail",
+              },
+            },
+          );
+    });
+    const client = new ApiClient(clientOptions(fetch));
+    await client.initialize();
+
+    await expect(client.taskDetail(TASK.id)).rejects.toMatchObject({
+      status: 200,
+      code: "INVALID_RESPONSE",
+      retryable: false,
+      requestId: "request-invalid-detail",
+      details: { path: "$.extra" },
+    });
   });
 
   it("surfaces the structured API error without automatically retrying a mutation", async () => {

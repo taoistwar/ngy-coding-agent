@@ -14,8 +14,8 @@ use coding_agent_api::{
     SseBackend, TaskDetailDto, TaskDto, TaskEventDto,
 };
 use coding_agent_domain::{
-    CanonicalPath, ClientRequestId, EventId, Repository, RepositoryId, Task, TaskId, TaskStatus,
-    UtcTimestamp,
+    CanonicalPath, ClientRequestId, DeliveryReadiness, EventId, Repository, RepositoryId, Task,
+    TaskId, TaskStatus, UtcTimestamp,
 };
 use futures_util::stream;
 use http::header::{COOKIE, HOST, ORIGIN};
@@ -229,6 +229,7 @@ impl ApiBackend for FakeBackend {
             activity: Vec::new(),
             diff: None,
             tests: None,
+            reviews: Vec::new(),
             timeline: Vec::new(),
             event_cursor: 1,
         })
@@ -533,6 +534,7 @@ fn task(repository_id: uuid::Uuid) -> TaskDto {
         repository_id: repository_id.to_string().parse().expect("repository ID"),
         prompt: "safe fixture prompt".to_owned(),
         status: TaskStatus::Queued,
+        delivery_readiness: DeliveryReadiness::Unreviewed,
         attempt: 1,
         retry_of: None,
         created_at: timestamp(),

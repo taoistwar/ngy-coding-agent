@@ -93,6 +93,7 @@ for (const race of CLAIM_RACES) {
               target: "actor_cancel_enqueued",
             },
           ],
+          legacy_v2_seed: { kind: "none" },
           marker_write_failure: false,
         };
       },
@@ -213,6 +214,7 @@ test("completion committed at result_before_write wins over an already-sent UI c
             target: "actor_cancel_enqueued",
           },
         ],
+        legacy_v2_seed: { kind: "none" },
         marker_write_failure: false,
       };
     },
@@ -456,7 +458,7 @@ async function waitForTaskStatus(
 }
 
 async function expectSelectedStatus(page: Page, status: TaskStatus): Promise<void> {
-  await expect(page.locator(".task-status-label")).toHaveText(`Status: ${status}`);
+  await expect(page.locator(".task-status-label")).toHaveText(`Execution status: ${status}`);
 }
 
 async function assertProcessIsConnected(page: Page, app: LocalApp): Promise<void> {

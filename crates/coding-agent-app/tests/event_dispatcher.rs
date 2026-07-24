@@ -2,8 +2,15 @@ mod support;
 
 use std::time::Duration;
 
-use coding_agent_app::EventDispatcherError;
-use coding_agent_domain::{EventCursor, TaskEvent, TaskEventKind, TaskEventPayload};
+use coding_agent_app::{EventDispatcherError, EventDispatcherHandle};
+use coding_agent_domain::{
+    DiffFile, DiffFileStatus, DiffSnapshot, EventCursor, ReviewVerdict, TaskEvent, TaskEventKind,
+    TaskEventPayload, TaskStatus, TestCase, TestSnapshot, TestStatus,
+};
+use coding_agent_store::{
+    AppendEventOutcome, CreateTaskOutcome, FinalizeReviewedTaskOutcome, TaskTransition,
+    TransitionOutcome,
+};
 use tokio::sync::broadcast::error::TryRecvError;
 
 fn messages(values: &[&str]) -> Vec<String> {
@@ -12,13 +19,177 @@ fn messages(values: &[&str]) -> Vec<String> {
 
 fn activity_message(event: &TaskEvent) -> &str {
     match &event.payload {
-        TaskEventPayload::ActivityAppended { entry } => &entry.message,
+        TaskEventPayload::ActivityAppended { entry } => entry.message(),
         payload => panic!("expected activity event, got {:?}", payload.kind()),
     }
 }
 
 fn cursor_after(cursor: EventCursor, amount: i64) -> EventCursor {
     EventCursor::new(cursor.get() + amount).expect("construct later event cursor")
+}
+
+#[tokio::test]
+async fn dispatcher_projects_typed_review_evidence_after_final_panels_and_before_lifecycle() {
+    let fixture = support::store_fixture().await;
+    let queued = match fixture
+        .store
+        .create_task(support::new_task(
+            fixture.repository.id,
+            "project a reviewed result",
+        ))
+        .await
+        .expect("create reviewed dispatcher task")
+    {
+        CreateTaskOutcome::Created { task, .. } | CreateTaskOutcome::Existing { task } => task,
+    };
+    let running = match fixture
+        .store
+        .transition_with_event(queued.id, TaskStatus::Queued, TaskTransition::Running)
+        .await
+        .expect("start reviewed dispatcher task")
+    {
+        TransitionOutcome::Applied { task, .. } => task,
+        TransitionOutcome::Conflict { .. } => panic!("reviewed dispatcher task must start"),
+    };
+    let plan = support::fixture_review_plan();
+    match fixture
+        .store
+        .append_running_event(running.id, TaskEventPayload::PlanUpdated { plan })
+        .await
+        .expect("persist structured review plan")
+    {
+        AppendEventOutcome::Applied { .. } => {}
+        AppendEventOutcome::NotRunning { .. } => {
+            panic!("reviewed dispatcher task must remain running")
+        }
+    }
+
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 16)
+        .await
+        .expect("spawn reviewed-event dispatcher");
+    let mut receiver = dispatcher.subscribe();
+    let diff = DiffSnapshot {
+        revision: 1,
+        files: vec![DiffFile {
+            path: "src/lib.rs".to_owned(),
+            status: DiffFileStatus::Modified,
+            patch: "@@ reviewed patch @@".to_owned(),
+            additions: 1,
+            deletions: 0,
+            truncated: false,
+        }],
+    };
+    let diff_event_id = match fixture
+        .store
+        .append_running_event(
+            running.id,
+            TaskEventPayload::DiffUpdated { diff: diff.clone() },
+        )
+        .await
+        .expect("persist final diff panel")
+    {
+        AppendEventOutcome::Applied { event_id } => event_id,
+        AppendEventOutcome::NotRunning { .. } => panic!("final diff must precede finalization"),
+    };
+    let tests = TestSnapshot {
+        revision: 1,
+        status: TestStatus::Passed,
+        cases: vec![TestCase {
+            id: "fixture-cargo-test".to_owned(),
+            name: "cargo test".to_owned(),
+            status: TestStatus::Passed,
+            duration_ms: 10,
+            summary: "fixture check passed".to_owned(),
+        }],
+    };
+    let test_event_id = match fixture
+        .store
+        .append_running_event(
+            running.id,
+            TaskEventPayload::TestUpdated {
+                tests: tests.clone(),
+            },
+        )
+        .await
+        .expect("persist final test panel")
+    {
+        AppendEventOutcome::Applied { event_id } => event_id,
+        AppendEventOutcome::NotRunning { .. } => panic!("final tests must precede finalization"),
+    };
+    let (review, review_event_id, terminal_event_id) = match fixture
+        .store
+        .finalize_reviewed_task(
+            running.id,
+            running.repository_id,
+            running.attempt,
+            support::approved_review(),
+        )
+        .await
+        .expect("atomically finalize approved task")
+    {
+        FinalizeReviewedTaskOutcome::Applied {
+            review,
+            review_event_id,
+            terminal_event_id,
+            ..
+        } => (review, review_event_id, terminal_event_id),
+        FinalizeReviewedTaskOutcome::Existing { .. } => {
+            panic!("first approved finalization must apply")
+        }
+    };
+
+    dispatcher.wake();
+    dispatcher
+        .flush_to(EventCursor::new(terminal_event_id.get()).unwrap())
+        .await
+        .expect("publish through terminal lifecycle");
+    let mut events = Vec::new();
+    for _ in 0..4 {
+        events.push(receiver.recv().await.expect("receive reviewed event"));
+    }
+
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.payload.kind())
+            .collect::<Vec<_>>(),
+        [
+            TaskEventKind::DiffUpdated,
+            TaskEventKind::TestUpdated,
+            TaskEventKind::ReviewUpdated,
+            TaskEventKind::TaskCompleted,
+        ]
+    );
+    assert_eq!(
+        events.iter().map(|event| event.id).collect::<Vec<_>>(),
+        [
+            diff_event_id,
+            test_event_id,
+            review_event_id,
+            terminal_event_id,
+        ]
+    );
+    assert_eq!(events[0].payload, TaskEventPayload::DiffUpdated { diff });
+    assert_eq!(events[1].payload, TaskEventPayload::TestUpdated { tests });
+    match &events[2].payload {
+        TaskEventPayload::ReviewUpdated { review: projected } => {
+            assert_eq!(projected, &review);
+            assert_eq!(projected.round(), 1);
+            assert_eq!(projected.verdict(), ReviewVerdict::Approved);
+            assert_eq!(projected.summary(), "fixture round 1 approved");
+        }
+        payload => panic!("expected typed review evidence, got {:?}", payload.kind()),
+    }
+    match &events[3].payload {
+        TaskEventPayload::TaskCompleted { task } => {
+            assert_eq!(
+                task.delivery_readiness,
+                coding_agent_domain::DeliveryReadiness::ReviewApproved
+            );
+            assert_eq!(task.last_event_id, terminal_event_id);
+        }
+        payload => panic!("expected completed lifecycle, got {:?}", payload.kind()),
+    }
 }
 
 #[tokio::test]

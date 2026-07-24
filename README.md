@@ -1,23 +1,40 @@
 # ngy 编码代理
 
-本仓库包含本地浏览器编码代理的 Project 2 实现。该应用程序是一个 Rust 进程，
+本仓库包含本地浏览器编码代理的 Project 3 实现。该应用程序是一个 Rust 进程，
 负责运行 Axum、SQLite、任务编排、原生对话框、隔离的 Git 工作树运行时，以及
 兼容 OpenAI 的提供方客户端；React UI 则通过随机的 `127.0.0.1` 端口提供服务。
 
-## 项目 2 范围
+## 项目 3 范围
 
-项目 2 同一时间只运行一个真实的编码任务。每次尝试都会基于已注册仓库所提交的
+应用同一时间只运行一个真实的编码任务。每次尝试都会基于已注册仓库所提交的
 `HEAD` 获得一个唯一分支和一个私有 Git 工作树。代理可以检查并安全替换该
-工作树内的文件，运行有界的 Cargo 命令，并通过项目 1 的持久化事件流发布
-计划、活动、差异和测试证据。用户原工作目录中已暂存、未暂存及未跟踪文件的
-字节内容不会复制到工作树中，也不会用作模型上下文。
+工作树内的文件，运行有界的 Cargo 命令，并通过持久化事件流发布计划、角色活动、
+差异、测试和逐轮审查证据。用户原工作目录中已暂存、未暂存及未跟踪文件的字节
+内容不会复制到工作树中，也不会用作模型上下文。
 
-`Completed` 表示执行循环正常结束，并且已有一项通过的 Cargo 测试与最终工作区
-指纹绑定。它**不**表示已经审查、可交付、可合并或已自动合并。项目 3 将增加
-独立的审查质量循环。
+一个任务顺序运行 `Planner #1 -> Executor #1 -> Reviewer #1`。Planner 只运行一次；
+Reviewer 要求修改时，只在 Executor 和 Reviewer 之间返工，最多两次返工、三轮审查。
+所有角色共享同一个任务 worktree、取消域、provider task session 和预算账本，但每次
+角色运行都使用新的 transcript。角色之间只传递已经验证且有界的计划、findings、
+检查证据和 workspace checkpoint，不传递隐藏推理或原始 provider 响应。
+
+角色权限是硬边界：Planner 只能只读分析，不能运行 Git、Cargo 或写文件；Executor
+可以使用受限的检查、写入、Git 和 Cargo 工具；Reviewer 可以只读检查完整差异并运行
+批准的 Git/Cargo 验证，但不能替换文件。Reviewer 的 `approved` 只有在最终 workspace
+generation、digest、完整 diff coverage 和全部必需检查一致时才生效。
+
+生命周期与交付质量分别显示。新质量闭环只有在最终批准时产生
+`Completed + ReviewApproved`；第三轮有效的 `changes_requested` 产生
+`Failed + ReviewRejected`。取消、阻塞、provider/runtime/store 错误或预算耗尽均保持
+`Unreviewed`，不能伪装成审查拒绝。Project 2 或更早的历史 `Completed` 任务迁移后也
+保持 `Completed + Unreviewed`，不会生成伪造的 review evidence。
+
+`ReviewApproved` 是本应用自动 Reviewer 对有界证据的判断，**不**代表人工审查、已经
+合并、可部署、已签名或生产安全。应用不提供 merge/approve 用户控件，也绝不会自动
+merge；保留的 Git 工作树和分支仍是供用户独立检查的权威构件。
 
 安装程序、macOS 应用程序包、Linux 桌面条目、代码签名与公证、自动更新以及
-完善的启动器打包属于项目 4，不是项目 2 的 CI 门禁条件。
+完善的启动器打包属于项目 4，不是项目 3 的 CI 门禁条件。
 
 ## 前置条件
 
@@ -207,39 +224,35 @@ DeepSeek [官方 Chat Completions 契约](https://api-docs.deepseek.com/zh-cn/ap
 不能遵守命名工具选择、并且确认支持通用强制选择时才需要此项。修改配置
 后必须完全退出并重新启动应用程序，再从失败的尝试明确重试。
 
-### 动态收敛与工具选择
+### 多角色预算、收敛与工具选择
 
-运行器会在每轮请求前刷新系统策略，向模型提供当前工作区修订号、精确的剩余模型
-响应数和工具调用数，以及当前收敛阶段。名义工具预留按
-`min(工具总上限, clamp(工具总上限 / 4, 3, 8))` 计算，名义模型响应预留按
-`min(模型响应总上限, clamp(模型响应总上限 / 4, 4, 5))` 计算，其中除法为整数除法。
-每轮系统策略显示的预留数还会与对应的当前剩余额度取较小值，绝不会显示超过实际剩余
-工具调用或模型响应的预留。生产上限是 20 轮模型响应和 32 次工具调用，名义预留正好为
-5 轮模型响应和 8 次工具调用。核心会根据阶段选择以下三种逻辑约束；各线路编码如下：
+生产默认使用一个 Task 级共享硬预算；进入新角色不会重置它：
 
-| 阶段 | 默认线路编码 | `required_as_required` | `required_as_auto` | 响应约束 |
-| --- | --- | --- | --- | --- |
-| 探索、测试失败后的修复，以及测试通过后的优先收尾 | `"auto"` | 不变 | 不变 | 可以返回最终文本或受支持的工具调用；通过测试后的系统策略要求模型立即返回最终文本。 |
-| 强制验证 | `{"type":"function","function":{"name":"cargo_test"}}` | `"required"`，只发送 `cargo_test` | `"auto"`，只发送 `cargo_test` | 必须且只能返回一个 `cargo_test` 调用。 |
-| 最终专用 | `"none"` | 不变 | 不变 | 只允许返回最终文本，不允许任何工具调用。 |
+| 范围 | 模型响应 | model-visible calls |
+| --- | ---: | ---: |
+| 整个 Task | 60 | 96 |
+| Planner | 8 | 12 |
+| 每轮 Executor | 20 | 32 |
+| 每轮 Reviewer | 10 | 16 |
 
-探索阶段中，如果一个完整工具调用批次会越过验证预留线，无论其中是否包含
-`cargo_test`，运行器都会让整个批次保持零执行：不增加工具调用计数、不记录调用 ID，
-也不把该批次加入对话记录；已经收到的模型响应仍计入模型响应和提供方字节预算。下一轮
-会强制要求唯一的 `cargo_test`。测试失败后，只有剩余模型响应至少为 3 且剩余工具调用
-至少为 2 时才进入修复阶段；该阶段继续使用 `"auto"`，要求根据失败证据做定向修复，
-并在整批执行前原子检查预算，至少留下 1 次工具调用用于重测。不得在未修改的同一修订
-上重复测试。任何替换或工作区指纹变化形成新修订，都会使旧的通过证据失效；任务完成前
-必须重新测试新修订。若修复或测试过程造成当前修订不同于最近一次已测试修订，下一轮会
-立即进入只允许一个 `cargo_test` 的强制重测，不再返回探索阶段；严格模式发送命名工具
-选择；`required_as_required` 发送通用强制选择，`required_as_auto` 发送自动选择，二者都只
-提供唯一的 `cargo_test` 工具定义，并保持相同的严格响应校验。
+角色上限之和可以高于 Task 上限，但共享账本总是先到先停。每次 provider HTTP request
+和 response 各最多 1 MiB，整个 Task 的 encoded provider 流量最多 8 MiB；单项送回模型
+的 tool result 最多 256 KiB，Task 级累计保留最多 768 KiB。Planner 的结果租约最多
+128 KiB，每轮 Executor/Reviewer 各最多 256 KiB。无效但已经收到的 provider response
+仍计费，已通过脱敏并保留的同一 tool result 在共享结果账本中只计一次。
 
-当前修订通过测试后，运行器先使用 `"auto"` 要求模型立即给出最终文本。只有工具调用
-额度归零且当前通过证据仍然有效时，才会进入最终专用阶段；进入前运行器会重新采集工作区
-指纹，指纹未变才发送 `"none"` 并只接受最终文本。仅剩最后一轮模型响应并不会单独触发
-`"none"`。提供方返回的响应若违反本轮 `tool_choice`，请求会以不可重试的
-`PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED` 失败，错误中不会包含提供方响应正文。
+进入 Executor 前，核心会同时为当前必需检查、交审控制动作以及紧随其后的 Reviewer
+完整 manifest/chunk/terminal 路径做原子预留；Reviewer coverage 预留不会被普通探索
+结果消费。如果 Reviewer 要求返工，但剩余额度不足以同时启动下一轮 Executor 和
+Reviewer，任务以阶段化预算错误结束为 `Failed + Unreviewed`，不会把该轮升级成
+`ReviewRejected`，也不会偷偷创建新的 provider session。
+
+Planner、Executor 和 Reviewer 都必须以各自的类型化 control action 正常结束；普通
+final text 不能冒充 `submit_plan`、`submit_execution` 或 `submit_review`。运行时工具
+调用批次会先整体验证权限、预算、路径、调用 ID 和参数，再按 provider 顺序执行；批次中
+任一后置调用无效时，整个批次保持零副作用。`tool_choice_compatibility` 只改变受限请求
+在线路上的编码，不放宽本地的恰好一次控制动作、角色权限或响应 schema 校验。违反本轮
+约束会以 `PROVIDER_RESPONSE_TOOL_CHOICE_VIOLATED` 失败，错误中不会包含响应正文。
 
 除上述显式的开发私网 HTTP 例外外，基础 URL 必须使用 HTTPS；生产环境始终必须使用
 HTTPS。基础 URL 不能包含用户信息、查询参数或片段。该值应
@@ -306,6 +319,13 @@ cargo run -p coding-agent-app
 `unclean-shutdown.json` 会记录未能持久化最终任务状态的关机；应用程序会在
 下次启动时根据该文件执行恢复。
 
+计划、活动、diff/test panel、逐轮 review evidence、delivery readiness 和 lifecycle
+事件都保存在 SQLite 中。中间 `changes_requested` evidence 不会在重启时丢失或被改写；
+启动恢复会先处理未完成的持久化结果，再发布新的浏览器描述符。崩溃或正常退出时仍未完成
+的角色任务会成为 `Interrupted + Unreviewed`，用户需要明确重试；重试会建立新的 attempt，
+不会继承旧 attempt 的 review approval。只有最终 diff/test 已获得持久确认后，最终 review、
+readiness 和 terminal lifecycle 才会在同一事务中提交。
+
 每次尝试的构件都会保留以供检查。分支采用
 `codex/task-<task-id>-attempt-<attempt>` 格式，工作树存储在私有数据目录下的
 `worktrees/<repository-id>/<task-id>/<attempt>`。SQLite 会记录不可变的仓库、
@@ -343,12 +363,14 @@ cargo run -p coding-agent-app
 将配置的提供方密钥复制到 SQLite。任务提示词和保留的构件仍属于持久化用户
 数据，其中可能包含以任务内容或仓库内容形式提供的机密。
 
-Git 工作树和基于能力的文件工具会将每次尝试与用户的原工作目录隔离，但项目 2
+Git 工作树和基于能力的文件工具会将每次尝试与用户的原工作目录隔离，但项目 3
 **不是**面向不受信任代码的操作系统沙箱。Cargo 可能以当前操作系统用户的权限
 执行现有或生成的 `build.rs`、过程宏、依赖项、测试二进制文件及其他仓库代码。
 这些代码可以尝试读写工作树之外的内容、访问网络或启动进程。只应对这样的仓库
 运行任务：您愿意以当前用户身份执行该仓库现有代码及任务生成的变更；对于真正
-不受信任的代码，请使用单独加固的虚拟机或容器。
+不受信任的代码，请使用单独加固的虚拟机或容器。Executor 和 Reviewer 运行的 Cargo
+检查具有相同的当前用户权限；“Reviewer 只读”限制的是应用提供的文件修改能力，并不把
+仓库自身的构建脚本或测试二进制文件变成安全代码。
 
 最终测试证据与实际的最终工作区指纹绑定。差异收集也会在收集前后检查工作区，
 但它不提供文件系统快照，也不针对恶意的同用户进程提供线性一致性保证；这种
@@ -392,7 +414,7 @@ UI 显示的错误包含稳定的代码和请求 ID。将错误与本地日志�
 | `FILE_NOT_TEXT` / `FILE_TOO_LARGE` / `FILE_CHANGED_SINCE_READ` / `ATOMIC_REPLACE_FAILED` | 无法安全读取或原子替换所请求的文件。请先检查保留的工作树状态，再重试。 |
 | `COMMAND_NOT_ALLOWED` / `COMMAND_TIMED_OUT` / `PROCESS_TREE_CLEANUP_FAILED` | 某个命令或 `.git` 路径违反了固定工具契约、发生超时，或无法安全进入静止状态。有界输出会作为明确标注已截断的工具证据返回。请检查工作树并终止任何可疑的仓库进程，然后再重试。 |
 | `CARGO_METADATA_FAILED` / `CARGO_DEPENDENCY_UNAVAILABLE_OFFLINE` | 修复 Cargo 工作区或明确预取其依赖项；任务中的 Cargo 命令不会从网络获取内容。 |
-| `AGENT_STEP_LIMIT_REACHED` / `AGENT_CONTEXT_LIMIT_REACHED` | 有界代理循环在得到有效最终结果前耗尽了步骤或上下文预算。每轮系统策略都会给出精确剩余额度、当前收敛阶段，以及不超过对应剩余额度的预留数；生产上限为 20 轮模型响应和 32 次工具调用，名义预留为 5 轮模型响应和 8 次工具调用。若正常规模的任务仍超限，请缩小任务范围后重试。 |
+| `*_STEP_LIMIT_REACHED` / `*_CONTEXT_LIMIT_REACHED` / `*_TASK_BUDGET_EXHAUSTED` | Planner、Executor 或 Reviewer 在得到有效类型化结果前耗尽角色额度、上下文或共享 Task 预算。Task 总上限为 60 次模型响应和 96 次 model-visible calls；Planner 为 8/12，每轮 Executor 为 20/32，每轮 Reviewer 为 10/16。若正常规模任务仍超限，请缩小范围后明确重试；系统不会借下一角色重置账本。 |
 | `CURRENT_TEST_REQUIRED` | 最终工作树指纹没有对应当前修订的已通过 Cargo 测试证据。任何替换或指纹变化都会建立新修订并令旧证据失效；请在最后一次源代码更改后重新测试。 |
 | `TERMINAL_DIFF_TRUNCATED` | 保留的最终差异超过安全上限，因此任务未被标记为 Completed。请检查工作树，并将变更拆分为较小的任务。 |
 | `TERMINAL_FINALIZATION_TIMEOUT` | 最终测试/差异证据未能在有界的终态收尾时间窗口内稳定下来。请检查保留的工作树，并仅在所有仓库进程停止后重试。 |

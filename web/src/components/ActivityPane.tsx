@@ -10,6 +10,19 @@ const ACTIVITY_GLYPH: Record<ActivityEntry["level"], string> = {
   error: "×",
 };
 
+function actorLabel(entry: ActivityEntry): string {
+  switch (entry.actor) {
+    case "system":
+      return "System";
+    case "planner":
+      return `Planner #${entry.role_run}`;
+    case "executor":
+      return `Executor #${entry.role_run}`;
+    case "reviewer":
+      return `Reviewer #${entry.role_run}`;
+  }
+}
+
 export function ActivityPane({ activity }: ActivityPaneProps) {
   return (
     <section className="evidence-panel activity-panel" aria-labelledby="activity-heading">
@@ -31,7 +44,10 @@ export function ActivityPane({ activity }: ActivityPaneProps) {
                   {ACTIVITY_GLYPH[entry.level]}
                 </span>
                 <span>
-                  <strong>{entry.level}</strong>{" "}
+                  <span className="activity-meta">
+                    <strong>{actorLabel(entry)}</strong>
+                    <span>{entry.level}</span>
+                  </span>
                   <span className="activity-message">{entry.message}</span>
                   <time dateTime={entry.created_at}>{entry.created_at}</time>
                 </span>

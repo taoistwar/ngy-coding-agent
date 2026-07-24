@@ -20,12 +20,16 @@ use coding_agent_app::{
 #[cfg(feature = "test-support")]
 use coding_agent_app::{
     FakeScenario, InstanceLock, PrimaryRuntime, PrimaryRuntimeTestHandles, ScriptedFakeRunner,
-    StartupOutcome, launch,
+    StartupOutcome, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterOperationKind,
+    StoreWriterTestController, launch,
 };
 use coding_agent_domain::{
-    ActivityEntry, ActivityLevel, CanonicalPath, ClientRequestId, EventCursor, EventId,
-    NewRepository, NewTask, PlanSnapshot, Repository, RepositoryId, Task, TaskEventKind,
-    TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestSnapshot, TestStatus, UtcTimestamp,
+    ActivityEntry, ActivityLevel, CanonicalPath, CheckActor, CheckEvidence, CheckEvidenceStatus,
+    ClientRequestId, EventCursor, EventId, FindingSeverity, NewRepository, NewReviewEvidence,
+    NewTask, PlanItem, PlanItemStatus, PlanSnapshot, Repository, RepositoryId, RequiredCheck,
+    ReviewCoverageEvidence, ReviewDecisionSource, ReviewFinding, ReviewVerdict, Task,
+    TaskEventKind, TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestSnapshot, TestStatus,
+    UtcTimestamp, WorkspaceDigest,
 };
 use coding_agent_store::{
     AppendEventOutcome, CreateTaskOutcome, RegisterRepositoryOutcome, Store, TaskTransition,
@@ -837,6 +841,54 @@ pub async fn task_manager_fixture(concurrency: usize) -> TaskManagerFixture {
     }
 }
 
+#[cfg(feature = "test-support")]
+pub async fn paused_finalize_task_manager_fixture()
+-> (TaskManagerFixture, Arc<StoreWriterTestController>) {
+    let fixture = store_fixture().await;
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
+        .await
+        .expect("spawn paused-finalize fixture dispatcher");
+    let controller = Arc::new(
+        StoreWriterTestController::try_new([StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+            operation: Some(StoreWriterOperationKind::FinalizeReviewedTask),
+            count: 1,
+        }])
+        .expect("construct paused-finalize controller"),
+    );
+    let writer = StoreWriterHandle::spawn_with_test_controller(
+        fixture.store.clone(),
+        Arc::new(dispatcher.clone()),
+        64,
+        controller.clone(),
+    );
+    let state = ServiceStateController::new(ServiceState::Ready);
+    let runner = Arc::new(ControlledRunner::default());
+    let manager = TaskManagerHandle::spawn(
+        fixture.store.clone(),
+        writer.clone(),
+        dispatcher.clone(),
+        state.clone(),
+        runner.clone(),
+        1,
+        64,
+    );
+    (
+        TaskManagerFixture {
+            store: fixture.store,
+            repository: fixture.repository,
+            writer,
+            dispatcher,
+            manager,
+            runner,
+            state,
+            busy_lock: AsyncMutex::new(None),
+            _temp_dir: fixture._temp_dir,
+        },
+        controller,
+    )
+}
+
 pub async fn degraded_fixture_with_concurrency(concurrency: usize) -> DegradedFixture {
     let fixture = store_fixture().await;
     let database_path = fixture.root.join("store.sqlite3");
@@ -870,6 +922,57 @@ pub async fn degraded_fixture_with_concurrency(concurrency: usize) -> DegradedFi
         database_path,
         _temp_dir: fixture._temp_dir,
     }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn degraded_fixture_with_writer_faults(
+    concurrency: usize,
+    faults: impl IntoIterator<Item = StoreWriterFaultSpec>,
+) -> (DegradedFixture, Arc<StoreWriterTestController>) {
+    let fixture = store_fixture().await;
+    let database_path = fixture.root.join("store.sqlite3");
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
+        .await
+        .expect("spawn degraded fixture dispatcher");
+    let controller = Arc::new(
+        StoreWriterTestController::try_new(faults)
+            .expect("construct degraded fixture StoreWriter controller"),
+    );
+    let writer = StoreWriterHandle::spawn_with_test_controller(
+        fixture.store.clone(),
+        Arc::new(dispatcher.clone()),
+        64,
+        controller.clone(),
+    );
+    let state = ServiceStateController::new(ServiceState::Ready);
+    let runner = Arc::new(ControlledRunner::default());
+    let manager = TaskManagerHandle::spawn(
+        fixture.store.clone(),
+        writer.clone(),
+        dispatcher.clone(),
+        state.clone(),
+        runner.clone(),
+        concurrency,
+        64,
+    );
+    let recovery_results = manager.subscribe_degraded_recovery();
+    (
+        DegradedFixture {
+            store: fixture.store,
+            writer,
+            dispatcher,
+            manager,
+            runner,
+            state,
+            repository: fixture.repository,
+            completion_gates: AsyncMutex::new(HashMap::new()),
+            recovery_results: AsyncMutex::new(recovery_results),
+            busy_lock: AsyncMutex::new(None),
+            database_path,
+            _temp_dir: fixture._temp_dir,
+        },
+        controller,
+    )
 }
 
 #[cfg(feature = "test-support")]
@@ -1198,6 +1301,10 @@ impl ScriptedFakeRunnerFixture {
         self.core.load(task_id).await
     }
 
+    pub async fn detail(&self, task_id: TaskId) -> coding_agent_store::TaskDetail {
+        self.core.detail(task_id).await
+    }
+
     pub async fn event_kinds(&self, task_id: TaskId) -> Vec<TaskEventKind> {
         self.core.event_kinds(task_id).await
     }
@@ -1247,12 +1354,12 @@ impl DispatcherFixture {
                 .append_running_event(
                     self.running_task.id,
                     TaskEventPayload::ActivityAppended {
-                        entry: ActivityEntry {
-                            id: format!("activity-{index}-{message}"),
-                            level: ActivityLevel::Info,
-                            message: message.clone(),
-                            created_at: timestamp(),
-                        },
+                        entry: ActivityEntry::legacy(
+                            format!("activity-{index}-{message}"),
+                            ActivityLevel::Info,
+                            message.clone(),
+                            timestamp(),
+                        ),
                     },
                 )
                 .await
@@ -1444,6 +1551,24 @@ impl DegradedFixture {
             .await
             .expect("notify degraded fixture running task");
         self.wait_for_status(task.id, TaskStatus::Running).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self
+                    .store
+                    .task_detail(task.id)
+                    .await
+                    .expect("load degraded fixture plan")
+                    .expect("degraded fixture task exists")
+                    .plan
+                    .is_some()
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("degraded fixture runner persists its review plan");
         task.id
     }
 
@@ -1590,6 +1715,17 @@ impl DegradedFixture {
             .expect("load degraded fixture task")
             .expect("degraded fixture task exists")
             .task
+    }
+
+    pub async fn event_kinds(&self, task_id: TaskId) -> Vec<TaskEventKind> {
+        self.store
+            .task_events_after(task_id, EventCursor::ZERO, usize::MAX)
+            .await
+            .expect("load degraded fixture events")
+            .events
+            .into_iter()
+            .map(|event| event.payload.kind())
+            .collect()
     }
 
     pub async fn next_recovery(&self) -> DegradedRecoveryResult {
@@ -1849,21 +1985,24 @@ impl TaskRunner for ControlledRunner {
         match scenario {
             RunnerScenario::Blocking(release) => tokio::select! {
                 () = context.cancellation.cancelled() => RunnerOutcome::Cancelled,
-                () = release.notified() => RunnerOutcome::Succeeded,
+                () = release.notified() => approved_outcome(&sink).await,
             },
             RunnerScenario::Panic => panic!("injected runner panic"),
             RunnerScenario::LateEvent { release, result } => {
+                if let Err(outcome) = persist_review_plan(&sink).await {
+                    return outcome;
+                }
                 tokio::spawn(async move {
                     release.notified().await;
                     let _ = result.send(
-                        sink.append(RunnerEvent::PlanUpdated(PlanSnapshot {
-                            revision: 99,
-                            items: Vec::new(),
-                        }))
+                        sink.append(RunnerEvent::PlanUpdated(PlanSnapshot::legacy(
+                            99,
+                            Vec::new(),
+                        )))
                         .await,
                     );
                 });
-                RunnerOutcome::Succeeded
+                RunnerOutcome::Approved(approved_review())
             }
             RunnerScenario::Events { events, result } => {
                 let mut ids = Vec::with_capacity(events.len());
@@ -1871,11 +2010,14 @@ impl TaskRunner for ControlledRunner {
                     ids.push(sink.append(event).await.expect("append running event"));
                 }
                 let _ = result.send(ids);
-                RunnerOutcome::Succeeded
+                approved_outcome(&sink).await
             }
             RunnerScenario::CompletionGate(release) => {
+                if let Err(outcome) = persist_review_plan(&sink).await {
+                    return outcome;
+                }
                 release.notified().await;
-                RunnerOutcome::Succeeded
+                RunnerOutcome::Approved(approved_review())
             }
             RunnerScenario::EventGate {
                 release,
@@ -1883,8 +2025,14 @@ impl TaskRunner for ControlledRunner {
                 result,
             } => {
                 release.notified().await;
-                let _ = result.send(sink.append(event).await);
-                RunnerOutcome::Succeeded
+                let append = sink.append(event).await;
+                let rejected = append.is_err();
+                let _ = result.send(append);
+                if rejected {
+                    RunnerOutcome::Failed(failure("RUNNER_EVENT_REJECTED"))
+                } else {
+                    approved_outcome(&sink).await
+                }
             }
             RunnerScenario::DurableThenLateEvent {
                 durable,
@@ -1896,11 +2044,31 @@ impl TaskRunner for ControlledRunner {
                     .await
                     .expect("append durable runner event before the gate");
                 release.notified().await;
-                let _ = result.send(sink.append(late).await);
-                RunnerOutcome::Succeeded
+                let append = sink.append(late).await;
+                let rejected = append.is_err();
+                let _ = result.send(append);
+                if rejected {
+                    RunnerOutcome::Failed(failure("RUNNER_EVENT_REJECTED"))
+                } else {
+                    approved_outcome(&sink).await
+                }
             }
         }
     }
+}
+
+async fn approved_outcome(sink: &RunnerEventSink) -> RunnerOutcome {
+    match persist_review_plan(sink).await {
+        Ok(()) => RunnerOutcome::Approved(approved_review()),
+        Err(outcome) => outcome,
+    }
+}
+
+async fn persist_review_plan(sink: &RunnerEventSink) -> Result<(), RunnerOutcome> {
+    sink.append(RunnerEvent::PlanUpdated(fixture_review_plan()))
+        .await
+        .map(|_| ())
+        .map_err(|_| RunnerOutcome::Failed(failure("RUNNER_EVENT_REJECTED")))
 }
 
 pub fn new_task(repository_id: RepositoryId, prompt: &str) -> NewTask {
@@ -1921,6 +2089,122 @@ pub fn failure(code: &str) -> TaskFailure {
         message: format!("safe message for {code}"),
         retryable: true,
     }
+}
+
+pub fn approved_review() -> NewReviewEvidence {
+    approved_review_round(1)
+}
+
+pub fn approved_review_round(round: u8) -> NewReviewEvidence {
+    approved_review_round_with_summary(round, format!("fixture round {round} approved"))
+}
+
+pub fn approved_review_round_with_summary(
+    round: u8,
+    summary: impl Into<String>,
+) -> NewReviewEvidence {
+    let generation = u64::from(round);
+    let digit = char::from(b'a' + round - 1);
+    let digest = WorkspaceDigest::try_new(digit.to_string().repeat(64))
+        .expect("construct fixture workspace digest");
+    let check = fixture_required_check();
+    let evidence = CheckEvidence::try_for_check(
+        &check,
+        CheckActor::Executor,
+        u32::from(round),
+        generation,
+        digest.clone(),
+        CheckEvidenceStatus::Passed,
+        10,
+        "fixture check passed",
+        false,
+    )
+    .expect("construct fixture check evidence");
+    let coverage =
+        ReviewCoverageEvidence::try_new(generation, digest.clone(), "f".repeat(64), vec![0], 1)
+            .expect("construct fixture coverage");
+    NewReviewEvidence::try_new(
+        round,
+        ReviewDecisionSource::Reviewer,
+        generation,
+        digest,
+        ReviewVerdict::Approved,
+        summary,
+        Vec::new(),
+        Vec::new(),
+        vec![check],
+        vec![evidence],
+        Some(coverage),
+    )
+    .expect("construct fixture approved review")
+}
+
+pub fn changes_requested_review(round: u8) -> NewReviewEvidence {
+    let generation = u64::from(round);
+    let digit = char::from(b'a' + round - 1);
+    let digest = WorkspaceDigest::try_new(digit.to_string().repeat(64))
+        .expect("construct fixture workspace digest");
+    let check = fixture_required_check();
+    let evidence = CheckEvidence::try_for_check(
+        &check,
+        CheckActor::Executor,
+        u32::from(round),
+        generation,
+        digest.clone(),
+        CheckEvidenceStatus::Passed,
+        10,
+        "fixture check passed",
+        false,
+    )
+    .expect("construct fixture check evidence");
+    NewReviewEvidence::try_new(
+        round,
+        ReviewDecisionSource::Reviewer,
+        generation,
+        digest,
+        ReviewVerdict::ChangesRequested,
+        format!("fixture round {round} changes requested"),
+        vec![
+            ReviewFinding::try_for_review(
+                round,
+                1,
+                FindingSeverity::Blocking,
+                "fixture blocking finding",
+                Some("src/lib.rs".to_owned()),
+                Some(1),
+            )
+            .expect("construct fixture finding"),
+        ],
+        Vec::new(),
+        vec![check],
+        vec![evidence],
+        None,
+    )
+    .expect("construct fixture changes-requested review")
+}
+
+fn fixture_required_check() -> RequiredCheck {
+    RequiredCheck::try_cargo_test("fixture-cargo-test", None, None)
+        .expect("construct fixture required check")
+}
+
+pub fn fixture_review_plan() -> PlanSnapshot {
+    PlanSnapshot::try_structured(
+        1,
+        "Fixture review plan",
+        vec![
+            PlanItem::try_structured(
+                "fixture-plan",
+                "Complete fixture work",
+                "Complete the deterministic fixture task",
+                vec!["The fixture required check passes".to_owned()],
+                PlanItemStatus::Completed,
+            )
+            .expect("construct fixture plan item"),
+        ],
+        vec![fixture_required_check()],
+    )
+    .expect("construct fixture structured plan")
 }
 
 fn repository_input_at(root: &std::path::Path, name: &str) -> NewRepository {

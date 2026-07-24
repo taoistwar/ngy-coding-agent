@@ -31,6 +31,12 @@ const STATUS_GLYPH: Record<Task["status"], string> = {
   interrupted: "!",
 };
 
+const READINESS_LABEL: Record<Task["delivery_readiness"], string> = {
+  unreviewed: "unreviewed",
+  review_approved: "review approved",
+  review_rejected: "review rejected",
+};
+
 const TERMINAL_STATUSES = new Set<Task["status"]>([
   "completed",
   "failed",
@@ -225,9 +231,17 @@ export function TaskWorkspace({
               <span className="status-glyph" aria-hidden="true">
                 {STATUS_GLYPH[task.status]}
               </span>{" "}
-              <span className="task-status-label">Status: {task.status}</span>
+              <span className="task-status-label">
+                Execution status: {task.status}
+              </span>
             </p>
-            {task.status === "completed" ? (
+            <p
+              className={`task-readiness readiness-${task.delivery_readiness}`}
+            >
+              Delivery readiness: {READINESS_LABEL[task.delivery_readiness]}
+            </p>
+            {task.status === "completed" &&
+            task.delivery_readiness === "unreviewed" ? (
               <p className="completion-disclaimer">Execution completed — not reviewed</p>
             ) : null}
           </div>
@@ -314,6 +328,7 @@ export function TaskWorkspace({
             task={task}
             diff={detail.diff ?? null}
             tests={detail.tests ?? null}
+            reviews={detail.reviews}
             timeline={detail.timeline}
             boundaryResetKey={`${task.id}:${detail.event_cursor}`}
           />

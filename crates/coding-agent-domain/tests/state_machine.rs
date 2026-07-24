@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use coding_agent_domain::{
-    ActivityEntry, ActivityLevel, CanonicalPath, ClientRequestId, DiffSnapshot, DomainError,
-    EventCursor, EventId, NewTask, PlanSnapshot, RepositoryId, Task, TaskEvent, TaskEventKind,
-    TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestSnapshot, TestStatus, UtcTimestamp,
+    ActivityEntry, ActivityLevel, CanonicalPath, ClientRequestId, DeliveryReadiness, DiffSnapshot,
+    DomainError, EventCursor, EventId, NewTask, PlanSnapshot, RepositoryId, Task, TaskEvent,
+    TaskEventKind, TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestSnapshot, TestStatus,
+    UtcTimestamp,
 };
 use time::format_description::well_known::Rfc3339;
 use time::{Date, Month, OffsetDateTime, Time, UtcOffset};
@@ -35,6 +36,30 @@ fn only_terminal_tasks_are_retryable() {
     for status in [Completed, Failed, Cancelled, Interrupted] {
         assert!(status.is_retryable());
     }
+}
+
+#[test]
+fn delivery_readiness_uses_exact_wire_values_and_defaults_to_unreviewed() {
+    assert_eq!(
+        serde_json::to_string(&DeliveryReadiness::Unreviewed).unwrap(),
+        r#""unreviewed""#
+    );
+    assert_eq!(
+        serde_json::to_string(&DeliveryReadiness::ReviewApproved).unwrap(),
+        r#""review_approved""#
+    );
+    assert_eq!(
+        serde_json::to_string(&DeliveryReadiness::ReviewRejected).unwrap(),
+        r#""review_rejected""#
+    );
+    assert_eq!(DeliveryReadiness::default(), DeliveryReadiness::Unreviewed);
+
+    let task = task_with_status(TaskStatus::Completed);
+    let mut legacy = serde_json::to_value(task).unwrap();
+    legacy.as_object_mut().unwrap().remove("delivery_readiness");
+
+    let decoded = serde_json::from_value::<Task>(legacy).unwrap();
+    assert_eq!(decoded.delivery_readiness, DeliveryReadiness::Unreviewed);
 }
 
 #[test]
@@ -237,6 +262,57 @@ fn stored_task_status_invariants_are_exhaustive() {
 }
 
 #[test]
+fn stored_task_delivery_readiness_matrix_is_closed() {
+    use DeliveryReadiness::*;
+    use TaskStatus::*;
+
+    for status in [Queued, Running, Completed, Failed, Cancelled, Interrupted] {
+        for readiness in [Unreviewed, ReviewApproved, ReviewRejected] {
+            let mut task = task_with_status(status);
+            task.delivery_readiness = readiness;
+            if readiness == ReviewRejected && status == Failed {
+                task.failure = Some(TaskFailure {
+                    code: "REVIEW_REJECTED".into(),
+                    message: "reviewer requested changes in the final round".into(),
+                    retryable: true,
+                });
+            }
+
+            let valid = readiness == Unreviewed
+                || (readiness == ReviewApproved && status == Completed)
+                || (readiness == ReviewRejected
+                    && status == Failed
+                    && task.failure.as_ref().unwrap().code == "REVIEW_REJECTED");
+
+            assert_eq!(
+                Task::try_from_stored(task).is_ok(),
+                valid,
+                "unexpected readiness validity for {status:?} + {readiness:?}"
+            );
+        }
+    }
+
+    let mut rejected_with_wrong_failure = task_with_status(Failed);
+    rejected_with_wrong_failure.delivery_readiness = ReviewRejected;
+    assert_eq!(
+        Task::try_from_stored(rejected_with_wrong_failure),
+        Err(DomainError::InvalidTaskState)
+    );
+
+    let mut rejected_not_retryable = task_with_status(Failed);
+    rejected_not_retryable.delivery_readiness = ReviewRejected;
+    rejected_not_retryable.failure = Some(TaskFailure {
+        code: "REVIEW_REJECTED".into(),
+        message: "reviewer requested changes in the final round".into(),
+        retryable: false,
+    });
+    assert_eq!(
+        Task::try_from_stored(rejected_not_retryable),
+        Err(DomainError::InvalidTaskState)
+    );
+}
+
+#[test]
 fn task_event_payload_kind_mapping_is_exhaustive() {
     let payloads = [
         TaskEventPayload::TaskQueued {
@@ -246,18 +322,10 @@ fn task_event_payload_kind_mapping_is_exhaustive() {
             task: task_with_status(TaskStatus::Running),
         },
         TaskEventPayload::PlanUpdated {
-            plan: PlanSnapshot {
-                revision: 1,
-                items: vec![],
-            },
+            plan: PlanSnapshot::legacy(1, vec![]),
         },
         TaskEventPayload::ActivityAppended {
-            entry: ActivityEntry {
-                id: "activity-1".into(),
-                level: ActivityLevel::Info,
-                message: "working".into(),
-                created_at: timestamp(),
-            },
+            entry: ActivityEntry::legacy("activity-1", ActivityLevel::Info, "working", timestamp()),
         },
         TaskEventPayload::DiffUpdated {
             diff: DiffSnapshot {
@@ -355,6 +423,7 @@ fn task_with_status(status: TaskStatus) -> Task {
         repository_id: RepositoryId::new(),
         prompt: "implement the domain".into(),
         status,
+        delivery_readiness: DeliveryReadiness::Unreviewed,
         attempt: 1,
         retry_of: None,
         created_at: timestamp(),

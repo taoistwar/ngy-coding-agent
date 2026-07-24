@@ -20,7 +20,11 @@ mod native_fs;
 // generic process entry point unexported so callers cannot bypass validation.
 #[allow(dead_code)]
 mod process_supervisor;
+mod quality_runtime;
 mod relative_path;
+mod review_diff;
+mod role_engine_factory;
+mod role_runtime;
 mod root_capability;
 mod runtime_session;
 mod tool_discovery;
@@ -47,8 +51,12 @@ pub use process_supervisor::{
     ProcessSpawnGuard, acquire_process_spawn_lock,
 };
 pub use relative_path::{RelativePath, RelativePathError};
+pub use role_engine_factory::RoleScopedEngineFactory;
+pub use role_runtime::RoleScopedRuntime;
 pub use root_capability::RootCapability;
-pub use runtime_session::{RuntimeSession, RuntimeSessionError, RuntimeSessionLimits};
+pub use runtime_session::{
+    ATTEMPT_IDENTITY_MISMATCH, RuntimeSession, RuntimeSessionError, RuntimeSessionLimits,
+};
 pub use tool_discovery::{ToolDiscoveryError, ToolchainPaths, discover as discover_toolchain};
 pub use worktree::{
     ProvisionedWorktree, WorktreeArtifactState, WorktreeError, WorktreeIdentity, WorktreeLimits,

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::model::is_valid_tool_request;
 use crate::{
     ActivityEvent, ActivityLevel, AgentEvent, AgentEventSink, AgentLimits, AgentRuntime,
     ContextRedactor, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelToolChoice,
@@ -180,7 +181,8 @@ impl AgentLoop {
                 .complete_live(
                     ModelRequest {
                         messages: messages.clone(),
-                        tool_choice,
+                        allowed_actions: crate::AllowedActions::legacy(),
+                        tool_choice: tool_choice.clone(),
                     },
                     &cancellation,
                 )
@@ -282,12 +284,21 @@ impl AgentLoop {
                 if let Some(stop) = cancellation_stop(&cancellation) {
                     return self.finish(stop, &mut state, &cancellation).await;
                 }
+                let Some(request) = call.request.as_tool_request() else {
+                    return self
+                        .finish(
+                            Stop::failed(INVALID_TOOL_CALL, false),
+                            &mut state,
+                            &cancellation,
+                        )
+                        .await;
+                };
 
                 if let Err(stop) = self
                     .emit_live(
                         AgentEvent::Activity(ActivityEvent {
                             level: ActivityLevel::Info,
-                            message: format!("tool {} started", tool_name(&call.request)),
+                            message: format!("tool {} started", tool_name(request)),
                         }),
                         &cancellation,
                     )
@@ -296,7 +307,7 @@ impl AgentLoop {
                     return self.finish(stop, &mut state, &cancellation).await;
                 }
 
-                let validation_start = if is_cargo_validation(&call.request) {
+                let validation_start = if is_cargo_validation(request) {
                     let fingerprint = match self.fingerprint_live(&cancellation).await {
                         Ok(fingerprint) => fingerprint,
                         Err(stop) => return self.finish(stop, &mut state, &cancellation).await,
@@ -312,7 +323,7 @@ impl AgentLoop {
                     }
                     if let Err(stop) = self
                         .emit_live(
-                            validation_event(&call.request, state.revision, TestStatus::Running),
+                            validation_event(request, state.revision, TestStatus::Running),
                             &cancellation,
                         )
                         .await
@@ -324,7 +335,7 @@ impl AgentLoop {
                     None
                 };
 
-                let result = match self.invoke_live(call.request.clone(), &cancellation).await {
+                let result = match self.invoke_live(request.clone(), &cancellation).await {
                     Ok(result) => result,
                     Err(stop) => {
                         let terminal_test_event = validation_start.is_some().then(|| {
@@ -333,7 +344,7 @@ impl AgentLoop {
                             } else {
                                 TestStatus::Failed
                             };
-                            validation_event(&call.request, state.revision, status)
+                            validation_event(request, state.revision, status)
                         });
                         return self
                             .finish_with_event(stop, &mut state, &cancellation, terminal_test_event)
@@ -341,7 +352,7 @@ impl AgentLoop {
                     }
                 };
 
-                if matches!(call.request, ToolRequest::ReplaceFile { .. })
+                if matches!(request, ToolRequest::ReplaceFile { .. })
                     && result.status() == ToolStatus::Succeeded
                 {
                     if let Err(stop) = state.replaced() {
@@ -388,14 +399,14 @@ impl AgentLoop {
                         };
                         if let Err(stop) = self
                             .emit_live(
-                                validation_event(&call.request, state.revision, test_status),
+                                validation_event(request, state.revision, test_status),
                                 &cancellation,
                             )
                             .await
                         {
                             return self.finish(stop, &mut state, &cancellation).await;
                         }
-                        if matches!(call.request, ToolRequest::CargoTest { .. })
+                        if matches!(request, ToolRequest::CargoTest { .. })
                             && result.status() == ToolStatus::Succeeded
                         {
                             state.passed = Some(TestEvidence {
@@ -409,7 +420,7 @@ impl AgentLoop {
                             }
                         }
                     }
-                    if is_cargo_test(&call.request) {
+                    if is_cargo_test(request) {
                         state.last_tested_revision = Some(tested_revision);
                     }
                 }
@@ -437,7 +448,7 @@ impl AgentLoop {
                             },
                             message: format!(
                                 "tool {} {}",
-                                tool_name(&call.request),
+                                tool_name(request),
                                 match result.status() {
                                     ToolStatus::Succeeded => "succeeded",
                                     ToolStatus::Failed => "failed",
@@ -937,43 +948,10 @@ fn valid_tool_call(call: &ToolCall, seen: &BTreeSet<String>) -> bool {
         && call.id.len() <= MAX_TOOL_CALL_ID_BYTES
         && !call.id.chars().any(char::is_control)
         && !seen.contains(&call.id)
-        && valid_tool_request(&call.request)
-}
-
-fn valid_tool_request(request: &ToolRequest) -> bool {
-    match request {
-        ToolRequest::ListFiles { depth, limit, .. } => *depth != 0 && *limit != 0,
-        ToolRequest::ReadFile {
-            path,
-            start_line,
-            end_line,
-        } => !path.is_empty() && *start_line != 0 && end_line >= start_line,
-        ToolRequest::SearchText { query, limit, .. } => !query.is_empty() && *limit != 0,
-        ToolRequest::ReplaceFile {
-            path,
-            expected_sha256,
-            ..
-        } => {
-            !path.is_empty()
-                && expected_sha256.as_ref().is_none_or(|digest| {
-                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-        }
-        ToolRequest::CargoCheck {
-            package,
-            timeout_ms,
-        } => *timeout_ms != 0 && package.as_ref().is_none_or(|value| !value.is_empty()),
-        ToolRequest::CargoTest {
-            package,
-            test,
-            timeout_ms,
-        } => {
-            *timeout_ms != 0
-                && package.as_ref().is_none_or(|value| !value.is_empty())
-                && test.as_ref().is_none_or(|value| !value.is_empty())
-        }
-        ToolRequest::GitStatus | ToolRequest::GitDiff => true,
-    }
+        && call
+            .request
+            .as_tool_request()
+            .is_some_and(is_valid_tool_request)
 }
 
 fn tool_call_batch_is_redaction_stable(
@@ -995,44 +973,7 @@ fn tool_call_batch_is_redaction_stable(
 }
 
 fn tool_call_is_redaction_stable(call: &ToolCall, redactor: &dyn ContextRedactor) -> bool {
-    redactor.redact(&call.id) == call.id
-        && match &call.request {
-            ToolRequest::ListFiles { path, .. } | ToolRequest::ReadFile { path, .. } => {
-                redactor.redact(path) == *path
-            }
-            ToolRequest::SearchText {
-                query, path, glob, ..
-            } => {
-                redactor.redact(query) == *query
-                    && redactor.redact(path) == *path
-                    && glob
-                        .as_ref()
-                        .is_none_or(|value| redactor.redact(value) == *value)
-            }
-            ToolRequest::ReplaceFile {
-                path,
-                expected_sha256,
-                content,
-            } => {
-                redactor.redact(path) == *path
-                    && redactor.redact(content) == *content
-                    && expected_sha256
-                        .as_ref()
-                        .is_none_or(|value| redactor.redact(value) == *value)
-            }
-            ToolRequest::CargoCheck { package, .. } => package
-                .as_ref()
-                .is_none_or(|value| redactor.redact(value) == *value),
-            ToolRequest::CargoTest { package, test, .. } => {
-                package
-                    .as_ref()
-                    .is_none_or(|value| redactor.redact(value) == *value)
-                    && test
-                        .as_ref()
-                        .is_none_or(|value| redactor.redact(value) == *value)
-            }
-            ToolRequest::GitStatus | ToolRequest::GitDiff => true,
-        }
+    redactor.redact(&call.id) == call.id && call.request.is_redaction_stable(redactor)
 }
 
 fn is_cargo_validation(request: &ToolRequest) -> bool {
@@ -1090,35 +1031,8 @@ fn tool_call_batch_bytes(batch: &ToolCallBatch) -> Option<usize> {
     batch.calls.iter().try_fold(batch_bytes, |total, call| {
         total
             .checked_add(call.id.len())?
-            .checked_add(tool_request_bytes(&call.request)?)
+            .checked_add(call.request.canonical_arguments().ok()?.len())
     })
-}
-
-fn tool_request_bytes(request: &ToolRequest) -> Option<usize> {
-    let strings = match request {
-        ToolRequest::ListFiles { path, .. } | ToolRequest::ReadFile { path, .. } => path.len(),
-        ToolRequest::SearchText {
-            query, path, glob, ..
-        } => query
-            .len()
-            .checked_add(path.len())?
-            .checked_add(glob.as_ref().map_or(0, String::len))?,
-        ToolRequest::ReplaceFile {
-            path,
-            expected_sha256,
-            content,
-        } => path
-            .len()
-            .checked_add(expected_sha256.as_ref().map_or(0, String::len))?
-            .checked_add(content.len())?,
-        ToolRequest::CargoCheck { package, .. } => package.as_ref().map_or(0, String::len),
-        ToolRequest::CargoTest { package, test, .. } => package
-            .as_ref()
-            .map_or(0, String::len)
-            .checked_add(test.as_ref().map_or(0, String::len))?,
-        ToolRequest::GitStatus | ToolRequest::GitDiff => 0,
-    };
-    16usize.checked_add(strings)
 }
 
 fn tool_result_context(result: &ToolResult, content: &str, redacted: bool) -> String {

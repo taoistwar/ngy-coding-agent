@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 #[cfg(feature = "test-support")]
 use coding_agent_app::{
-    ActorPausePoint, ProcessTestConfig, ProcessTestEnvironment, VirtualReleaseSignal,
+    ActorPausePoint, LegacyV2Seed, ProcessTestConfig, ProcessTestEnvironment, VirtualReleaseSignal,
     VirtualReleaseTarget,
 };
 use coding_agent_app::{
@@ -18,7 +18,8 @@ use coding_agent_app::{
     StartupRunnerSelection, SystemSecurityClock, build_runtime_router, launch,
 };
 use coding_agent_domain::{
-    CanonicalPath, ClientRequestId, NewRepository, NewTask, TaskEventKind, TaskStatus, UtcTimestamp,
+    CanonicalPath, ClientRequestId, DeliveryReadiness, NewRepository, NewTask, TaskEventKind,
+    TaskStatus, UtcTimestamp,
 };
 use coding_agent_store::{CreateTaskOutcome, RegisterRepositoryOutcome, Store};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -665,6 +666,85 @@ async fn listener_binding_retries_are_finite_and_never_publish_a_descriptor() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+async fn process_test_legacy_v2_seed_migrates_before_primary_store_projection() {
+    let fixture = support::StartupFixture::new();
+    fixture.prepare();
+    let repository_path = fixture.paths.data_dir.join("legacy-repository");
+    std::fs::create_dir(&repository_path).expect("create legacy repository path");
+    let scenario = fixture.paths.data_dir.join("legacy-v2-scenario.json");
+    std::fs::write(
+        &scenario,
+        serde_json::to_vec(&ProcessTestConfig {
+            fake_scenarios: Vec::new(),
+            store_writer_faults: Vec::new(),
+            actor_pauses: Vec::new(),
+            virtual_release_signals: Vec::new(),
+            legacy_v2_seed: LegacyV2Seed::CompletedTask {
+                repository_path,
+                task_prompt: "Inspect migrated legacy Completed task".to_owned(),
+            },
+            marker_write_failure: false,
+        })
+        .expect("serialize legacy v2 scenario"),
+    )
+    .expect("write legacy v2 scenario");
+    let environment = ProcessTestEnvironment::load(
+        &fixture.paths.data_dir,
+        &fixture.paths.runtime_dir,
+        &scenario,
+    )
+    .expect("load legacy v2 process-test environment");
+    let dependencies = environment
+        .apply(fixture.dependencies(Default::default()))
+        .expect("apply legacy v2 process-test environment");
+
+    let outcome = launch(dependencies)
+        .await
+        .expect("migrate the v2 seed and launch a primary");
+    let StartupOutcome::Primary(primary) = outcome else {
+        panic!("the isolated legacy seed must launch a primary");
+    };
+    let store = &primary.test_handles().store;
+    let bootstrap = store
+        .bootstrap_snapshot()
+        .await
+        .expect("project the migrated bootstrap");
+    let task = bootstrap
+        .tasks
+        .iter()
+        .find(|task| task.prompt == "Inspect migrated legacy Completed task")
+        .expect("legacy completed task remains visible");
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(task.delivery_readiness, DeliveryReadiness::Unreviewed);
+    let detail = store
+        .task_detail(task.id)
+        .await
+        .expect("load migrated legacy detail")
+        .expect("legacy detail remains present");
+    assert!(
+        detail.reviews.is_empty(),
+        "migration must not invent review evidence"
+    );
+    assert_eq!(
+        detail
+            .plan
+            .as_ref()
+            .expect("legacy plan remains projected")
+            .format_version(),
+        0
+    );
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(store.pool())
+            .await
+            .expect("read migrated schema versions");
+    assert_eq!(versions, vec![1, 2, 3]);
+
+    let _ = primary.shutdown().await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 async fn cancelling_launch_at_descriptor_pause_cleans_descriptor_lock_and_listener() {
     let fixture = support::StartupFixture::new();
     fixture.prepare();
@@ -689,6 +769,7 @@ async fn cancelling_launch_at_descriptor_pause_cleans_descriptor_lock_and_listen
                 path: release,
                 target: VirtualReleaseTarget::ActorDescriptorBeforeBrowser,
             }],
+            legacy_v2_seed: LegacyV2Seed::None,
             marker_write_failure: false,
         })
         .expect("serialize process-test scenario"),

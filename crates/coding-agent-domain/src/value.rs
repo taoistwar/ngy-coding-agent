@@ -28,6 +28,12 @@ pub enum DomainError {
     InvalidTaskAttempt,
     #[error("task fields do not match its status")]
     InvalidTaskState,
+    #[error("quality evidence violates the domain contract")]
+    InvalidQualityEvidence,
+    #[error("plan violates the domain contract")]
+    InvalidPlan,
+    #[error("activity violates the domain contract")]
+    InvalidActivity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]

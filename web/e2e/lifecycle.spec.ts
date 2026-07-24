@@ -114,7 +114,7 @@ test("a terminal commit survives a kill before its writer wake", async (
         store_writer_faults: [
           {
             point: "pause_after_commit_before_wake",
-            operation: "finish_task",
+            operation: "finalize_reviewed_task",
             count: 1,
           },
         ],
@@ -144,7 +144,7 @@ test("a terminal commit survives a kill before its writer wake", async (
         (task) => task.status === "running",
         "blocking task to enter Running",
       );
-      await expect(page.locator(".task-status-label")).toHaveText("Status: running");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: running");
       if (runnerReleasePath.length === 0) throw new Error("runner release path was not configured");
       await publishUncoordinatedReleaseSignal(app.runtimeDir, runnerReleasePath);
 
@@ -157,7 +157,7 @@ test("a terminal commit survives a kill before its writer wake", async (
         15,
       );
       expect(durable.failure).toBeNull();
-      await expect(page.locator(".task-status-label")).toHaveText("Status: running");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: running");
 
       await app.hardKillPrimaryPreservingRoot();
       await app.restart(emptyScenario());
@@ -173,7 +173,7 @@ test("a terminal commit survives a kill before its writer wake", async (
       await page
         .getByRole("button", { name: `${prompt} Attempt 1`, exact: true })
         .click();
-      await expect(page.locator(".task-status-label")).toHaveText("Status: completed");
+      await expect(page.locator(".task-status-label")).toHaveText("Execution status: completed");
       await quitThroughUi(page, app);
     },
   );
@@ -208,7 +208,7 @@ test("a secondary exits without replacing the primary writer or descriptor", asy
       (candidate) => candidate.status === "completed",
       "primary task completion after secondary exit",
     );
-    await expect(page.locator(".task-status-label")).toHaveText("Status: completed");
+    await expect(page.locator(".task-status-label")).toHaveText("Execution status: completed");
     await quitThroughUi(page, app);
   });
 });
