@@ -1,0 +1,90 @@
+use std::fmt;
+
+use coding_agent_domain::TaskId;
+
+use crate::delivery::merges::MergeConflictPaths;
+use crate::delivery::merges::proof::{MergeAbortAppliedProof, MergeAbortProof};
+use crate::delivery::{DeliveryError, DeliveryOperationId, DeliveryVersion};
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct BeginMergeAbortRequest {
+    pub(in crate::delivery::merges) task_id: TaskId,
+    pub(in crate::delivery::merges) operation_id: DeliveryOperationId,
+    pub(in crate::delivery::merges) expected_version: DeliveryVersion,
+    pub(in crate::delivery::merges) proof: MergeAbortProof,
+}
+
+impl BeginMergeAbortRequest {
+    pub fn try_new(
+        task_id: TaskId,
+        operation_id: DeliveryOperationId,
+        expected_version: DeliveryVersion,
+        proof: MergeAbortProof,
+    ) -> Result<Self, DeliveryError> {
+        if task_id.as_uuid().is_nil() || operation_id.as_uuid().is_nil() {
+            return Err(DeliveryError::InvalidCommandRequest);
+        }
+        expected_version.next()?;
+        Ok(Self {
+            task_id,
+            operation_id,
+            expected_version,
+            proof,
+        })
+    }
+}
+
+impl fmt::Debug for BeginMergeAbortRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BeginMergeAbortRequest")
+            .field("task_id", &self.task_id)
+            .field("operation_id", &self.operation_id)
+            .field("expected_version", &self.expected_version)
+            .field("proof", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CompleteMergeAbortRequest {
+    pub(in crate::delivery::merges) task_id: TaskId,
+    pub(in crate::delivery::merges) operation_id: DeliveryOperationId,
+    pub(in crate::delivery::merges) expected_version: DeliveryVersion,
+    pub(in crate::delivery::merges) proof: MergeAbortAppliedProof,
+    pub(in crate::delivery::merges) paths: MergeConflictPaths,
+}
+
+impl CompleteMergeAbortRequest {
+    pub fn try_new(
+        task_id: TaskId,
+        operation_id: DeliveryOperationId,
+        expected_version: DeliveryVersion,
+        proof: MergeAbortAppliedProof,
+        paths: MergeConflictPaths,
+    ) -> Result<Self, DeliveryError> {
+        if task_id.as_uuid().is_nil() || operation_id.as_uuid().is_nil() {
+            return Err(DeliveryError::InvalidCommandRequest);
+        }
+        expected_version.next()?;
+        Ok(Self {
+            task_id,
+            operation_id,
+            expected_version,
+            proof,
+            paths,
+        })
+    }
+}
+
+impl fmt::Debug for CompleteMergeAbortRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompleteMergeAbortRequest")
+            .field("task_id", &self.task_id)
+            .field("operation_id", &self.operation_id)
+            .field("expected_version", &self.expected_version)
+            .field("proof_and_paths", &"<redacted>")
+            .finish()
+    }
+}

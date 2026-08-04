@@ -318,10 +318,10 @@ pub(crate) async fn load_review_by_event(
     Ok(stored.review)
 }
 
-pub(crate) async fn load_reviews_for_task(
+pub(crate) async fn load_stored_reviews_for_task(
     connection: &mut SqliteConnection,
     task_id: TaskId,
-) -> Result<Vec<ReviewEvidence>, StoreError> {
+) -> Result<Vec<StoredReview>, StoreError> {
     ensure_review_graph(connection, task_id).await?;
     let records = sqlx::query_as::<_, ReviewRecord>(
         "SELECT r.* FROM task_review_evidence r \
@@ -360,7 +360,18 @@ pub(crate) async fn load_reviews_for_task(
         let initial_checks = load_initial_required_checks(connection, task_id).await?;
         validate_review_check_chain(&initial_checks, &reviews)?;
     }
-    Ok(reviews.into_iter().map(|stored| stored.review).collect())
+    Ok(reviews)
+}
+
+pub(crate) async fn load_reviews_for_task(
+    connection: &mut SqliteConnection,
+    task_id: TaskId,
+) -> Result<Vec<ReviewEvidence>, StoreError> {
+    Ok(load_stored_reviews_for_task(connection, task_id)
+        .await?
+        .into_iter()
+        .map(|stored| stored.review)
+        .collect())
 }
 
 pub(crate) async fn validate_task_review_aggregate(

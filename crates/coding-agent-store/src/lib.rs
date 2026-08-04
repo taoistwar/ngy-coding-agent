@@ -2,6 +2,7 @@
 
 mod artifacts;
 mod claims;
+pub mod delivery;
 mod migrate;
 mod projection;
 mod recovery;
@@ -17,6 +18,47 @@ use coding_agent_domain::{DomainError, TaskStatus};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection as _, SqlitePool};
 
+pub use delivery::{
+    AcceptMergeCommandRequest, AcceptMergeOutcome, AcceptedDeliverySourceState,
+    AdvanceDeliverySourceObjectRequest, ArtifactDispositionRecord, BeginMergeAbortRequest,
+    BranchCleanupKnownNotAppliedReason, BranchDisposition, CleanupAcceptanceOutcome, CleanupKind,
+    CleanupOperationAnchor, CleanupOperationRecord, CleanupOperationState,
+    CleanupReconciliationReason, CleanupState, CleanupTargetHeadObservationRecord,
+    CleanupTransition, CleanupTransitionOutcome, CleanupTransitionReceipt,
+    CommitDeliverySourceRequest, CompleteBranchCleanupRequest, CompleteMergeAbortRequest,
+    CompleteMergeRequest, CompleteWorktreeCleanupRequest, CreateDeliverySourceOutcome,
+    CreateDeliverySourceRequest, CreatePreflightOutcome, CreatePreflightRequest,
+    DELIVERY_COMMAND_REQUEST_HASH_ALGORITHM, DELIVERY_COMMAND_REQUEST_HASH_DOMAIN,
+    DELIVERY_COMMAND_REQUEST_HASH_VERSION, DIRECTORY_IDENTITY_ALGORITHM_V1,
+    DeleteBranchCommandRequest, DeliveryAcceptedOperationState, DeliveryArtifactProvenance,
+    DeliveryCommand, DeliveryCommandId, DeliveryCommandKind, DeliveryCommandLookup,
+    DeliveryCommandReceipt, DeliveryCommitMetadata, DeliveryEligibilitySnapshot, DeliveryError,
+    DeliveryIdentity, DeliveryOperationId, DeliveryOwnershipSnapshot, DeliveryRecoveryAction,
+    DeliveryRecoveryBatch, DeliveryRecoveryCursor, DeliveryRecoveryDisposition,
+    DeliveryRecoveryEntry, DeliveryRecoveryQuery, DeliveryRecoveryQueryError,
+    DeliveryResponseDiscriminator, DeliverySourceAnchor, DeliverySourceAppliedProof,
+    DeliverySourceObjectProof, DeliverySourceReconciliationReason, DeliverySourceRecord,
+    DeliverySourceRetryReason, DeliverySourceState, DeliverySourceTransitionOutcome,
+    DeliverySourceTransitionReceipt, DeliveryState, DeliveryTimestamp, DeliveryVersion,
+    DirectoryIdentity, EVIDENCE_IDENTITY_ALGORITHM_V1, EnterMergePendingRequest,
+    EnterWorktreeRemovePendingRequest, EvidenceIdentityV1, FailureCode, GitBranchRef, GitCommitOid,
+    GitObjectAlgorithm, GitOid, GitTreeOid, MAX_DELIVERY_RECOVERY_BATCH, MarkPreflightStaleOutcome,
+    MarkPreflightStaleRequest, MergeAbortAppliedProof, MergeAbortProof, MergeAppliedProof,
+    MergeAutostashObservation, MergeCommitObjectProof, MergeConflictPathEncoding,
+    MergeConflictPaths, MergeConflictRecord, MergeKnownNotAppliedReason, MergeOperationRecord,
+    MergeOperationState, MergePreflightResult, MergeReconciliationReason, MergeTransitionOutcome,
+    MergeTransitionReceipt, OtherGitOperationObservation, PersistentEligibilityBlocker,
+    PreflightCommandRequest, PreflightRejectedReason, PreflightStaleReason,
+    ReconcileBranchCleanupRequest, ReconcileDeliverySourceOutcome, ReconcileDeliverySourceReceipt,
+    ReconcileDeliverySourceRequest, ReconcileMergeRequest, ReconcileWorktreeCleanupRequest,
+    RecordBranchCleanupFailureRequest, RecordDeliverySourceRetryRequest,
+    RecordMergeKnownFailureRequest, RecordMergePreflightResultRequest,
+    RecordWorktreeCleanupFailureRequest, RecordWorktreeUnlockedRequest,
+    RefreshBranchCleanupTargetRequest, RemoveWorktreeCommandRequest, Sha256Digest,
+    SourceWorktreeProof, StartupDeliveryOwnership, StateTransition,
+    WorktreeCleanupKnownNotAppliedReason, WorktreeDisposition, validate_cleanup_state,
+    validate_cleanup_transition, validate_merge_source_state,
+};
 pub use projection::{
     BootstrapSnapshot, EventPage, QueueCapacity, SchedulerBootstrapSnapshot, TaskDetail,
 };
@@ -42,6 +84,8 @@ pub enum StoreError {
     Database(#[from] sqlx::Error),
     #[error(transparent)]
     Domain(#[from] DomainError),
+    #[error(transparent)]
+    Delivery(#[from] DeliveryError),
     #[error("stored repository ID is invalid: {0}")]
     InvalidRepositoryId(#[from] uuid::Error),
     #[error("stored task ID is invalid: {0}")]
@@ -66,10 +110,16 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("illegal task transition from {from:?} to {to:?}")]
     IllegalTransition { from: TaskStatus, to: TaskStatus },
-    #[error("the client request ID belongs to different task input")]
+    #[error("IDEMPOTENCY_CONFLICT")]
     IdempotencyConflict,
     #[error("task was not found")]
     TaskNotFound,
+    #[error("TASK_NOT_MERGE_ELIGIBLE")]
+    TaskNotMergeEligible,
+    #[error("DELIVERY_OPERATION_IN_PROGRESS")]
+    DeliveryOperationInProgress,
+    #[error("DELIVERY_RECONCILIATION_REQUIRED")]
+    DeliveryReconciliationRequired,
     #[error("attempt artifact input is invalid")]
     InvalidArtifactInput,
     #[error("attempt artifact identity conflicts with durable state")]

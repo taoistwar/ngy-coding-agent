@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use coding_agent_domain::{CanonicalPath, RepositoryId, TaskId, UtcTimestamp};
@@ -59,7 +60,7 @@ pub struct ReserveAttemptArtifact {
     pub worktree_path: CanonicalPath,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TaskAttemptArtifact {
     pub identity: AttemptArtifactIdentity,
     pub base_commit: String,
@@ -69,6 +70,16 @@ pub struct TaskAttemptArtifact {
     pub failure_code: Option<String>,
     pub created_at: UtcTimestamp,
     pub updated_at: UtcTimestamp,
+}
+
+impl fmt::Debug for TaskAttemptArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TaskAttemptArtifact")
+            .field("identity", &self.identity)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,7 +277,7 @@ impl Store {
     }
 }
 
-async fn load_artifact<'e, E>(
+pub(crate) async fn load_artifact<'e, E>(
     executor: E,
     task_id: TaskId,
 ) -> Result<Option<TaskAttemptArtifact>, StoreError>

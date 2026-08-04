@@ -10,9 +10,11 @@ default = []
 test-support = []
 
 [dependencies]
+base64.workspace = true
 coding-agent-domain = { path = "../coding-agent-domain" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true

@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+pub mod delivery;
+pub mod migration_v5;
+
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +26,9 @@ pub struct FileStoreFixture {
 pub struct DurableTaskEventSnapshot {
     pub tasks: Vec<String>,
     pub events: Vec<String>,
+    pub delivery_states: Vec<String>,
+    pub review_evidence: Vec<String>,
+    pub attempt_artifacts: Vec<String>,
     pub stop_intents: Vec<String>,
     pub sequences: Vec<(String, i64)>,
     pub high_watermark: i64,
@@ -108,6 +114,60 @@ pub async fn durable_task_event_snapshot(store: &Store) -> DurableTaskEventSnaps
     .fetch_all(store.pool())
     .await
     .unwrap();
+    let delivery_states = sqlx::query_scalar(
+        "SELECT json_array(\
+             typeof(task_id), quote(task_id),\
+             typeof(readiness), quote(readiness),\
+             typeof(final_review_round), quote(final_review_round),\
+             typeof(final_verdict), quote(final_verdict),\
+             typeof(decided_at), quote(decided_at)\
+         ) FROM task_delivery_state ORDER BY task_id",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    let review_evidence = sqlx::query_scalar(
+        "SELECT json_array(\
+             typeof(task_id), quote(task_id),\
+             typeof(repository_id), quote(repository_id),\
+             typeof(attempt), quote(attempt),\
+             typeof(review_round), quote(review_round),\
+             typeof(workspace_generation), quote(workspace_generation),\
+             typeof(digest_algorithm), quote(digest_algorithm),\
+             typeof(workspace_digest), quote(workspace_digest),\
+             typeof(decision_source), quote(decision_source),\
+             typeof(verdict), quote(verdict),\
+             typeof(summary), quote(summary),\
+             typeof(findings_json), quote(findings_json),\
+             typeof(added_checks_json), quote(added_checks_json),\
+             typeof(required_checks_json), quote(required_checks_json),\
+             typeof(check_evidence_json), quote(check_evidence_json),\
+             typeof(coverage_json), quote(coverage_json),\
+             typeof(created_at), quote(created_at),\
+             typeof(event_id), quote(event_id),\
+             typeof(event_kind), quote(event_kind)\
+         ) FROM task_review_evidence ORDER BY task_id, review_round",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    let attempt_artifacts = sqlx::query_scalar(
+        "SELECT json_array(\
+             typeof(task_id), quote(task_id),\
+             typeof(repository_id), quote(repository_id),\
+             typeof(attempt), quote(attempt),\
+             typeof(base_commit), quote(base_commit),\
+             typeof(branch_name), quote(branch_name),\
+             typeof(worktree_path), quote(worktree_path),\
+             typeof(state), quote(state),\
+             typeof(failure_code), quote(failure_code),\
+             typeof(created_at), quote(created_at),\
+             typeof(updated_at), quote(updated_at)\
+         ) FROM task_attempt_artifacts ORDER BY task_id",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
     let stop_intents = sqlx::query_scalar(
         "SELECT json_array(\
              typeof(task_id), quote(task_id),\
@@ -132,6 +192,9 @@ pub async fn durable_task_event_snapshot(store: &Store) -> DurableTaskEventSnaps
     DurableTaskEventSnapshot {
         tasks,
         events,
+        delivery_states,
+        review_evidence,
+        attempt_artifacts,
         stop_intents,
         sequences,
         high_watermark,

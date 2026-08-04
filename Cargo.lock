@@ -444,10 +444,12 @@ dependencies = [
 name = "coding-agent-store"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "coding-agent-domain",
  "coding-agent-store",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror",

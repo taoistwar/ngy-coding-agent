@@ -4,7 +4,12 @@ use time::OffsetDateTime;
 
 use crate::StoreError;
 
-const LATEST_DATABASE_MIGRATION_VERSION: i64 = 4;
+mod v5_manifest;
+
+use v5_manifest::validate_v5_schema_manifest;
+
+const LATEST_DATABASE_MIGRATION_VERSION: i64 = 5;
+const V5_MIGRATION_SQL: &str = include_str!("../migrations/0005_controlled_delivery.sql");
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
@@ -17,6 +22,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         4,
         include_str!("../migrations/0004_concurrent_scheduler.sql"),
     ),
+    (5, V5_MIGRATION_SQL),
 ];
 
 pub(crate) async fn run(pool: &SqlitePool) -> Result<(), StoreError> {
@@ -53,6 +59,8 @@ pub(crate) async fn run(pool: &SqlitePool) -> Result<(), StoreError> {
             "database migration receipt history is incomplete",
         ));
     }
+
+    validate_v5_schema_manifest(&mut transaction).await?;
 
     let foreign_key_violation = sqlx::query("PRAGMA foreign_key_check")
         .fetch_optional(&mut *transaction)

@@ -7,6 +7,17 @@ use coding_agent_store::{DATABASE_SCHEMA_UNSUPPORTED, Store};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Row, SqliteConnection};
 
+const V5_DELIVERY_TABLES: [&str; 8] = [
+    "task_delivery_sources",
+    "task_merge_operations",
+    "task_merge_conflicts",
+    "task_artifact_dispositions",
+    "task_cleanup_operations",
+    "task_cleanup_target_head_observations",
+    "task_delivery_command_receipts",
+    "task_delivery_operation_transitions",
+];
+
 #[tokio::test]
 async fn migrations_configure_connections_and_are_idempotent() {
     let fixture = support::file_store().await;
@@ -36,7 +47,7 @@ async fn migrations_configure_connections_and_are_idempotent() {
             .fetch_all(fixture.store.pool())
             .await
             .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
 
     for table in [
         "schema_migrations",
@@ -47,6 +58,14 @@ async fn migrations_configure_connections_and_are_idempotent() {
         "task_review_evidence",
         "task_delivery_state",
         "task_stop_intents",
+        "task_delivery_sources",
+        "task_merge_operations",
+        "task_merge_conflicts",
+        "task_artifact_dispositions",
+        "task_cleanup_operations",
+        "task_cleanup_target_head_observations",
+        "task_delivery_command_receipts",
+        "task_delivery_operation_transitions",
     ] {
         let exists: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -1410,7 +1429,7 @@ async fn failed_migration_rolls_back_without_replacing_the_database() {
 }
 
 #[tokio::test]
-async fn version_one_database_upgrades_to_v4_and_repeat_is_a_no_op() {
+async fn version_one_database_upgrades_to_v5_and_repeat_is_a_no_op() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("v1.sqlite3");
     seed_v1(&path, false).await;
@@ -1424,7 +1443,7 @@ async fn version_one_database_upgrades_to_v4_and_repeat_is_a_no_op() {
             .fetch_all(store.pool())
             .await
             .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     for table in [
         "task_attempt_artifacts",
         "task_review_evidence",
@@ -1437,6 +1456,7 @@ async fn version_one_database_upgrades_to_v4_and_repeat_is_a_no_op() {
     assert_eq!(row_count(store.pool(), "task_review_evidence").await, 0);
     assert_eq!(row_count(store.pool(), "task_delivery_state").await, 0);
     assert_eq!(row_count(store.pool(), "task_stop_intents").await, 0);
+    assert_no_delivery_rows(store.pool()).await;
     assert_legacy_rows_preserved(store.pool()).await;
     assert_foreign_keys_clean(store.pool()).await;
 }
@@ -1475,7 +1495,7 @@ async fn failed_v2_upgrade_rolls_back_every_v2_statement_and_preserves_v1() {
 }
 
 #[tokio::test]
-async fn version_two_database_upgrades_to_v4_without_rewriting_existing_rows() {
+async fn version_two_database_upgrades_to_v5_without_rewriting_existing_rows() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("v2.sqlite3");
     seed_v2(&path, false).await;
@@ -1489,11 +1509,12 @@ async fn version_two_database_upgrades_to_v4_without_rewriting_existing_rows() {
             .fetch_all(store.pool())
             .await
             .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     assert_eq!(row_count(store.pool(), "task_attempt_artifacts").await, 1);
     assert_eq!(row_count(store.pool(), "task_review_evidence").await, 0);
     assert_eq!(row_count(store.pool(), "task_delivery_state").await, 0);
     assert_eq!(row_count(store.pool(), "task_stop_intents").await, 0);
+    assert_no_delivery_rows(store.pool()).await;
 
     let artifact: (String, String, i64, String) = sqlx::query_as(
         "SELECT task_id, repository_id, attempt, state \
@@ -1572,7 +1593,7 @@ async fn failed_v3_upgrade_rolls_back_every_v3_statement_and_preserves_v2() {
 }
 
 #[tokio::test]
-async fn version_three_database_upgrades_to_v4_without_rewriting_quality_or_event_rows() {
+async fn version_three_database_upgrades_to_v5_without_rewriting_quality_or_event_rows() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("v3.sqlite3");
     seed_v3(&path).await;
@@ -1628,7 +1649,7 @@ async fn version_three_database_upgrades_to_v4_without_rewriting_quality_or_even
             .fetch_all(store.pool())
             .await
             .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     assert_eq!(quality_rows_snapshot(store.pool()).await, quality_before);
     assert_eq!(event_rows_snapshot(store.pool()).await, events_before);
     assert_eq!(
@@ -1640,6 +1661,7 @@ async fn version_three_database_upgrades_to_v4_without_rewriting_quality_or_even
     );
     assert_eq!(schema_snapshot(store.pool()).await, schema_after_first);
     assert_eq!(row_count(store.pool(), "task_stop_intents").await, 0);
+    assert_no_delivery_rows(store.pool()).await;
     assert_foreign_keys_clean(store.pool()).await;
 }
 
@@ -1704,7 +1726,8 @@ async fn invalid_migration_histories_fail_closed_before_any_schema_write() {
             "future version",
             CANONICAL_HISTORY_SCHEMA,
             "INSERT INTO schema_migrations VALUES
-                 (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');",
+                 (1, 'one'), (2, 'two'), (3, 'three'),
+                 (4, 'four'), (5, 'five'), (6, 'six');",
         ),
         (
             "zero version",
@@ -1820,7 +1843,7 @@ async fn temporary_migration_table_cannot_shadow_main_history() {
             .fetch_all(store.pool())
             .await
             .unwrap();
-    assert_eq!(main_versions, vec![1, 2, 3, 4]);
+    assert_eq!(main_versions, vec![1, 2, 3, 4, 5]);
     assert_eq!(temporary_versions, vec![99]);
 }
 
@@ -2084,6 +2107,16 @@ async fn assert_foreign_keys_clean(pool: &sqlx::SqlitePool) {
     );
 }
 
+async fn assert_no_delivery_rows(pool: &sqlx::SqlitePool) {
+    for table in V5_DELIVERY_TABLES {
+        assert_eq!(
+            row_count(pool, table).await,
+            0,
+            "legacy migration invented rows in {table}"
+        );
+    }
+}
+
 async fn schema_snapshot(pool: &sqlx::SqlitePool) -> Vec<(String, String, String, Option<String>)> {
     sqlx::query_as(
         "SELECT type, name, tbl_name, sql \
@@ -2161,6 +2194,18 @@ async fn row_count(pool: &sqlx::SqlitePool, table: &str) -> i64 {
         "task_review_evidence" => "SELECT COUNT(*) FROM task_review_evidence",
         "task_delivery_state" => "SELECT COUNT(*) FROM task_delivery_state",
         "task_stop_intents" => "SELECT COUNT(*) FROM task_stop_intents",
+        "task_delivery_sources" => "SELECT COUNT(*) FROM task_delivery_sources",
+        "task_merge_operations" => "SELECT COUNT(*) FROM task_merge_operations",
+        "task_merge_conflicts" => "SELECT COUNT(*) FROM task_merge_conflicts",
+        "task_artifact_dispositions" => "SELECT COUNT(*) FROM task_artifact_dispositions",
+        "task_cleanup_operations" => "SELECT COUNT(*) FROM task_cleanup_operations",
+        "task_cleanup_target_head_observations" => {
+            "SELECT COUNT(*) FROM task_cleanup_target_head_observations"
+        }
+        "task_delivery_command_receipts" => "SELECT COUNT(*) FROM task_delivery_command_receipts",
+        "task_delivery_operation_transitions" => {
+            "SELECT COUNT(*) FROM task_delivery_operation_transitions"
+        }
         other => panic!("unsupported fixture table {other}"),
     };
     sqlx::query_scalar(query).fetch_one(pool).await.unwrap()
