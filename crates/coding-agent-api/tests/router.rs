@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use coding_agent_api::{api_openapi, build_api_router};
-use http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HOST, SET_COOKIE};
+use http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HOST, RETRY_AFTER, SET_COOKIE};
 use http::{Method, StatusCode};
 use support::{CancelMode, PickMode, Ports, RetryMode};
 
@@ -84,7 +84,7 @@ fn openapi_paths_and_cancel_responses_are_exact() {
             "/api/tasks",
             "post",
             &[
-                "200", "201", "400", "401", "403", "409", "415", "422", "500", "503",
+                "200", "201", "400", "401", "403", "409", "415", "422", "429", "500", "503",
             ],
         ),
         (
@@ -103,7 +103,7 @@ fn openapi_paths_and_cancel_responses_are_exact() {
             "/api/tasks/{id}/retry",
             "post",
             &[
-                "200", "201", "400", "401", "403", "404", "409", "500", "503",
+                "200", "201", "400", "401", "403", "404", "409", "429", "500", "503",
             ],
         ),
         (
@@ -370,6 +370,11 @@ async fn task_create_validates_body_and_maps_idempotency_and_store_failures() {
             StatusCode::CONFLICT,
             Some("IDEMPOTENCY_CONFLICT"),
         ),
+        (
+            "queue-full",
+            StatusCode::TOO_MANY_REQUESTS,
+            Some("TASK_QUEUE_FULL"),
+        ),
         ("busy", StatusCode::SERVICE_UNAVAILABLE, Some("STORE_BUSY")),
         (
             "degraded",
@@ -414,6 +419,67 @@ async fn task_create_validates_body_and_maps_idempotency_and_store_failures() {
     assert_eq!(
         support::send(router(&ports), request).await.status(),
         StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+}
+
+#[tokio::test]
+async fn queue_full_and_stop_winner_errors_have_exact_envelopes() {
+    let ports = Ports::new();
+    let create = support::send(
+        router(&ports),
+        support::mutation_request("/api/tasks", support::create_task_body("queue-full")),
+    )
+    .await;
+    assert_queue_full_response(create).await;
+
+    ports.backend.set_retry_mode(RetryMode::QueueFull);
+    let task_id = ports.backend.task().id;
+    let retry = support::send(
+        router(&ports),
+        support::empty_mutation_request(&format!("/api/tasks/{task_id}/retry")),
+    )
+    .await;
+    assert_queue_full_response(retry).await;
+
+    ports
+        .backend
+        .set_cancel_mode(CancelMode::StopAlreadyRequested);
+    let cancel = support::send(
+        router(&ports),
+        support::empty_mutation_request(&format!("/api/tasks/{task_id}/cancel")),
+    )
+    .await;
+    let (status, headers, body) = support::json(cancel).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(!headers.contains_key(RETRY_AFTER));
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "code": "TASK_STOP_ALREADY_REQUESTED",
+            "message": "another stop request already won for this task",
+            "retryable": false,
+            "request_id": support::REQUEST_ID,
+            "details": {},
+        })
+    );
+}
+
+async fn assert_queue_full_response(response: axum::response::Response) {
+    let (status, headers, body) = support::json(response).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(!headers.contains_key(RETRY_AFTER));
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "code": "TASK_QUEUE_FULL",
+            "message": "the task queue is full; retry after capacity becomes available",
+            "retryable": true,
+            "request_id": support::REQUEST_ID,
+            "details": {
+                "queued_tasks": 32,
+                "max_queued_tasks": 32,
+            },
+        })
     );
 }
 

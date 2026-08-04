@@ -51,6 +51,7 @@ test("a dropped create wake converges through the dispatcher poll exactly once",
       startReleasePath = roots.releaseSignalPath("release-paused-start-after-poll");
       return {
         ...successScenario(),
+        runtime_config: null,
         fake_scenarios: ["blocking"],
         store_writer_faults: [
           {
@@ -149,6 +150,7 @@ test("an ahead cursor receives an id-less reset and the normal UI stream reconne
       releasePath = roots.releaseSignalPath("bootstrap-cursor-ahead");
       return {
         ...successScenario(),
+        runtime_config: null,
         actor_pauses: ["bootstrap_cursor_ahead"],
         virtual_release_signals: [
           {
@@ -227,16 +229,17 @@ test("a newer service control cannot regress behind a paused bootstrap snapshot"
       recoveryReleasePath = roots.releaseSignalPath("recovery-after-service-change");
       return {
         ...successScenario(),
-        fake_scenarios: ["failure"],
+        runtime_config: null,
+        fake_scenarios: ["success"],
         store_writer_faults: [
           {
             point: "fail_before_execute",
-            operation: "finish_task",
+            operation: "append_running_event",
             count: 1,
           },
           {
             point: "pause_before_execute",
-            operation: "recover_incomplete",
+            operation: "interrupt_remaining_after_stops",
             count: 1,
           },
         ],
@@ -323,16 +326,17 @@ test("store degradation stays visible until recovery persists the interrupted ta
       recoveryReleasePath = roots.releaseSignalPath("release-degraded-recovery");
       return {
         ...successScenario(),
-        fake_scenarios: ["failure"],
+        runtime_config: null,
+        fake_scenarios: ["success"],
         store_writer_faults: [
           {
             point: "fail_before_execute",
-            operation: "finish_task",
+            operation: "append_running_event",
             count: 1,
           },
           {
             point: "pause_before_execute",
-            operation: "recover_incomplete",
+            operation: "interrupt_remaining_after_stops",
             count: 1,
           },
         ],
@@ -351,7 +355,7 @@ test("store degradation stays visible until recovery persists the interrupted ta
       const created = await createTaskThroughUi(
         page,
         app,
-        "Recover an ambiguous terminal write",
+        "Recover a failed activity write",
       );
       if (recoveryReleasePath.length === 0) {
         throw new Error("degraded recovery release path was not configured");
@@ -378,7 +382,7 @@ test("store degradation stays visible until recovery persists the interrupted ta
         app.origin,
         created.id,
         (task) => task.status === "interrupted",
-        "degraded recovery to interrupt the ambiguous task",
+        "degraded recovery to interrupt the running task",
       );
       expect(recovered.failure?.code).toBe("STORE_WRITE_FAILED");
       const recoveryEvents = await taskEvents(context.request, app.origin, created.id);

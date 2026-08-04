@@ -236,6 +236,7 @@ export interface components {
             /** Format: int32 */
             max_concurrent_tasks: number;
             repositories: components["schemas"]["RepositoryDto"][];
+            scheduler: components["schemas"]["SchedulerStateDto"];
             server_started_at: components["schemas"]["UtcTimestampDto"];
             service_state: components["schemas"]["ServiceStateDto"];
             /** Format: int64 */
@@ -448,6 +449,161 @@ export interface components {
         };
         /** @enum {string} */
         ReviewVerdictDto: "approved" | "changes_requested";
+        /** @enum {string} */
+        SchedulerAdmissionStateDto: "running" | "paused";
+        SchedulerControlStorageDto: {
+            data: components["schemas"]["SchedulerStorageScopeDto"];
+            runtime: components["schemas"]["SchedulerStorageScopeDto"];
+            state: components["schemas"]["SchedulerStorageStateDto"];
+        };
+        SchedulerLimitsDto: {
+            /** Format: int32 */
+            cargo_jobs_per_task: number;
+            /** Format: int32 */
+            global: number;
+            /** Format: int32 */
+            per_repository: number;
+            /** Format: int32 */
+            queued: number;
+        };
+        /** @enum {string} */
+        SchedulerQueueReasonDto: "service_paused" | "storage_pressure" | "global_capacity" | "repository_capacity" | "repository_control_busy";
+        SchedulerQueuedTaskDto: {
+            reason: components["schemas"]["SchedulerQueueReasonDto"];
+            /** Format: uuid */
+            task_id: string;
+        };
+        SchedulerQueuedTaskItemDto: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "queued_task";
+            reason: components["schemas"]["SchedulerQueueReasonDto"];
+            /** Format: uuid */
+            task_id: string;
+        };
+        /** @enum {string} */
+        SchedulerQueuedTaskItemKind: "queued_task";
+        SchedulerRepositoryStorageDto: {
+            /** Format: uuid */
+            repository_id: string;
+            state: components["schemas"]["SchedulerStorageStateDto"];
+        };
+        SchedulerRepositoryStorageItemDto: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "repository_storage";
+            /** Format: uuid */
+            repository_id: string;
+            state: components["schemas"]["SchedulerStorageStateDto"];
+        };
+        /** @enum {string} */
+        SchedulerRepositoryStorageItemKind: "repository_storage";
+        SchedulerStateChunkControl: {
+            /** Format: int32 */
+            chunk_count: number;
+            /** Format: int32 */
+            chunk_index: number;
+            /** Format: int64 */
+            generation: number;
+            items: components["schemas"]["SchedulerStateItemDto"][];
+            kind: components["schemas"]["SchedulerStateChunkKind"];
+            /** Format: int32 */
+            schema_version: number;
+            /** Format: uuid */
+            server_instance_id: string;
+            snapshot_digest: string;
+        };
+        /** @enum {string} */
+        SchedulerStateChunkKind: "scheduler.state.chunk";
+        SchedulerStateControl: {
+            /** Format: int32 */
+            active_task_count: number;
+            admission_state: components["schemas"]["SchedulerAdmissionStateDto"];
+            /** Format: int64 */
+            as_of_event_id: number;
+            /** Format: int32 */
+            chunk_count: number;
+            /** Format: int64 */
+            generation: number;
+            /** Format: int32 */
+            item_count: number;
+            kind: components["schemas"]["SchedulerStateKind"];
+            limits: components["schemas"]["SchedulerLimitsDto"];
+            /** Format: int32 */
+            queued_task_count: number;
+            /** Format: int32 */
+            repository_storage_count: number;
+            /** Format: int32 */
+            schema_version: number;
+            /** Format: uuid */
+            server_instance_id: string;
+            server_started_at: components["schemas"]["UtcTimestampDto"];
+            /** Format: int64 */
+            service_state_generation: number;
+            snapshot_digest: string;
+            /** Format: int32 */
+            stopping_task_count: number;
+            storage: components["schemas"]["SchedulerControlStorageDto"];
+        };
+        SchedulerStateDto: {
+            /** Format: int32 */
+            active_task_count: number;
+            admission_state: components["schemas"]["SchedulerAdmissionStateDto"];
+            /** Format: int64 */
+            as_of_event_id: number;
+            /** Format: int64 */
+            generation: number;
+            limits: components["schemas"]["SchedulerLimitsDto"];
+            /** Format: int32 */
+            queued_task_count: number;
+            queued_tasks: components["schemas"]["SchedulerQueuedTaskDto"][];
+            /** Format: int32 */
+            schema_version: number;
+            /** Format: uuid */
+            server_instance_id: string;
+            server_started_at: components["schemas"]["UtcTimestampDto"];
+            /** Format: int64 */
+            service_state_generation: number;
+            stopping_tasks: components["schemas"]["SchedulerStoppingTaskDto"][];
+            storage: components["schemas"]["SchedulerStorageDto"];
+        };
+        SchedulerStateItemDto: components["schemas"]["SchedulerQueuedTaskItemDto"] | components["schemas"]["SchedulerStoppingTaskItemDto"] | components["schemas"]["SchedulerRepositoryStorageItemDto"];
+        /** @enum {string} */
+        SchedulerStateKind: "scheduler.state";
+        /** @enum {string} */
+        SchedulerStopIntentDto: "user_cancelled" | "disk_pressure_critical";
+        SchedulerStoppingTaskDto: {
+            intent: components["schemas"]["SchedulerStopIntentDto"];
+            /** Format: uuid */
+            task_id: string;
+        };
+        SchedulerStoppingTaskItemDto: {
+            intent: components["schemas"]["SchedulerStopIntentDto"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "stopping_task";
+            /** Format: uuid */
+            task_id: string;
+        };
+        /** @enum {string} */
+        SchedulerStoppingTaskItemKind: "stopping_task";
+        SchedulerStorageDto: {
+            data: components["schemas"]["SchedulerStorageScopeDto"];
+            repositories: components["schemas"]["SchedulerRepositoryStorageDto"][];
+            runtime: components["schemas"]["SchedulerStorageScopeDto"];
+            state: components["schemas"]["SchedulerStorageStateDto"];
+        };
+        SchedulerStorageScopeDto: {
+            state: components["schemas"]["SchedulerStorageStateDto"];
+        };
+        /** @enum {string} */
+        SchedulerStorageStateDto: "normal" | "pressure" | "critical" | "unavailable";
         ServiceStateControl: {
             /** Format: int64 */
             generation: number;
@@ -463,7 +619,7 @@ export interface components {
         SessionExchangeRequest: {
             token: string;
         };
-        SseMessage: components["schemas"]["TaskEventDto"] | components["schemas"]["StreamResetControl"] | components["schemas"]["ServiceStateControl"];
+        SseMessage: components["schemas"]["TaskEventDto"] | components["schemas"]["StreamResetControl"] | components["schemas"]["ServiceStateControl"] | components["schemas"]["SchedulerStateControl"] | components["schemas"]["SchedulerStateChunkControl"];
         StreamResetControl: {
             kind: components["schemas"]["StreamResetKind"];
             /** Format: int64 */
@@ -1291,6 +1447,14 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             500: {
                 headers: {
                     [name: string]: unknown;
@@ -1599,6 +1763,14 @@ export interface operations {
                 };
             };
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

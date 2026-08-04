@@ -1,12 +1,13 @@
 use std::fmt;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use coding_agent_domain::{RepositoryId, TaskId};
 use futures_util::Stream;
 
 use crate::{
     AddRepositoryRequest, ApiResult, BootstrapResponse, CreateTaskRequest, RepositoryDto,
-    ServiceStateControl, TaskDetailDto, TaskDto, TaskEventDto,
+    SchedulerStateDto, ServiceStateControl, TaskDetailDto, TaskDto, TaskEventDto,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -83,13 +84,19 @@ pub trait ApiBackend: Send + Sync + 'static {
         auth: &AuthContext,
         repository_id: Option<RepositoryId>,
     ) -> ApiResult<Vec<TaskDto>>;
+    /// Resolve idempotent Existing and conflicting inputs before capacity; only a genuinely new
+    /// task may return [`crate::ApiError::task_queue_full`].
     async fn create_task(
         &self,
         auth: &AuthContext,
         request: CreateTaskRequest,
     ) -> ApiResult<CreateResult<TaskDto>>;
     async fn task_detail(&self, auth: &AuthContext, id: TaskId) -> ApiResult<TaskDetailDto>;
+    /// Preserve an already-durable stop winner; a competing user cancellation returns
+    /// [`crate::ApiError::task_stop_already_requested`].
     async fn cancel_task(&self, auth: &AuthContext, id: TaskId) -> ApiResult<CancelResult>;
+    /// Resolve an existing direct retry child and source retryability before capacity; only a
+    /// genuinely new retry child may return [`crate::ApiError::task_queue_full`].
     async fn retry_task(&self, auth: &AuthContext, id: TaskId) -> ApiResult<CreateResult<TaskDto>>;
     async fn task_events(
         &self,
@@ -110,12 +117,19 @@ pub enum LiveEventItem {
 
 pub type LiveEventStream = Pin<Box<dyn Stream<Item = LiveEventItem> + Send + 'static>>;
 pub type ServiceStateStream = Pin<Box<dyn Stream<Item = ServiceStateControl> + Send + 'static>>;
+pub type SchedulerStateStream =
+    Pin<Box<dyn Stream<Item = ApiResult<Arc<SchedulerStateDto>>> + Send + 'static>>;
 
 #[async_trait::async_trait]
 pub trait SseBackend: Send + Sync + 'static {
     fn subscribe_live(&self) -> LiveEventStream;
     fn subscribe_service_state(&self) -> ServiceStateStream;
+    fn subscribe_scheduler_state(&self) -> SchedulerStateStream;
     async fn current_service_state(&self) -> ApiResult<ServiceStateControl>;
+    async fn current_scheduler_state(&self) -> ApiResult<Arc<SchedulerStateDto>>;
+    /// Returns the greatest persisted membership lifecycle event ID at or before
+    /// `after_cursor`. The result must be in `0..=after_cursor`.
+    async fn membership_watermark_through(&self, after_cursor: i64) -> ApiResult<i64>;
     async fn latest_event_id(&self) -> ApiResult<i64>;
     async fn events_between(
         &self,

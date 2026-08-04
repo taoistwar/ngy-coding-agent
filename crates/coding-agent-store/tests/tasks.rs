@@ -11,7 +11,8 @@ use coding_agent_domain::{
     WorkspaceDigest,
 };
 use coding_agent_store::{
-    AppendEventOutcome, CreateTaskOutcome, RetryTaskOutcome, Store, StoreError, TaskTransition,
+    AppendEventOutcome, CreateTaskOutcome, FinalizeUnreviewedTaskOutcome,
+    FinalizeUnreviewedTaskRequest, RetryTaskOutcome, Store, StoreError, TaskTransition,
     TransitionOutcome,
 };
 use tokio::sync::Barrier;
@@ -154,6 +155,116 @@ async fn transitions_set_timestamps_and_failure_fields_from_the_closed_transitio
     assert!(cancelled.finished_at.is_some());
     assert_eq!(cancelled.failure, None);
     assert_eq!(cancelled.delivery_readiness, DeliveryReadiness::Unreviewed);
+}
+
+#[tokio::test]
+async fn unreviewed_finalization_is_exact_and_idempotent() {
+    let store = support::seeded_store().await;
+    let running = support::running_task(&store).await;
+    let failure = support::failure("EXACT_UNREVIEWED_FAILURE");
+    let request = FinalizeUnreviewedTaskRequest {
+        task_id: running.id,
+        expected_repository_id: running.repository_id,
+        expected_attempt: running.attempt,
+        transition: TaskTransition::Failed(failure.clone()),
+    };
+    let first = store
+        .finalize_unreviewed_task(request.clone())
+        .await
+        .unwrap();
+    let (task, event_id) = match first {
+        FinalizeUnreviewedTaskOutcome::Applied { task, event_id } => (task, event_id),
+        other => panic!("first exact finalization must apply: {other:?}"),
+    };
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(task.delivery_readiness, DeliveryReadiness::Unreviewed);
+    assert_eq!(task.failure, Some(failure));
+    assert_eq!(task.last_event_id, event_id);
+
+    assert!(matches!(
+        store.finalize_unreviewed_task(request).await.unwrap(),
+        FinalizeUnreviewedTaskOutcome::Existing {
+            task: existing,
+            event_id: existing_event,
+        } if existing == task && existing_event == event_id
+    ));
+    assert_eq!(
+        store
+            .task_events_after(task.id, EventCursor::ZERO, usize::MAX)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| event.payload.kind() == TaskEventKind::TaskFailed)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unreviewed_finalization_replay_rejects_wrong_terminal_kind_payload_and_readiness() {
+    for corruption in ["kind", "payload"] {
+        let store = support::seeded_store().await;
+        let running = support::running_task(&store).await;
+        let request = FinalizeUnreviewedTaskRequest {
+            task_id: running.id,
+            expected_repository_id: running.repository_id,
+            expected_attempt: running.attempt,
+            transition: TaskTransition::Cancelled,
+        };
+        let terminal = match store
+            .finalize_unreviewed_task(request.clone())
+            .await
+            .unwrap()
+        {
+            FinalizeUnreviewedTaskOutcome::Applied { task, .. } => task,
+            other => panic!("canonical finalization must apply: {other:?}"),
+        };
+        match corruption {
+            "kind" => {
+                sqlx::query("UPDATE task_events SET kind = 'activity.appended' WHERE id = ?")
+                    .bind(terminal.last_event_id.get())
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+            }
+            "payload" => {
+                sqlx::query("UPDATE task_events SET payload_json = '{}' WHERE id = ?")
+                    .bind(terminal.last_event_id.get())
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                store.finalize_unreviewed_task(request).await.unwrap(),
+                FinalizeUnreviewedTaskOutcome::InvariantConflict
+            ),
+            "{corruption}"
+        );
+    }
+
+    let store = support::seeded_store().await;
+    let running = support::running_task(&store).await;
+    let reviewed =
+        install_delivery_fixture(&store, running, DeliveryReadiness::ReviewRejected).await;
+    let request = FinalizeUnreviewedTaskRequest {
+        task_id: reviewed.id,
+        expected_repository_id: reviewed.repository_id,
+        expected_attempt: reviewed.attempt,
+        transition: TaskTransition::Failed(
+            reviewed
+                .failure
+                .clone()
+                .expect("review-rejected task carries its exact failure"),
+        ),
+    };
+    assert!(matches!(
+        store.finalize_unreviewed_task(request).await.unwrap(),
+        FinalizeUnreviewedTaskOutcome::InvariantConflict
+    ));
 }
 
 #[tokio::test]
@@ -505,6 +616,12 @@ async fn every_lifecycle_payload_contains_the_final_task_pointing_to_its_event()
         .await
         .unwrap();
     let retry = store.retry_task(running.id).await.unwrap().task().clone();
+    let retry = applied_task(
+        store
+            .transition_with_event(retry.id, TaskStatus::Queued, TaskTransition::Running)
+            .await
+            .unwrap(),
+    );
     support::terminal_task(&store, TaskStatus::Completed).await;
     support::terminal_task(&store, TaskStatus::Cancelled).await;
     store
@@ -576,30 +693,44 @@ async fn every_lifecycle_payload_contains_the_final_task_pointing_to_its_event()
 }
 
 #[tokio::test]
-async fn recovery_interrupts_incomplete_tasks_in_deterministic_order_and_reports_watermark() {
+async fn recovery_interrupts_only_running_tasks_in_deterministic_order_and_reports_watermark() {
     let store = support::seeded_store().await;
     let queued = support::queued_task(&store).await;
     let running = support::running_task(&store).await;
-    let tied = support::queued_task(&store).await;
+    let tied = support::running_task(&store).await;
     let terminal = support::terminal_task(&store, TaskStatus::Completed).await;
-    sqlx::query("UPDATE tasks SET created_at = ? WHERE id = ?")
-        .bind("2026-01-01T00:00:00.000000001Z")
-        .bind(queued.id.to_string())
+    for (task, created_at) in [
+        (&queued, "2026-01-01T00:00:00.000000001Z"),
+        (&running, "2026-01-01T00:00:00.000000002Z"),
+        (&tied, "2026-01-01T00:00:00.000000002Z"),
+    ] {
+        sqlx::query("UPDATE tasks SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(task.id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE task_events \
+             SET payload_json = json_set(payload_json, '$.task.created_at', ?) \
+             WHERE task_id = ? \
+               AND kind IN ('task.queued', 'task.started')",
+        )
+        .bind(created_at)
+        .bind(task.id.to_string())
         .execute(store.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE tasks SET created_at = ? WHERE id = ?")
-        .bind("2026-01-01T00:00:00.000000002Z")
-        .bind(running.id.to_string())
+        sqlx::query(
+            "UPDATE task_events SET created_at = ? \
+             WHERE task_id = ? AND kind = 'task.queued'",
+        )
+        .bind(created_at)
+        .bind(task.id.to_string())
         .execute(store.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE tasks SET created_at = ? WHERE id = ?")
-        .bind("2026-01-01T00:00:00.000000002Z")
-        .bind(tied.id.to_string())
-        .execute(store.pool())
-        .await
-        .unwrap();
+    }
 
     let now = UtcTimestamp::parse_rfc3339("2026-01-02T03:04:05.000000006Z").unwrap();
     let failure = support::failure("APP_RESTARTED");
@@ -607,7 +738,7 @@ async fn recovery_interrupts_incomplete_tasks_in_deterministic_order_and_reports
         .recover_incomplete(now, failure.clone())
         .await
         .unwrap();
-    assert_eq!(outcome.interrupted_count, 3);
+    assert_eq!(outcome.interrupted_count, 2);
     assert!(outcome.first_event_id < outcome.last_event_id);
     assert_eq!(
         outcome.high_watermark,
@@ -629,15 +760,19 @@ async fn recovery_interrupts_incomplete_tasks_in_deterministic_order_and_reports
         .collect();
     let mut tied_ids = [running.id, tied.id];
     tied_ids.sort_by_key(ToString::to_string);
-    assert_eq!(interrupted_ids, vec![queued.id, tied_ids[0], tied_ids[1]]);
+    assert_eq!(interrupted_ids, vec![tied_ids[0], tied_ids[1]]);
 
-    for task_id in [queued.id, running.id, tied.id] {
+    for task_id in [running.id, tied.id] {
         let task = store.task_detail(task_id).await.unwrap().unwrap().task;
         assert_eq!(task.status, TaskStatus::Interrupted);
         assert_eq!(task.finished_at, Some(now));
         assert_eq!(task.failure, Some(failure.clone()));
         assert_eq!(task.delivery_readiness, DeliveryReadiness::Unreviewed);
     }
+    let queued_after = store.task_detail(queued.id).await.unwrap().unwrap().task;
+    assert_eq!(queued_after.status, TaskStatus::Queued);
+    assert_eq!(queued_after.finished_at, None);
+    assert_eq!(queued_after.failure, None);
     assert_eq!(
         store.task_detail(terminal.id).await.unwrap().unwrap().task,
         terminal
@@ -654,7 +789,7 @@ async fn recovery_interrupts_incomplete_tasks_in_deterministic_order_and_reports
 #[tokio::test]
 async fn recovery_failure_rolls_back_every_task_and_event() {
     let store = support::seeded_store().await;
-    let first = support::queued_task(&store).await;
+    let first = support::running_task(&store).await;
     let second = support::running_task(&store).await;
     let before_events = event_count(&store).await;
     let before_first = store.task_detail(first.id).await.unwrap().unwrap().task;
@@ -703,6 +838,19 @@ async fn faults_at_each_lifecycle_write_stage_roll_back_without_publishable_plac
     }
 }
 
+#[tokio::test]
+async fn queue_limited_create_and_retry_roll_back_at_each_lifecycle_write_stage() {
+    for point in [
+        FaultPoint::TaskStateUpdated,
+        FaultPoint::PlaceholderInserted,
+        FaultPoint::LastEventUpdated,
+        FaultPoint::FinalPayloadUpdated,
+    ] {
+        assert_queue_limited_create_fault_rolls_back(point).await;
+        assert_queue_limited_retry_fault_rolls_back(point).await;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum FaultPoint {
     TaskStateUpdated,
@@ -734,6 +882,47 @@ async fn assert_transition_fault_rolls_back(point: FaultPoint) {
     .await
     .unwrap();
     assert_eq!(later_publishable, 0, "fault point {point:?}");
+}
+
+async fn assert_queue_limited_create_fault_rolls_back(point: FaultPoint) {
+    let store = support::seeded_store().await;
+    let repository = store.list_repositories().await.unwrap().remove(0);
+    let before = support::durable_task_event_snapshot(&store).await;
+    install_fault(&store, point).await;
+
+    store
+        .create_task_with_queue_limit(
+            support::new_task(repository.id, "faulted limited create"),
+            support::queue_limit(1),
+        )
+        .await
+        .expect_err("injected create fault must escape");
+
+    assert_eq!(
+        support::durable_task_event_snapshot(&store).await,
+        before,
+        "{point:?}"
+    );
+    assert_eq!(placeholder_count(&store).await, 0, "{point:?}");
+}
+
+async fn assert_queue_limited_retry_fault_rolls_back(point: FaultPoint) {
+    let store = support::seeded_store().await;
+    let source = support::terminal_task(&store, TaskStatus::Interrupted).await;
+    let before = support::durable_task_event_snapshot(&store).await;
+    install_fault(&store, point).await;
+
+    store
+        .retry_task_with_queue_limit(source.id, support::queue_limit(1))
+        .await
+        .expect_err("injected retry fault must escape");
+
+    assert_eq!(
+        support::durable_task_event_snapshot(&store).await,
+        before,
+        "{point:?}"
+    );
+    assert_eq!(placeholder_count(&store).await, 0, "{point:?}");
 }
 
 async fn install_fault(store: &Store, point: FaultPoint) {

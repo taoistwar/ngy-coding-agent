@@ -1,4 +1,13 @@
 import type { SseMessage } from "./types";
+import {
+  SchedulerSnapshotAssembler,
+  SchedulerSnapshotError,
+  validateSchedulerStateChunkControl,
+  validateSchedulerStateControl,
+  type SchedulerAssemblerOutcome,
+  type SchedulerSnapshotCandidate,
+  type SchedulerWireControl,
+} from "./schedulerSnapshot";
 import { ValidationError, validateTaskEvent } from "./validation";
 
 const DEFAULT_ENDPOINT = "/api/events";
@@ -275,6 +284,11 @@ export interface SseMessageContext {
   readonly persistedId: number | null;
 }
 
+export type SseProjectionMessage = Exclude<
+  SseMessage,
+  { kind: "scheduler.state" | "scheduler.state.chunk" }
+>;
+
 export type SseClientState =
   | { readonly kind: "connecting"; readonly cursor: number }
   | { readonly kind: "open"; readonly cursor: number }
@@ -306,8 +320,11 @@ export type SseClientState =
 
 export interface SseClientCallbacks {
   readonly onMessage: (
-    message: SseMessage,
+    message: SseProjectionMessage,
     context: SseMessageContext,
+  ) => void | Promise<void>;
+  readonly onSchedulerSnapshot: (
+    candidate: SchedulerSnapshotCandidate,
   ) => void | Promise<void>;
   readonly onDiagnostic: (
     diagnostic: SseDiagnostic,
@@ -635,19 +652,27 @@ export class SseClient {
       const parser = new IncrementalSseParser({
         maxFrameBytes: this.#maxFrameBytes,
       });
+      const schedulerAssembler = new SchedulerSnapshotAssembler();
 
       while (!this.#stopped) {
         let result: ReadableStreamReadResult<Uint8Array>;
         try {
           result = await reader.read();
         } catch {
-          return this.#stopped
-            ? { kind: "stopped" }
-            : {
-                kind: "transient",
-                reason: "transport",
-              cursorAdvanced: cursorAdvanced(),
-            };
+          if (this.#stopped) {
+            return { kind: "stopped" };
+          }
+          if (schedulerAssembler.hasPartial) {
+            return incompleteSchedulerSnapshotExit(
+              "the event stream transport failed before the scheduler snapshot completed",
+              cursorAdvanced(),
+            );
+          }
+          return {
+            kind: "transient",
+            reason: "transport",
+            cursorAdvanced: cursorAdvanced(),
+          };
         }
 
         if (this.#stopped) {
@@ -661,7 +686,7 @@ export class SseClient {
               if (this.#stopped) {
                 return { kind: "stopped" };
               }
-              await this.#applyFrame(frame);
+              await this.#applyFrame(frame, schedulerAssembler);
               if (this.#stopped) {
                 return { kind: "stopped" };
               }
@@ -671,6 +696,12 @@ export class SseClient {
               return { kind: "stopped" };
             }
             return protocolExit(error, cursorAdvanced());
+          }
+          if (schedulerAssembler.hasPartial) {
+            return incompleteSchedulerSnapshotExit(
+              "the event stream ended before the scheduler snapshot completed",
+              cursorAdvanced(),
+            );
           }
           return {
             kind: "transient",
@@ -685,7 +716,7 @@ export class SseClient {
             if (this.#stopped) {
               return { kind: "stopped" };
             }
-            await this.#applyFrame(frame);
+            await this.#applyFrame(frame, schedulerAssembler);
             if (this.#stopped) {
               return { kind: "stopped" };
             }
@@ -718,14 +749,42 @@ export class SseClient {
     }
   }
 
-  async #applyFrame(frame: SseFrame): Promise<void> {
+  async #applyFrame(
+    frame: SseFrame,
+    schedulerAssembler: SchedulerSnapshotAssembler,
+  ): Promise<void> {
     const decoded = decodeFrame(frame, this.#schemaVersion);
 
     if (decoded.kind === "reset") {
+      schedulerAssembler.reset();
       throw new SseProtocolError(
         "STREAM_RESET",
         `server requested a stream reset at event ${decoded.latestEventId}`,
       );
+    }
+    if (decoded.kind === "scheduler") {
+      let outcome: SchedulerAssemblerOutcome;
+      try {
+        outcome = await schedulerAssembler.accept(decoded.control);
+      } catch (error) {
+        throw schedulerControlError(
+          "scheduler snapshot assembly rejected a validated control",
+          error,
+        );
+      }
+      if (outcome.kind !== "complete") {
+        return;
+      }
+      try {
+        await this.#callbacks.onSchedulerSnapshot(outcome.candidate);
+      } catch (error) {
+        throw new SseProtocolError(
+          "PROJECTION_ERROR",
+          "scheduler projection callback rejected a complete snapshot",
+          { cause: error },
+        );
+      }
+      return;
     }
     if (decoded.persistedId !== null) {
       if (decoded.persistedId === this.#lastAppliedId) {
@@ -740,8 +799,16 @@ export class SseClient {
     }
 
     if (decoded.kind === "diagnostic") {
+      try {
+        await this.#callbacks.onDiagnostic(decoded.diagnostic);
+      } catch (error) {
+        throw new SseProtocolError(
+          "PROJECTION_ERROR",
+          "diagnostic projection callback rejected a validated SSE message",
+          { cause: error },
+        );
+      }
       this.#lastAppliedId = decoded.persistedId;
-      await this.#callbacks.onDiagnostic(decoded.diagnostic);
       return;
     }
 
@@ -899,13 +966,18 @@ export class SseClient {
 type DecodedFrame =
   | {
       readonly kind: "message";
-      readonly message: SseMessage;
+      readonly message: SseProjectionMessage;
       readonly persistedId: number | null;
     }
   | {
       readonly kind: "diagnostic";
       readonly diagnostic: SseDiagnostic;
       readonly persistedId: number;
+    }
+  | {
+      readonly kind: "scheduler";
+      readonly control: SchedulerWireControl;
+      readonly persistedId: null;
     }
   | { readonly kind: "reset"; readonly latestEventId: number; readonly persistedId: null };
 
@@ -990,6 +1062,30 @@ function decodeFrame(frame: SseFrame, schemaVersion: number): DecodedFrame {
     return { kind: "message", message: value, persistedId: null };
   }
 
+  if (
+    value.kind === "scheduler.state" ||
+    value.kind === "scheduler.state.chunk"
+  ) {
+    if (frame.id !== undefined) {
+      throw new SseProtocolError(
+        "MALFORMED_ENVELOPE",
+        "scheduler state controls must be id-less",
+      );
+    }
+    try {
+      const control =
+        value.kind === "scheduler.state"
+          ? validateSchedulerStateControl(value)
+          : validateSchedulerStateChunkControl(value);
+      return { kind: "scheduler", control, persistedId: null };
+    } catch (error) {
+      throw schedulerControlError(
+        `${value.kind} envelope was malformed`,
+        error,
+      );
+    }
+  }
+
   const frameId = parsePersistedId(frame.id);
   if (!isPositiveSafeInteger(value.id)) {
     throw new SseProtocolError(
@@ -1039,7 +1135,7 @@ function decodeFrame(frame: SseFrame, schemaVersion: number): DecodedFrame {
 
 function isServiceStateMessage(
   value: unknown,
-): value is Extract<SseMessage, { kind: "service.state" }> {
+): value is Extract<SseProjectionMessage, { kind: "service.state" }> {
   return (
     isRecord(value) &&
     value.kind === "service.state" &&
@@ -1085,6 +1181,36 @@ function protocolExit(
     },
     cursorAdvanced,
   };
+}
+
+function incompleteSchedulerSnapshotExit(
+  message: string,
+  cursorAdvanced: boolean,
+): ConnectionExit {
+  return {
+    kind: "protocol",
+    reason: { code: "MALFORMED_ENVELOPE", message },
+    cursorAdvanced,
+  };
+}
+
+function schedulerControlError(
+  message: string,
+  error: unknown,
+): SseProtocolError {
+  if (error instanceof SseProtocolError) {
+    return error;
+  }
+  if (error instanceof SchedulerSnapshotError) {
+    return new SseProtocolError(
+      "MALFORMED_ENVELOPE",
+      `${message}: ${error.message}`,
+      { cause: error },
+    );
+  }
+  return new SseProtocolError("MALFORMED_ENVELOPE", message, {
+    cause: error,
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

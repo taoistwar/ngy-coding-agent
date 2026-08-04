@@ -16,6 +16,31 @@ const BOOTSTRAP: BootstrapResponse = {
   server_started_at: "2026-07-15T00:00:00Z",
   service_state: "ready",
   service_state_generation: 4,
+  scheduler: {
+    schema_version: 1,
+    server_instance_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    server_started_at: "2026-07-15T00:00:00Z",
+    generation: 3,
+    as_of_event_id: 17,
+    service_state_generation: 4,
+    admission_state: "running",
+    limits: {
+      global: 2,
+      per_repository: 2,
+      queued: 32,
+      cargo_jobs_per_task: 4,
+    },
+    active_task_count: 0,
+    queued_task_count: 0,
+    queued_tasks: [],
+    stopping_tasks: [],
+    storage: {
+      state: "normal",
+      data: { state: "normal" },
+      runtime: { state: "normal" },
+      repositories: [],
+    },
+  },
   tasks: [],
 };
 
@@ -428,5 +453,43 @@ describe("ApiClient REST commands", () => {
 
     expect(JSON.parse(bodies[0] ?? "null").client_request_id).toBe(create.clientRequestId);
     expect(bodies[1]).toBe(bodies[0]);
+  });
+
+  it("retains the complete create replay input after TASK_QUEUE_FULL", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_input, init) => {
+      if (fetch.mock.calls.length === 1) return jsonResponse(BOOTSTRAP);
+      expect(init?.body).toBe(
+        JSON.stringify({
+          client_request_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          repository_id: TASK.repository_id,
+          prompt: TASK.prompt,
+        }),
+      );
+      return jsonResponse(
+        {
+          code: "TASK_QUEUE_FULL",
+          message: "the task queue is full",
+          retryable: true,
+          request_id: "queue-full-request",
+          details: {
+            queued_tasks: 32,
+            max_queued_tasks: 32,
+          },
+        },
+        { status: 429 },
+      );
+    });
+    const client = new ApiClient(clientOptions(fetch));
+    await client.initialize();
+    const create = client.newCreateTask(TASK.repository_id, TASK.prompt);
+
+    await expect(create.execute()).rejects.toMatchObject({
+      status: 429,
+      code: "TASK_QUEUE_FULL",
+      requestId: "queue-full-request",
+    });
+    expect(create).toMatchObject({
+      clientRequestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    });
   });
 });

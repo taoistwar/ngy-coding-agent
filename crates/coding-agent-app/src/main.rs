@@ -243,6 +243,13 @@ mod tests {
             Ok(PlatformPaths::new("unused-data", "unused-runtime"))
         }
 
+        fn prepare_lock_parent(&self, _paths: &PlatformPaths) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected lock-parent preparation failure",
+            ))
+        }
+
         fn prepare(&self, _paths: &PlatformPaths) -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

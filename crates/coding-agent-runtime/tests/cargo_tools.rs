@@ -1,5 +1,6 @@
 mod support;
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -47,14 +48,20 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
 
     let rustc = concrete_rustc();
     let git = path_executable(if cfg!(windows) { "git.exe" } else { "git" });
-    let toolchain = discover_toolchain(&runtime_directory, Some(&rustc), Some(&git))
-        .await
-        .unwrap();
+    let toolchain = discover_toolchain(
+        &runtime_directory,
+        support::instance_process_scope(&runtime_directory),
+        Some(&rustc),
+        Some(&git),
+    )
+    .await
+    .unwrap();
     let tools = CargoTools::from_trusted_capabilities(
         &toolchain,
         Arc::new(ExecutionDirectory::open(&workspace).unwrap()),
         Arc::new(ExecutionDirectory::open(&target).unwrap()),
         &runtime_directory,
+        support::task_process_scope(&runtime_directory),
         ProcessLimits::try_new(
             512 * 1024,
             512 * 1024,
@@ -65,6 +72,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
         CargoToolLimits::try_new(Duration::from_secs(5), 8, 32, 128).unwrap(),
     )
     .unwrap();
+    let cargo_jobs_per_task = NonZeroU32::new(3).expect("test Cargo jobs are nonzero");
 
     let catalog = tools.catalog(CancellationToken::new()).await.unwrap();
     assert_eq!(catalog.packages().len(), 1);
@@ -89,6 +97,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
 
     let check = tools
         .check(
+            cargo_jobs_per_task,
             Some("typed_fixture"),
             Duration::from_secs(10),
             CancellationToken::new(),
@@ -99,6 +108,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
 
     let passing = tools
         .test(
+            cargo_jobs_per_task,
             Some("typed_fixture"),
             Some("passing"),
             Duration::from_secs(10),
@@ -110,6 +120,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
 
     let package_required = tools
         .test(
+            cargo_jobs_per_task,
             None,
             Some("passing"),
             Duration::from_secs(10),
@@ -121,6 +132,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
 
     let workspace_test = tools
         .test(
+            cargo_jobs_per_task,
             None,
             None,
             Duration::from_secs(10),
@@ -137,6 +149,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
     .unwrap();
     let failing = tools
         .test(
+            cargo_jobs_per_task,
             Some("typed_fixture"),
             Some("passing"),
             Duration::from_secs(10),
@@ -148,6 +161,7 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
 
     let timed_out = tools
         .test(
+            cargo_jobs_per_task,
             Some("typed_fixture"),
             Some("slow"),
             Duration::from_secs(10),
@@ -160,7 +174,13 @@ async fn typed_offline_metadata_check_and_test_use_only_catalogued_selectors() {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
     let cancelled = tools
-        .test(None, None, Duration::from_secs(1), cancellation)
+        .test(
+            cargo_jobs_per_task,
+            None,
+            None,
+            Duration::from_secs(1),
+            cancellation,
+        )
         .await
         .unwrap_err();
     assert_eq!(cancelled.code(), "COMMAND_CANCELLED");

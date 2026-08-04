@@ -1,21 +1,49 @@
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use coding_agent_domain::{
     EventId, NewRepository, NewReviewEvidence, NewTask, RepositoryId, TaskEventPayload,
     TaskFailure, TaskId, TaskStatus, UtcTimestamp,
 };
+#[cfg(feature = "test-support")]
+use coding_agent_store::PersistStopIntentOutcome;
 use coding_agent_store::{
-    AppendEventOutcome, AttemptArtifactIdentity, CreateTaskOutcome, FinalizeReviewedTaskOutcome,
-    RecordReviewOutcome, RecoveryOutcome, RegisterRepositoryOutcome, ReserveAttemptArtifact,
-    ReserveAttemptArtifactOutcome, RetryTaskOutcome, Store, StoreError, TaskTransition,
+    AppendEventOutcome, AttemptArtifactIdentity, ClaimTaskOutcome, ClaimTaskReconciliationOutcome,
+    ClaimTaskRequest, CreateTaskOutcome, FinalizeReviewedTaskOutcome, FinalizeStoppedTaskOutcome,
+    FinalizeStoppedTaskRequest, QueueLimitedCreateTaskOutcome, QueueLimitedRetryTaskOutcome,
+    RecordReviewOutcome, RecoveryOutcome, RecoveryReceipt, RegisterRepositoryOutcome,
+    ReserveAttemptArtifact, ReserveAttemptArtifactOutcome, RetryTaskOutcome,
+    StopIntentBatchReceipt, StopIntentKind, StopIntentRequest, Store, StoreError, TaskTransition,
     TransitionOutcome, UpdateAttemptArtifactOutcome,
 };
+pub use coding_agent_store::{FinalizeUnreviewedTaskOutcome, FinalizeUnreviewedTaskRequest};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
+
+use crate::pending_durable::{
+    DurableCompletion, DurableDisposition, DurableOperationIdentity, DurableOperationKind,
+    KnownNotAppliedError, KnownNotAppliedReason, MutationSequenceDisposition, OutcomeUnknownReason,
+    PendingDurableResult, PendingReplayReceipt, TaskMutationIdentity,
+};
+
+mod command;
+
+pub(crate) use command::execution::sqlite_code_is_retryable;
+#[cfg(test)]
+use command::execution::{StoreFailureClassification, classify_store_failure};
+use command::{
+    WriteCommand,
+    execution::{
+        claim_outcome_from_reconciliation, classify_store_error, completed_transition_bypass_error,
+        receive,
+    },
+    run_writer,
+};
 
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(25),
@@ -57,10 +85,522 @@ pub struct FinalizeReviewedTaskRequest {
 pub enum StoreWriterError {
     #[error("SQLite writer remained busy through its bounded retry window")]
     Busy,
+    #[error("the caller's absolute StoreWriter deadline elapsed")]
+    DeadlineElapsed,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("store writer is closed")]
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StoreWriterSubmitError {
+    #[error("the selected StoreWriter ingress is full")]
+    Full,
+    #[error("the StoreWriter ingress is closed")]
+    Closed,
+    #[error("the StoreWriter mutation identity does not match its typed request")]
+    InvalidIdentity,
+    #[error("a per-task mutation sequence contains a gap")]
+    SequenceGap,
+    #[error("a per-task mutation sequence is duplicated or reversed")]
+    SequenceReversed,
+}
+
+pub struct StoreWriterSubmission<T> {
+    identity: DurableOperationIdentity,
+    pending: Option<PendingDurableResult>,
+    completion_channel_closed_reason: OutcomeUnknownReason,
+    receiver: oneshot::Receiver<DurableCompletion<T>>,
+}
+
+impl<T> StoreWriterSubmission<T> {
+    pub async fn completion(self) -> DurableCompletion<T> {
+        match self.receiver.await {
+            Ok(completion) => completion,
+            Err(_) => DurableCompletion {
+                identity: self.identity,
+                sequence_disposition: MutationSequenceDisposition::BlockUnknown,
+                disposition: DurableDisposition::OutcomeUnknown {
+                    reason: self.completion_channel_closed_reason,
+                    pending: self.pending,
+                },
+            },
+        }
+    }
+}
+
+pub enum PendingDurableSubmission {
+    QueueLimitedCreate(StoreWriterSubmission<QueueLimitedCreateTaskOutcome>),
+    QueueLimitedRetry(StoreWriterSubmission<QueueLimitedRetryTaskOutcome>),
+    ClaimTask(StoreWriterSubmission<ClaimTaskOutcome>),
+    ReconcileClaimTask(StoreWriterSubmission<ClaimTaskReconciliationOutcome>),
+    PersistStopIntentBatch(StoreWriterSubmission<StopIntentBatchReceipt>),
+    FinalizeStoppedTask(StoreWriterSubmission<FinalizeStoppedTaskOutcome>),
+    RecordReview(StoreWriterSubmission<RecordReviewOutcome>),
+    FinalizeReviewedTask(StoreWriterSubmission<FinalizeReviewedTaskOutcome>),
+    FinalizeUnreviewedTask(StoreWriterSubmission<FinalizeUnreviewedTaskOutcome>),
+}
+
+impl PendingDurableSubmission {
+    pub async fn completion(self) -> DurableCompletion<PendingReplayReceipt> {
+        match self {
+            Self::QueueLimitedCreate(submission) => map_pending_completion(
+                submission.completion().await,
+                PendingReplayReceipt::QueueLimitedCreate,
+            ),
+            Self::QueueLimitedRetry(submission) => map_pending_completion(
+                submission.completion().await,
+                PendingReplayReceipt::QueueLimitedRetry,
+            ),
+            Self::ClaimTask(submission) => map_pending_completion(
+                submission.completion().await,
+                PendingReplayReceipt::ClaimTask,
+            ),
+            Self::ReconcileClaimTask(submission) => {
+                map_pending_completion(submission.completion().await, |outcome| {
+                    PendingReplayReceipt::ClaimTask(claim_outcome_from_reconciliation(outcome))
+                })
+            }
+            Self::PersistStopIntentBatch(submission) => map_pending_completion(
+                submission.completion().await,
+                PendingReplayReceipt::PersistStopIntentBatch,
+            ),
+            Self::FinalizeStoppedTask(submission) => map_pending_completion(
+                submission.completion().await,
+                PendingReplayReceipt::FinalizeStoppedTask,
+            ),
+            Self::RecordReview(submission) => map_pending_completion(
+                submission.completion().await,
+                PendingReplayReceipt::RecordReview,
+            ),
+            Self::FinalizeReviewedTask(submission) => map_pending_completion(
+                submission.completion().await,
+                PendingReplayReceipt::FinalizeReviewedTask,
+            ),
+            Self::FinalizeUnreviewedTask(submission) => map_pending_completion(
+                submission.completion().await,
+                PendingReplayReceipt::FinalizeUnreviewedTask,
+            ),
+        }
+    }
+}
+
+fn map_pending_completion<T>(
+    completion: DurableCompletion<T>,
+    receipt: impl Fn(T) -> PendingReplayReceipt,
+) -> DurableCompletion<PendingReplayReceipt> {
+    let disposition = match completion.disposition {
+        DurableDisposition::Confirmed(outcome) => DurableDisposition::Confirmed(receipt(outcome)),
+        DurableDisposition::KnownNotApplied {
+            reason,
+            outcome,
+            error,
+        } => DurableDisposition::KnownNotApplied {
+            reason,
+            outcome: outcome.map(receipt),
+            error,
+        },
+        DurableDisposition::OutcomeUnknown { reason, pending } => {
+            DurableDisposition::OutcomeUnknown { reason, pending }
+        }
+        DurableDisposition::InvariantConflict { message, outcome } => {
+            DurableDisposition::InvariantConflict {
+                message,
+                outcome: outcome.map(receipt),
+            }
+        }
+    };
+    DurableCompletion {
+        identity: completion.identity,
+        sequence_disposition: completion.sequence_disposition,
+        disposition,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreWriterPriority {
+    Normal,
+    Urgent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StoreWriterSchedulingError {
+    #[cfg(feature = "test-support")]
+    #[error("the StoreWriter ingress is closed")]
+    IngressClosed,
+    #[cfg(feature = "test-support")]
+    #[error("the StoreWriter mutation identity is invalid")]
+    InvalidIdentity,
+    #[error("the normal StoreWriter ingress is full")]
+    NormalIngressFull,
+    #[error("the urgent StoreWriter ingress is full")]
+    UrgentIngressFull,
+    #[cfg(feature = "test-support")]
+    #[error("a per-task mutation sequence contains a gap")]
+    SequenceGap,
+    #[cfg(feature = "test-support")]
+    #[error("a per-task mutation sequence is duplicated or reversed")]
+    SequenceReversed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationIngressStatus {
+    Admitted,
+    Unresolved,
+    Completed,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TaskIngressState {
+    last_reserved: u64,
+    completed_through: u64,
+    states: BTreeMap<u64, MutationIngressStatus>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IngressSequenceLedger {
+    tasks: HashMap<TaskId, TaskIngressState>,
+}
+
+impl IngressSequenceLedger {
+    fn accept(&mut self, items: &[TaskMutationIdentity]) -> Result<(), StoreWriterSubmitError> {
+        let mut proposed = self.clone();
+        for item in items {
+            let state = proposed.tasks.entry(item.task_id).or_default();
+            if state
+                .states
+                .values()
+                .any(|status| *status == MutationIngressStatus::Unresolved)
+            {
+                return Err(StoreWriterSubmitError::SequenceGap);
+            }
+            let expected = state
+                .last_reserved
+                .checked_add(1)
+                .ok_or(StoreWriterSubmitError::SequenceGap)?;
+            match item.sequence.get().cmp(&expected) {
+                std::cmp::Ordering::Equal => {
+                    state.last_reserved = item.sequence.get();
+                    state
+                        .states
+                        .insert(item.sequence.get(), MutationIngressStatus::Admitted);
+                }
+                std::cmp::Ordering::Greater => return Err(StoreWriterSubmitError::SequenceGap),
+                std::cmp::Ordering::Less => return Err(StoreWriterSubmitError::SequenceReversed),
+            }
+        }
+        *self = proposed;
+        Ok(())
+    }
+
+    fn accept_reconciliation(
+        &mut self,
+        items: &[TaskMutationIdentity],
+    ) -> Result<(), StoreWriterSubmitError> {
+        let mut proposed = self.clone();
+        for item in items {
+            let Some(state) = proposed.tasks.get_mut(&item.task_id) else {
+                return Err(StoreWriterSubmitError::SequenceGap);
+            };
+            match state.states.get_mut(&item.sequence.get()) {
+                Some(status @ MutationIngressStatus::Unresolved) => {
+                    *status = MutationIngressStatus::Admitted;
+                }
+                Some(MutationIngressStatus::Admitted | MutationIngressStatus::Completed) => {
+                    return Err(StoreWriterSubmitError::SequenceReversed);
+                }
+                None if item.sequence.get() > state.last_reserved => {
+                    return Err(StoreWriterSubmitError::SequenceGap);
+                }
+                None => return Err(StoreWriterSubmitError::SequenceReversed),
+            }
+        }
+        *self = proposed;
+        Ok(())
+    }
+
+    fn mark_unresolved(&mut self, items: &[TaskMutationIdentity]) {
+        for item in items {
+            let state = self.tasks.entry(item.task_id).or_default();
+            state.last_reserved = state.last_reserved.max(item.sequence.get());
+            state
+                .states
+                .insert(item.sequence.get(), MutationIngressStatus::Unresolved);
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        items: &[TaskMutationIdentity],
+        disposition: MutationSequenceDisposition,
+    ) {
+        for item in items {
+            let state = self.tasks.entry(item.task_id).or_default();
+            match disposition {
+                MutationSequenceDisposition::AdvanceNext => {
+                    state
+                        .states
+                        .insert(item.sequence.get(), MutationIngressStatus::Completed);
+                    while let Some(next) = state.completed_through.checked_add(1) {
+                        if state.states.get(&next) != Some(&MutationIngressStatus::Completed) {
+                            break;
+                        }
+                        state.completed_through = next;
+                        state.states.remove(&next);
+                    }
+                }
+                MutationSequenceDisposition::RetainSame
+                | MutationSequenceDisposition::BlockUnknown => {
+                    state
+                        .states
+                        .insert(item.sequence.get(), MutationIngressStatus::Unresolved);
+                }
+            }
+        }
+    }
+}
+
+struct MutationSequenceGuard {
+    ledger: Arc<Mutex<IngressSequenceLedger>>,
+    identities: Vec<TaskMutationIdentity>,
+    resolved: bool,
+}
+
+impl MutationSequenceGuard {
+    fn new(
+        ledger: Arc<Mutex<IngressSequenceLedger>>,
+        identities: Vec<TaskMutationIdentity>,
+    ) -> Self {
+        Self {
+            ledger,
+            identities,
+            resolved: false,
+        }
+    }
+
+    fn resolve(&mut self, disposition: MutationSequenceDisposition) {
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve(&self.identities, disposition);
+        self.resolved = true;
+    }
+}
+
+impl Drop for MutationSequenceGuard {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mark_unresolved(&self.identities);
+        }
+    }
+}
+
+struct ScheduledCommand<T> {
+    #[cfg(feature = "test-support")]
+    priority: StoreWriterPriority,
+    identities: Vec<TaskMutationIdentity>,
+    value: T,
+}
+
+struct PriorityScheduler<T> {
+    normal_capacity: usize,
+    urgent_capacity: usize,
+    reconciliation_capacity: usize,
+    normal: VecDeque<ScheduledCommand<T>>,
+    urgent: VecDeque<ScheduledCommand<T>>,
+    reconciliation: VecDeque<ScheduledCommand<T>>,
+    completed: HashMap<TaskId, u64>,
+    urgent_streak: usize,
+}
+
+impl<T> PriorityScheduler<T> {
+    fn new(normal_capacity: usize, urgent_capacity: usize) -> Self {
+        assert!(normal_capacity > 0);
+        assert!(urgent_capacity > 0);
+        Self {
+            normal_capacity,
+            urgent_capacity,
+            reconciliation_capacity: 1,
+            normal: VecDeque::with_capacity(normal_capacity),
+            urgent: VecDeque::with_capacity(urgent_capacity),
+            reconciliation: VecDeque::with_capacity(1),
+            completed: HashMap::new(),
+            urgent_streak: 0,
+        }
+    }
+
+    fn has_normal_capacity(&self) -> bool {
+        self.normal.len() < self.normal_capacity
+    }
+
+    fn has_urgent_capacity(&self) -> bool {
+        self.urgent.len() < self.urgent_capacity
+    }
+
+    fn has_reconciliation_capacity(&self) -> bool {
+        self.reconciliation.len() < self.reconciliation_capacity
+    }
+
+    fn enqueue(
+        &mut self,
+        priority: StoreWriterPriority,
+        identities: Vec<TaskMutationIdentity>,
+        value: T,
+    ) -> Result<(), StoreWriterSchedulingError> {
+        let queue = match priority {
+            StoreWriterPriority::Normal => {
+                if !self.has_normal_capacity() {
+                    return Err(StoreWriterSchedulingError::NormalIngressFull);
+                }
+                &mut self.normal
+            }
+            StoreWriterPriority::Urgent => {
+                if !self.has_urgent_capacity() {
+                    return Err(StoreWriterSchedulingError::UrgentIngressFull);
+                }
+                &mut self.urgent
+            }
+        };
+        queue.push_back(ScheduledCommand {
+            #[cfg(feature = "test-support")]
+            priority,
+            identities,
+            value,
+        });
+        Ok(())
+    }
+
+    fn enqueue_reconciliation(
+        &mut self,
+        identities: Vec<TaskMutationIdentity>,
+        value: T,
+    ) -> Result<(), StoreWriterSchedulingError> {
+        if !self.has_reconciliation_capacity() {
+            return Err(StoreWriterSchedulingError::NormalIngressFull);
+        }
+        self.reconciliation.push_back(ScheduledCommand {
+            #[cfg(feature = "test-support")]
+            priority: StoreWriterPriority::Normal,
+            identities,
+            value,
+        });
+        Ok(())
+    }
+
+    fn pop_next(&mut self) -> Option<ScheduledCommand<T>> {
+        let completed = &self.completed;
+        let eligible = |scheduled: &ScheduledCommand<T>| {
+            scheduled.identities.iter().all(|identity| {
+                completed
+                    .get(&identity.task_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    == Some(identity.sequence.get())
+            })
+        };
+        if let Some(reconciliation) = self.reconciliation.iter().position(&eligible) {
+            return self.reconciliation.remove(reconciliation);
+        }
+        let urgent = self.urgent.iter().position(&eligible);
+        let normal = self.normal.iter().position(eligible);
+        let choose_urgent = urgent.is_some() && (self.urgent_streak < 4 || normal.is_none());
+        if choose_urgent {
+            self.urgent_streak += 1;
+            self.urgent.remove(urgent.expect("eligible urgent index"))
+        } else if let Some(normal) = normal {
+            self.urgent_streak = 0;
+            self.normal.remove(normal)
+        } else {
+            None
+        }
+    }
+
+    fn complete(&mut self, identities: &[TaskMutationIdentity], advance: bool) {
+        if !advance {
+            return;
+        }
+        for identity in identities {
+            self.completed
+                .insert(identity.task_id, identity.sequence.get());
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.normal.is_empty() && self.urgent.is_empty() && self.reconciliation.is_empty()
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub struct StoreWriterSchedulingHarness {
+    ingress: IngressSequenceLedger,
+    scheduler: PriorityScheduler<()>,
+}
+
+#[cfg(feature = "test-support")]
+impl StoreWriterSchedulingHarness {
+    pub fn new(normal_capacity: usize, urgent_capacity: usize) -> Self {
+        Self {
+            ingress: IngressSequenceLedger::default(),
+            scheduler: PriorityScheduler::new(normal_capacity, urgent_capacity),
+        }
+    }
+
+    pub fn try_enqueue_normal(
+        &mut self,
+        identity: TaskMutationIdentity,
+    ) -> Result<(), StoreWriterSchedulingError> {
+        if !self.scheduler.has_normal_capacity() {
+            return Err(StoreWriterSchedulingError::NormalIngressFull);
+        }
+        self.ingress.accept(&[identity]).map_err(scheduling_error)?;
+        self.scheduler
+            .enqueue(StoreWriterPriority::Normal, vec![identity], ())
+    }
+
+    pub fn try_enqueue_urgent(
+        &mut self,
+        identity: DurableOperationIdentity,
+    ) -> Result<(), StoreWriterSchedulingError> {
+        if !self.scheduler.has_urgent_capacity() {
+            return Err(StoreWriterSchedulingError::UrgentIngressFull);
+        }
+        let items = task_mutation_identities(&identity);
+        self.ingress.accept(&items).map_err(scheduling_error)?;
+        self.scheduler
+            .enqueue(StoreWriterPriority::Urgent, items, ())
+    }
+
+    pub fn pop_next(&mut self) -> Option<StoreWriterPriority> {
+        let command = self.scheduler.pop_next()?;
+        let priority = command.priority;
+        self.scheduler.complete(&command.identities, true);
+        Some(priority)
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn scheduling_error(error: StoreWriterSubmitError) -> StoreWriterSchedulingError {
+    match error {
+        StoreWriterSubmitError::SequenceGap => StoreWriterSchedulingError::SequenceGap,
+        StoreWriterSubmitError::SequenceReversed => StoreWriterSchedulingError::SequenceReversed,
+        StoreWriterSubmitError::Full => StoreWriterSchedulingError::NormalIngressFull,
+        StoreWriterSubmitError::Closed => StoreWriterSchedulingError::IngressClosed,
+        StoreWriterSubmitError::InvalidIdentity => StoreWriterSchedulingError::InvalidIdentity,
+    }
+}
+
+fn task_mutation_identities(identity: &DurableOperationIdentity) -> Vec<TaskMutationIdentity> {
+    match identity {
+        DurableOperationIdentity::TaskMutation(identity) => vec![*identity],
+        DurableOperationIdentity::StopIntentBatch { items } => items.clone(),
+        DurableOperationIdentity::CreateTask { .. }
+        | DurableOperationIdentity::RetryTask { .. } => Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +608,18 @@ enum StoreWriterOperation {
     RegisterRepository(NewRepository),
     CreateTask(NewTask),
     RetryTask(TaskId),
+    QueueLimitedCreate {
+        input: NewTask,
+        max_queued_tasks: NonZeroU32,
+    },
+    QueueLimitedRetry {
+        source_task_id: TaskId,
+        max_queued_tasks: NonZeroU32,
+    },
+    ClaimTask(ClaimTaskRequest),
+    ReconcileClaimTask(ClaimTaskRequest),
+    PersistStopIntentBatch(Vec<StopIntentRequest>),
+    FinalizeStoppedTask(FinalizeStoppedTaskRequest),
     TransitionWithEvent {
         task_id: TaskId,
         expected: TaskStatus,
@@ -79,12 +631,14 @@ enum StoreWriterOperation {
     },
     RecordReview(RecordReviewRequest),
     FinalizeReviewedTask(FinalizeReviewedTaskRequest),
+    FinalizeUnreviewedTask(FinalizeUnreviewedTaskRequest),
     ReserveAttemptArtifact(ReserveAttemptArtifact),
     MarkAttemptArtifactReady(AttemptArtifactIdentity),
     MarkAttemptArtifactInconsistent {
         identity: AttemptArtifactIdentity,
         failure_code: String,
     },
+    InterruptRemainingAfterStops(TaskFailure),
     RecoverIncomplete {
         now: UtcTimestamp,
         failure: TaskFailure,
@@ -96,12 +650,20 @@ enum StoreWriterOperationOutcome {
     RegisterRepository(RegisterRepositoryOutcome),
     CreateTask(CreateTaskOutcome),
     RetryTask(RetryTaskOutcome),
+    QueueLimitedCreate(QueueLimitedCreateTaskOutcome),
+    QueueLimitedRetry(QueueLimitedRetryTaskOutcome),
+    ClaimTask(ClaimTaskOutcome),
+    ReconcileClaimTask(ClaimTaskReconciliationOutcome),
+    PersistStopIntentBatch(StopIntentBatchReceipt),
+    FinalizeStoppedTask(FinalizeStoppedTaskOutcome),
     TransitionWithEvent(TransitionOutcome),
     AppendRunningEvent(AppendEventOutcome),
     RecordReview(Box<RecordReviewOutcome>),
     FinalizeReviewedTask(Box<FinalizeReviewedTaskOutcome>),
+    FinalizeUnreviewedTask(FinalizeUnreviewedTaskOutcome),
     ReserveAttemptArtifact(ReserveAttemptArtifactOutcome),
     UpdateAttemptArtifact(UpdateAttemptArtifactOutcome),
+    InterruptRemainingAfterStops(RecoveryReceipt),
     RecoverIncomplete(RecoveryOutcome),
 }
 
@@ -112,6 +674,12 @@ impl StoreWriterOperation {
             Self::RegisterRepository(_) => StoreWriterOperationKind::RegisterRepository,
             Self::CreateTask(_) => StoreWriterOperationKind::CreateTask,
             Self::RetryTask(_) => StoreWriterOperationKind::RetryTask,
+            Self::QueueLimitedCreate { .. } => StoreWriterOperationKind::CreateTask,
+            Self::QueueLimitedRetry { .. } => StoreWriterOperationKind::RetryTask,
+            Self::ClaimTask(_) => StoreWriterOperationKind::StartTask,
+            Self::ReconcileClaimTask(_) => StoreWriterOperationKind::ReconcileClaimTask,
+            Self::PersistStopIntentBatch(_) => StoreWriterOperationKind::PersistStopIntentBatch,
+            Self::FinalizeStoppedTask(_) => StoreWriterOperationKind::FinalizeStoppedTask,
             Self::TransitionWithEvent { transition, .. } => match transition {
                 TaskTransition::Running => StoreWriterOperationKind::StartTask,
                 TaskTransition::Completed | TaskTransition::Failed(_) => {
@@ -123,10 +691,20 @@ impl StoreWriterOperation {
             Self::AppendRunningEvent { .. } => StoreWriterOperationKind::AppendRunningEvent,
             Self::RecordReview(_) => StoreWriterOperationKind::RecordReview,
             Self::FinalizeReviewedTask(_) => StoreWriterOperationKind::FinalizeReviewedTask,
+            Self::FinalizeUnreviewedTask(request) => match request.transition {
+                TaskTransition::Failed(_) => StoreWriterOperationKind::FinishTask,
+                TaskTransition::Cancelled => StoreWriterOperationKind::CancelTask,
+                TaskTransition::Running
+                | TaskTransition::Completed
+                | TaskTransition::Interrupted(_) => StoreWriterOperationKind::FinishTask,
+            },
             Self::ReserveAttemptArtifact(_) => StoreWriterOperationKind::ReserveAttemptArtifact,
             Self::MarkAttemptArtifactReady(_) => StoreWriterOperationKind::MarkAttemptArtifactReady,
             Self::MarkAttemptArtifactInconsistent { .. } => {
                 StoreWriterOperationKind::MarkAttemptArtifactInconsistent
+            }
+            Self::InterruptRemainingAfterStops(_) => {
+                StoreWriterOperationKind::InterruptRemainingAfterStops
             }
             Self::RecoverIncomplete { .. } => StoreWriterOperationKind::RecoverIncomplete,
         }
@@ -135,20 +713,60 @@ impl StoreWriterOperation {
 
 #[cfg(feature = "test-support")]
 impl StoreWriterOperationOutcome {
+    fn committed_durable_state(&self) -> bool {
+        match self {
+            Self::PersistStopIntentBatch(receipt) => receipt
+                .items
+                .iter()
+                .any(|item| matches!(item.outcome, PersistStopIntentOutcome::Applied(_))),
+            _ => self.has_durable_event(),
+        }
+    }
+
     fn has_durable_event(&self) -> bool {
         match self {
             Self::RegisterRepository(_) => false,
             Self::ReserveAttemptArtifact(_) | Self::UpdateAttemptArtifact(_) => false,
+            Self::PersistStopIntentBatch(_) => false,
             Self::CreateTask(CreateTaskOutcome::Created { .. })
             | Self::RetryTask(RetryTaskOutcome::Created { .. })
+            | Self::QueueLimitedCreate(QueueLimitedCreateTaskOutcome::Created { .. })
+            | Self::QueueLimitedRetry(QueueLimitedRetryTaskOutcome::Created { .. })
+            | Self::ClaimTask(
+                ClaimTaskOutcome::Applied(_) | ClaimTaskOutcome::ExistingApplied(_),
+            )
+            | Self::ReconcileClaimTask(ClaimTaskReconciliationOutcome::ExistingApplied(_))
+            | Self::FinalizeStoppedTask(
+                FinalizeStoppedTaskOutcome::Applied(_) | FinalizeStoppedTaskOutcome::Existing(_),
+            )
             | Self::TransitionWithEvent(TransitionOutcome::Applied { .. })
             | Self::AppendRunningEvent(AppendEventOutcome::Applied { .. })
             | Self::RecordReview(_)
-            | Self::FinalizeReviewedTask(_) => true,
+            | Self::FinalizeReviewedTask(_)
+            | Self::FinalizeUnreviewedTask(FinalizeUnreviewedTaskOutcome::Applied { .. })
+            | Self::FinalizeUnreviewedTask(FinalizeUnreviewedTaskOutcome::Existing { .. }) => true,
             Self::CreateTask(CreateTaskOutcome::Existing { .. })
             | Self::RetryTask(RetryTaskOutcome::Existing { .. })
+            | Self::QueueLimitedCreate(
+                QueueLimitedCreateTaskOutcome::Existing { .. }
+                | QueueLimitedCreateTaskOutcome::QueueFull { .. },
+            )
+            | Self::QueueLimitedRetry(
+                QueueLimitedRetryTaskOutcome::Existing { .. }
+                | QueueLimitedRetryTaskOutcome::QueueFull { .. },
+            )
+            | Self::ClaimTask(
+                ClaimTaskOutcome::KnownNotApplied { .. } | ClaimTaskOutcome::InvariantConflict,
+            )
+            | Self::ReconcileClaimTask(
+                ClaimTaskReconciliationOutcome::KnownNotApplied { .. }
+                | ClaimTaskReconciliationOutcome::InvariantConflict,
+            )
+            | Self::FinalizeStoppedTask(FinalizeStoppedTaskOutcome::InvariantConflict)
             | Self::TransitionWithEvent(TransitionOutcome::Conflict { .. })
+            | Self::FinalizeUnreviewedTask(FinalizeUnreviewedTaskOutcome::InvariantConflict)
             | Self::AppendRunningEvent(AppendEventOutcome::NotRunning { .. }) => false,
+            Self::InterruptRemainingAfterStops(receipt) => receipt.last_event_id.is_some(),
             Self::RecoverIncomplete(outcome) => outcome.last_event_id.is_some(),
         }
     }
@@ -167,6 +785,8 @@ trait StoreWriterBackend: Send + Sync + 'static {
 #[serde(rename_all = "snake_case")]
 pub enum StoreWriterFaultPoint {
     FailBeforeExecute,
+    FailUnknownBeforeExecute,
+    FailAfterCommitBeforeReply,
     BusyBeforeExecute,
     PauseBeforeExecute,
     PauseAfterCommitBeforeWake,
@@ -180,7 +800,10 @@ pub enum StoreWriterOperationKind {
     RegisterRepository,
     CreateTask,
     RetryTask,
+    PersistStopIntentBatch,
+    FinalizeStoppedTask,
     StartTask,
+    ReconcileClaimTask,
     FinishTask,
     CancelTask,
     InterruptTask,
@@ -190,6 +813,7 @@ pub enum StoreWriterOperationKind {
     ReserveAttemptArtifact,
     MarkAttemptArtifactReady,
     MarkAttemptArtifactInconsistent,
+    InterruptRemainingAfterStops,
     RecoverIncomplete,
 }
 
@@ -268,6 +892,31 @@ impl StoreWriterTestController {
             generation,
             dropped_wakes: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    pub fn arm_fault(&self, spec: StoreWriterFaultSpec) -> Result<(), StoreWriterTestConfigError> {
+        if spec.count == 0 {
+            return Err(StoreWriterTestConfigError::ZeroCount);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            spec.point,
+            StoreWriterFaultPoint::PauseBeforeExecute
+                | StoreWriterFaultPoint::PauseAfterCommitBeforeWake
+        ) {
+            state
+                .pause_gates
+                .entry(spec.point)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(0)));
+        }
+        let remaining = spec.count;
+        state
+            .scripts
+            .push(StoreWriterFaultScript { spec, remaining });
+        Ok(())
     }
 
     pub fn hit_count(
@@ -412,23 +1061,38 @@ impl StoreWriterBackend for TestStoreWriterBackend {
             }
             if self
                 .controller
+                .consume(StoreWriterFaultPoint::FailUnknownBeforeExecute, kind)
+                .is_some()
+            {
+                return Err(StoreWriterError::Closed);
+            }
+            if self
+                .controller
                 .consume(StoreWriterFaultPoint::BusyBeforeExecute, kind)
                 .is_some()
             {
                 return Err(StoreWriterError::Busy);
             }
             let outcome = StoreWriterBackend::execute(&self.inner, operation).await?;
-            if outcome.has_durable_event() {
+            if outcome.committed_durable_state() {
                 self.controller
                     .pause_if_scripted(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, kind)
                     .await;
-                if self
+            }
+            if self
+                .controller
+                .consume(StoreWriterFaultPoint::FailAfterCommitBeforeReply, kind)
+                .is_some()
+            {
+                return Err(StoreWriterError::Closed);
+            }
+            if outcome.has_durable_event()
+                && self
                     .controller
                     .consume(StoreWriterFaultPoint::DropWakeAfterCommit, kind)
                     .is_some()
-                {
-                    self.controller.mark_dropped_wake();
-                }
+            {
+                self.controller.mark_dropped_wake();
             }
             Ok(outcome)
         })
@@ -466,6 +1130,36 @@ impl StoreWriterBackend for Store {
                     .retry_task(task_id)
                     .await
                     .map(StoreWriterOperationOutcome::RetryTask),
+                StoreWriterOperation::QueueLimitedCreate {
+                    input,
+                    max_queued_tasks,
+                } => self
+                    .create_task_with_queue_limit(input, max_queued_tasks)
+                    .await
+                    .map(StoreWriterOperationOutcome::QueueLimitedCreate),
+                StoreWriterOperation::QueueLimitedRetry {
+                    source_task_id,
+                    max_queued_tasks,
+                } => self
+                    .retry_task_with_queue_limit(source_task_id, max_queued_tasks)
+                    .await
+                    .map(StoreWriterOperationOutcome::QueueLimitedRetry),
+                StoreWriterOperation::ClaimTask(request) => self
+                    .claim_task(request)
+                    .await
+                    .map(StoreWriterOperationOutcome::ClaimTask),
+                StoreWriterOperation::ReconcileClaimTask(request) => self
+                    .reconcile_task_claim(&request)
+                    .await
+                    .map(StoreWriterOperationOutcome::ReconcileClaimTask),
+                StoreWriterOperation::PersistStopIntentBatch(requests) => self
+                    .persist_stop_intent_batch(requests)
+                    .await
+                    .map(StoreWriterOperationOutcome::PersistStopIntentBatch),
+                StoreWriterOperation::FinalizeStoppedTask(request) => self
+                    .finalize_stopped_task(request)
+                    .await
+                    .map(StoreWriterOperationOutcome::FinalizeStoppedTask),
                 StoreWriterOperation::TransitionWithEvent {
                     task_id,
                     expected,
@@ -503,6 +1197,10 @@ impl StoreWriterBackend for Store {
                     .map(|outcome| {
                         StoreWriterOperationOutcome::FinalizeReviewedTask(Box::new(outcome))
                     }),
+                StoreWriterOperation::FinalizeUnreviewedTask(request) => self
+                    .finalize_unreviewed_task(request)
+                    .await
+                    .map(StoreWriterOperationOutcome::FinalizeUnreviewedTask),
                 StoreWriterOperation::ReserveAttemptArtifact(input) => self
                     .reserve_attempt_artifact(input)
                     .await
@@ -518,6 +1216,10 @@ impl StoreWriterBackend for Store {
                     .mark_attempt_artifact_inconsistent(identity, failure_code)
                     .await
                     .map(StoreWriterOperationOutcome::UpdateAttemptArtifact),
+                StoreWriterOperation::InterruptRemainingAfterStops(failure) => self
+                    .interrupt_remaining_after_stops(failure)
+                    .await
+                    .map(StoreWriterOperationOutcome::InterruptRemainingAfterStops),
                 StoreWriterOperation::RecoverIncomplete { now, failure } => self
                     .recover_incomplete(now, failure)
                     .await
@@ -531,6 +1233,9 @@ impl StoreWriterBackend for Store {
 #[derive(Clone)]
 pub struct StoreWriterHandle {
     sender: mpsc::Sender<WriteCommand>,
+    urgent_sender: mpsc::Sender<WriteCommand>,
+    reconciliation_sender: mpsc::Sender<WriteCommand>,
+    ingress_sequences: Arc<Mutex<IngressSequenceLedger>>,
 }
 
 impl StoreWriterHandle {
@@ -556,6 +1261,22 @@ impl StoreWriterHandle {
         Self::spawn_with_backend(backend, wake, capacity)
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn closed_for_test() -> Self {
+        let (sender, normal_receiver) = mpsc::channel(1);
+        let (urgent_sender, urgent_receiver) = mpsc::channel(1);
+        let (reconciliation_sender, reconciliation_receiver) = mpsc::channel(1);
+        drop(normal_receiver);
+        drop(urgent_receiver);
+        drop(reconciliation_receiver);
+        Self {
+            sender,
+            urgent_sender,
+            reconciliation_sender,
+            ingress_sequences: Arc::new(Mutex::new(IngressSequenceLedger::default())),
+        }
+    }
+
     fn spawn_with_backend(
         backend: Arc<dyn StoreWriterBackend>,
         wake: Arc<dyn EventWake>,
@@ -565,9 +1286,644 @@ impl StoreWriterHandle {
             capacity > 0,
             "store-writer channel capacity must be positive"
         );
-        let (sender, receiver) = mpsc::channel(capacity);
-        tokio::spawn(run_writer(receiver, backend, wake));
-        Self { sender }
+        let (sender, normal_receiver) = mpsc::channel(capacity);
+        let (urgent_sender, urgent_receiver) = mpsc::channel(capacity);
+        let (reconciliation_sender, reconciliation_receiver) = mpsc::channel(1);
+        tokio::spawn(run_writer(
+            normal_receiver,
+            urgent_receiver,
+            reconciliation_receiver,
+            backend,
+            wake,
+            capacity,
+        ));
+        Self {
+            sender,
+            urgent_sender,
+            reconciliation_sender,
+            ingress_sequences: Arc::new(Mutex::new(IngressSequenceLedger::default())),
+        }
+    }
+
+    pub fn submit_queue_limited_create(
+        &self,
+        input: NewTask,
+        max_queued_tasks: NonZeroU32,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<QueueLimitedCreateTaskOutcome>, StoreWriterSubmitError> {
+        self.submit_queue_limited_create_on(input, max_queued_tasks, deadline, false)
+    }
+
+    fn submit_queue_limited_create_on(
+        &self,
+        input: NewTask,
+        max_queued_tasks: NonZeroU32,
+        deadline: Instant,
+        reconciliation_lane: bool,
+    ) -> Result<StoreWriterSubmission<QueueLimitedCreateTaskOutcome>, StoreWriterSubmitError> {
+        let identity = DurableOperationIdentity::CreateTask {
+            client_request_id: input.client_request_id,
+        };
+        let pending = PendingDurableResult::QueueLimitedCreate {
+            identity: identity.clone(),
+            input,
+            max_queued_tasks,
+        };
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[], reconciliation_lane) {
+            Ok(permit) => {
+                permit.send(WriteCommand::QueueLimitedCreate {
+                    identity: identity.clone(),
+                    input: match &pending {
+                        PendingDurableResult::QueueLimitedCreate { input, .. } => input.clone(),
+                        _ => unreachable!("constructed queue-limited create pending"),
+                    },
+                    max_queued_tasks,
+                    deadline,
+                    pending: pending.clone(),
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(
+                    response,
+                    identity.clone(),
+                    &pending,
+                    error,
+                    reconciliation_lane,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity,
+            pending: Some(pending),
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
+        })
+    }
+
+    pub fn submit_queue_limited_retry(
+        &self,
+        source_task_id: TaskId,
+        max_queued_tasks: NonZeroU32,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<QueueLimitedRetryTaskOutcome>, StoreWriterSubmitError> {
+        self.submit_queue_limited_retry_on(source_task_id, max_queued_tasks, deadline, false)
+    }
+
+    fn submit_queue_limited_retry_on(
+        &self,
+        source_task_id: TaskId,
+        max_queued_tasks: NonZeroU32,
+        deadline: Instant,
+        reconciliation_lane: bool,
+    ) -> Result<StoreWriterSubmission<QueueLimitedRetryTaskOutcome>, StoreWriterSubmitError> {
+        let identity = DurableOperationIdentity::RetryTask { source_task_id };
+        let pending = PendingDurableResult::QueueLimitedRetry {
+            identity: identity.clone(),
+            source_task_id,
+            max_queued_tasks,
+        };
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[], reconciliation_lane) {
+            Ok(permit) => {
+                permit.send(WriteCommand::QueueLimitedRetry {
+                    identity: identity.clone(),
+                    source_task_id,
+                    max_queued_tasks,
+                    deadline,
+                    pending: pending.clone(),
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(
+                    response,
+                    identity.clone(),
+                    &pending,
+                    error,
+                    reconciliation_lane,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity,
+            pending: Some(pending),
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
+        })
+    }
+
+    pub fn submit_claim_task(
+        &self,
+        identity: TaskMutationIdentity,
+        request: ClaimTaskRequest,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<ClaimTaskOutcome>, StoreWriterSubmitError> {
+        self.submit_claim_task_on(identity, request, deadline, false)
+    }
+
+    fn submit_claim_task_on(
+        &self,
+        identity: TaskMutationIdentity,
+        request: ClaimTaskRequest,
+        deadline: Instant,
+        reconciliation_lane: bool,
+    ) -> Result<StoreWriterSubmission<ClaimTaskOutcome>, StoreWriterSubmitError> {
+        if identity.kind != DurableOperationKind::ClaimTask || identity.task_id != request.task_id {
+            return Err(StoreWriterSubmitError::InvalidIdentity);
+        }
+        let operation = DurableOperationIdentity::TaskMutation(identity);
+        let pending = PendingDurableResult::ClaimTask { identity, request };
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[identity], reconciliation_lane) {
+            Ok(permit) => {
+                permit.send(WriteCommand::ClaimTask {
+                    identity: operation.clone(),
+                    sequence_guard: self.sequence_guard(&[identity]),
+                    request: match &pending {
+                        PendingDurableResult::ClaimTask { request, .. } => request.clone(),
+                        _ => unreachable!("constructed claim pending"),
+                    },
+                    deadline,
+                    pending: pending.clone(),
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(
+                    response,
+                    operation.clone(),
+                    &pending,
+                    error,
+                    reconciliation_lane,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity: operation,
+            pending: Some(pending),
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
+        })
+    }
+
+    /// Reconciles a previously admitted claim sequence without attempting the
+    /// claim mutation again.
+    ///
+    /// This command is deliberately typed separately from `submit_claim_task`:
+    /// an unknown claim may only be resolved by the store's read-only exact
+    /// tuple query, so reconciliation can never newly transition a queued task
+    /// to running.
+    pub fn submit_reconcile_claim_task(
+        &self,
+        identity: TaskMutationIdentity,
+        request: ClaimTaskRequest,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<ClaimTaskReconciliationOutcome>, StoreWriterSubmitError> {
+        if identity.kind != DurableOperationKind::ClaimTask || identity.task_id != request.task_id {
+            return Err(StoreWriterSubmitError::InvalidIdentity);
+        }
+        let operation = DurableOperationIdentity::TaskMutation(identity);
+        let pending = PendingDurableResult::ClaimTask { identity, request };
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[identity], true) {
+            Ok(permit) => {
+                permit.send(WriteCommand::ReconcileClaimTask {
+                    identity: operation.clone(),
+                    sequence_guard: self.sequence_guard(&[identity]),
+                    request: match &pending {
+                        PendingDurableResult::ClaimTask { request, .. } => request.clone(),
+                        _ => unreachable!("constructed claim reconciliation pending"),
+                    },
+                    deadline,
+                    pending: pending.clone(),
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(response, operation.clone(), &pending, error, true);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity: operation,
+            pending: Some(pending),
+            completion_channel_closed_reason: OutcomeUnknownReason::ReconciliationFailed,
+            receiver,
+        })
+    }
+
+    pub fn submit_stop_intent_batch(
+        &self,
+        identity: DurableOperationIdentity,
+        requests: Vec<StopIntentRequest>,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<StopIntentBatchReceipt>, StoreWriterSubmitError> {
+        self.submit_stop_intent_batch_on(identity, requests, deadline, false, true)
+    }
+
+    pub fn submit_user_stop_intent(
+        &self,
+        identity: TaskMutationIdentity,
+        request: StopIntentRequest,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<StopIntentBatchReceipt>, StoreWriterSubmitError> {
+        if identity.kind != DurableOperationKind::PersistStopIntent
+            || identity.task_id != request.task_id
+            || request.kind != StopIntentKind::UserCancelled
+        {
+            return Err(StoreWriterSubmitError::InvalidIdentity);
+        }
+        let identity = DurableOperationIdentity::stop_intent_batch(vec![identity])
+            .map_err(|_| StoreWriterSubmitError::InvalidIdentity)?;
+        self.submit_stop_intent_batch_on(identity, vec![request], deadline, false, false)
+    }
+
+    fn submit_stop_intent_batch_on(
+        &self,
+        identity: DurableOperationIdentity,
+        requests: Vec<StopIntentRequest>,
+        deadline: Instant,
+        reconciliation_lane: bool,
+        urgent: bool,
+    ) -> Result<StoreWriterSubmission<StopIntentBatchReceipt>, StoreWriterSubmitError> {
+        validate_stop_batch_identity(&identity, &requests)?;
+        let pending = PendingDurableResult::PersistStopIntentBatch {
+            identity: identity.clone(),
+            requests,
+        };
+        let (response, receiver) = oneshot::channel();
+        let mutation_identities = task_mutation_identities(&identity);
+        let reservation = if urgent {
+            self.reserve_urgent(&mutation_identities, reconciliation_lane)
+        } else {
+            self.reserve_normal(&mutation_identities, reconciliation_lane)
+        };
+        match reservation {
+            Ok(permit) => {
+                permit.send(WriteCommand::PersistStopIntentBatch {
+                    identity: identity.clone(),
+                    sequence_guard: self.sequence_guard(&mutation_identities),
+                    requests: match &pending {
+                        PendingDurableResult::PersistStopIntentBatch { requests, .. } => {
+                            requests.clone()
+                        }
+                        _ => unreachable!("constructed stop-intent pending"),
+                    },
+                    deadline,
+                    pending: pending.clone(),
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(
+                    response,
+                    identity.clone(),
+                    &pending,
+                    error,
+                    reconciliation_lane,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity,
+            pending: Some(pending),
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
+        })
+    }
+
+    pub fn submit_finalize_stopped_task(
+        &self,
+        identity: TaskMutationIdentity,
+        request: FinalizeStoppedTaskRequest,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<FinalizeStoppedTaskOutcome>, StoreWriterSubmitError> {
+        self.submit_finalize_stopped_task_on(identity, request, deadline, false)
+    }
+
+    fn submit_finalize_stopped_task_on(
+        &self,
+        identity: TaskMutationIdentity,
+        request: FinalizeStoppedTaskRequest,
+        deadline: Instant,
+        reconciliation_lane: bool,
+    ) -> Result<StoreWriterSubmission<FinalizeStoppedTaskOutcome>, StoreWriterSubmitError> {
+        if identity.kind != DurableOperationKind::FinalizeStoppedTask
+            || identity.task_id != request.task_id
+        {
+            return Err(StoreWriterSubmitError::InvalidIdentity);
+        }
+        let operation = DurableOperationIdentity::TaskMutation(identity);
+        let pending = PendingDurableResult::FinalizeStoppedTask { identity, request };
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[identity], reconciliation_lane) {
+            Ok(permit) => {
+                permit.send(WriteCommand::FinalizeStoppedTask {
+                    identity: operation.clone(),
+                    sequence_guard: self.sequence_guard(&[identity]),
+                    request,
+                    deadline,
+                    pending: pending.clone(),
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(
+                    response,
+                    operation.clone(),
+                    &pending,
+                    error,
+                    reconciliation_lane,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity: operation,
+            pending: Some(pending),
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
+        })
+    }
+
+    pub fn submit_record_review(
+        &self,
+        identity: TaskMutationIdentity,
+        request: RecordReviewRequest,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<RecordReviewOutcome>, StoreWriterSubmitError> {
+        self.submit_record_review_on(identity, request, deadline, false)
+    }
+
+    fn submit_record_review_on(
+        &self,
+        identity: TaskMutationIdentity,
+        request: RecordReviewRequest,
+        deadline: Instant,
+        reconciliation_lane: bool,
+    ) -> Result<StoreWriterSubmission<RecordReviewOutcome>, StoreWriterSubmitError> {
+        if identity.kind != DurableOperationKind::RecordReview
+            || identity.task_id != request.task_id
+        {
+            return Err(StoreWriterSubmitError::InvalidIdentity);
+        }
+        let operation = DurableOperationIdentity::TaskMutation(identity);
+        let pending = PendingDurableResult::RecordReview { identity, request };
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[identity], reconciliation_lane) {
+            Ok(permit) => {
+                permit.send(WriteCommand::TypedRecordReview {
+                    identity: operation.clone(),
+                    sequence_guard: self.sequence_guard(&[identity]),
+                    request: match &pending {
+                        PendingDurableResult::RecordReview { request, .. } => request.clone(),
+                        _ => unreachable!("constructed review pending"),
+                    },
+                    deadline,
+                    pending: pending.clone(),
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(
+                    response,
+                    operation.clone(),
+                    &pending,
+                    error,
+                    reconciliation_lane,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity: operation,
+            pending: Some(pending),
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
+        })
+    }
+
+    pub fn submit_finalize_reviewed_task(
+        &self,
+        identity: TaskMutationIdentity,
+        request: FinalizeReviewedTaskRequest,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<FinalizeReviewedTaskOutcome>, StoreWriterSubmitError> {
+        self.submit_finalize_reviewed_task_on(identity, request, deadline, false)
+    }
+
+    fn submit_finalize_reviewed_task_on(
+        &self,
+        identity: TaskMutationIdentity,
+        request: FinalizeReviewedTaskRequest,
+        deadline: Instant,
+        reconciliation_lane: bool,
+    ) -> Result<StoreWriterSubmission<FinalizeReviewedTaskOutcome>, StoreWriterSubmitError> {
+        if identity.kind != DurableOperationKind::FinalizeReviewedTask
+            || identity.task_id != request.task_id
+        {
+            return Err(StoreWriterSubmitError::InvalidIdentity);
+        }
+        let operation = DurableOperationIdentity::TaskMutation(identity);
+        let pending = PendingDurableResult::FinalizeReviewedTask { identity, request };
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[identity], reconciliation_lane) {
+            Ok(permit) => {
+                permit.send(WriteCommand::TypedFinalizeReviewedTask {
+                    identity: operation.clone(),
+                    sequence_guard: self.sequence_guard(&[identity]),
+                    request: match &pending {
+                        PendingDurableResult::FinalizeReviewedTask { request, .. } => {
+                            request.clone()
+                        }
+                        _ => unreachable!("constructed finalization pending"),
+                    },
+                    deadline,
+                    pending: pending.clone(),
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(
+                    response,
+                    operation.clone(),
+                    &pending,
+                    error,
+                    reconciliation_lane,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity: operation,
+            pending: Some(pending),
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
+        })
+    }
+
+    pub fn submit_finalize_unreviewed_task(
+        &self,
+        identity: TaskMutationIdentity,
+        request: FinalizeUnreviewedTaskRequest,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<FinalizeUnreviewedTaskOutcome>, StoreWriterSubmitError> {
+        self.submit_finalize_unreviewed_task_on(identity, request, deadline, false)
+    }
+
+    fn submit_finalize_unreviewed_task_on(
+        &self,
+        identity: TaskMutationIdentity,
+        request: FinalizeUnreviewedTaskRequest,
+        deadline: Instant,
+        reconciliation_lane: bool,
+    ) -> Result<StoreWriterSubmission<FinalizeUnreviewedTaskOutcome>, StoreWriterSubmitError> {
+        if identity.kind != DurableOperationKind::FinalizeUnreviewedTask
+            || identity.task_id != request.task_id
+            || !matches!(
+                request.transition,
+                TaskTransition::Failed(_) | TaskTransition::Cancelled
+            )
+        {
+            return Err(StoreWriterSubmitError::InvalidIdentity);
+        }
+        let operation = DurableOperationIdentity::TaskMutation(identity);
+        let pending = PendingDurableResult::FinalizeUnreviewedTask { identity, request };
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[identity], reconciliation_lane) {
+            Ok(permit) => {
+                permit.send(WriteCommand::TypedFinalizeUnreviewedTask {
+                    identity: operation.clone(),
+                    sequence_guard: self.sequence_guard(&[identity]),
+                    request: match &pending {
+                        PendingDurableResult::FinalizeUnreviewedTask { request, .. } => {
+                            request.clone()
+                        }
+                        _ => unreachable!("constructed unreviewed finalization pending"),
+                    },
+                    deadline,
+                    pending: pending.clone(),
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_ingress_rejection(
+                    response,
+                    operation.clone(),
+                    &pending,
+                    error,
+                    reconciliation_lane,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity: operation,
+            pending: Some(pending),
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
+        })
+    }
+
+    pub fn submit_append_running_event(
+        &self,
+        identity: TaskMutationIdentity,
+        payload: TaskEventPayload,
+        deadline: Instant,
+    ) -> Result<StoreWriterSubmission<AppendEventOutcome>, StoreWriterSubmitError> {
+        if identity.kind != DurableOperationKind::AppendRunningEvent {
+            return Err(StoreWriterSubmitError::InvalidIdentity);
+        }
+        let operation = DurableOperationIdentity::TaskMutation(identity);
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_nonreplayable_normal(&[identity]) {
+            Ok(permit) => {
+                permit.send(WriteCommand::TypedAppendRunningEvent {
+                    identity: operation.clone(),
+                    sequence_guard: self.sequence_guard(&[identity]),
+                    task_id: identity.task_id,
+                    payload,
+                    deadline,
+                    response,
+                });
+            }
+            Err(error @ (StoreWriterSubmitError::Full | StoreWriterSubmitError::Closed)) => {
+                send_nonreplayable_ingress_rejection(response, operation.clone(), error);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(StoreWriterSubmission {
+            identity: operation,
+            pending: None,
+            completion_channel_closed_reason: OutcomeUnknownReason::NonReplayableOperation,
+            receiver,
+        })
+    }
+
+    pub fn reconcile_pending(
+        &self,
+        pending: PendingDurableResult,
+        deadline: Instant,
+    ) -> Result<PendingDurableSubmission, StoreWriterSubmitError> {
+        match pending {
+            PendingDurableResult::QueueLimitedCreate {
+                identity,
+                input,
+                max_queued_tasks,
+            } => {
+                let expected = DurableOperationIdentity::CreateTask {
+                    client_request_id: input.client_request_id,
+                };
+                if identity != expected {
+                    return Err(StoreWriterSubmitError::InvalidIdentity);
+                }
+                self.submit_queue_limited_create_on(input, max_queued_tasks, deadline, true)
+                    .map(PendingDurableSubmission::QueueLimitedCreate)
+            }
+            PendingDurableResult::QueueLimitedRetry {
+                identity,
+                source_task_id,
+                max_queued_tasks,
+            } => {
+                if identity != (DurableOperationIdentity::RetryTask { source_task_id }) {
+                    return Err(StoreWriterSubmitError::InvalidIdentity);
+                }
+                self.submit_queue_limited_retry_on(source_task_id, max_queued_tasks, deadline, true)
+                    .map(PendingDurableSubmission::QueueLimitedRetry)
+            }
+            PendingDurableResult::ClaimTask { identity, request } => self
+                .submit_reconcile_claim_task(identity, request, deadline)
+                .map(PendingDurableSubmission::ReconcileClaimTask),
+            PendingDurableResult::PersistStopIntentBatch { identity, requests } => self
+                .submit_stop_intent_batch_on(identity, requests, deadline, true, true)
+                .map(PendingDurableSubmission::PersistStopIntentBatch),
+            PendingDurableResult::FinalizeStoppedTask { identity, request } => self
+                .submit_finalize_stopped_task_on(identity, request, deadline, true)
+                .map(PendingDurableSubmission::FinalizeStoppedTask),
+            PendingDurableResult::RecordReview { identity, request } => self
+                .submit_record_review_on(identity, request, deadline, true)
+                .map(PendingDurableSubmission::RecordReview),
+            PendingDurableResult::FinalizeReviewedTask { identity, request } => self
+                .submit_finalize_reviewed_task_on(identity, request, deadline, true)
+                .map(PendingDurableSubmission::FinalizeReviewedTask),
+            PendingDurableResult::FinalizeUnreviewedTask { identity, request } => self
+                .submit_finalize_unreviewed_task_on(identity, request, deadline, true)
+                .map(PendingDurableSubmission::FinalizeUnreviewedTask),
+        }
     }
 
     pub async fn register_repository(
@@ -723,6 +2079,26 @@ impl StoreWriterHandle {
         receive(receiver).await
     }
 
+    /// Atomically interrupts the remaining Queued and Running tasks after all
+    /// durable stop intents have reached their exact terminal tuples.
+    ///
+    /// The caller remains responsible for proving that every affected process
+    /// tree has exited before submitting this final shutdown/degraded step.
+    pub async fn interrupt_remaining_after_stops(
+        &self,
+        failure: TaskFailure,
+        deadline: Instant,
+    ) -> Result<WriteReceipt<RecoveryReceipt>, StoreWriterError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(WriteCommand::InterruptRemainingAfterStops {
+            failure,
+            deadline,
+            response,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
     pub async fn recover_incomplete(
         &self,
         now: UtcTimestamp,
@@ -793,1426 +2169,180 @@ impl StoreWriterHandle {
             .await
             .map_err(|_| StoreWriterError::Closed)
     }
+
+    fn reserve_normal(
+        &self,
+        identities: &[TaskMutationIdentity],
+        reconciliation_lane: bool,
+    ) -> Result<mpsc::Permit<'_, WriteCommand>, StoreWriterSubmitError> {
+        let sender = if reconciliation_lane {
+            &self.reconciliation_sender
+        } else {
+            &self.sender
+        };
+        self.reserve_on(sender, identities, reconciliation_lane)
+    }
+
+    fn reserve_urgent(
+        &self,
+        identities: &[TaskMutationIdentity],
+        reconciliation_lane: bool,
+    ) -> Result<mpsc::Permit<'_, WriteCommand>, StoreWriterSubmitError> {
+        let sender = if reconciliation_lane {
+            &self.reconciliation_sender
+        } else {
+            &self.urgent_sender
+        };
+        self.reserve_on(sender, identities, reconciliation_lane)
+    }
+
+    fn reserve_on<'a>(
+        &'a self,
+        sender: &'a mpsc::Sender<WriteCommand>,
+        identities: &[TaskMutationIdentity],
+        reconciliation_lane: bool,
+    ) -> Result<mpsc::Permit<'a, WriteCommand>, StoreWriterSubmitError> {
+        let mut ingress = self
+            .ingress_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut proposed = ingress.clone();
+        if reconciliation_lane {
+            proposed.accept_reconciliation(identities)?;
+        } else {
+            proposed.accept(identities)?;
+        }
+        match sender.try_reserve() {
+            Ok(permit) => {
+                *ingress = proposed;
+                Ok(permit)
+            }
+            Err(error) => {
+                if !reconciliation_lane {
+                    proposed.mark_unresolved(identities);
+                    *ingress = proposed;
+                }
+                Err(match error {
+                    mpsc::error::TrySendError::Full(()) => StoreWriterSubmitError::Full,
+                    mpsc::error::TrySendError::Closed(()) => StoreWriterSubmitError::Closed,
+                })
+            }
+        }
+    }
+
+    fn reserve_nonreplayable_normal(
+        &self,
+        identities: &[TaskMutationIdentity],
+    ) -> Result<mpsc::Permit<'_, WriteCommand>, StoreWriterSubmitError> {
+        self.reserve_on(&self.sender, identities, false)
+    }
+
+    fn sequence_guard(&self, identities: &[TaskMutationIdentity]) -> MutationSequenceGuard {
+        MutationSequenceGuard::new(self.ingress_sequences.clone(), identities.to_vec())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_unresolved_mutations_for_test(
+        &self,
+        identities: &[TaskMutationIdentity],
+    ) -> Result<(), StoreWriterSubmitError> {
+        let mut ingress = self
+            .ingress_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ingress.accept(identities)?;
+        ingress.mark_unresolved(identities);
+        Ok(())
+    }
 }
 
-enum WriteCommand {
-    RegisterRepository {
-        input: NewRepository,
-        deadline: Instant,
-        response:
-            oneshot::Sender<Result<WriteReceipt<RegisterRepositoryOutcome>, StoreWriterError>>,
-    },
-    CreateTask {
-        input: NewTask,
-        deadline: Instant,
-        response: oneshot::Sender<Result<WriteReceipt<CreateTaskOutcome>, StoreWriterError>>,
-    },
-    RetryTask {
-        task_id: TaskId,
-        deadline: Instant,
-        response: oneshot::Sender<Result<WriteReceipt<RetryTaskOutcome>, StoreWriterError>>,
-    },
-    TransitionWithEvent {
-        task_id: TaskId,
-        expected: TaskStatus,
-        transition: TaskTransition,
-        deadline: Instant,
-        response: oneshot::Sender<Result<WriteReceipt<TransitionOutcome>, StoreWriterError>>,
-    },
-    AppendRunningEvent {
-        task_id: TaskId,
-        payload: TaskEventPayload,
-        deadline: Instant,
-        response: oneshot::Sender<Result<WriteReceipt<AppendEventOutcome>, StoreWriterError>>,
-    },
-    RecordReview {
-        request: RecordReviewRequest,
-        deadline: Instant,
-        response: oneshot::Sender<Result<WriteReceipt<RecordReviewOutcome>, StoreWriterError>>,
-    },
-    FinalizeReviewedTask {
-        request: FinalizeReviewedTaskRequest,
-        deadline: Instant,
-        response:
-            oneshot::Sender<Result<WriteReceipt<FinalizeReviewedTaskOutcome>, StoreWriterError>>,
-    },
-    ReserveAttemptArtifact {
-        input: ReserveAttemptArtifact,
-        deadline: Instant,
-        response:
-            oneshot::Sender<Result<WriteReceipt<ReserveAttemptArtifactOutcome>, StoreWriterError>>,
-    },
-    MarkAttemptArtifactReady {
-        identity: AttemptArtifactIdentity,
-        deadline: Instant,
-        response:
-            oneshot::Sender<Result<WriteReceipt<UpdateAttemptArtifactOutcome>, StoreWriterError>>,
-    },
-    MarkAttemptArtifactInconsistent {
-        identity: AttemptArtifactIdentity,
-        failure_code: String,
-        deadline: Instant,
-        response:
-            oneshot::Sender<Result<WriteReceipt<UpdateAttemptArtifactOutcome>, StoreWriterError>>,
-    },
-    RecoverIncomplete {
-        now: UtcTimestamp,
-        failure: TaskFailure,
-        deadline: Instant,
-        response: oneshot::Sender<Result<WriteReceipt<RecoveryOutcome>, StoreWriterError>>,
-    },
+fn completion_channel_closed_reason(reconciliation_lane: bool) -> OutcomeUnknownReason {
+    if reconciliation_lane {
+        OutcomeUnknownReason::ReconciliationFailed
+    } else {
+        OutcomeUnknownReason::CompletionChannelClosed
+    }
 }
 
-async fn run_writer(
-    mut receiver: mpsc::Receiver<WriteCommand>,
-    backend: Arc<dyn StoreWriterBackend>,
-    wake: Arc<dyn EventWake>,
+fn send_ingress_rejection<T>(
+    response: oneshot::Sender<DurableCompletion<T>>,
+    identity: DurableOperationIdentity,
+    pending: &PendingDurableResult,
+    error: StoreWriterSubmitError,
+    reconciliation_lane: bool,
 ) {
-    while let Some(command) = receiver.recv().await {
-        match command {
-            WriteCommand::RegisterRepository {
-                input,
-                deadline,
-                response,
-            } => {
-                let result = execute(
-                    &*backend,
-                    StoreWriterOperation::RegisterRepository(input),
-                    deadline,
-                )
-                .await
-                .and_then(expect_repository)
-                .map(|value| WriteReceipt {
-                    value,
-                    event_id: None,
-                });
-                let _ = response.send(result);
-            }
-            WriteCommand::CreateTask {
-                input,
-                deadline,
-                response,
-            } => {
-                let result = execute(&*backend, StoreWriterOperation::CreateTask(input), deadline)
-                    .await
-                    .and_then(expect_create)
-                    .map(|value| {
-                        let event_id = match &value {
-                            CreateTaskOutcome::Created { event_id, .. } => Some(*event_id),
-                            CreateTaskOutcome::Existing { .. } => None,
-                        };
-                        receipt_and_wake(value, event_id, &*wake)
-                    });
-                let _ = response.send(result);
-            }
-            WriteCommand::RetryTask {
-                task_id,
-                deadline,
-                response,
-            } => {
-                let result = execute(
-                    &*backend,
-                    StoreWriterOperation::RetryTask(task_id),
-                    deadline,
-                )
-                .await
-                .and_then(expect_retry)
-                .map(|value| {
-                    let event_id = match &value {
-                        RetryTaskOutcome::Created { event_id, .. } => Some(*event_id),
-                        RetryTaskOutcome::Existing { .. } => None,
-                    };
-                    receipt_and_wake(value, event_id, &*wake)
-                });
-                let _ = response.send(result);
-            }
-            WriteCommand::TransitionWithEvent {
-                task_id,
-                expected,
-                transition,
-                deadline,
-                response,
-            } => {
-                if matches!(transition, TaskTransition::Completed) {
-                    let _ = response.send(Err(completed_transition_bypass_error().into()));
-                    continue;
-                }
-                let operation = StoreWriterOperation::TransitionWithEvent {
-                    task_id,
-                    expected,
-                    transition,
-                };
-                let result = execute(&*backend, operation, deadline)
-                    .await
-                    .and_then(expect_transition)
-                    .map(|value| {
-                        let event_id = match &value {
-                            TransitionOutcome::Applied { event_id, .. } => Some(*event_id),
-                            TransitionOutcome::Conflict { .. } => None,
-                        };
-                        receipt_and_wake(value, event_id, &*wake)
-                    });
-                let _ = response.send(result);
-            }
-            WriteCommand::AppendRunningEvent {
-                task_id,
-                payload,
-                deadline,
-                response,
-            } => {
-                let operation = StoreWriterOperation::AppendRunningEvent { task_id, payload };
-                let result = execute(&*backend, operation, deadline)
-                    .await
-                    .and_then(expect_append)
-                    .map(|value| {
-                        let event_id = match &value {
-                            AppendEventOutcome::Applied { event_id } => Some(*event_id),
-                            AppendEventOutcome::NotRunning { .. } => None,
-                        };
-                        receipt_and_wake(value, event_id, &*wake)
-                    });
-                let _ = response.send(result);
-            }
-            WriteCommand::RecordReview {
-                request,
-                deadline,
-                response,
-            } => {
-                let result = execute(
-                    &*backend,
-                    StoreWriterOperation::RecordReview(request),
-                    deadline,
-                )
-                .await
-                .and_then(expect_record_review)
-                .map(|value| {
-                    let event_id = match &value {
-                        RecordReviewOutcome::Applied { event_id, .. }
-                        | RecordReviewOutcome::Existing { event_id, .. } => Some(*event_id),
-                    };
-                    receipt_and_wake(value, event_id, &*wake)
-                });
-                let _ = response.send(result);
-            }
-            WriteCommand::FinalizeReviewedTask {
-                request,
-                deadline,
-                response,
-            } => {
-                let result = execute(
-                    &*backend,
-                    StoreWriterOperation::FinalizeReviewedTask(request),
-                    deadline,
-                )
-                .await
-                .and_then(expect_finalize_reviewed_task)
-                .map(|value| {
-                    let event_id = match &value {
-                        FinalizeReviewedTaskOutcome::Applied {
-                            terminal_event_id, ..
-                        }
-                        | FinalizeReviewedTaskOutcome::Existing {
-                            terminal_event_id, ..
-                        } => Some(*terminal_event_id),
-                    };
-                    receipt_and_wake(value, event_id, &*wake)
-                });
-                let _ = response.send(result);
-            }
-            WriteCommand::RecoverIncomplete {
-                now,
-                failure,
-                deadline,
-                response,
-            } => {
-                let operation = StoreWriterOperation::RecoverIncomplete { now, failure };
-                let result = execute(&*backend, operation, deadline)
-                    .await
-                    .and_then(expect_recovery)
-                    .map(|value| {
-                        let event_id = value.last_event_id;
-                        receipt_and_wake(value, event_id, &*wake)
-                    });
-                let _ = response.send(result);
-            }
-            WriteCommand::ReserveAttemptArtifact {
-                input,
-                deadline,
-                response,
-            } => {
-                let result = execute(
-                    &*backend,
-                    StoreWriterOperation::ReserveAttemptArtifact(input),
-                    deadline,
-                )
-                .await
-                .and_then(expect_reserve_artifact)
-                .map(|value| WriteReceipt {
-                    value,
-                    event_id: None,
-                });
-                let _ = response.send(result);
-            }
-            WriteCommand::MarkAttemptArtifactReady {
-                identity,
-                deadline,
-                response,
-            } => {
-                let result = execute(
-                    &*backend,
-                    StoreWriterOperation::MarkAttemptArtifactReady(identity),
-                    deadline,
-                )
-                .await
-                .and_then(expect_update_artifact)
-                .map(|value| WriteReceipt {
-                    value,
-                    event_id: None,
-                });
-                let _ = response.send(result);
-            }
-            WriteCommand::MarkAttemptArtifactInconsistent {
-                identity,
-                failure_code,
-                deadline,
-                response,
-            } => {
-                let result = execute(
-                    &*backend,
-                    StoreWriterOperation::MarkAttemptArtifactInconsistent {
-                        identity,
-                        failure_code,
-                    },
-                    deadline,
-                )
-                .await
-                .and_then(expect_update_artifact)
-                .map(|value| WriteReceipt {
-                    value,
-                    event_id: None,
-                });
-                let _ = response.send(result);
-            }
+    let disposition = if reconciliation_lane {
+        DurableDisposition::OutcomeUnknown {
+            reason: OutcomeUnknownReason::ReconciliationFailed,
+            pending: Some(pending.clone()),
         }
-    }
-}
-
-async fn execute(
-    backend: &dyn StoreWriterBackend,
-    operation: StoreWriterOperation,
-    deadline: Instant,
-) -> Result<StoreWriterOperationOutcome, StoreWriterError> {
-    if Instant::now() >= deadline {
-        return Err(StoreWriterError::Busy);
-    }
-
-    let mut retry = 0;
-    loop {
-        match backend.execute(operation.clone()).await {
-            Err(StoreWriterError::Busy) if retry < RETRY_DELAYS.len() => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(StoreWriterError::Busy);
+    } else {
+        DurableDisposition::KnownNotApplied {
+            reason: match error {
+                StoreWriterSubmitError::Full => KnownNotAppliedReason::IngressFull,
+                StoreWriterSubmitError::Closed => KnownNotAppliedReason::IngressClosed,
+                StoreWriterSubmitError::InvalidIdentity
+                | StoreWriterSubmitError::SequenceGap
+                | StoreWriterSubmitError::SequenceReversed => {
+                    unreachable!("only ingress availability is converted to a completion")
                 }
-                let retry_at = now + RETRY_DELAYS[retry];
-                retry += 1;
-                if retry_at >= deadline {
-                    sleep_until(deadline).await;
-                    return Err(StoreWriterError::Busy);
-                }
-                sleep_until(retry_at).await;
-                if Instant::now() >= deadline {
-                    return Err(StoreWriterError::Busy);
-                }
-            }
-            result => return result,
+            },
+            outcome: None,
+            error: None,
         }
-    }
+    };
+    let _ = response.send(DurableCompletion {
+        identity,
+        sequence_disposition: if reconciliation_lane {
+            MutationSequenceDisposition::BlockUnknown
+        } else {
+            MutationSequenceDisposition::RetainSame
+        },
+        disposition,
+    });
 }
 
-async fn receive<T>(
-    receiver: oneshot::Receiver<Result<WriteReceipt<T>, StoreWriterError>>,
-) -> Result<WriteReceipt<T>, StoreWriterError> {
-    receiver.await.map_err(|_| StoreWriterError::Closed)?
+fn send_nonreplayable_ingress_rejection<T>(
+    response: oneshot::Sender<DurableCompletion<T>>,
+    identity: DurableOperationIdentity,
+    error: StoreWriterSubmitError,
+) {
+    let reason = match error {
+        StoreWriterSubmitError::Full => KnownNotAppliedReason::IngressFull,
+        StoreWriterSubmitError::Closed => KnownNotAppliedReason::IngressClosed,
+        StoreWriterSubmitError::InvalidIdentity
+        | StoreWriterSubmitError::SequenceGap
+        | StoreWriterSubmitError::SequenceReversed => {
+            unreachable!("only ingress availability is converted to a completion")
+        }
+    };
+    let _ = response.send(DurableCompletion {
+        identity,
+        sequence_disposition: MutationSequenceDisposition::RetainSame,
+        disposition: DurableDisposition::KnownNotApplied {
+            reason,
+            outcome: None,
+            error: None,
+        },
+    });
 }
 
-fn receipt_and_wake<T>(
-    value: T,
-    event_id: Option<EventId>,
-    wake: &dyn EventWake,
-) -> WriteReceipt<T> {
-    if event_id.is_some() && catch_unwind(AssertUnwindSafe(|| wake.wake())).is_err() {
-        tracing::warn!("event wake panicked after a durable store commit");
-    }
-    WriteReceipt { value, event_id }
-}
-
-fn classify_store_error(error: StoreError) -> StoreWriterError {
-    if let StoreError::Database(database) = &error
-        && let Some(code) = database.as_database_error().and_then(|error| error.code())
-        && sqlite_code_is_retryable(&code)
+fn validate_stop_batch_identity(
+    identity: &DurableOperationIdentity,
+    requests: &[StopIntentRequest],
+) -> Result<(), StoreWriterSubmitError> {
+    let DurableOperationIdentity::StopIntentBatch { items } = identity else {
+        return Err(StoreWriterSubmitError::InvalidIdentity);
+    };
+    if items.len() != requests.len()
+        || items.iter().zip(requests).any(|(item, request)| {
+            item.kind != DurableOperationKind::PersistStopIntent || item.task_id != request.task_id
+        })
     {
-        return StoreWriterError::Busy;
+        return Err(StoreWriterSubmitError::InvalidIdentity);
     }
-    StoreWriterError::Store(error)
-}
-
-pub(crate) fn sqlite_code_is_retryable(code: &str) -> bool {
-    code.parse::<i32>()
-        .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
-}
-
-fn unexpected_outcome() -> StoreWriterError {
-    StoreWriterError::Store(StoreError::InvariantViolation(
-        "store writer backend returned a mismatched outcome",
-    ))
-}
-
-fn completed_transition_bypass_error() -> StoreError {
-    StoreError::InvariantViolation(COMPLETED_TRANSITION_BYPASS)
-}
-
-fn expect_repository(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<RegisterRepositoryOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::RegisterRepository(value) => Ok(value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_create(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<CreateTaskOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::CreateTask(value) => Ok(value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_retry(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<RetryTaskOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::RetryTask(value) => Ok(value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_transition(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<TransitionOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::TransitionWithEvent(value) => Ok(value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_append(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<AppendEventOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::AppendRunningEvent(value) => Ok(value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_record_review(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<RecordReviewOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::RecordReview(value) => Ok(*value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_finalize_reviewed_task(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<FinalizeReviewedTaskOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::FinalizeReviewedTask(value) => Ok(*value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_recovery(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<RecoveryOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::RecoverIncomplete(value) => Ok(value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_reserve_artifact(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<ReserveAttemptArtifactOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::ReserveAttemptArtifact(value) => Ok(value),
-        _ => Err(unexpected_outcome()),
-    }
-}
-
-fn expect_update_artifact(
-    outcome: StoreWriterOperationOutcome,
-) -> Result<UpdateAttemptArtifactOutcome, StoreWriterError> {
-    match outcome {
-        StoreWriterOperationOutcome::UpdateAttemptArtifact(value) => Ok(value),
-        _ => Err(unexpected_outcome()),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-    use std::path::PathBuf;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use coding_agent_domain::{CanonicalPath, ClientRequestId, Repository};
-    use tokio::sync::Notify;
-
-    use super::*;
-
-    struct UnitFixture {
-        store: Store,
-        repository: Repository,
-        _temp_dir: tempfile::TempDir,
-    }
-
-    async fn unit_fixture() -> UnitFixture {
-        let temp_dir = tempfile::tempdir().expect("create writer unit-test directory");
-        let store = Store::open(temp_dir.path().join("store.sqlite3"))
-            .await
-            .expect("open writer unit-test store");
-        store
-            .migrate()
-            .await
-            .expect("migrate writer unit-test store");
-        let repository = match store
-            .register_repository(NewRepository {
-                selected_path: canonical(temp_dir.path().join("selected")),
-                display_name: "unit repository".to_owned(),
-                git_root: canonical(temp_dir.path().join("git")),
-                cargo_workspace_root: canonical(temp_dir.path().join("workspace")),
-            })
-            .await
-            .expect("register writer unit-test repository")
-        {
-            RegisterRepositoryOutcome::Created(repository)
-            | RegisterRepositoryOutcome::Existing(repository) => repository,
-        };
-        UnitFixture {
-            store,
-            repository,
-            _temp_dir: temp_dir,
-        }
-    }
-
-    fn canonical(path: PathBuf) -> CanonicalPath {
-        CanonicalPath::try_from_canonical(path).expect("construct unit-test canonical path")
-    }
-
-    fn new_task(repository: &Repository, prompt: &str) -> NewTask {
-        NewTask::try_new(ClientRequestId::new(), repository.id, prompt)
-            .expect("construct writer unit-test task")
-    }
-
-    fn deadline() -> Instant {
-        Instant::now() + Duration::from_secs(10)
-    }
-
-    #[derive(Default)]
-    struct CountingWake(AtomicUsize);
-
-    impl CountingWake {
-        fn count(&self) -> usize {
-            self.0.load(Ordering::SeqCst)
-        }
-    }
-
-    impl EventWake for CountingWake {
-        fn wake(&self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    enum InjectedAttempt {
-        KnownUncommittedBusy,
-        TerminalRollback,
-    }
-
-    struct FaultControlledBackend {
-        inner: Store,
-        attempts: AtomicUsize,
-        injected: Mutex<VecDeque<InjectedAttempt>>,
-        pause: Option<Arc<PausePoint>>,
-    }
-
-    impl FaultControlledBackend {
-        fn new(inner: Store, injected: impl IntoIterator<Item = InjectedAttempt>) -> Self {
-            Self {
-                inner,
-                attempts: AtomicUsize::new(0),
-                injected: Mutex::new(injected.into_iter().collect()),
-                pause: None,
-            }
-        }
-
-        fn paused(inner: Store, pause: Arc<PausePoint>) -> Self {
-            Self {
-                inner,
-                attempts: AtomicUsize::new(0),
-                injected: Mutex::new(VecDeque::new()),
-                pause: Some(pause),
-            }
-        }
-
-        fn attempts(&self) -> usize {
-            self.attempts.load(Ordering::SeqCst)
-        }
-    }
-
-    impl StoreWriterBackend for FaultControlledBackend {
-        fn execute(&self, operation: StoreWriterOperation) -> StoreWriterBackendFuture<'_> {
-            Box::pin(async move {
-                self.attempts.fetch_add(1, Ordering::SeqCst);
-                if let Some(pause) = &self.pause {
-                    pause.started.notify_one();
-                    pause.release.notified().await;
-                }
-                let injected = self
-                    .injected
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pop_front();
-                match injected {
-                    Some(InjectedAttempt::KnownUncommittedBusy) => Err(StoreWriterError::Busy),
-                    Some(InjectedAttempt::TerminalRollback) => Err(StoreWriterError::Store(
-                        StoreError::InvariantViolation("injected rolled-back attempt"),
-                    )),
-                    None => StoreWriterBackend::execute(&self.inner, operation).await,
-                }
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct PausePoint {
-        started: Notify,
-        release: Notify,
-    }
-
-    #[test]
-    fn sqlite_retry_classification_is_limited_to_busy_and_locked_families() {
-        for code in ["5", "6", "261", "517", "262"] {
-            assert!(sqlite_code_is_retryable(code), "retry SQLite code {code}");
-        }
-        for code in ["4", "7", "260", "516", "787", "not-a-code"] {
-            assert!(
-                !sqlite_code_is_retryable(code),
-                "do not retry SQLite code {code}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn completed_transition_is_rejected_by_backend_and_internal_command_without_side_effects()
-    {
-        let fixture = unit_fixture().await;
-        let queued = fixture
-            .store
-            .create_task(new_task(&fixture.repository, "review finalization only"))
-            .await
-            .expect("create task")
-            .task()
-            .clone();
-        let running = match fixture
-            .store
-            .transition_with_event(queued.id, TaskStatus::Queued, TaskTransition::Running)
-            .await
-            .expect("start task")
-        {
-            TransitionOutcome::Applied { task, .. } => task,
-            TransitionOutcome::Conflict { .. } => panic!("fixture transition must apply"),
-        };
-        let before = fixture
-            .store
-            .bootstrap_snapshot()
-            .await
-            .expect("load before snapshot");
-
-        let backend_error = StoreWriterBackend::execute(
-            &fixture.store,
-            StoreWriterOperation::TransitionWithEvent {
-                task_id: running.id,
-                expected: TaskStatus::Running,
-                transition: TaskTransition::Completed,
-            },
-        )
-        .await
-        .expect_err("backend must reject generic Completed");
-        assert!(matches!(
-            backend_error,
-            StoreWriterError::Store(StoreError::InvariantViolation(message))
-                if message == COMPLETED_TRANSITION_BYPASS
-        ));
-
-        let wake = Arc::new(CountingWake::default());
-        let writer = StoreWriterHandle::spawn(fixture.store.clone(), wake.clone(), 4);
-        let (response, receiver) = oneshot::channel();
-        writer
-            .send(WriteCommand::TransitionWithEvent {
-                task_id: running.id,
-                expected: TaskStatus::Running,
-                transition: TaskTransition::Completed,
-                deadline: deadline(),
-                response,
-            })
-            .await
-            .expect("send internal command");
-        let command_error = receive::<TransitionOutcome>(receiver)
-            .await
-            .expect_err("internal command must reject generic Completed");
-        assert!(matches!(
-            command_error,
-            StoreWriterError::Store(StoreError::InvariantViolation(message))
-                if message == COMPLETED_TRANSITION_BYPASS
-        ));
-
-        let after = fixture
-            .store
-            .bootstrap_snapshot()
-            .await
-            .expect("load after snapshot");
-        assert_eq!(after.latest_event_id, before.latest_event_id);
-        assert_eq!(
-            after
-                .tasks
-                .iter()
-                .find(|task| task.id == running.id)
-                .expect("running task remains")
-                .status,
-            TaskStatus::Running
-        );
-        assert_eq!(wake.count(), 0);
-    }
-
-    #[tokio::test]
-    async fn retries_two_known_uncommitted_busy_attempts_then_commits_once() {
-        let fixture = unit_fixture().await;
-        let backend = Arc::new(FaultControlledBackend::new(
-            fixture.store.clone(),
-            [
-                InjectedAttempt::KnownUncommittedBusy,
-                InjectedAttempt::KnownUncommittedBusy,
-            ],
-        ));
-        let wake = Arc::new(CountingWake::default());
-        let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
-
-        let receipt = writer
-            .create_task(
-                new_task(&fixture.repository, "retry transient busy"),
-                deadline(),
-            )
-            .await
-            .expect("third attempt commits");
-
-        assert!(matches!(receipt.value, CreateTaskOutcome::Created { .. }));
-        assert_eq!(backend.attempts(), 3);
-        assert_eq!(
-            fixture
-                .store
-                .bootstrap_snapshot()
-                .await
-                .unwrap()
-                .tasks
-                .len(),
-            1
-        );
-        assert_eq!(wake.count(), 1);
-    }
-
-    #[tokio::test]
-    async fn retry_schedule_is_exact_and_bounded() {
-        let fixture = unit_fixture().await;
-        tokio::time::pause();
-        let backend = Arc::new(FaultControlledBackend::new(
-            fixture.store.clone(),
-            [InjectedAttempt::KnownUncommittedBusy; 6],
-        ));
-        let writer = StoreWriterHandle::spawn_with_backend(
-            backend.clone(),
-            Arc::new(CountingWake::default()),
-            4,
-        );
-        let request = tokio::spawn({
-            let writer = writer.clone();
-            let input = new_task(&fixture.repository, "bounded retries");
-            async move { writer.create_task(input, deadline()).await }
-        });
-
-        wait_for_attempts(&backend, 1).await;
-        for (index, delay_ms) in [25_u64, 50, 100, 200, 400].into_iter().enumerate() {
-            tokio::time::advance(Duration::from_millis(delay_ms - 1)).await;
-            tokio::task::yield_now().await;
-            assert_eq!(backend.attempts(), index + 1);
-            tokio::time::advance(Duration::from_millis(2)).await;
-            wait_for_attempts(&backend, index + 2).await;
-        }
-
-        assert!(matches!(
-            request.await.unwrap(),
-            Err(StoreWriterError::Busy)
-        ));
-        assert_eq!(backend.attempts(), 6);
-    }
-
-    #[tokio::test]
-    async fn deadline_expiring_during_backoff_prevents_the_next_attempt() {
-        let fixture = unit_fixture().await;
-        tokio::time::pause();
-        let backend = Arc::new(FaultControlledBackend::new(
-            fixture.store.clone(),
-            [InjectedAttempt::KnownUncommittedBusy],
-        ));
-        let wake = Arc::new(CountingWake::default());
-        let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
-
-        let result = writer
-            .create_task(
-                new_task(&fixture.repository, "deadline during backoff"),
-                Instant::now() + Duration::from_millis(10),
-            )
-            .await;
-        // The retry deadline above deliberately uses paused Tokio time. Restore real time before
-        // asking SQLx for a pooled connection so its acquire timeout cannot auto-advance first.
-        tokio::time::resume();
-
-        assert!(matches!(result, Err(StoreWriterError::Busy)));
-        assert_eq!(backend.attempts(), 1);
-        assert!(
-            fixture
-                .store
-                .bootstrap_snapshot()
-                .await
-                .unwrap()
-                .tasks
-                .is_empty()
-        );
-        assert_eq!(wake.count(), 0);
-    }
-
-    #[tokio::test]
-    async fn terminal_rolled_back_attempt_is_not_retried_or_woken() {
-        let fixture = unit_fixture().await;
-        let backend = Arc::new(FaultControlledBackend::new(
-            fixture.store.clone(),
-            [InjectedAttempt::TerminalRollback],
-        ));
-        let wake = Arc::new(CountingWake::default());
-        let writer = StoreWriterHandle::spawn_with_backend(backend.clone(), wake.clone(), 4);
-
-        let result = writer
-            .create_task(new_task(&fixture.repository, "rolled back"), deadline())
-            .await;
-
-        assert!(matches!(result, Err(StoreWriterError::Store(_))));
-        assert_eq!(backend.attempts(), 1);
-        assert!(
-            fixture
-                .store
-                .bootstrap_snapshot()
-                .await
-                .unwrap()
-                .tasks
-                .is_empty()
-        );
-        assert_eq!(wake.count(), 0);
-    }
-
-    #[tokio::test]
-    async fn dropping_request_future_does_not_cancel_a_started_attempt() {
-        let fixture = unit_fixture().await;
-        let pause = Arc::new(PausePoint::default());
-        let backend = Arc::new(FaultControlledBackend::paused(
-            fixture.store.clone(),
-            pause.clone(),
-        ));
-        let writer =
-            StoreWriterHandle::spawn_with_backend(backend, Arc::new(CountingWake::default()), 4);
-        let request = tokio::spawn({
-            let writer = writer.clone();
-            let input = new_task(&fixture.repository, "detached request");
-            async move { writer.create_task(input, deadline()).await }
-        });
-        pause.started.notified().await;
-        request.abort();
-        pause.release.notify_one();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if !fixture
-                    .store
-                    .bootstrap_snapshot()
-                    .await
-                    .unwrap()
-                    .tasks
-                    .is_empty()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("actor completes an already-started transaction");
-    }
-
-    #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn scripted_failures_are_operation_scoped_and_counted_exactly() {
-        let fixture = unit_fixture().await;
-        let controller = Arc::new(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::FailBeforeExecute,
-                operation: Some(StoreWriterOperationKind::CreateTask),
-                count: 2,
-            }])
-            .expect("valid writer fault script"),
-        );
-        let writer = StoreWriterHandle::spawn_with_test_controller(
-            fixture.store.clone(),
-            Arc::new(CountingWake::default()),
-            4,
-            controller.clone(),
-        );
-
-        for prompt in ["first injected failure", "second injected failure"] {
-            assert!(matches!(
-                writer
-                    .create_task(new_task(&fixture.repository, prompt), deadline())
-                    .await,
-                Err(StoreWriterError::Store(StoreError::InvariantViolation(
-                    "injected test-support StoreWriter failure"
-                )))
-            ));
-        }
-        writer
-            .create_task(
-                new_task(&fixture.repository, "fault budget exhausted"),
-                deadline(),
-            )
-            .await
-            .expect("third matching operation commits");
-
-        assert_eq!(
-            controller.hit_count(
-                StoreWriterFaultPoint::FailBeforeExecute,
-                StoreWriterOperationKind::CreateTask,
-            ),
-            2
-        );
-    }
-
-    #[cfg(feature = "test-support")]
-    #[test]
-    fn fault_specs_have_a_closed_schema_and_positive_counts() {
-        let parsed = serde_json::from_str::<StoreWriterFaultSpec>(
-            r#"{
-                "point": "pause_before_execute",
-                "operation": "finish_task",
-                "count": 3
-            }"#,
-        )
-        .expect("deserialize a closed fault spec");
-        assert_eq!(parsed.point, StoreWriterFaultPoint::PauseBeforeExecute);
-        assert_eq!(parsed.operation, Some(StoreWriterOperationKind::FinishTask));
-        assert_eq!(parsed.count, 3);
-
-        assert!(
-            serde_json::from_str::<StoreWriterFaultSpec>(
-                r#"{
-                    "point": "fail_before_execute",
-                    "count": 1,
-                    "prompt_contains": "magic"
-                }"#,
-            )
-            .is_err()
-        );
-        assert_eq!(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::FailBeforeExecute,
-                operation: None,
-                count: 0,
-            }])
-            .err(),
-            Some(StoreWriterTestConfigError::ZeroCount)
-        );
-    }
-
-    #[cfg(feature = "test-support")]
-    #[test]
-    fn transition_fault_filters_distinguish_start_finish_cancel_and_interrupt() {
-        let task_id = TaskId::new();
-        let transition = |expected, transition| StoreWriterOperation::TransitionWithEvent {
-            task_id,
-            expected,
-            transition,
-        };
-        assert_eq!(
-            transition(TaskStatus::Queued, TaskTransition::Running).test_kind(),
-            StoreWriterOperationKind::StartTask
-        );
-        assert_eq!(
-            transition(TaskStatus::Running, TaskTransition::Completed).test_kind(),
-            StoreWriterOperationKind::FinishTask
-        );
-        assert_eq!(
-            transition(
-                TaskStatus::Running,
-                TaskTransition::Failed(failure("FAILED"))
-            )
-            .test_kind(),
-            StoreWriterOperationKind::FinishTask
-        );
-        assert_eq!(
-            transition(TaskStatus::Queued, TaskTransition::Cancelled).test_kind(),
-            StoreWriterOperationKind::CancelTask
-        );
-        assert_eq!(
-            transition(
-                TaskStatus::Running,
-                TaskTransition::Interrupted(failure("INTERRUPTED")),
-            )
-            .test_kind(),
-            StoreWriterOperationKind::InterruptTask
-        );
-    }
-
-    #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn before_execute_pause_is_releasable_and_precedes_the_commit() {
-        let fixture = unit_fixture().await;
-        let controller = Arc::new(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::PauseBeforeExecute,
-                operation: Some(StoreWriterOperationKind::CreateTask),
-                count: 1,
-            }])
-            .expect("valid writer pause script"),
-        );
-        let wake = Arc::new(CountingWake::default());
-        let writer = StoreWriterHandle::spawn_with_test_controller(
-            fixture.store.clone(),
-            wake.clone(),
-            4,
-            controller.clone(),
-        );
-        let request = tokio::spawn({
-            let writer = writer.clone();
-            let input = new_task(&fixture.repository, "before execute");
-            async move { writer.create_task(input, deadline()).await }
-        });
-
-        controller
-            .wait_until_reached(StoreWriterFaultPoint::PauseBeforeExecute, 1)
-            .await;
-        assert!(
-            fixture
-                .store
-                .bootstrap_snapshot()
-                .await
-                .expect("read store before release")
-                .tasks
-                .is_empty()
-        );
-        assert_eq!(wake.count(), 0);
-        assert!(!request.is_finished());
-
-        assert_eq!(
-            controller.release(StoreWriterFaultPoint::PauseBeforeExecute),
-            1
-        );
-        request
-            .await
-            .expect("join paused request")
-            .expect("released request succeeds");
-        assert_eq!(wake.count(), 1);
-    }
-
-    #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn scripted_busy_attempts_use_the_normal_bounded_retry_path() {
-        let fixture = unit_fixture().await;
-        let controller = Arc::new(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::BusyBeforeExecute,
-                operation: Some(StoreWriterOperationKind::CreateTask),
-                count: 2,
-            }])
-            .expect("valid writer busy script"),
-        );
-        let writer = StoreWriterHandle::spawn_with_test_controller(
-            fixture.store.clone(),
-            Arc::new(CountingWake::default()),
-            4,
-            controller.clone(),
-        );
-
-        writer
-            .create_task(new_task(&fixture.repository, "busy retries"), deadline())
-            .await
-            .expect("third attempt commits");
-        assert_eq!(
-            controller.hit_count(
-                StoreWriterFaultPoint::BusyBeforeExecute,
-                StoreWriterOperationKind::CreateTask,
-            ),
-            2
-        );
-    }
-
-    #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn commit_before_wake_pause_is_releasable_without_hiding_the_commit() {
-        let fixture = unit_fixture().await;
-        let controller = Arc::new(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
-                operation: Some(StoreWriterOperationKind::CreateTask),
-                count: 1,
-            }])
-            .expect("valid writer pause script"),
-        );
-        let wake = Arc::new(CountingWake::default());
-        let writer = StoreWriterHandle::spawn_with_test_controller(
-            fixture.store.clone(),
-            wake.clone(),
-            4,
-            controller.clone(),
-        );
-        let request = tokio::spawn({
-            let writer = writer.clone();
-            let input = new_task(&fixture.repository, "commit before wake");
-            async move { writer.create_task(input, deadline()).await }
-        });
-
-        controller
-            .wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1)
-            .await;
-        assert_eq!(
-            fixture
-                .store
-                .bootstrap_snapshot()
-                .await
-                .expect("read committed task")
-                .tasks
-                .len(),
-            1
-        );
-        assert_eq!(wake.count(), 0);
-        assert!(!request.is_finished());
-
-        assert_eq!(
-            controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
-            1
-        );
-        request
-            .await
-            .expect("join paused request")
-            .expect("released request succeeds");
-        assert_eq!(wake.count(), 1);
-    }
-
-    #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn commit_before_wake_pause_skips_existing_without_consuming_its_budget() {
-        let fixture = unit_fixture().await;
-        let input = new_task(&fixture.repository, "existing outcome");
-        fixture
-            .store
-            .create_task(input.clone())
-            .await
-            .expect("seed the existing task");
-        let controller = Arc::new(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
-                operation: Some(StoreWriterOperationKind::CreateTask),
-                count: 1,
-            }])
-            .expect("valid writer pause script"),
-        );
-        let writer = StoreWriterHandle::spawn_with_test_controller(
-            fixture.store.clone(),
-            Arc::new(CountingWake::default()),
-            4,
-            controller.clone(),
-        );
-
-        let existing = tokio::time::timeout(
-            Duration::from_secs(1),
-            writer.create_task(input, deadline()),
-        )
-        .await
-        .expect("Existing does not pause")
-        .expect("Existing succeeds");
-        assert!(matches!(existing.value, CreateTaskOutcome::Existing { .. }));
-        assert_eq!(
-            controller.hit_count(
-                StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
-                StoreWriterOperationKind::CreateTask,
-            ),
-            0
-        );
-
-        let request = tokio::spawn({
-            let writer = writer.clone();
-            let input = new_task(&fixture.repository, "durable after existing");
-            async move { writer.create_task(input, deadline()).await }
-        });
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
-        )
-        .await
-        .expect("the next durable create consumes the preserved pause budget");
-        assert_eq!(
-            controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
-            1
-        );
-        request
-            .await
-            .expect("join durable create")
-            .expect("released durable create succeeds");
-    }
-
-    #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn commit_before_wake_pause_skips_conflict_without_consuming_its_budget() {
-        let fixture = unit_fixture().await;
-        let conflict_task = fixture
-            .store
-            .create_task(new_task(&fixture.repository, "conflict outcome"))
-            .await
-            .expect("seed conflict task")
-            .task()
-            .clone();
-        fixture
-            .store
-            .transition_with_event(
-                conflict_task.id,
-                TaskStatus::Queued,
-                TaskTransition::Cancelled,
-            )
-            .await
-            .expect("move conflict task out of queued");
-        let durable_task = fixture
-            .store
-            .create_task(new_task(&fixture.repository, "durable after conflict"))
-            .await
-            .expect("seed durable transition task")
-            .task()
-            .clone();
-        let controller = Arc::new(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
-                operation: Some(StoreWriterOperationKind::StartTask),
-                count: 1,
-            }])
-            .expect("valid writer pause script"),
-        );
-        let writer = StoreWriterHandle::spawn_with_test_controller(
-            fixture.store.clone(),
-            Arc::new(CountingWake::default()),
-            4,
-            controller.clone(),
-        );
-
-        let conflict = tokio::time::timeout(
-            Duration::from_secs(1),
-            writer.transition_with_event(
-                conflict_task.id,
-                TaskStatus::Queued,
-                TaskTransition::Running,
-                deadline(),
-            ),
-        )
-        .await
-        .expect("Conflict does not pause")
-        .expect("Conflict is a successful outcome");
-        assert!(matches!(conflict.value, TransitionOutcome::Conflict { .. }));
-        assert_eq!(
-            controller.hit_count(
-                StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
-                StoreWriterOperationKind::StartTask,
-            ),
-            0
-        );
-
-        let request = tokio::spawn({
-            let writer = writer.clone();
-            async move {
-                writer
-                    .transition_with_event(
-                        durable_task.id,
-                        TaskStatus::Queued,
-                        TaskTransition::Running,
-                        deadline(),
-                    )
-                    .await
-            }
-        });
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
-        )
-        .await
-        .expect("the next durable transition consumes the preserved pause budget");
-        assert_eq!(
-            controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
-            1
-        );
-        request
-            .await
-            .expect("join durable transition")
-            .expect("released durable transition succeeds");
-    }
-
-    #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn commit_before_wake_pause_skips_not_running_without_consuming_its_budget() {
-        let fixture = unit_fixture().await;
-        let task = fixture
-            .store
-            .create_task(new_task(&fixture.repository, "not-running outcome"))
-            .await
-            .expect("seed not-running task")
-            .task()
-            .clone();
-        let controller = Arc::new(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
-                operation: Some(StoreWriterOperationKind::AppendRunningEvent),
-                count: 1,
-            }])
-            .expect("valid writer pause script"),
-        );
-        let writer = StoreWriterHandle::spawn_with_test_controller(
-            fixture.store.clone(),
-            Arc::new(CountingWake::default()),
-            4,
-            controller.clone(),
-        );
-
-        let not_running = tokio::time::timeout(
-            Duration::from_secs(1),
-            writer.append_running_event(task.id, plan_payload(1), deadline()),
-        )
-        .await
-        .expect("NotRunning does not pause")
-        .expect("NotRunning is a successful outcome");
-        assert!(matches!(
-            not_running.value,
-            AppendEventOutcome::NotRunning { .. }
-        ));
-        assert_eq!(
-            controller.hit_count(
-                StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
-                StoreWriterOperationKind::AppendRunningEvent,
-            ),
-            0
-        );
-        fixture
-            .store
-            .transition_with_event(task.id, TaskStatus::Queued, TaskTransition::Running)
-            .await
-            .expect("move task to running");
-
-        let request = tokio::spawn({
-            let writer = writer.clone();
-            async move {
-                writer
-                    .append_running_event(task.id, plan_payload(2), deadline())
-                    .await
-            }
-        });
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
-        )
-        .await
-        .expect("the next durable append consumes the preserved pause budget");
-        assert_eq!(
-            controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
-            1
-        );
-        request
-            .await
-            .expect("join durable append")
-            .expect("released durable append succeeds");
-    }
-
-    #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn dropped_wake_budget_does_not_drop_the_next_notification() {
-        let fixture = unit_fixture().await;
-        let controller = Arc::new(
-            StoreWriterTestController::try_new([StoreWriterFaultSpec {
-                point: StoreWriterFaultPoint::DropWakeAfterCommit,
-                operation: Some(StoreWriterOperationKind::CreateTask),
-                count: 1,
-            }])
-            .expect("valid writer drop-wake script"),
-        );
-        let wake = Arc::new(CountingWake::default());
-        let writer = StoreWriterHandle::spawn_with_test_controller(
-            fixture.store.clone(),
-            wake.clone(),
-            4,
-            controller,
-        );
-
-        writer
-            .create_task(new_task(&fixture.repository, "dropped wake"), deadline())
-            .await
-            .expect("first commit succeeds");
-        assert_eq!(wake.count(), 0);
-        writer
-            .create_task(new_task(&fixture.repository, "delivered wake"), deadline())
-            .await
-            .expect("second commit succeeds");
-        assert_eq!(wake.count(), 1);
-    }
-
-    async fn wait_for_attempts(backend: &FaultControlledBackend, expected: usize) {
-        for _ in 0..100 {
-            if backend.attempts() == expected {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!(
-            "store attempts did not reach {expected}; observed {}",
-            backend.attempts()
-        );
-    }
-
-    #[cfg(feature = "test-support")]
-    fn failure(code: &str) -> TaskFailure {
-        TaskFailure {
-            code: code.to_owned(),
-            message: "unit-test failure".to_owned(),
-            retryable: true,
-        }
-    }
-
-    #[cfg(feature = "test-support")]
-    fn plan_payload(revision: u64) -> TaskEventPayload {
-        TaskEventPayload::PlanUpdated {
-            plan: coding_agent_domain::PlanSnapshot::legacy(revision, Vec::new()),
-        }
-    }
-}
+mod tests;

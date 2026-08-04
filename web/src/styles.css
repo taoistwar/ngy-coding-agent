@@ -171,7 +171,7 @@ ol {
 
 .app-shell {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   min-height: 100vh;
   min-height: 100dvh;
 }
@@ -248,6 +248,69 @@ ol {
   justify-self: end;
   background: transparent;
   color: var(--text-muted);
+}
+
+.scheduler-summary {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.72rem 1.1rem;
+  border-bottom: 1px solid var(--border);
+  background: rgb(17 19 26 / 0.92);
+}
+
+.scheduler-summary-heading {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.scheduler-summary h2,
+.scheduler-summary-heading p {
+  margin-bottom: 0;
+}
+
+.scheduler-freshness,
+.scheduler-stale-note {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.scheduler-stale .scheduler-freshness,
+.scheduler-stale-note {
+  color: var(--warning);
+}
+
+.scheduler-capacity {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin: 0;
+}
+
+.scheduler-capacity > div {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  padding: 0.5rem 0.62rem;
+  background: var(--surface);
+}
+
+.scheduler-capacity dt {
+  color: var(--text-faint);
+  font-size: 0.68rem;
+  font-weight: 750;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.scheduler-capacity dd {
+  margin: 0.18rem 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 0.85rem;
+  font-weight: 700;
 }
 
 .workbench-grid {
@@ -449,6 +512,15 @@ ol {
   text-align: right;
 }
 
+.task-queue-reason {
+  grid-column: 1 / -1;
+  padding: 0 0.45rem 0.35rem;
+  overflow-wrap: anywhere;
+  color: var(--warning);
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+
 .readiness-review_approved {
   border-color: rgb(99 215 160 / 0.42);
   color: var(--success);
@@ -550,6 +622,30 @@ ol {
   justify-content: space-between;
   color: var(--text-faint);
   font-size: 0.75rem;
+}
+
+.queue-capacity-note,
+.scheduler-task-control,
+.task-final-outcome {
+  margin-bottom: 0.45rem;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.queue-capacity-note,
+.scheduler-task-control {
+  color: var(--warning);
+}
+
+.scheduler-task-control.stopping {
+  font-weight: 700;
+}
+
+.task-final-outcome {
+  color: var(--text);
+  font-weight: 700;
 }
 
 .task-heading {
@@ -1243,6 +1339,10 @@ ol {
     max-width: none;
   }
 
+  .scheduler-capacity {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .workbench-grid {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -1283,6 +1383,15 @@ ol {
   .connection-banner {
     grid-column: 1;
     justify-self: stretch;
+  }
+
+  .scheduler-summary-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .scheduler-capacity {
+    grid-template-columns: 1fr;
   }
 
   .quit-button {

@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { ReviewEvidence, SseMessage } from "./types";
+import type {
+  ReviewEvidence,
+  SchedulerState,
+  SchedulerStateChunkControl,
+  SchedulerStateControl,
+  SseMessage,
+} from "./types";
+import {
+  schedulerStateDigest,
+  type SchedulerSnapshotCandidate,
+} from "./schedulerSnapshot";
 import {
   IncrementalSseParser,
   SseClient,
@@ -201,6 +211,99 @@ function persistedFrame(
   return `id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(body)}\n\n`;
 }
 
+const SCHEDULER_SERVER_INSTANCE_ID =
+  "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const SCHEDULER_TASK_ID = "11111111-1111-4111-8111-111111111111";
+
+function schedulerState(): SchedulerState {
+  return {
+    schema_version: 1,
+    server_instance_id: SCHEDULER_SERVER_INSTANCE_ID,
+    server_started_at: "2026-07-27T00:00:00Z",
+    generation: 5,
+    as_of_event_id: 7,
+    service_state_generation: 3,
+    admission_state: "running",
+    limits: {
+      global: 2,
+      per_repository: 1,
+      queued: 8,
+      cargo_jobs_per_task: 2,
+    },
+    active_task_count: 0,
+    queued_task_count: 1,
+    queued_tasks: [
+      { task_id: SCHEDULER_TASK_ID, reason: "global_capacity" },
+    ],
+    stopping_tasks: [],
+    storage: {
+      state: "normal",
+      data: { state: "normal" },
+      runtime: { state: "normal" },
+      repositories: [],
+    },
+  };
+}
+
+async function schedulerControls(): Promise<{
+  state: SchedulerState;
+  manifest: SchedulerStateControl;
+  chunk: SchedulerStateChunkControl;
+}> {
+  const state = schedulerState();
+  const snapshotDigest = await schedulerStateDigest(state);
+  return {
+    state,
+    manifest: {
+      schema_version: 1,
+      kind: "scheduler.state",
+      server_instance_id: state.server_instance_id,
+      server_started_at: state.server_started_at,
+      generation: state.generation,
+      as_of_event_id: state.as_of_event_id,
+      service_state_generation: state.service_state_generation,
+      admission_state: state.admission_state,
+      limits: state.limits,
+      active_task_count: state.active_task_count,
+      queued_task_count: state.queued_task_count,
+      stopping_task_count: state.stopping_tasks.length,
+      repository_storage_count: state.storage.repositories.length,
+      storage: {
+        state: state.storage.state,
+        data: state.storage.data,
+        runtime: state.storage.runtime,
+      },
+      item_count: 1,
+      chunk_count: 1,
+      snapshot_digest: snapshotDigest,
+    },
+    chunk: {
+      schema_version: 1,
+      kind: "scheduler.state.chunk",
+      server_instance_id: state.server_instance_id,
+      generation: state.generation,
+      snapshot_digest: snapshotDigest,
+      chunk_index: 0,
+      chunk_count: 1,
+      items: [
+        {
+          kind: "queued_task",
+          task_id: SCHEDULER_TASK_ID,
+          reason: "global_capacity",
+        },
+      ],
+    },
+  };
+}
+
+function schedulerFrame(
+  control: SchedulerStateControl | SchedulerStateChunkControl,
+  id?: number,
+): string {
+  const idLine = id === undefined ? "" : `id: ${id}\n`;
+  return `${idLine}event: ${control.kind}\ndata: ${JSON.stringify(control)}\n\n`;
+}
+
 function eventStream(
   chunks: readonly (string | Uint8Array)[],
   options: {
@@ -208,6 +311,7 @@ function eventStream(
     holdOpen?: boolean;
     status?: number;
     contentType?: string;
+    transportError?: Error;
   } = {},
 ): Response {
   let index = 0;
@@ -216,6 +320,10 @@ function eventStream(
       pull(controller) {
         const chunk = chunks[index++];
         if (chunk === undefined) {
+          if (options.transportError !== undefined) {
+            controller.error(options.transportError);
+            return;
+          }
           if (!options.holdOpen) {
             controller.close();
           }
@@ -241,6 +349,7 @@ function callbacks(
 ): SseClientCallbacks {
   return {
     onMessage: vi.fn(),
+    onSchedulerSnapshot: vi.fn(),
     onDiagnostic: vi.fn(),
     onState: vi.fn(),
     recover: vi.fn(async () => 0),
@@ -451,6 +560,197 @@ describe("SseClient", () => {
     expect(client.lastAppliedId).toBe(8);
   });
 
+  it("assembles id-less scheduler controls and projects only the complete snapshot", async () => {
+    const { state, manifest, chunk } = await schedulerControls();
+    const candidates: SchedulerSnapshotCandidate[] = [];
+    let client: SseClient;
+    const onSchedulerSnapshot = vi.fn(
+      (candidate: SchedulerSnapshotCandidate) => {
+        candidates.push(candidate);
+        client.stop();
+      },
+    );
+    const cb = callbacks({
+      onSchedulerSnapshot,
+    });
+    client = new SseClient({
+      fetch: vi.fn(async () =>
+        eventStream([schedulerFrame(manifest), schedulerFrame(chunk)]),
+      ),
+      callbacks: cb,
+    });
+
+    await client.start(7);
+
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        snapshot: state,
+        digest: manifest.snapshot_digest,
+      }),
+    ]);
+    expect(onSchedulerSnapshot).toHaveBeenCalledTimes(1);
+    expect(cb.onMessage).not.toHaveBeenCalled();
+    expect(client.lastAppliedId).toBe(7);
+  });
+
+  it.each(["clean EOF", "transport failure"] as const)(
+    "recovers from the unchanged cursor when a partial scheduler snapshot meets %s",
+    async (exitKind) => {
+      const { manifest } = await schedulerControls();
+      let client: SseClient;
+      const recover = vi.fn(async () => {
+        client.stop();
+        return 20;
+      });
+      client = new SseClient({
+        fetch: vi.fn(async () =>
+          eventStream(
+            [schedulerFrame(manifest)],
+            exitKind === "transport failure"
+              ? { transportError: new TypeError("connection lost") }
+              : {},
+          ),
+        ),
+        callbacks: callbacks({ recover }),
+      });
+
+      await client.start(7);
+
+      expect(recover).toHaveBeenCalledWith(
+        expect.objectContaining({
+          code: "MALFORMED_ENVELOPE",
+          message: expect.stringContaining(
+            "before the scheduler snapshot completed",
+          ),
+        }),
+        expect.any(AbortSignal),
+      );
+      expect(client.lastAppliedId).toBe(7);
+    },
+  );
+
+  it("clears a partial scheduler snapshot on stream.reset and rejects its orphaned chunk after recovery", async () => {
+    const { manifest, chunk } = await schedulerControls();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        eventStream([
+          schedulerFrame(manifest) +
+            "event: stream.reset\ndata: {\"schema_version\":1,\"kind\":\"stream.reset\",\"latest_event_id\":7}\n\n",
+        ]),
+      )
+      .mockResolvedValueOnce(eventStream([schedulerFrame(chunk)]));
+    const reasons: SseRecoveryReason[] = [];
+    let client: SseClient;
+    const recover = vi.fn(async (reason: SseRecoveryReason) => {
+      reasons.push(reason);
+      if (reasons.length === 2) {
+        client.stop();
+      }
+      return 7;
+    });
+    const cb = callbacks({ recover });
+    client = new SseClient({
+      fetch: fetchMock,
+      callbacks: cb,
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+      jitter: () => 0,
+      sleep: vi.fn(async () => undefined),
+    });
+
+    await client.start(7);
+
+    expect(reasons.map(({ code }) => code)).toEqual([
+      "STREAM_RESET",
+      "MALFORMED_ENVELOPE",
+    ]);
+    expect(reasons[1]?.message).toContain("matching manifest");
+    expect(cb.onSchedulerSnapshot).not.toHaveBeenCalled();
+    expect(cb.onMessage).not.toHaveBeenCalled();
+  });
+
+  it("rejects ID-bearing scheduler controls before persisted event decoding", async () => {
+    const { manifest, chunk } = await schedulerControls();
+
+    for (const control of [manifest, chunk]) {
+      let client: SseClient;
+      const recover = vi.fn(async () => {
+        client.stop();
+        return 7;
+      });
+      client = new SseClient({
+        fetch: vi.fn(async () => eventStream([schedulerFrame(control, 8)])),
+        callbacks: callbacks({ recover }),
+      });
+
+      await client.start(7);
+
+      expect(recover).toHaveBeenCalledWith(
+        expect.objectContaining({
+          code: "MALFORMED_ENVELOPE",
+          message: expect.stringContaining("must be id-less"),
+        }),
+        expect.any(AbortSignal),
+      );
+    }
+  });
+
+  it("maps scheduler validator and assembler failures to protocol recovery", async () => {
+    const { manifest, chunk } = await schedulerControls();
+    const invalidManifest = { ...manifest, unexpected: true };
+
+    for (const frame of [
+      `event: scheduler.state\ndata: ${JSON.stringify(invalidManifest)}\n\n`,
+      schedulerFrame(chunk),
+    ]) {
+      let client: SseClient;
+      const recover = vi.fn(async () => {
+        client.stop();
+        return 7;
+      });
+      client = new SseClient({
+        fetch: vi.fn(async () => eventStream([frame])),
+        callbacks: callbacks({ recover }),
+      });
+
+      await client.start(7);
+
+      expect(recover).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "MALFORMED_ENVELOPE" }),
+        expect.any(AbortSignal),
+      );
+    }
+  });
+
+  it("maps a complete scheduler snapshot callback rejection to PROJECTION_ERROR", async () => {
+    const { manifest, chunk } = await schedulerControls();
+    let client: SseClient;
+    const recover = vi.fn(async () => {
+      client.stop();
+      return 7;
+    });
+    client = new SseClient({
+      fetch: vi.fn(async () =>
+        eventStream([schedulerFrame(manifest), schedulerFrame(chunk)]),
+      ),
+      callbacks: callbacks({
+        onSchedulerSnapshot: vi.fn(async () => {
+          throw new Error("scheduler reducer rejected candidate");
+        }),
+        recover,
+      }),
+    });
+
+    await client.start(7);
+
+    expect(recover).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "PROJECTION_ERROR" }),
+      expect.any(AbortSignal),
+    );
+    expect(client.lastAppliedId).toBe(7);
+  });
+
   it("recognizes and projects a self-contained typed review.updated event", async () => {
     const onMessage = vi.fn();
     const recover = vi.fn(async () => 8);
@@ -599,6 +899,41 @@ describe("SseClient", () => {
     expect(client.lastAppliedId).toBe(12);
     expect(recover).toHaveBeenCalledWith(
       expect.objectContaining({ code: "NON_MONOTONIC_ID" }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("does not commit an unknown-event cursor when its diagnostic callback rejects", async () => {
+    let client: SseClient;
+    const recover = vi.fn(async () => {
+      client.stop();
+      return 7;
+    });
+    const future = {
+      id: 8,
+      schema_version: 1,
+      kind: "task.future",
+      task_id: "00000000-0000-4000-8000-000000000001",
+      created_at: "2026-07-15T00:00:00Z",
+      payload: {},
+    };
+    client = new SseClient({
+      fetch: vi.fn(async () =>
+        eventStream([persistedFrame(8, future, "task.future")]),
+      ),
+      callbacks: callbacks({
+        onDiagnostic: () => {
+          throw new Error("projection rejected the diagnostic");
+        },
+        recover,
+      }),
+    });
+
+    await client.start(7);
+
+    expect(client.lastAppliedId).toBe(7);
+    expect(recover).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "PROJECTION_ERROR" }),
       expect.any(AbortSignal),
     );
   });

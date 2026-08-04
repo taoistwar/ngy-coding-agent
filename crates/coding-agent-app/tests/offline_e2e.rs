@@ -1,8 +1,11 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::io;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,14 +20,17 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Request, Response, StatusCode};
 use axum::routing::post;
 use coding_agent_api::{
-    LiveEventItem, LiveEventStream, ServiceStateControl, ServiceStateDto, ServiceStateStream,
-    SseBackend, TaskEventDto,
+    LiveEventItem, LiveEventStream, SchedulerAdmissionStateDto, SchedulerLimitsDto,
+    SchedulerStateDto, SchedulerStateStream, SchedulerStorageDto, SchedulerStorageScopeDto,
+    SchedulerStorageStateDto, ServiceStateControl, ServiceStateDto, ServiceStateStream, SseBackend,
+    TaskEventDto,
 };
 use coding_agent_app::{
     CodingAgentRunner, CodingAgentRunnerConfig, CodingAttemptError, EventDispatcherHandle,
     Project2RuntimeSessionFactory, QuiesceResult, RepositoryWorktreeProvisionerFactory,
-    ServiceState, ServiceStateController, StoreWriterHandle, SystemWallClock, TaskManagerHandle,
-    WallClock, WorktreeCodingAgentAttemptFactory,
+    SchedulerConcurrencyLimits, ServiceState, ServiceStateController, StoreWriterHandle,
+    SystemWallClock, TaskManagerHandle, TaskManagerLaunchResources, WallClock,
+    WorktreeCodingAgentAttemptFactory,
 };
 use coding_agent_domain::{
     CanonicalPath, EventCursor, NewRepository, Repository, Task, TaskEventKind, TaskFailure,
@@ -32,7 +38,8 @@ use coding_agent_domain::{
 };
 use coding_agent_provider::{ChatCompletionsClient, ClientLimits, ProviderConfig};
 use coding_agent_runtime::{
-    ProcessLimits, ToolchainPaths, WorktreeLimits, WorktreeProvisioner, discover_toolchain,
+    ProcessLimits, ProcessLivenessScope, ToolchainPaths, WorktreeLimits, WorktreeProvisioner,
+    discover_toolchain,
 };
 use coding_agent_store::{AttemptArtifactState, RegisterRepositoryOutcome, Store};
 use futures_util::stream as futures_stream;
@@ -47,6 +54,8 @@ const PACKAGE: &str = "offline_fixture";
 const CHANGED_SOURCE: &str = "pub fn answer() -> u32 { 42 }\n";
 const POST_PASS_SOURCE: &str = "pub fn answer() -> u32 { 43 }\n";
 const FAILED_SOURCE: &str = "pub fn answer() -> u32 { 0 }\n";
+const DEFAULT_TASK_STATUS_TIMEOUT: Duration = Duration::from_secs(180);
+const COMPATIBILITY_TASK_STATUS_TIMEOUT: Duration = Duration::from_secs(300);
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -822,8 +831,10 @@ impl E2eFixture {
 
         let rustc = concrete_rustc();
         let git = path_executable(if cfg!(windows) { "git.exe" } else { "git" });
+        let instance_process_scope = support::instance_process_scope(&runtime_directory);
         let toolchain = discover_toolchain(
             &runtime_directory,
+            instance_process_scope.clone(),
             Some(rustc.as_path()),
             Some(git.as_path()),
         )
@@ -863,13 +874,26 @@ impl E2eFixture {
         let runtimes = Arc::new(Project2RuntimeSessionFactory::project_2_defaults(
             toolchain,
             runtime_directory.clone(),
+            NonZeroU32::new(1).expect("test Cargo jobs are nonzero"),
         ));
         let attempts = Arc::new(WorktreeCodingAgentAttemptFactory::new(
             provisioners,
             runtimes,
         ));
+        let (repository_control, repository_identity_resolver) =
+            support::repository_control_fixture(&store).await;
+        let launch_resources = TaskManagerLaunchResources::new_for_test(
+            SchedulerConcurrencyLimits::try_new(1, 1).expect("valid offline E2E concurrency"),
+            Arc::clone(&repository_control),
+            instance_process_scope.clone(),
+        );
         let runner = Arc::new(CodingAgentRunner::new(
-            writer.clone(),
+            coding_agent_app::CodingAgentPreparationControl::new(
+                store.clone(),
+                writer.clone(),
+                Arc::clone(&repository_control),
+                repository_identity_resolver,
+            ),
             provider_client,
             attempts,
             Arc::new(SystemWallClock),
@@ -882,7 +906,7 @@ impl E2eFixture {
             dispatcher.clone(),
             ServiceStateController::new(ServiceState::Ready),
             runner,
-            1,
+            launch_resources,
             128,
         );
 
@@ -925,7 +949,17 @@ impl E2eFixture {
     }
 
     async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) -> Task {
-        tokio::time::timeout(Duration::from_secs(180), async {
+        self.wait_for_status_with_timeout(task_id, expected, DEFAULT_TASK_STATUS_TIMEOUT)
+            .await
+    }
+
+    async fn wait_for_status_with_timeout(
+        &self,
+        task_id: TaskId,
+        expected: TaskStatus,
+        timeout: Duration,
+    ) -> Task {
+        let result = tokio::time::timeout(timeout, async {
             loop {
                 let detail = self
                     .store
@@ -952,8 +986,25 @@ impl E2eFixture {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .unwrap_or_else(|_| panic!("task {task_id} did not reach {expected:?}"))
+        .await;
+        if let Ok(task) = result {
+            return task;
+        }
+
+        let detail = self
+            .store
+            .task_detail(task_id)
+            .await
+            .expect("read timed-out E2E task")
+            .expect("timed-out E2E task exists");
+        panic!(
+            "task {task_id} did not reach {expected:?} within {timeout:?}; current={:?}; failure={:?}; last_event_id={}; diff={:?}; tests={:?}",
+            detail.task.status,
+            detail.task.failure,
+            detail.task.last_event_id,
+            detail.diff,
+            detail.tests
+        )
     }
 
     async fn assert_isolation_invariants(&self, task_id: TaskId) {
@@ -1066,13 +1117,17 @@ fn provisioner_factory(
     runtime_directory: PathBuf,
 ) -> Arc<dyn RepositoryWorktreeProvisionerFactory> {
     Arc::new(
-        move |repository: &Repository| -> Result<Arc<WorktreeProvisioner>, CodingAttemptError> {
+        move |repository: &Repository,
+              process_liveness_scope: ProcessLivenessScope|
+              -> Result<Arc<WorktreeProvisioner>, CodingAttemptError> {
             WorktreeProvisioner::from_trusted_paths(
                 &toolchain,
+                repository.id.to_string(),
                 repository.git_root.as_path(),
                 repository.cargo_workspace_root.as_path(),
                 &artifact_root,
                 &runtime_directory,
+                process_liveness_scope,
                 ProcessLimits::try_new(
                     512 * 1024,
                     256 * 1024,
@@ -1113,8 +1168,31 @@ impl SseBackend for StorePersistedEventReplay {
         Box::pin(futures_stream::empty())
     }
 
+    fn subscribe_scheduler_state(&self) -> SchedulerStateStream {
+        Box::pin(futures_stream::empty())
+    }
+
     async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
         Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        let latest = self.store.latest_event_id().await.unwrap().get();
+        Ok(Arc::new(replay_scheduler_state(latest)))
+    }
+
+    async fn membership_watermark_through(
+        &self,
+        after_cursor: i64,
+    ) -> coding_agent_api::ApiResult<i64> {
+        let through = EventCursor::new(after_cursor)
+            .expect("SSE supplies a nonnegative membership watermark bound");
+        Ok(self
+            .store
+            .membership_watermark_through(through)
+            .await
+            .unwrap()
+            .get())
     }
 
     async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
@@ -1138,6 +1216,39 @@ impl SseBackend for StorePersistedEventReplay {
             .filter(|event| event.id.get() <= through)
             .map(Into::into)
             .collect())
+    }
+}
+
+fn replay_scheduler_state(as_of_event_id: i64) -> SchedulerStateDto {
+    SchedulerStateDto {
+        schema_version: 1,
+        server_instance_id: uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000")
+            .expect("offline replay scheduler instance UUID"),
+        server_started_at: support::timestamp().into(),
+        generation: 0,
+        as_of_event_id: u64::try_from(as_of_event_id).expect("persisted event IDs are nonnegative"),
+        service_state_generation: 0,
+        admission_state: SchedulerAdmissionStateDto::Running,
+        limits: SchedulerLimitsDto {
+            global: 1,
+            per_repository: 1,
+            queued: 256,
+            cargo_jobs_per_task: 1,
+        },
+        active_task_count: 0,
+        queued_task_count: 0,
+        queued_tasks: Vec::new(),
+        stopping_tasks: Vec::new(),
+        storage: SchedulerStorageDto {
+            state: SchedulerStorageStateDto::Normal,
+            data: SchedulerStorageScopeDto {
+                state: SchedulerStorageStateDto::Normal,
+            },
+            runtime: SchedulerStorageScopeDto {
+                state: SchedulerStorageStateDto::Normal,
+            },
+            repositories: Vec::new(),
+        },
     }
 }
 
@@ -1276,7 +1387,11 @@ async fn compatibility_modes_force_one_visible_cargo_test_without_an_http_retry(
             .await;
 
         let completed = fixture
-            .wait_for_status(task.id, TaskStatus::Completed)
+            .wait_for_status_with_timeout(
+                task.id,
+                TaskStatus::Completed,
+                COMPATIBILITY_TASK_STATUS_TIMEOUT,
+            )
             .await;
         assert!(completed.failure.is_none(), "scenario={scenario:?}");
         let detail = fixture.store.task_detail(task.id).await.unwrap().unwrap();

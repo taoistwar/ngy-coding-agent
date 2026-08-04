@@ -309,9 +309,14 @@ impl RepositoryFixture {
     ) -> WorkspaceFingerprinter {
         let rustc = concrete_rustc();
         let git = path_executable(if cfg!(windows) { "git.exe" } else { "git" });
-        let toolchain = discover_toolchain(&self.runtime_directory, Some(&rustc), Some(&git))
-            .await
-            .unwrap();
+        let toolchain = discover_toolchain(
+            &self.runtime_directory,
+            support::instance_process_scope(&self.runtime_directory),
+            Some(&rustc),
+            Some(&git),
+        )
+        .await
+        .unwrap();
         WorkspaceFingerprinter::from_trusted_capabilities(
             &toolchain,
             Arc::new(
@@ -320,6 +325,7 @@ impl RepositoryFixture {
             ),
             Arc::new(ExecutionDirectory::open(self.repository.canonicalize().unwrap()).unwrap()),
             &self.runtime_directory,
+            support::task_process_scope(&self.runtime_directory),
             ProcessLimits::try_new(
                 256 * 1024,
                 64 * 1024,

@@ -1,16 +1,945 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use coding_agent_app::{
-    CancelOutcome, FakeRunnerConfig, QuiesceResult, RunnerEvent, RunnerEventError, ServiceState,
+    CancelOutcome, FakeRunnerConfig, QuiesceResult, RunnerEvent, RunnerEventError,
+    SchedulerRepositoryStorageState, SchedulerStorageNotification, ServiceState, StorageState,
     StoreWriterError, TaskManagerError,
 };
 #[cfg(feature = "test-support")]
-use coding_agent_app::{FakeScenario, StoreWriterFaultPoint, StoreWriterOperationKind};
+use coding_agent_app::{
+    FakeScenario, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterOperationKind,
+    TaskManagerSafetySnapshot,
+};
 use coding_agent_domain::{
     ActivityEntry, ActivityLevel, DiffFile, DiffFileStatus, DiffSnapshot, PlanItemStatus,
-    PlanSnapshot, TaskEventKind, TaskFailure, TaskStatus, TestCase, TestSnapshot, TestStatus,
+    PlanSnapshot, TaskEventKind, TaskFailure, TaskId, TaskStatus, TestCase, TestSnapshot,
+    TestStatus,
 };
+use coding_agent_store::{StopIntentKind, TaskTransition, TransitionOutcome};
 use tokio::time::{Duration, Instant};
+
+#[cfg(feature = "test-support")]
+async fn wait_for_safety_snapshot(
+    fixture: &support::TaskManagerFixture,
+    active_count: usize,
+    available_permits: usize,
+) -> TaskManagerSafetySnapshot {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = fixture
+                .manager
+                .safety_snapshot_for_test()
+                .await
+                .expect("inspect task-manager safety");
+            if snapshot.active_count == active_count
+                && snapshot.available_permits == available_permits
+            {
+                return snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "task-manager safety did not reach active={active_count}, available={available_permits}"
+        )
+    })
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn typed_claim_unknown_is_read_only_and_does_not_spawn() {
+    let (fixture, writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [
+            StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::FailUnknownBeforeExecute,
+                operation: Some(StoreWriterOperationKind::StartTask),
+                count: 1,
+            },
+            StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::PauseBeforeExecute,
+                operation: Some(StoreWriterOperationKind::ReconcileClaimTask),
+                count: 1,
+            },
+        ],
+    )
+    .await;
+    fixture.runner.push_blocking(1);
+    let task = fixture.enqueue_tasks(1, false).await.remove(0);
+
+    fixture.manager.notify_queued(task.id).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer_faults.wait_until_reached(StoreWriterFaultPoint::PauseBeforeExecute, 1),
+    )
+    .await
+    .expect("unknown claim reaches the exact read-only reconciliation");
+
+    assert_eq!(fixture.load(task.id).await.status, TaskStatus::Queued);
+    assert_eq!(fixture.runner.started_count(task.id), 0);
+    let retained = fixture.manager.safety_snapshot_for_test().await.unwrap();
+    assert_eq!(retained.active_count, 1);
+    assert_eq!(retained.available_permits, 0);
+
+    fixture.state.set(ServiceState::StoreDegraded).unwrap();
+    assert_eq!(
+        writer_faults.release(StoreWriterFaultPoint::PauseBeforeExecute),
+        1
+    );
+    wait_for_safety_snapshot(&fixture, 0, 1).await;
+
+    assert_eq!(fixture.load(task.id).await.status, TaskStatus::Queued);
+    assert_eq!(fixture.runner.started_count(task.id), 0);
+    assert_eq!(
+        fixture.event_kinds(task.id).await,
+        vec![TaskEventKind::TaskQueued]
+    );
+
+    fixture.state.set(ServiceState::Ready).unwrap();
+    fixture.manager.notify_queued(task.id).await.unwrap();
+    assert_eq!(fixture.runner.wait_for_started_task(0).await, task.id);
+    assert_eq!(fixture.runner.started_count(task.id), 1);
+    fixture.runner.release(task.id).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn global_two_allows_two_same_repository_roles_to_overlap_and_globally_blocks_the_rest() {
+    let (fixture, other_repository) =
+        support::gated_two_repository_task_manager_fixture(2, 2).await;
+    fixture.runner.push_blocking(4);
+    let same_repository = fixture
+        .enqueue_tasks_for_repository(fixture.repository.id, "same repository", 3)
+        .await;
+    for (task, timestamp) in same_repository.iter().zip([
+        "2026-07-15T00:00:01.000000000Z",
+        "2026-07-15T00:00:02.000000000Z",
+        "2026-07-15T00:00:03.000000000Z",
+    ]) {
+        fixture.set_created_at(task.id, timestamp).await;
+    }
+    fixture.state.set(ServiceState::Ready).unwrap();
+    fixture
+        .manager
+        .notify_queued(same_repository[0].id)
+        .await
+        .unwrap();
+
+    let first = fixture.runner.wait_for_started_task(0).await;
+    let second = fixture.runner.wait_for_started_task(1).await;
+    assert_eq!(
+        [first, second],
+        [same_repository[0].id, same_repository[1].id]
+    );
+    assert_eq!(
+        fixture.load(same_repository[2].id).await.status,
+        TaskStatus::Queued
+    );
+
+    fixture.state.set(ServiceState::StoreDegraded).unwrap();
+    let other = fixture
+        .enqueue_tasks_for_repository(other_repository.id, "other repository", 1)
+        .await;
+    fixture
+        .set_created_at(other[0].id, "2026-07-15T00:00:04.000000000Z")
+        .await;
+    fixture.state.set(ServiceState::Ready).unwrap();
+    fixture.manager.notify_queued(other[0].id).await.unwrap();
+
+    assert_eq!(fixture.load(other[0].id).await.status, TaskStatus::Queued);
+    let snapshot = wait_for_safety_snapshot(&fixture, 2, 0).await;
+    assert_eq!(snapshot.recovery_release_ready_count, 0);
+
+    fixture.runner.release(first).await;
+    fixture.runner.release(second).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn repository_two_skips_the_blocked_fifo_candidate_and_starts_another_repository() {
+    let (fixture, other_repository) =
+        support::gated_two_repository_task_manager_fixture(3, 2).await;
+    fixture.runner.push_blocking(4);
+    let same_repository = fixture
+        .enqueue_tasks_for_repository(fixture.repository.id, "same repository", 3)
+        .await;
+    for (task, timestamp) in same_repository.iter().zip([
+        "2026-07-15T00:00:01.000000000Z",
+        "2026-07-15T00:00:02.000000000Z",
+        "2026-07-15T00:00:03.000000000Z",
+    ]) {
+        fixture.set_created_at(task.id, timestamp).await;
+    }
+    fixture.state.set(ServiceState::Ready).unwrap();
+    fixture
+        .manager
+        .notify_queued(same_repository[0].id)
+        .await
+        .unwrap();
+
+    let same_repository_starts = [
+        fixture.runner.wait_for_started_task(0).await,
+        fixture.runner.wait_for_started_task(1).await,
+    ];
+    assert_eq!(
+        same_repository_starts,
+        [same_repository[0].id, same_repository[1].id]
+    );
+    assert_eq!(
+        fixture.load(same_repository[2].id).await.status,
+        TaskStatus::Queued
+    );
+
+    fixture.state.set(ServiceState::StoreDegraded).unwrap();
+    let other = fixture
+        .enqueue_tasks_for_repository(other_repository.id, "other repository", 1)
+        .await;
+    fixture
+        .set_created_at(other[0].id, "2026-07-15T00:00:04.000000000Z")
+        .await;
+    fixture.state.set(ServiceState::Ready).unwrap();
+    fixture
+        .manager
+        .notify_queued(same_repository[2].id)
+        .await
+        .unwrap();
+    assert_eq!(fixture.runner.wait_for_started_task(2).await, other[0].id);
+
+    fixture.runner.release(other[0].id).await;
+    wait_for_safety_snapshot(&fixture, 2, 1).await;
+    assert_eq!(
+        fixture.load(same_repository[2].id).await.status,
+        TaskStatus::Queued
+    );
+    assert_eq!(fixture.runner.started_count(same_repository[2].id), 0);
+
+    fixture.runner.release(same_repository[0].id).await;
+    assert_eq!(
+        fixture.runner.wait_for_started_task(3).await,
+        same_repository[2].id
+    );
+    fixture.runner.release(same_repository[1].id).await;
+    fixture.runner.release(same_repository[2].id).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn claim_completion_wait_does_not_block_mailbox() {
+    let (fixture, writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+            operation: Some(StoreWriterOperationKind::StartTask),
+            count: 1,
+        }],
+    )
+    .await;
+    fixture.runner.push_blocking(1);
+    let task = fixture.enqueue_tasks(1, false).await.remove(0);
+
+    fixture.manager.notify_queued(task.id).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer_faults.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+    )
+    .await
+    .expect("claim commit reaches the paused completion boundary");
+    assert_eq!(fixture.load(task.id).await.status, TaskStatus::Running);
+    assert_eq!(fixture.runner.started_count(task.id), 0);
+
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.manager.safety_snapshot_for_test(),
+    )
+    .await
+    .expect("safety inspection remains responsive")
+    .unwrap();
+    assert_eq!(snapshot.active_count, 1);
+    assert_eq!(snapshot.available_permits, 0);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.manager.notify_queued(TaskId::new()),
+    )
+    .await
+    .expect("high-priority queue notification remains responsive")
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.manager.safety_snapshot_for_test(),
+    )
+    .await
+    .expect("mailbox processes the notification before the following inspection")
+    .unwrap();
+
+    assert_eq!(
+        writer_faults.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+        1
+    );
+    assert_eq!(fixture.runner.wait_for_started_task(0).await, task.id);
+    assert_eq!(fixture.runner.started_count(task.id), 1);
+    fixture.runner.release(task.id).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn quiesce_during_claim_completion_wait_latches_and_keeps_mailbox_responsive() {
+    let (fixture, writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+            operation: Some(StoreWriterOperationKind::StartTask),
+            count: 1,
+        }],
+    )
+    .await;
+    fixture.runner.push_blocking(1);
+    let task = fixture.enqueue_tasks(1, false).await.remove(0);
+    fixture.manager.notify_queued(task.id).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer_faults.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+    )
+    .await
+    .expect("claim commit reaches the paused completion boundary");
+
+    let quiescing_manager = fixture.manager.clone();
+    let quiesce = tokio::spawn(async move {
+        quiescing_manager
+            .quiesce_and_interrupt(Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !fixture.manager.shutdown_latched_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actor accepts and publishes the shutdown latch");
+    assert!(
+        !quiesce.is_finished(),
+        "the quiesce receipt may remain pending behind StoreWriter"
+    );
+
+    let safety = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.manager.safety_snapshot_for_test(),
+    )
+    .await
+    .expect("latched shutdown keeps the safety mailbox responsive");
+    assert!(matches!(safety, Err(TaskManagerError::Frozen)));
+    let notification = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.manager.notify_queued(TaskId::new()),
+    )
+    .await
+    .expect("latched shutdown keeps queue notification responsive");
+    assert!(matches!(notification, Err(TaskManagerError::Frozen)));
+
+    assert_eq!(
+        writer_faults.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+        1
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), quiesce)
+            .await
+            .expect("quiesce completes after the writer resumes")
+            .expect("quiesce task does not panic")
+            .expect("quiesce returns a typed result"),
+        QuiesceResult::Durable { .. }
+    ));
+    assert_eq!(fixture.runner.started_count(task.id), 0);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn quiesce_during_runner_event_writer_lag_keeps_the_mailbox_responsive() {
+    let (fixture, writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+            operation: Some(StoreWriterOperationKind::AppendRunningEvent),
+            count: 1,
+        }],
+    )
+    .await;
+    let gate = fixture
+        .runner
+        .push_event_gate(RunnerEvent::PlanUpdated(support::fixture_review_plan()));
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    assert_eq!(fixture.runner.wait_for_started_task(0).await, task.id);
+    gate.release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer_faults.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+    )
+    .await
+    .expect("runner event reaches the paused commit-before-reply boundary");
+
+    let safety = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.manager.safety_snapshot_for_test(),
+    )
+    .await
+    .expect("runner event writer lag does not block the safety mailbox")
+    .expect("the active safety snapshot remains available");
+    assert_eq!(safety.active_count, 1);
+    assert_eq!(safety.available_permits, 0);
+
+    let quiescing_manager = fixture.manager.clone();
+    let quiesce = tokio::spawn(async move {
+        quiescing_manager
+            .quiesce_and_interrupt(Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !fixture.manager.shutdown_latched_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quiesce is accepted while the runner event reply is pending");
+    assert!(
+        !quiesce.is_finished(),
+        "quiesce still waits for the exact in-flight mutation and runner cleanup"
+    );
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.manager.notify_queued(task.id),
+        )
+        .await
+        .expect("queue notification receives a prompt shutdown answer"),
+        Err(TaskManagerError::Frozen)
+    ));
+
+    assert_eq!(
+        writer_faults.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+        1
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), gate.result)
+            .await
+            .expect("the runner event receives its exact durable completion")
+            .expect("the event result channel remains live")
+            .is_ok()
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), quiesce)
+            .await
+            .expect("quiesce completes after the event mutation and runner return")
+            .expect("quiesce task does not panic")
+            .expect("quiesce returns a typed result"),
+        QuiesceResult::Durable { .. }
+    ));
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn quiesce_during_review_writer_lag_keeps_the_mailbox_responsive() {
+    let (fixture, writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+            operation: Some(StoreWriterOperationKind::RecordReview),
+            count: 1,
+        }],
+    )
+    .await;
+    let gate = fixture
+        .runner
+        .push_review_gate(support::changes_requested_review(1));
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    assert_eq!(fixture.runner.wait_for_started_task(0).await, task.id);
+    gate.release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer_faults.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+    )
+    .await
+    .expect("review reaches the paused commit-before-reply boundary");
+
+    let safety = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.manager.safety_snapshot_for_test(),
+    )
+    .await
+    .expect("review writer lag does not block the safety mailbox")
+    .expect("the active safety snapshot remains available");
+    assert_eq!(safety.active_count, 1);
+    assert_eq!(safety.available_permits, 0);
+
+    let quiescing_manager = fixture.manager.clone();
+    let quiesce = tokio::spawn(async move {
+        quiescing_manager
+            .quiesce_and_interrupt(Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !fixture.manager.shutdown_latched_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quiesce is accepted while the review reply is pending");
+    assert!(
+        !quiesce.is_finished(),
+        "quiesce still waits for the exact review mutation and runner cleanup"
+    );
+
+    assert_eq!(
+        writer_faults.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+        1
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), gate.result)
+            .await
+            .expect("the review receives its exact durable completion")
+            .expect("the review result channel remains live")
+            .is_ok()
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), quiesce)
+            .await
+            .expect("quiesce completes after review mutation and runner return")
+            .expect("quiesce task does not panic")
+            .expect("quiesce returns a typed result"),
+        QuiesceResult::Durable { .. }
+    ));
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn terminal_release_waits_for_writer_receipt_projection_and_process_return() {
+    let (fixture, writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [
+            StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+                operation: Some(StoreWriterOperationKind::FinalizeReviewedTask),
+                count: 1,
+            },
+            StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::DropWakeAfterCommit,
+                operation: Some(StoreWriterOperationKind::FinalizeReviewedTask),
+                count: 1,
+            },
+        ],
+    )
+    .await;
+    fixture.runner.push_blocking(2);
+    let tasks = fixture.enqueue_tasks(2, true).await;
+    assert_eq!(fixture.runner.wait_for_started_task(0).await, tasks[0].id);
+
+    fixture.runner.release(tasks[0].id).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer_faults.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+    )
+    .await
+    .expect("terminal commit reaches the receipt/wake boundary");
+
+    assert_eq!(
+        fixture.load(tasks[0].id).await.status,
+        TaskStatus::Completed
+    );
+    assert_eq!(fixture.load(tasks[1].id).await.status, TaskStatus::Queued);
+    assert_eq!(fixture.runner.started_count(tasks[1].id), 0);
+    let retained = fixture.manager.safety_snapshot_for_test().await.unwrap();
+    assert_eq!(retained.active_count, 1);
+    assert_eq!(retained.available_permits, 0);
+
+    assert_eq!(
+        writer_faults.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+        1
+    );
+    assert_eq!(fixture.runner.wait_for_started_task(1).await, tasks[1].id);
+    assert_eq!(
+        fixture
+            .event_kinds(tasks[0].id)
+            .await
+            .into_iter()
+            .filter(|kind| *kind == TaskEventKind::TaskCompleted)
+            .count(),
+        1
+    );
+    fixture.runner.release(tasks[1].id).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn reviewed_terminal_after_commit_before_reply_reconciles_exactly_once() {
+    let (fixture, _writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::FailAfterCommitBeforeReply,
+            operation: Some(StoreWriterOperationKind::FinalizeReviewedTask),
+            count: 1,
+        }],
+    )
+    .await;
+    fixture.runner.push_blocking(2);
+    let tasks = fixture.enqueue_tasks(2, true).await;
+    assert_eq!(fixture.runner.wait_for_started_task(0).await, tasks[0].id);
+
+    fixture.runner.release(tasks[0].id).await;
+    fixture
+        .wait_for_status(tasks[0].id, TaskStatus::Completed)
+        .await;
+    assert_eq!(fixture.runner.wait_for_started_task(1).await, tasks[1].id);
+    let kinds = fixture.event_kinds(tasks[0].id).await;
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == TaskEventKind::ReviewUpdated)
+            .count(),
+        1
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == TaskEventKind::TaskCompleted)
+            .count(),
+        1
+    );
+    assert!(!kinds.contains(&TaskEventKind::TaskInterrupted));
+    fixture.runner.release(tasks[1].id).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn unreviewed_terminal_drop_wake_still_releases_only_after_exact_receipt() {
+    let (fixture, _writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::DropWakeAfterCommit,
+            operation: Some(StoreWriterOperationKind::FinishTask),
+            count: 1,
+        }],
+    )
+    .await;
+    let failure = TaskFailure {
+        code: "DROP_WAKE_EXACT_FAILURE".to_owned(),
+        message: "the typed terminal receipt survives a dropped dispatcher wake".to_owned(),
+        retryable: false,
+    };
+    fixture.runner.push_failure(failure.clone());
+    fixture.runner.push_blocking(1);
+    let tasks = fixture.enqueue_tasks(2, true).await;
+
+    fixture
+        .wait_for_status(tasks[0].id, TaskStatus::Failed)
+        .await;
+    assert_eq!(fixture.load(tasks[0].id).await.failure, Some(failure));
+    assert_eq!(
+        fixture
+            .event_kinds(tasks[0].id)
+            .await
+            .into_iter()
+            .filter(|kind| *kind == TaskEventKind::TaskFailed)
+            .count(),
+        1
+    );
+    assert_eq!(fixture.runner.wait_for_started_task(1).await, tasks[1].id);
+    fixture.runner.release(tasks[1].id).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn persistently_unknown_unreviewed_terminal_freezes_and_retains_ownership() {
+    let (fixture, _writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::FailUnknownBeforeExecute,
+            operation: Some(StoreWriterOperationKind::FinishTask),
+            count: 4,
+        }],
+    )
+    .await;
+    fixture.runner.push_failure(TaskFailure {
+        code: "PERSISTENT_UNKNOWN_FAILURE".to_owned(),
+        message: "the outcome remains unknown through local exact replay".to_owned(),
+        retryable: false,
+    });
+    fixture.runner.push_blocking(1);
+    let tasks = fixture.enqueue_tasks(2, true).await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fixture.manager.shutdown_latched_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("persistent unknown freezes the task manager");
+    assert_eq!(fixture.load(tasks[0].id).await.status, TaskStatus::Running);
+    assert_eq!(fixture.load(tasks[1].id).await.status, TaskStatus::Queued);
+    assert_eq!(fixture.runner.started_count(tasks[1].id), 0);
+    assert!(matches!(
+        fixture.manager.safety_snapshot_for_test().await,
+        Err(TaskManagerError::Frozen)
+    ));
+    assert!(matches!(
+        fixture.manager.notify_queued(tasks[1].id).await,
+        Err(TaskManagerError::Frozen)
+    ));
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn failed_after_commit_before_reply_preserves_the_exact_terminal_and_releases_the_permit() {
+    let (fixture, _writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::FailAfterCommitBeforeReply,
+            operation: Some(StoreWriterOperationKind::FinishTask),
+            count: 1,
+        }],
+    )
+    .await;
+    let expected_failure = TaskFailure {
+        code: "EXACT_RUNNER_FAILURE".to_owned(),
+        message: "preserve the exact runner failure".to_owned(),
+        retryable: false,
+    };
+    fixture.runner.push_failure(expected_failure.clone());
+    fixture.runner.push_blocking(1);
+    let tasks = fixture.enqueue_tasks(2, true).await;
+
+    fixture
+        .wait_for_status(tasks[0].id, TaskStatus::Failed)
+        .await;
+    assert_eq!(
+        fixture.load(tasks[0].id).await.failure,
+        Some(expected_failure)
+    );
+    assert_eq!(
+        fixture
+            .event_kinds(tasks[0].id)
+            .await
+            .into_iter()
+            .filter(|kind| *kind == TaskEventKind::TaskFailed)
+            .count(),
+        1
+    );
+    assert_eq!(fixture.runner.wait_for_started_task(1).await, tasks[1].id);
+    fixture.runner.release(tasks[1].id).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cancelled_after_commit_before_reply_preserves_the_terminal_and_releases_the_permit() {
+    let (fixture, _writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::FailAfterCommitBeforeReply,
+            operation: Some(StoreWriterOperationKind::FinalizeStoppedTask),
+            count: 1,
+        }],
+    )
+    .await;
+    fixture.runner.push_blocking(2);
+    let tasks = fixture.enqueue_tasks(2, true).await;
+    assert_eq!(fixture.runner.wait_for_started_task(0).await, tasks[0].id);
+
+    assert!(matches!(
+        fixture.manager.cancel(tasks[0].id).await.unwrap(),
+        CancelOutcome::Accepted { .. }
+    ));
+    fixture
+        .wait_for_status(tasks[0].id, TaskStatus::Cancelled)
+        .await;
+    assert_eq!(fixture.load(tasks[0].id).await.failure, None);
+    assert_eq!(
+        fixture
+            .event_kinds(tasks[0].id)
+            .await
+            .into_iter()
+            .filter(|kind| *kind == TaskEventKind::TaskCancelled)
+            .count(),
+        1
+    );
+    assert_eq!(fixture.runner.wait_for_started_task(1).await, tasks[1].id);
+    fixture.runner.release(tasks[1].id).await;
+}
+
+#[tokio::test]
+async fn running_cancel_waits_for_the_durable_intent_and_keeps_the_mailbox_responsive() {
+    let (fixture, controller) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+            operation: Some(StoreWriterOperationKind::PersistStopIntentBatch),
+            count: 1,
+        }],
+    )
+    .await;
+    fixture.runner.push_blocking(1);
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+
+    let cancel = tokio::spawn({
+        let manager = fixture.manager.clone();
+        async move { manager.cancel(task.id).await }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+    )
+    .await
+    .expect("running cancel reaches durable stop-intent persistence");
+    assert!(
+        !cancel.is_finished(),
+        "user cancellation is not accepted before the durable reply"
+    );
+    let snapshot = fixture
+        .store
+        .scheduler_bootstrap_snapshot()
+        .await
+        .expect("read the committed stop intent");
+    assert!(snapshot.running_stop_intents.iter().any(|intent| {
+        intent.task_id == task.id && intent.kind == StopIntentKind::UserCancelled
+    }));
+    let safety = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture.manager.safety_snapshot_for_test(),
+    )
+    .await
+    .expect("the actor mailbox remains responsive while the intent reply is paused")
+    .expect("inspect task-manager safety");
+    assert_eq!(safety.active_count, 1);
+    assert_eq!(safety.available_permits, 0);
+    fixture
+        .manager
+        .notify_storage_critical_for_test(vec![coding_agent_app::MonitoredStorageScope::Data]);
+
+    assert_eq!(
+        controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+        1
+    );
+    assert!(matches!(
+        cancel
+            .await
+            .expect("join cancel request")
+            .expect("cancel task"),
+        CancelOutcome::Accepted { .. }
+    ));
+    fixture
+        .wait_for_status(task.id, TaskStatus::Cancelled)
+        .await;
+    let retained: (i64, String) =
+        sqlx::query_as("SELECT COUNT(*), MIN(kind) FROM task_stop_intents WHERE task_id = ?")
+            .bind(task.id.to_string())
+            .fetch_one(fixture.store.pool())
+            .await
+            .expect("load retained user-first stop intent");
+    assert_eq!(retained, (1, "user_cancelled".to_owned()));
+    assert_eq!(
+        fixture
+            .event_kinds(task.id)
+            .await
+            .into_iter()
+            .filter(|kind| *kind == TaskEventKind::TaskCancelled)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn disk_critical_uses_a_durable_intent_and_the_exact_retryable_failure() {
+    let fixture = support::task_manager_fixture(1).await;
+    fixture.runner.push_blocking(1);
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+    fixture.wait_for_runner_start(task.id).await;
+
+    fixture
+        .manager
+        .notify_storage_critical_for_test(vec![coding_agent_app::MonitoredStorageScope::Data]);
+    fixture.wait_for_status(task.id, TaskStatus::Failed).await;
+
+    assert_eq!(
+        fixture.load(task.id).await.failure,
+        Some(TaskFailure {
+            code: "DISK_PRESSURE_CRITICAL".to_owned(),
+            message: "critical disk pressure stopped the task".to_owned(),
+            retryable: true,
+        })
+    );
+    let retained: (i64, String) =
+        sqlx::query_as("SELECT COUNT(*), MIN(kind) FROM task_stop_intents WHERE task_id = ?")
+            .bind(task.id.to_string())
+            .fetch_one(fixture.store.pool())
+            .await
+            .expect("load retained disk stop intent");
+    assert_eq!(retained, (1, "disk_pressure_critical".to_owned()));
+    assert_eq!(
+        fixture
+            .event_kinds(task.id)
+            .await
+            .into_iter()
+            .filter(|kind| *kind == TaskEventKind::TaskFailed)
+            .count(),
+        1
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn disk_intent_assigned_first_rejects_a_later_user_cancel_with_typed_conflict() {
+    let (fixture, controller) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseAfterCommitBeforeWake,
+            operation: Some(StoreWriterOperationKind::PersistStopIntentBatch),
+            count: 1,
+        }],
+    )
+    .await;
+    fixture.runner.push_blocking(1);
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+    fixture.wait_for_runner_start(task.id).await;
+
+    fixture
+        .manager
+        .notify_storage_critical_for_test(vec![coding_agent_app::MonitoredStorageScope::Data]);
+    controller
+        .wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1)
+        .await;
+    let cancel = fixture.manager.cancel(task.id).await;
+    assert!(
+        matches!(
+            &cancel,
+            Err(TaskManagerError::StopAlreadyRequested {
+                task: current,
+                existing: StopIntentKind::DiskPressureCritical,
+            }) if current.id == task.id
+        ),
+        "unexpected disk-first cancellation outcome: {cancel:?}"
+    );
+
+    assert_eq!(
+        controller.release(StoreWriterFaultPoint::PauseAfterCommitBeforeWake),
+        1
+    );
+    fixture.wait_for_status(task.id, TaskStatus::Failed).await;
+}
 
 #[tokio::test]
 async fn fifth_task_stays_queued_until_a_permit_is_released() {
@@ -25,6 +954,7 @@ async fn fifth_task_stays_queued_until_a_permit_is_released() {
     fixture
         .wait_for_status(tasks[4].id, TaskStatus::Running)
         .await;
+    fixture.wait_for_runner_start(tasks[4].id).await;
     assert_eq!(fixture.runner.started_count(tasks[4].id), 1);
 }
 
@@ -51,11 +981,42 @@ async fn running_is_never_visible_without_an_active_handle() {
 async fn queued_cancel_committed_before_notification_prevents_runner_start() {
     let fixture = support::task_manager_fixture(1).await;
     fixture.runner.push_blocking(1);
+    let blocker = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture
+        .wait_for_status(blocker.id, TaskStatus::Running)
+        .await;
+    fixture.wait_for_runner_start(blocker.id).await;
     let task = fixture.enqueue_tasks(1, false).await.remove(0);
 
     let outcome = fixture.manager.cancel(task.id).await.unwrap();
-    assert!(matches!(outcome, CancelOutcome::Cancelled { .. }));
+    let cancelled = match outcome {
+        CancelOutcome::Cancelled { task } => task,
+        other => panic!("queued cancel must finish synchronously: {other:?}"),
+    };
+    let projected = fixture.manager.scheduler_projection_for_test();
+    let durable = fixture
+        .store
+        .scheduler_bootstrap_snapshot()
+        .await
+        .expect("load queued-cancel Store witness");
+    let mut durable_tasks = durable
+        .tasks
+        .iter()
+        .map(|task| (task.id, task.status))
+        .collect::<Vec<_>>();
+    durable_tasks.sort_unstable_by_key(|(task_id, _)| task_id.as_uuid());
+    assert_eq!(projected.tasks, durable_tasks);
+    assert!(
+        projected.as_of_event_id.get() >= cancelled.last_event_id.get(),
+        "cancel response must follow exact Scheduler terminal publication"
+    );
+    assert_eq!(durable.membership_event_id, projected.as_of_event_id);
     fixture.manager.notify_queued(task.id).await.unwrap();
+    fixture.runner.release(blocker.id).await;
+    fixture
+        .wait_for_status(blocker.id, TaskStatus::Completed)
+        .await;
+    wait_for_safety_snapshot(&fixture, 0, 1).await;
     fixture.reconcile().await;
 
     assert_eq!(fixture.load(task.id).await.status, TaskStatus::Cancelled);
@@ -63,11 +1024,117 @@ async fn queued_cancel_committed_before_notification_prevents_runner_start() {
 }
 
 #[tokio::test]
+async fn queued_cancel_conflict_replay_publishes_exact_terminal_before_response() {
+    let (fixture, writer_faults) = support::task_manager_fixture_with_writer_faults(
+        1,
+        1,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseBeforeExecute,
+            operation: Some(StoreWriterOperationKind::CancelTask),
+            count: 1,
+        }],
+    )
+    .await;
+    fixture.runner.push_blocking(1);
+    let occupied = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture
+        .wait_for_status(occupied.id, TaskStatus::Running)
+        .await;
+    fixture.wait_for_runner_start(occupied.id).await;
+
+    let task = fixture.enqueue_tasks(1, false).await.remove(0);
+    let cancel = tokio::spawn({
+        let manager = fixture.manager.clone();
+        async move { manager.cancel(task.id).await }
+    });
+    writer_faults
+        .wait_until_reached(StoreWriterFaultPoint::PauseBeforeExecute, 1)
+        .await;
+
+    let terminal = match fixture
+        .store
+        .transition_with_event(task.id, TaskStatus::Queued, TaskTransition::Cancelled)
+        .await
+        .expect("commit the competing queued cancellation")
+    {
+        TransitionOutcome::Applied { task, .. } => task,
+        TransitionOutcome::Conflict { .. } => {
+            panic!("the direct competing transition must win")
+        }
+    };
+    assert_eq!(
+        writer_faults.release(StoreWriterFaultPoint::PauseBeforeExecute),
+        1
+    );
+    let outcome = tokio::time::timeout(Duration::from_secs(5), cancel)
+        .await
+        .expect("conflicting queued cancel returns")
+        .expect("join conflicting queued cancel")
+        .expect("terminal conflict is an idempotent cancel replay");
+    assert!(matches!(outcome, CancelOutcome::Cancelled { task } if task == terminal));
+
+    let projected = fixture.manager.scheduler_projection_for_test();
+    let durable = fixture
+        .store
+        .scheduler_bootstrap_snapshot()
+        .await
+        .expect("load conflict-replay Store witness");
+    let mut durable_tasks = durable
+        .tasks
+        .iter()
+        .map(|task| (task.id, task.status))
+        .collect::<Vec<_>>();
+    durable_tasks.sort_unstable_by_key(|(task_id, _)| task_id.as_uuid());
+    assert_eq!(projected.tasks, durable_tasks);
+    assert_eq!(projected.as_of_event_id, durable.membership_event_id);
+    assert!(projected.as_of_event_id.get() >= terminal.last_event_id.get());
+}
+
+#[tokio::test]
+async fn categorical_storage_change_publishes_once_and_identical_replay_is_stable() {
+    let fixture = support::task_manager_fixture(1).await;
+    let before = fixture.manager.scheduler_projection_for_test();
+    let pressure = SchedulerStorageNotification::new(
+        StorageState::Pressure,
+        StorageState::Pressure,
+        StorageState::Normal,
+        vec![SchedulerRepositoryStorageState::new(
+            fixture.repository.id,
+            StorageState::Normal,
+        )],
+    );
+    fixture
+        .manager
+        .notify_scheduler_storage_for_test(pressure.clone());
+    let changed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = fixture.manager.scheduler_projection_for_test();
+            if current.generation > before.generation {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("storage classification publishes a Scheduler generation");
+
+    fixture.manager.notify_scheduler_storage_for_test(pressure);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        fixture.manager.scheduler_projection_for_test().generation,
+        changed.generation,
+        "identical categorical storage replay must not consume a generation"
+    );
+}
+
+#[tokio::test]
 async fn busy_claim_cleans_provisional_state_and_reconciliation_claims_once() {
     let fixture = support::task_manager_fixture(1).await;
+    fixture.state.set(ServiceState::StoreDegraded).unwrap();
     fixture.runner.push_blocking(1);
     let task = fixture.enqueue_tasks(1, false).await.remove(0);
     fixture.force_claim_busy(true).await;
+    fixture.state.set(ServiceState::Ready).unwrap();
     fixture.manager.notify_queued(task.id).await.unwrap();
     fixture.manager.notify_queued(task.id).await.unwrap();
     assert_eq!(fixture.load(task.id).await.status, TaskStatus::Queued);
@@ -76,14 +1143,17 @@ async fn busy_claim_cleans_provisional_state_and_reconciliation_claims_once() {
     fixture.force_claim_busy(false).await;
     fixture.manager.notify_queued(task.id).await.unwrap();
     fixture.wait_for_status(task.id, TaskStatus::Running).await;
+    fixture.wait_for_runner_start(task.id).await;
     assert_eq!(fixture.runner.started_count(task.id), 1);
 }
 
 #[tokio::test]
 async fn queued_cancel_preserves_known_uncommitted_store_busy() {
     let fixture = support::task_manager_fixture(1).await;
+    fixture.state.set(ServiceState::StoreDegraded).unwrap();
     let task = fixture.enqueue_tasks(1, false).await.remove(0);
     fixture.force_claim_busy(true).await;
+    fixture.state.set(ServiceState::Ready).unwrap();
 
     assert!(matches!(
         fixture.manager.cancel(task.id).await,
@@ -108,6 +1178,7 @@ async fn terminal_claim_failure_cleans_provisional_state_and_reconciliation_clai
     fixture.fail_started_event_inserts(false).await;
     fixture.manager.notify_queued(task.id).await.unwrap();
     fixture.wait_for_status(task.id, TaskStatus::Running).await;
+    fixture.wait_for_runner_start(task.id).await;
     assert_eq!(fixture.runner.started_count(task.id), 1);
 }
 
@@ -150,6 +1221,7 @@ async fn reconciliation_claims_a_task_after_its_queue_notification_is_lost() {
 
     assert_eq!(fixture.load(task.id).await.status, TaskStatus::Queued);
     fixture.wait_for_status(task.id, TaskStatus::Running).await;
+    fixture.wait_for_runner_start(task.id).await;
 
     assert_eq!(fixture.runner.started_count(task.id), 1);
 }
@@ -264,8 +1336,8 @@ async fn completed_and_cancelled_are_decided_by_the_first_terminal_commit() {
         .wait_for_status(task.id, TaskStatus::Completed)
         .await;
     assert!(matches!(
-        completion_wins.manager.cancel(task.id).await,
-        Err(TaskManagerError::TaskNotCancellable { .. })
+        completion_wins.manager.cancel(task.id).await.unwrap(),
+        CancelOutcome::Finished { task: existing } if existing.id == task.id
     ));
 
     let cancel_wins = support::task_manager_fixture(1).await;
@@ -320,8 +1392,8 @@ async fn approved_finalize_entered_first_makes_later_cancel_not_cancellable() {
         1
     );
     assert!(matches!(
-        cancel.await.unwrap(),
-        Err(TaskManagerError::TaskNotCancellable { .. })
+        cancel.await.unwrap().unwrap(),
+        CancelOutcome::Finished { task: existing } if existing.id == task.id
     ));
     let persisted = fixture.load(task.id).await;
     assert_eq!(persisted.status, TaskStatus::Completed);
@@ -352,6 +1424,7 @@ async fn runner_panic_becomes_failed_and_does_not_affect_another_task() {
             retryable: false,
         })
     );
+    assert_eq!(fixture.runner.wait_for_started_task(1).await, tasks[1].id);
     assert_eq!(fixture.runner.started_count(tasks[1].id), 1);
 }
 
@@ -452,7 +1525,6 @@ async fn forced_quiesce_retains_the_latest_durable_diff_and_rejects_late_updates
         Some(durable.clone())
     );
 
-    gate.release.notify_one();
     assert!(matches!(
         gate.result.await.unwrap(),
         Err(RunnerEventError::TaskNotRunning | RunnerEventError::StoreDegraded)
@@ -462,7 +1534,7 @@ async fn forced_quiesce_retains_the_latest_durable_diff_and_rejects_late_updates
 }
 
 #[tokio::test]
-async fn durable_quiesce_does_not_cancel_runners_before_the_shutdown_owner_decides() {
+async fn durable_quiesce_cancels_all_runners_before_recovery() {
     let fixture = support::task_manager_fixture(1).await;
     fixture.runner.push_blocking(1);
     let task = fixture.enqueue_tasks(1, true).await.remove(0);
@@ -479,9 +1551,16 @@ async fn durable_quiesce_does_not_cancel_runners_before_the_shutdown_owner_decid
     };
 
     assert_eq!(active.len(), 1);
-    assert!(!active[0].cancellation.is_cancelled());
-    active[0].cancellation.cancel();
-    active.into_iter().next().unwrap().done.await.unwrap();
+    let runner = active.into_iter().next().unwrap();
+    let was_cancelled = runner.cancellation.is_cancelled();
+    if !was_cancelled {
+        runner.cancellation.cancel();
+    }
+    runner.done.await.unwrap();
+    assert!(
+        was_cancelled,
+        "TaskManager owns active process cleanup and must cancel before recovery"
+    );
 }
 
 #[tokio::test]
@@ -500,7 +1579,7 @@ async fn failed_quiesce_is_frozen_and_returns_the_same_active_handles() {
         .unwrap();
     let active = match result {
         QuiesceResult::Frozen { active, error } => {
-            assert!(matches!(error, StoreWriterError::Busy));
+            assert!(matches!(error, StoreWriterError::DeadlineElapsed));
             active
         }
         QuiesceResult::Durable { .. } => panic!("expired deadline must not commit"),
@@ -526,11 +1605,15 @@ async fn a_degraded_service_rejects_runner_events_without_persistence() {
         )));
     let task = fixture.enqueue_tasks(1, true).await.remove(0);
     fixture.wait_for_status(task.id, TaskStatus::Running).await;
+    fixture.wait_for_runner_start(task.id).await;
     fixture.state.set(ServiceState::StoreDegraded).unwrap();
     append.release.notify_one();
 
     assert_eq!(
-        append.result.await.unwrap(),
+        tokio::time::timeout(Duration::from_secs(5), append.result)
+            .await
+            .expect("degraded runner event receives a bounded rejection")
+            .unwrap(),
         Err(RunnerEventError::StoreDegraded)
     );
     assert!(fixture.load_detail(task.id).await.plan.is_none());
@@ -824,6 +1907,10 @@ async fn cancel_processed_first_overrides_late_approved_outcome() {
         fixture.cancel(task.id).await,
         CancelOutcome::Accepted { .. }
     ));
+    assert!(matches!(
+        fixture.cancel(task.id).await,
+        CancelOutcome::Accepted { task: replay } if replay.id == task.id
+    ));
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
@@ -856,6 +1943,7 @@ async fn scripted_fake_runner_panic_is_isolated_from_another_task() {
         fixture.load(tasks[0].id).await.failure.unwrap().code,
         "RUNNER_PANICKED"
     );
+    fixture.wait_for_runner_start(tasks[1].id).await;
     assert!(fixture.runner.release(tasks[1].id));
     fixture
         .wait_for_status(tasks[1].id, TaskStatus::Completed)
@@ -878,6 +1966,7 @@ async fn scripted_fake_runner_consumes_scenarios_in_task_creation_order_not_prom
     fixture
         .wait_for_status(tasks[1].id, TaskStatus::Running)
         .await;
+    fixture.wait_for_runner_start(tasks[1].id).await;
     assert_eq!(
         fixture.runner.started_task_ids(),
         vec![tasks[0].id, tasks[1].id]
@@ -907,6 +1996,7 @@ async fn scripted_fake_runner_orders_scenarios_by_launch_when_inner_polls_are_re
         fixture
             .wait_for_status(tasks[1].id, TaskStatus::Running)
             .await;
+        fixture.wait_for_runner_start(tasks[1].id).await;
         let started = fixture.runner.started_task_ids();
         assert_eq!(
             &started[started.len() - 2..],
@@ -915,7 +2005,11 @@ async fn scripted_fake_runner_orders_scenarios_by_launch_when_inner_polls_are_re
         );
         assert!(fixture.runner.release(tasks[1].id));
         fixture
-            .wait_for_status(tasks[1].id, TaskStatus::Completed)
+            .wait_for_status_with_timeout(
+                tasks[1].id,
+                TaskStatus::Completed,
+                Duration::from_secs(30),
+            )
             .await;
     }
 }

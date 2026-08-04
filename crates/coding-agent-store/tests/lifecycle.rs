@@ -1,6 +1,61 @@
-use coding_agent_store::{Store, StoreError};
+mod support;
+
+use std::time::Duration;
+
+use coding_agent_store::{
+    FinalizeStoppedTaskOutcome, FinalizeStoppedTaskRequest, PersistStopIntentOutcome,
+    StopIntentKind, StopIntentRequest, Store, StoreError,
+};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection as _, SqliteConnection};
+
+#[tokio::test]
+async fn stop_intent_and_final_receipts_survive_checkpoint_and_reopen() {
+    let fixture = support::store_fixture().await;
+    support::register_repository(&fixture.store, "lifecycle-stop").await;
+    let running = support::running_task(&fixture.store).await;
+    let intent_request = StopIntentRequest {
+        task_id: running.id,
+        expected_repository_id: running.repository_id,
+        expected_attempt: running.attempt,
+        kind: StopIntentKind::DiskPressureCritical,
+    };
+    let intent = match fixture
+        .store
+        .persist_stop_intent(intent_request)
+        .await
+        .unwrap()
+    {
+        PersistStopIntentOutcome::Applied(intent) => intent,
+        other => panic!("fixture intent must apply, got {other:?}"),
+    };
+    let final_request = FinalizeStoppedTaskRequest {
+        task_id: running.id,
+        expected_repository_id: running.repository_id,
+        expected_attempt: running.attempt,
+        expected_intent: StopIntentKind::DiskPressureCritical,
+    };
+    let terminal = match fixture
+        .store
+        .finalize_stopped_task(final_request)
+        .await
+        .unwrap()
+    {
+        FinalizeStoppedTaskOutcome::Applied(receipt) => receipt,
+        other => panic!("fixture final stop must apply, got {other:?}"),
+    };
+
+    fixture.store.checkpoint_and_close().await.unwrap();
+    let reopened = Store::open(&fixture.database_path).await.unwrap();
+    assert!(matches!(
+        reopened.persist_stop_intent(intent_request).await.unwrap(),
+        PersistStopIntentOutcome::Existing(existing) if existing == intent
+    ));
+    assert!(matches!(
+        reopened.finalize_stopped_task(final_request).await.unwrap(),
+        FinalizeStoppedTaskOutcome::Existing(existing) if existing == terminal
+    ));
+}
 
 #[tokio::test]
 async fn checkpoint_and_close_preserves_committed_data_for_reopen() {
@@ -30,6 +85,47 @@ async fn checkpoint_and_close_preserves_committed_data_for_reopen() {
         .expect("read checkpointed probe row");
     assert_eq!(value, "durable");
     reopened.pool().close().await;
+}
+
+#[tokio::test]
+async fn checkpoint_seals_a_saturated_pool_before_waiting_for_borrowers() {
+    let temp_dir = tempfile::tempdir().expect("create lifecycle temp directory");
+    let database_path = temp_dir.path().join("saturated-pool.sqlite3");
+    let store = Store::open(&database_path).await.expect("open store");
+    sqlx::query("CREATE TABLE lifecycle_probe (value TEXT NOT NULL)")
+        .execute(store.pool())
+        .await
+        .expect("create lifecycle probe table");
+    sqlx::query("INSERT INTO lifecycle_probe (value) VALUES ('durable')")
+        .execute(store.pool())
+        .await
+        .expect("insert lifecycle probe row");
+
+    let connection_count = store.pool().options().get_max_connections() as usize;
+    let mut borrowers = Vec::with_capacity(connection_count);
+    for _ in 0..connection_count {
+        borrowers.push(
+            store
+                .pool()
+                .acquire()
+                .await
+                .expect("saturate the shared pool"),
+        );
+    }
+
+    let shutdown_store = store.clone();
+    let shutdown = tokio::spawn(async move { shutdown_store.checkpoint_and_close().await });
+    tokio::time::timeout(Duration::from_secs(1), store.pool().close_event())
+        .await
+        .expect("checkpoint shutdown seals the pool before waiting for borrowers");
+    drop(borrowers);
+
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("checkpoint completes after saturated borrowers return")
+        .expect("join checkpoint shutdown")
+        .expect("checkpoint saturated pool");
+    assert!(store.pool().is_closed());
 }
 
 #[tokio::test]
@@ -65,21 +161,15 @@ async fn checkpoint_failure_still_closes_every_shared_pool_handle() {
         .await
         .expect("append WAL frame after reader snapshot");
 
-    // Configure every existing pooled connection to report checkpoint contention
+    // Configure the dedicated shutdown connection to report checkpoint contention
     // immediately instead of consuming SQLite's normal five-second busy timeout.
-    let connection_count = store.pool().options().get_max_connections() as usize;
-    let mut connections = Vec::with_capacity(connection_count);
-    for _ in 0..connection_count {
-        let mut connection = store.pool().acquire().await.expect("acquire connection");
-        sqlx::query("PRAGMA busy_timeout = 0")
-            .execute(&mut *connection)
-            .await
-            .expect("disable checkpoint busy wait");
-        connections.push(connection);
-    }
-    for mut connection in connections {
-        connection.return_to_pool().await;
-    }
+    let checkpoint_options = store
+        .pool()
+        .connect_options()
+        .as_ref()
+        .clone()
+        .busy_timeout(Duration::ZERO);
+    store.pool().set_connect_options(checkpoint_options);
 
     let shared = store.clone();
     let result = store.checkpoint_and_close().await;

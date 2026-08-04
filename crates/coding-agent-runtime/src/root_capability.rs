@@ -1,7 +1,11 @@
+use std::collections::hash_map::RandomState;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::File;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::RelativePath;
 use crate::native_fs::{
@@ -9,6 +13,47 @@ use crate::native_fs::{
     open_child_directory, open_child_file, reopen_directory, reopen_directory_for_child_directory,
     reopen_directory_for_write, reopen_directory_path_lease,
 };
+
+/// Opaque filesystem identity for an authenticated directory capability.
+///
+/// The marker is useful only for equality and hashing. Its representation is
+/// deliberately private, has no accessors, and is not serializable, so callers
+/// cannot forge one or recover a path from it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryIdentityMarker {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+    opaque_hash: u64,
+}
+
+impl fmt::Debug for DirectoryIdentityMarker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DirectoryIdentityMarker(<opaque>)")
+    }
+}
+
+impl Hash for DirectoryIdentityMarker {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.opaque_hash.hash(state);
+    }
+}
+
+/// Failure to observe or match an authenticated directory identity.
+///
+/// Both variants intentionally use fixed, path-free diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DirectoryIdentityError {
+    #[error("authenticated directory identity is unavailable")]
+    Unavailable,
+    #[error("authenticated directory identity does not match")]
+    Mismatch,
+}
 
 /// Retained handles for an application-owned directory path created relative
 /// to a root capability. Keeping the guard alive preserves every validated
@@ -43,6 +88,26 @@ impl RootCapability {
 
     pub fn open_file_for_read(&self, path: &RelativePath) -> io::Result<File> {
         self.open_file_for_read_with_hook(path, |_| Ok(()))
+    }
+
+    /// Returns the identity of the retained, already-authenticated root handle.
+    ///
+    /// This never resolves the namespace path again and never falls back to a
+    /// path-string identity.
+    pub fn identity_marker(&self) -> Result<DirectoryIdentityMarker, DirectoryIdentityError> {
+        directory_identity_marker(&self.root)
+    }
+
+    /// Requires this retained capability to identify the expected directory.
+    pub fn require_identity(
+        &self,
+        expected: DirectoryIdentityMarker,
+    ) -> Result<(), DirectoryIdentityError> {
+        if self.identity_marker()? == expected {
+            Ok(())
+        } else {
+            Err(DirectoryIdentityError::Mismatch)
+        }
     }
 
     /// Duplicates the already-validated root directory handle without
@@ -149,6 +214,73 @@ impl RootCapability {
         }
         unreachable!("the empty path returned before traversal")
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn directory_identity_marker(
+    directory: &File,
+) -> Result<DirectoryIdentityMarker, DirectoryIdentityError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| DirectoryIdentityError::Unavailable)?;
+    let device = metadata.dev();
+    let inode = metadata.ino();
+    Ok(DirectoryIdentityMarker {
+        device,
+        inode,
+        opaque_hash: opaque_directory_identity_hash(|hasher| {
+            hasher.write_u8(1);
+            hasher.write_u64(device);
+            hasher.write_u64(inode);
+        }),
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn directory_identity_marker(
+    directory: &File,
+) -> Result<DirectoryIdentityMarker, DirectoryIdentityError> {
+    use std::ffi::c_void;
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            directory.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            information.as_mut_ptr().cast::<c_void>(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(DirectoryIdentityError::Unavailable);
+    }
+    let information = unsafe { information.assume_init() };
+    let volume_serial_number = information.VolumeSerialNumber;
+    let file_id = information.FileId.Identifier;
+    Ok(DirectoryIdentityMarker {
+        volume_serial_number,
+        file_id,
+        opaque_hash: opaque_directory_identity_hash(|hasher| {
+            hasher.write_u8(2);
+            hasher.write_u64(volume_serial_number);
+            hasher.write(&file_id);
+        }),
+    })
+}
+
+fn opaque_directory_identity_hash(write_identity: impl FnOnce(&mut dyn Hasher)) -> u64 {
+    static RANDOM_STATE: OnceLock<RandomState> = OnceLock::new();
+    let mut hasher = RANDOM_STATE.get_or_init(RandomState::new).build_hasher();
+    write_identity(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(unix)]

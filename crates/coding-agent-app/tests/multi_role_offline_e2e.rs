@@ -3,6 +3,7 @@
 mod support;
 
 use std::io;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,10 +21,10 @@ use coding_agent_app::{
     ApplicationBackend, CodingAgentRunner, CodingAgentRunnerConfig, CodingAttemptError,
     EventDispatcherHandle, MutationGate, Project2RuntimeSessionFactory,
     ProvisionedAgentRuntimeFactory, RepositoryDiscovery, RepositoryWorktreeProvisionerFactory,
-    ServiceState, ServiceStateController, StoreWriterFaultPoint, StoreWriterFaultSpec,
-    StoreWriterHandle, StoreWriterOperationKind, StoreWriterTestController, SystemWallClock,
-    TaskAgentRuntime, TaskManagerHandle, TaskModelProviderFactory, TaskModelSession, WallClock,
-    WorktreeCodingAgentAttemptFactory,
+    SchedulerConcurrencyLimits, ServiceState, ServiceStateController, StoreWriterFaultPoint,
+    StoreWriterFaultSpec, StoreWriterHandle, StoreWriterOperationKind, StoreWriterTestController,
+    SystemWallClock, TaskAgentRuntime, TaskManagerHandle, TaskManagerLaunchResources,
+    TaskModelProviderFactory, TaskModelSession, WallClock, WorktreeCodingAgentAttemptFactory,
 };
 use coding_agent_domain::{
     ActivityActor, CanonicalPath, CheckEvidenceStatus, DeliveryReadiness, EventCursor,
@@ -32,8 +33,8 @@ use coding_agent_domain::{
 };
 use coding_agent_provider::{ChatCompletionsClient, ClientLimits, ProviderConfig};
 use coding_agent_runtime::{
-    ProcessLimits, ProvisionedWorktree, ToolchainPaths, WorktreeLimits, WorktreeProvisioner,
-    discover_toolchain,
+    ProcessLimits, ProcessLivenessScope, ProvisionedWorktree, ToolchainPaths, WorktreeLimits,
+    WorktreeProvisioner, discover_toolchain,
 };
 use coding_agent_store::{AttemptArtifactState, RegisterRepositoryOutcome, Store};
 use tempfile::TempDir;
@@ -207,6 +208,7 @@ impl ProvisionedAgentRuntimeFactory for FailingRuntimeFactory {
     async fn create(
         &self,
         _worktree: &ProvisionedWorktree,
+        _process_liveness_scope: ProcessLivenessScope,
         _cancellation: CancellationToken,
     ) -> Result<TaskAgentRuntime, CodingAttemptError> {
         Err(CodingAttemptError::new("RUNTIME_SESSION_FAILED", true))
@@ -825,8 +827,10 @@ impl E2eFixture {
 
         let rustc = concrete_rustc();
         let git = path_executable(if cfg!(windows) { "git.exe" } else { "git" });
+        let instance_process_scope = support::instance_process_scope(&runtime_directory);
         let toolchain = discover_toolchain(
             &runtime_directory,
+            instance_process_scope.clone(),
             Some(rustc.as_path()),
             Some(git.as_path()),
         )
@@ -880,14 +884,28 @@ impl E2eFixture {
                 Arc::new(Project2RuntimeSessionFactory::project_2_defaults(
                     toolchain,
                     runtime_directory,
+                    NonZeroU32::new(1).expect("test Cargo jobs are nonzero"),
                 ))
             };
         let attempts = Arc::new(WorktreeCodingAgentAttemptFactory::new(
             provisioners,
             runtimes,
         ));
+        let (repository_control, repository_identity_resolver) =
+            support::repository_control_fixture(&store).await;
+        let launch_resources = TaskManagerLaunchResources::new_for_test(
+            SchedulerConcurrencyLimits::try_new(1, 1)
+                .expect("valid multi-role offline E2E concurrency"),
+            Arc::clone(&repository_control),
+            instance_process_scope.clone(),
+        );
         let runner = Arc::new(CodingAgentRunner::new(
-            writer.clone(),
+            coding_agent_app::CodingAgentPreparationControl::new(
+                store.clone(),
+                writer.clone(),
+                Arc::clone(&repository_control),
+                repository_identity_resolver,
+            ),
             providers.clone(),
             attempts,
             Arc::new(SystemWallClock),
@@ -901,7 +919,7 @@ impl E2eFixture {
             dispatcher.clone(),
             service_state.clone(),
             runner,
-            1,
+            launch_resources,
             128,
         );
 
@@ -968,18 +986,19 @@ impl E2eFixture {
     }
 
     fn backend(&self, security: &support::SecurityFixture) -> Arc<ApplicationBackend> {
-        Arc::new(ApplicationBackend::new(
+        Arc::new(ApplicationBackend::new_without_repository_runtime_for_test(
             self.store.clone(),
             self.writer.clone(),
             self.dispatcher.clone(),
             self.manager.clone(),
-            RepositoryDiscovery::new(self.root.clone()),
+            RepositoryDiscovery::new_without_commands_for_test(self.root.clone()),
             None,
             security.manager.clone(),
             self.service_state.clone(),
             MutationGate::new(self.service_state.clone()),
             support::timestamp(),
             4,
+            NonZeroU32::new(256).unwrap(),
             Duration::from_secs(2),
             Arc::new(|| {}),
         ))
@@ -1384,9 +1403,9 @@ async fn intermediate_review_store_failure_recovers_as_interrupted_without_false
     let _guard = E2E_LOCK.lock().await;
     let controller = Arc::new(
         StoreWriterTestController::try_new([StoreWriterFaultSpec {
-            point: StoreWriterFaultPoint::FailBeforeExecute,
+            point: StoreWriterFaultPoint::FailUnknownBeforeExecute,
             operation: Some(StoreWriterOperationKind::RecordReview),
-            count: 1,
+            count: 2,
         }])
         .unwrap(),
     );
@@ -1407,10 +1426,10 @@ async fn intermediate_review_store_failure_recovers_as_interrupted_without_false
     assert_eq!(recovery.replayed_pending_count, 1);
     assert_eq!(
         controller.hit_count(
-            StoreWriterFaultPoint::FailBeforeExecute,
+            StoreWriterFaultPoint::FailUnknownBeforeExecute,
             StoreWriterOperationKind::RecordReview,
         ),
-        1
+        2
     );
     let interrupted = fixture.wait_for_terminal(task.id).await;
     assert_eq!(interrupted.status, TaskStatus::Interrupted);
@@ -1589,13 +1608,17 @@ fn provisioner_factory(
     runtime_directory: PathBuf,
 ) -> Arc<dyn RepositoryWorktreeProvisionerFactory> {
     Arc::new(
-        move |repository: &Repository| -> Result<Arc<WorktreeProvisioner>, CodingAttemptError> {
+        move |repository: &Repository,
+              process_liveness_scope: ProcessLivenessScope|
+              -> Result<Arc<WorktreeProvisioner>, CodingAttemptError> {
             WorktreeProvisioner::from_trusted_paths(
                 &toolchain,
+                repository.id.to_string(),
                 repository.git_root.as_path(),
                 repository.cargo_workspace_root.as_path(),
                 &artifact_root,
                 &runtime_directory,
+                process_liveness_scope,
                 ProcessLimits::try_new(
                     512 * 1024,
                     256 * 1024,

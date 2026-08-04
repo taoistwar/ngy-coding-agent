@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use coding_agent_domain::{
     ClientRequestId, DeliveryReadiness, DomainError, EventCursor, EventId, NewTask, Task,
     TaskEventKind, TaskEventPayload, TaskFailure, TaskId, TaskStatus, UtcTimestamp,
@@ -5,7 +7,12 @@ use coding_agent_domain::{
 use sqlx::{SqliteConnection, Transaction};
 use time::OffsetDateTime;
 
+use crate::claims::task_lifecycle_is_exact;
+use crate::stop_intents::{ensure_no_stop_intent, validate_optional_stop_intent};
 use crate::{Store, StoreError};
+
+const GENERIC_RUNNING_TRANSITION_BYPASS: &str =
+    "running tasks must be committed through the typed claim transaction";
 
 pub(crate) type TaskRecord = (
     String,
@@ -66,6 +73,21 @@ impl CreateTaskOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueLimitedCreateTaskOutcome {
+    Created {
+        task: Task,
+        event_id: EventId,
+    },
+    Existing {
+        task: Task,
+    },
+    QueueFull {
+        queued_tasks: u64,
+        max_queued_tasks: NonZeroU32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryTaskOutcome {
     Created { task: Task, event_id: EventId },
     Existing { task: Task },
@@ -80,9 +102,39 @@ impl RetryTaskOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueLimitedRetryTaskOutcome {
+    Created {
+        task: Task,
+        event_id: EventId,
+    },
+    Existing {
+        task: Task,
+    },
+    QueueFull {
+        queued_tasks: u64,
+        max_queued_tasks: NonZeroU32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionOutcome {
     Applied { task: Task, event_id: EventId },
     Conflict { current: Task },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeUnreviewedTaskRequest {
+    pub task_id: TaskId,
+    pub expected_repository_id: coding_agent_domain::RepositoryId,
+    pub expected_attempt: u32,
+    pub transition: TaskTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeUnreviewedTaskOutcome {
+    Applied { task: Task, event_id: EventId },
+    Existing { task: Task, event_id: EventId },
+    InvariantConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +153,36 @@ pub struct RecoveryOutcome {
 
 impl Store {
     pub async fn create_task(&self, input: NewTask) -> Result<CreateTaskOutcome, StoreError> {
+        match self
+            .create_task_with_optional_queue_limit(input, None)
+            .await?
+        {
+            QueueLimitedCreateTaskOutcome::Created { task, event_id } => {
+                Ok(CreateTaskOutcome::Created { task, event_id })
+            }
+            QueueLimitedCreateTaskOutcome::Existing { task } => {
+                Ok(CreateTaskOutcome::Existing { task })
+            }
+            QueueLimitedCreateTaskOutcome::QueueFull { .. } => Err(StoreError::InvariantViolation(
+                "unlimited task creation returned queue full",
+            )),
+        }
+    }
+
+    pub async fn create_task_with_queue_limit(
+        &self,
+        input: NewTask,
+        max_queued_tasks: NonZeroU32,
+    ) -> Result<QueueLimitedCreateTaskOutcome, StoreError> {
+        self.create_task_with_optional_queue_limit(input, Some(max_queued_tasks))
+            .await
+    }
+
+    async fn create_task_with_optional_queue_limit(
+        &self,
+        input: NewTask,
+        max_queued_tasks: Option<NonZeroU32>,
+    ) -> Result<QueueLimitedCreateTaskOutcome, StoreError> {
         let input = NewTask::try_new(input.client_request_id, input.repository_id, input.prompt)?;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
@@ -111,7 +193,18 @@ impl Store {
                 return Err(StoreError::IdempotencyConflict);
             }
             transaction.commit().await?;
-            return Ok(CreateTaskOutcome::Existing { task: existing });
+            return Ok(QueueLimitedCreateTaskOutcome::Existing { task: existing });
+        }
+
+        if let Some(max_queued_tasks) = max_queued_tasks {
+            let queued_tasks = count_queued_tasks(&mut transaction).await?;
+            if queued_tasks >= u64::from(max_queued_tasks.get()) {
+                transaction.commit().await?;
+                return Ok(QueueLimitedCreateTaskOutcome::QueueFull {
+                    queued_tasks,
+                    max_queued_tasks,
+                });
+            }
         }
 
         let now = current_timestamp()?;
@@ -134,10 +227,40 @@ impl Store {
             append_lifecycle_event(&mut transaction, task_id, TaskEventKind::TaskQueued, now)
                 .await?;
         transaction.commit().await?;
-        Ok(CreateTaskOutcome::Created { task, event_id })
+        Ok(QueueLimitedCreateTaskOutcome::Created { task, event_id })
     }
 
     pub async fn retry_task(&self, source_id: TaskId) -> Result<RetryTaskOutcome, StoreError> {
+        match self
+            .retry_task_with_optional_queue_limit(source_id, None)
+            .await?
+        {
+            QueueLimitedRetryTaskOutcome::Created { task, event_id } => {
+                Ok(RetryTaskOutcome::Created { task, event_id })
+            }
+            QueueLimitedRetryTaskOutcome::Existing { task } => {
+                Ok(RetryTaskOutcome::Existing { task })
+            }
+            QueueLimitedRetryTaskOutcome::QueueFull { .. } => Err(StoreError::InvariantViolation(
+                "unlimited task retry returned queue full",
+            )),
+        }
+    }
+
+    pub async fn retry_task_with_queue_limit(
+        &self,
+        source_id: TaskId,
+        max_queued_tasks: NonZeroU32,
+    ) -> Result<QueueLimitedRetryTaskOutcome, StoreError> {
+        self.retry_task_with_optional_queue_limit(source_id, Some(max_queued_tasks))
+            .await
+    }
+
+    async fn retry_task_with_optional_queue_limit(
+        &self,
+        source_id: TaskId,
+        max_queued_tasks: Option<NonZeroU32>,
+    ) -> Result<QueueLimitedRetryTaskOutcome, StoreError> {
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let source = load_task(&mut transaction, source_id)
             .await?
@@ -148,13 +271,23 @@ impl Store {
 
         if let Some(existing) = load_retry_child(&mut transaction, source_id).await? {
             transaction.commit().await?;
-            return Ok(RetryTaskOutcome::Existing { task: existing });
+            return Ok(QueueLimitedRetryTaskOutcome::Existing { task: existing });
         }
 
         let attempt = source
             .attempt
             .checked_add(1)
             .ok_or(StoreError::TaskAttemptOverflow)?;
+        if let Some(max_queued_tasks) = max_queued_tasks {
+            let queued_tasks = count_queued_tasks(&mut transaction).await?;
+            if queued_tasks >= u64::from(max_queued_tasks.get()) {
+                transaction.commit().await?;
+                return Ok(QueueLimitedRetryTaskOutcome::QueueFull {
+                    queued_tasks,
+                    max_queued_tasks,
+                });
+            }
+        }
         let now = current_timestamp()?;
         let task_id = TaskId::new();
         let client_request_id = ClientRequestId::new();
@@ -178,7 +311,7 @@ impl Store {
             append_lifecycle_event(&mut transaction, task_id, TaskEventKind::TaskQueued, now)
                 .await?;
         transaction.commit().await?;
-        Ok(RetryTaskOutcome::Created { task, event_id })
+        Ok(QueueLimitedRetryTaskOutcome::Created { task, event_id })
     }
 
     pub async fn transition_with_event(
@@ -194,6 +327,18 @@ impl Store {
                 to: next,
             });
         }
+        if matches!(transition, TaskTransition::Running) {
+            #[cfg(feature = "test-support")]
+            {
+                return crate::claims::transition_running_for_test(self, task_id, expected).await;
+            }
+            #[cfg(not(feature = "test-support"))]
+            {
+                return Err(StoreError::InvariantViolation(
+                    GENERIC_RUNNING_TRANSITION_BYPASS,
+                ));
+            }
+        }
         if matches!(transition, TaskTransition::Completed) {
             return Err(StoreError::InvariantViolation(
                 "completed tasks require reviewed finalization",
@@ -201,6 +346,15 @@ impl Store {
         }
 
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = load_task(&mut transaction, task_id)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        if current.status != expected {
+            validate_optional_stop_intent(&mut transaction, &current).await?;
+            transaction.commit().await?;
+            return Ok(TransitionOutcome::Conflict { current });
+        }
+        ensure_no_stop_intent(&mut transaction, task_id).await?;
         let now = current_timestamp()?;
         let failure_json = transition
             .failure()
@@ -208,16 +362,9 @@ impl Store {
             .transpose()?;
         let updated = match transition {
             TaskTransition::Running => {
-                sqlx::query(
-                    "UPDATE tasks \
-                     SET status = 'running', started_at = ?, finished_at = NULL, failure_json = NULL \
-                     WHERE id = ? AND status = ?",
-                )
-                .bind(now.to_string())
-                .bind(task_id.to_string())
-                .bind(status_text(expected))
-                .execute(&mut *transaction)
-                .await?
+                return Err(StoreError::InvariantViolation(
+                    GENERIC_RUNNING_TRANSITION_BYPASS,
+                ));
             }
             TaskTransition::Completed => {
                 return Err(StoreError::InvariantViolation(
@@ -243,11 +390,9 @@ impl Store {
         };
 
         if updated.rows_affected() == 0 {
-            let current = load_task(&mut transaction, task_id).await?;
-            transaction.commit().await?;
-            return current
-                .map(|current| TransitionOutcome::Conflict { current })
-                .ok_or(StoreError::TaskNotFound);
+            return Err(StoreError::InvariantViolation(
+                "task transition lost its writer-fenced compare-and-swap",
+            ));
         }
         ensure_exactly_one(
             updated.rows_affected(),
@@ -258,6 +403,114 @@ impl Store {
             append_lifecycle_event(&mut transaction, task_id, lifecycle_kind(next), now).await?;
         transaction.commit().await?;
         Ok(TransitionOutcome::Applied { task, event_id })
+    }
+
+    pub async fn finalize_unreviewed_task(
+        &self,
+        request: FinalizeUnreviewedTaskRequest,
+    ) -> Result<FinalizeUnreviewedTaskOutcome, StoreError> {
+        if request.expected_attempt == 0
+            || !matches!(
+                request.transition,
+                TaskTransition::Failed(_) | TaskTransition::Cancelled
+            )
+        {
+            return Ok(FinalizeUnreviewedTaskOutcome::InvariantConflict);
+        }
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = load_task(&mut transaction, request.task_id)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        if current.id != request.task_id
+            || current.repository_id != request.expected_repository_id
+            || current.attempt != request.expected_attempt
+        {
+            transaction.commit().await?;
+            return Ok(FinalizeUnreviewedTaskOutcome::InvariantConflict);
+        }
+        let no_stop_intent = match validate_optional_stop_intent(&mut transaction, &current).await {
+            Ok(None) => true,
+            Ok(Some(_)) | Err(StoreError::InvariantViolation(_)) => false,
+            Err(error) => return Err(error),
+        };
+        let lifecycle_exact = match task_lifecycle_is_exact(&mut transaction, &current).await {
+            Ok(exact) => exact,
+            Err(StoreError::InvariantViolation(_)) => false,
+            Err(error) => return Err(error),
+        };
+        if !no_stop_intent || !lifecycle_exact {
+            transaction.commit().await?;
+            return Ok(FinalizeUnreviewedTaskOutcome::InvariantConflict);
+        }
+        if exact_unreviewed_terminal(&mut transaction, &current, &request).await? {
+            let event_id = current.last_event_id;
+            transaction.commit().await?;
+            return Ok(FinalizeUnreviewedTaskOutcome::Existing {
+                task: current,
+                event_id,
+            });
+        }
+        if current.status != TaskStatus::Running
+            || current.delivery_readiness != DeliveryReadiness::Unreviewed
+            || current.started_at.is_none()
+            || current.finished_at.is_some()
+            || current.failure.is_some()
+        {
+            transaction.commit().await?;
+            return Ok(FinalizeUnreviewedTaskOutcome::InvariantConflict);
+        }
+
+        let now = current_timestamp()?;
+        let next = request.transition.next();
+        let failure_json = request
+            .transition
+            .failure()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let updated = sqlx::query(
+            "UPDATE tasks \
+             SET status = ?, finished_at = ?, failure_json = ? \
+             WHERE id = ? AND repository_id = ? AND attempt = ? \
+               AND status = 'running' AND started_at = ? \
+               AND finished_at IS NULL AND failure_json IS NULL \
+               AND last_event_id = ? \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM task_delivery_state d WHERE d.task_id = tasks.id\
+               ) \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM task_stop_intents i WHERE i.task_id = tasks.id\
+               )",
+        )
+        .bind(status_text(next))
+        .bind(now.to_string())
+        .bind(failure_json)
+        .bind(current.id.to_string())
+        .bind(current.repository_id.to_string())
+        .bind(i64::from(current.attempt))
+        .bind(
+            current
+                .started_at
+                .expect("validated running task")
+                .to_string(),
+        )
+        .bind(current.last_event_id.get())
+        .execute(&mut *transaction)
+        .await?;
+        ensure_exactly_one(
+            updated.rows_affected(),
+            "unreviewed finalization did not update exactly one running task",
+        )?;
+        let (task, event_id) =
+            append_lifecycle_event(&mut transaction, current.id, lifecycle_kind(next), now).await?;
+        if !exact_unreviewed_terminal(&mut transaction, &task, &request).await?
+            || task.last_event_id != event_id
+        {
+            return Err(StoreError::InvariantViolation(
+                "unreviewed finalization post-state is inconsistent",
+            ));
+        }
+        transaction.commit().await?;
+        Ok(FinalizeUnreviewedTaskOutcome::Applied { task, event_id })
     }
 
     pub async fn append_running_event(
@@ -312,59 +565,73 @@ impl Store {
         now: UtcTimestamp,
         failure: TaskFailure,
     ) -> Result<RecoveryOutcome, StoreError> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let task_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM tasks \
-             WHERE status IN ('queued', 'running') \
-             ORDER BY created_at, id",
-        )
-        .fetch_all(&mut *transaction)
-        .await?;
-        let failure_json = serde_json::to_string(&failure)?;
-        let mut event_ids = Vec::with_capacity(task_ids.len());
-
-        for task_id in task_ids {
-            let task_id: TaskId = task_id.parse().map_err(StoreError::InvalidTaskId)?;
-            let updated = sqlx::query(
-                "UPDATE tasks \
-                 SET status = 'interrupted', finished_at = ?, failure_json = ? \
-                 WHERE id = ? AND status IN ('queued', 'running')",
-            )
-            .bind(now.to_string())
-            .bind(&failure_json)
-            .bind(task_id.to_string())
-            .execute(&mut *transaction)
-            .await?;
-            ensure_exactly_one(
-                updated.rows_affected(),
-                "recovery did not update exactly one task",
-            )?;
-            let (_, event_id) = append_lifecycle_event(
-                &mut transaction,
-                task_id,
-                TaskEventKind::TaskInterrupted,
-                now,
-            )
-            .await?;
-            event_ids.push(event_id);
-        }
-
-        let high_watermark = latest_event_cursor(&mut transaction).await?;
-        transaction.commit().await?;
+        let receipt = crate::recovery::recover_incomplete_compat(self, now, failure).await?;
         Ok(RecoveryOutcome {
-            interrupted_count: event_ids.len(),
-            first_event_id: event_ids.first().copied(),
-            last_event_id: event_ids.last().copied(),
-            high_watermark,
+            interrupted_count: receipt.interrupted_count,
+            first_event_id: receipt.first_event_id,
+            last_event_id: receipt.last_event_id,
+            high_watermark: receipt.high_watermark,
         })
     }
+}
+
+async fn exact_unreviewed_terminal(
+    connection: &mut SqliteConnection,
+    task: &Task,
+    request: &FinalizeUnreviewedTaskRequest,
+) -> Result<bool, StoreError> {
+    if task.id != request.task_id
+        || task.repository_id != request.expected_repository_id
+        || task.attempt != request.expected_attempt
+        || task.status != request.transition.next()
+        || task.delivery_readiness != DeliveryReadiness::Unreviewed
+        || task.started_at.is_none()
+        || task.finished_at.is_none()
+        || task.failure.as_ref() != request.transition.failure()
+    {
+        return Ok(false);
+    }
+    let delivery_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_delivery_state WHERE task_id = ?")
+            .bind(task.id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+    let stop_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_stop_intents WHERE task_id = ?")
+            .bind(task.id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+    let raw_failure: Option<String> =
+        sqlx::query_scalar("SELECT failure_json FROM tasks WHERE id = ?")
+            .bind(task.id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+    let expected_failure = request
+        .transition
+        .failure()
+        .map(serde_json::to_string)
+        .transpose()?;
+    Ok(delivery_count == 0
+        && stop_count == 0
+        && raw_failure == expected_failure
+        && task_lifecycle_is_exact(connection, task).await?)
 }
 
 pub(crate) async fn load_task(
     connection: &mut SqliteConnection,
     task_id: TaskId,
 ) -> Result<Option<Task>, StoreError> {
-    let record: Option<TaskRecord> = sqlx::query_as(
+    load_task_record(connection, task_id)
+        .await?
+        .map(task_from_record)
+        .transpose()
+}
+
+pub(crate) async fn load_task_record(
+    connection: &mut SqliteConnection,
+    task_id: TaskId,
+) -> Result<Option<TaskRecord>, StoreError> {
+    sqlx::query_as(
         "SELECT t.id, t.client_request_id, t.repository_id, t.prompt, t.status, t.attempt, \
                 t.retry_of, t.created_at, t.started_at, t.finished_at, t.last_event_id, \
                 t.failure_json, d.readiness \
@@ -374,8 +641,8 @@ pub(crate) async fn load_task(
     )
     .bind(task_id.to_string())
     .fetch_optional(connection)
-    .await?;
-    record.map(task_from_record).transpose()
+    .await
+    .map_err(Into::into)
 }
 
 pub(crate) fn task_from_record(record: TaskRecord) -> Result<Task, StoreError> {
@@ -509,6 +776,16 @@ pub(crate) async fn latest_event_cursor(
         .fetch_one(connection)
         .await?;
     Ok(EventCursor::new(maximum)?)
+}
+
+pub(crate) async fn count_queued_tasks(
+    connection: &mut SqliteConnection,
+) -> Result<u64, StoreError> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
+        .fetch_one(connection)
+        .await?;
+    u64::try_from(count)
+        .map_err(|_| StoreError::InvariantViolation("queued task count is negative"))
 }
 
 async fn load_task_by_client_request(

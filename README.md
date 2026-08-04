@@ -1,16 +1,16 @@
 # ngy 编码代理
 
-本仓库包含本地浏览器编码代理的 Project 3 实现。该应用程序是一个 Rust 进程，
+本仓库包含本地浏览器编码代理的 Project 4 / P4-A 实现。该应用程序是一个 Rust 进程，
 负责运行 Axum、SQLite、任务编排、原生对话框、隔离的 Git 工作树运行时，以及
 兼容 OpenAI 的提供方客户端；React UI 则通过随机的 `127.0.0.1` 端口提供服务。
 
-## 项目 3 范围
+## Project 4 / P4-A 范围
 
-应用同一时间只运行一个真实的编码任务。每次尝试都会基于已注册仓库所提交的
-`HEAD` 获得一个唯一分支和一个私有 Git 工作树。代理可以检查并安全替换该
-工作树内的文件，运行有界的 Cargo 命令，并通过持久化事件流发布计划、角色活动、
-差异、测试和逐轮审查证据。用户原工作目录中已暂存、未暂存及未跟踪文件的字节
-内容不会复制到工作树中，也不会用作模型上下文。
+P4-A 在 Project 3 的质量闭环上增加受控并发和资源准入。默认最多同时运行两个任务，
+同一仓库也最多运行两个；每个尝试仍基于已注册仓库所提交的 `HEAD` 获得唯一分支和
+私有 Git 工作树。代理可以检查并安全替换该工作树内的文件，运行有界的 Cargo 命令，
+并通过持久化事件流发布计划、角色活动、差异、测试和逐轮审查证据。用户原工作目录中
+已暂存、未暂存及未跟踪文件的字节内容不会复制到工作树中，也不会用作模型上下文。
 
 一个任务顺序运行 `Planner #1 -> Executor #1 -> Reviewer #1`。Planner 只运行一次；
 Reviewer 要求修改时，只在 Executor 和 Reviewer 之间返工，最多两次返工、三轮审查。
@@ -33,8 +33,8 @@ generation、digest、完整 diff coverage 和全部必需检查一致时才生�
 合并、可部署、已签名或生产安全。应用不提供 merge/approve 用户控件，也绝不会自动
 merge；保留的 Git 工作树和分支仍是供用户独立检查的权威构件。
 
-安装程序、macOS 应用程序包、Linux 桌面条目、代码签名与公证、自动更新以及
-完善的启动器打包属于项目 4，不是项目 3 的 CI 门禁条件。
+P4-A 不提供自动 merge、worktree cleanup、构件或历史生命周期、动态运行时设置、
+安装程序、代码签名、公证或自动更新；这些属于后续项目范围，不是 P4-A 的完成条件。
 
 ## 前置条件
 
@@ -145,6 +145,60 @@ PowerShell 中则使用 `.\target\release\coding-agent-app.exe`。
 
 启动第二个副本不会创建另一个数据库写入器。它会验证现有主进程，请求新的
 单次使用 URL，打开浏览器，然后退出。辅助进程不会读取或验证 `provider.json`。
+
+## 受控并发与 runtime.json
+
+应用从数据目录中的 `runtime.json` 读取启动期运行参数。文件缺失时使用已记录的默认值：
+全局并发 2、同仓库并发 2、队列上限 32，以及两个 2 GiB 的数据卷保留值。若需要覆盖，
+必须提供下面这个完整且严格的对象：
+
+```json
+{
+  "schema_version": 1,
+  "max_concurrent_tasks": 2,
+  "max_concurrent_tasks_per_repository": 2,
+  "max_queued_tasks": 32,
+  "storage": {
+    "data_control_reserve_bytes": 2147483648,
+    "data_task_reservation_bytes": 2147483648
+  }
+}
+```
+
+`max_concurrent_tasks` 和 `max_concurrent_tasks_per_repository` 的范围都是 1–4，且后者
+不能大于前者；`max_queued_tasks` 的范围是 1–256。两个 storage 值必须是非零 `u64`，
+并且控制保留值加“每任务保留值 × 全局并发”的计算不能溢出。对象缺字段、包含未知或
+重复字段、版本不匹配、值越界或文件不私有时，启动会以 `RUNTIME_CONFIG_INVALID`
+fail closed；只有文件确实不存在时才会回退到默认值。该配置只在主进程启动时读取，
+运行中修改不会动态生效，Web UI 也不提供修改入口。
+
+`runtime.json` 与 `provider.json` 采用相同的私有普通文件要求：不能是链接或重解析点；
+Unix 上使用 `0600`，Windows 上只允许当前用户访问。各平台的数据目录见下文。每任务
+Cargo 并行度由启动时可用并行度自动计算为
+`max(1, min(8, available_parallelism / max_concurrent_tasks))`；无法读取可用并行度时为 1。
+
+Scheduler 按任务创建时间和任务 ID 确定性选择任务，同一仓库不超车；某个仓库暂时
+受阻时，其他仓库可以继续。服务端只投影以下五种队列原因，UI 不显示队列位置或 ETA：
+
+- `service_paused` — Waiting for the service
+- `storage_pressure` — Waiting for storage
+- `global_capacity` — Waiting for global capacity
+- `repository_capacity` — Waiting for repository capacity
+- `repository_control_busy` — Waiting for repository coordination
+
+全局队列达到上限时，全新的创建或 retry 返回 `TASK_QUEUE_FULL`；幂等重放仍按原
+`client_request_id` 解析，结果未知或 queue-full 的原命令不会被 UI 静默改成新请求。
+升级前已经存在且超过新上限的有限 legacy 队列会如实保留并自然排空，而不是被截断。
+
+空间监控只覆盖应用数据卷、各已注册仓库的 Git 卷和 runtime 卷。`pressure` 或
+`unavailable` 会阻止新的准入，但通常不会停止已经运行的任务；`critical` 会为受影响
+任务提交持久的 `disk_pressure_critical` 停止意图。数据卷的下一候选阈值使用
+`data_control_reserve_bytes + data_task_reservation_bytes × min(全局上限, active + 1)`；
+Git/runtime 卷的准入阈值是 256 MiB，紧急阈值是 64 MiB。恢复准入需要两次满足恢复
+余量且至少相隔 5 秒的成功样本。共享物理卷只采样一次并应用最严格谓词。
+
+这些值是应用管理范围内的准入和安全保留，不是主机磁盘硬配额；公开状态也不会暴露
+原始可用字节、路径或卷身份。P4-A 同样不限制主机 CPU、内存、进程数或网络使用。
 
 ## 提供方配置
 
@@ -321,10 +375,13 @@ cargo run -p coding-agent-app
 
 计划、活动、diff/test panel、逐轮 review evidence、delivery readiness 和 lifecycle
 事件都保存在 SQLite 中。中间 `changes_requested` evidence 不会在重启时丢失或被改写；
-启动恢复会先处理未完成的持久化结果，再发布新的浏览器描述符。崩溃或正常退出时仍未完成
-的角色任务会成为 `Interrupted + Unreviewed`，用户需要明确重试；重试会建立新的 attempt，
-不会继承旧 attempt 的 review approval。只有最终 diff/test 已获得持久确认后，最终 review、
-readiness 和 terminal lifecycle 才会在同一事务中提交。
+启动恢复会先处理未完成的持久化结果，再开放 Scheduler 并发布新的浏览器描述符。冷启动
+保留原有 `Queued` 任务等待重新准入；崩溃时的普通 `Running` 任务恢复为
+`Interrupted + Unreviewed`。若 `Running` 任务已有持久停止意图，则恢复遵守该意图：
+`user_cancelled` 最终为 `Cancelled`，`disk_pressure_critical` 最终为可重试的 `Failed`。
+用户需要对普通中断明确 retry；retry 会建立新的 attempt，不会继承旧 attempt 的 review
+approval。只有最终 diff/test 已获得持久确认后，最终 review、readiness 和 terminal
+lifecycle 才会在同一事务中提交。
 
 每次尝试的构件都会保留以供检查。分支采用
 `codex/task-<task-id>-attempt-<attempt>` 格式，工作树存储在私有数据目录下的
@@ -345,10 +402,16 @@ readiness 和 terminal lifecycle 才会在同一事务中提交。
 ## 退出应用程序与恢复浏览器访问
 
 请使用 Web UI 中的应用程序菜单，并选择 **Quit local application**。进程会关闭
-变更门禁，妥善收尾进行中的工作，持久化被中断的任务，尝试执行最终的 SQLite
-检查点，移除描述符，并释放单实例锁。如果出现降级警告或
+变更门禁，妥善收尾进行中的工作，等待已启动进程树得到退出证明，完成持久停止意图或
+将其余运行任务持久化为中断，再尝试执行最终的 SQLite 检查点、移除描述符并释放
+单实例锁。如果出现降级警告或
 `unclean-shutdown.json`，说明正常的持久化/检查点流程未能干净完成。关闭标签页
 或整个浏览器**不会**停止任务或应用程序。
+
+对 `Running` 任务的用户取消只有在 `user_cancelled` 意图持久化后才会被确认，最终显示
+`Cancelled`。critical storage 触发的是不同的 `disk_pressure_critical` 意图，最终显示
+可重试 `Failed`；同一任务最先被接受的停止分类不会被后来的另一分类覆盖。对仍在
+`Queued` 的任务取消会直接成为 `Cancelled`，不创建停止意图。
 
 如果自动打开浏览器失败，请从原生错误对话框中复制完整的单次使用 URL，并手动
 打开。如果标签页丢失或该 URL 已过期，请再次启动可执行文件；辅助进程会向通过
@@ -363,7 +426,7 @@ readiness 和 terminal lifecycle 才会在同一事务中提交。
 将配置的提供方密钥复制到 SQLite。任务提示词和保留的构件仍属于持久化用户
 数据，其中可能包含以任务内容或仓库内容形式提供的机密。
 
-Git 工作树和基于能力的文件工具会将每次尝试与用户的原工作目录隔离，但项目 3
+Git 工作树和基于能力的文件工具会将每次尝试与用户的原工作目录隔离，但 P4-A
 **不是**面向不受信任代码的操作系统沙箱。Cargo 可能以当前操作系统用户的权限
 执行现有或生成的 `build.rs`、过程宏、依赖项、测试二进制文件及其他仓库代码。
 这些代码可以尝试读写工作树之外的内容、访问网络或启动进程。只应对这样的仓库

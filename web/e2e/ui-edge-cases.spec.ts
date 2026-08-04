@@ -50,7 +50,9 @@ test("keeps a Running task alive across reload, page close, and a fresh reopen",
     (roots): ProcessScenario => {
       runnerReleasePath = roots.releaseSignalPath("complete-after-reopen");
       return {
+        runtime_config: null,
         fake_scenarios: ["blocking"],
+        storage_samples: [{ kind: "native" }],
         store_writer_faults: [],
         actor_pauses: [],
         virtual_release_signals: [
@@ -124,7 +126,9 @@ test("renders STORE_BUSY and reuses one create UUID for an explicit successful r
   // StoreWriter makes one initial attempt plus one attempt after each of its
   // five fixed retry delays. Six injected Busy results exhaust that window.
   const scenario: ProcessScenario = {
+    runtime_config: null,
     fake_scenarios: ["success"],
+    storage_samples: [{ kind: "native" }],
     store_writer_faults: [
       {
         point: "busy_before_execute",
@@ -204,7 +208,9 @@ test("replays the same create UUID after the first response is lost post-commit"
     (roots): ProcessScenario => {
       writerReleasePath = roots.releaseSignalPath("create-committed-response-lost");
       return {
+        runtime_config: null,
         fake_scenarios: ["success"],
+        storage_samples: [{ kind: "native" }],
         store_writer_faults: [
           {
             point: "pause_after_commit_before_wake",

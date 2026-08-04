@@ -1,13 +1,20 @@
 mod support;
 
 use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use coding_agent_api::{
-    LiveEventItem, LiveEventStream, ServiceStateControl, ServiceStateDto, ServiceStateStream,
-    SseBackend, TaskEventDto, build_api_router,
+    LiveEventItem, LiveEventStream, MAX_SCHEDULER_FRAME_BYTES, MAX_SCHEDULER_ITEMS_PER_CHUNK,
+    SchedulerAdmissionStateDto, SchedulerLimitsDto, SchedulerQueueReasonDto,
+    SchedulerQueuedTaskDto, SchedulerRepositoryStorageDto, SchedulerStateDto, SchedulerStateFrames,
+    SchedulerStateItemDto, SchedulerStopIntentDto, SchedulerStoppingTaskDto, SchedulerStorageDto,
+    SchedulerStorageScopeDto, SchedulerStorageStateDto, SchedulerWireError, ServiceStateControl,
+    ServiceStateDto, ServiceStateStream, SseBackend, SseMessage, TaskEventDto, build_api_router,
+    canonical_scheduler_state_bytes, ensure_scheduler_state_frame_size, scheduler_snapshot_digest,
+    scheduler_state_chunk_frame_len, scheduler_state_frame_len,
 };
 use coding_agent_domain::{
     ActivityEntry, ActivityLevel, ClientRequestId, DeliveryReadiness, DiffSnapshot, EventId,
@@ -22,13 +29,47 @@ use tokio::sync::{Semaphore, mpsc};
 
 use support::{FakeBackend, FakeSecurity, read_request, send};
 
+type TestSchedulerStateStream = Pin<
+    Box<
+        dyn futures_util::Stream<Item = coding_agent_api::ApiResult<Arc<SchedulerStateDto>>>
+            + Send
+            + 'static,
+    >,
+>;
+
 struct ScriptedSse {
     calls: Mutex<Vec<&'static str>>,
     highs: Mutex<VecDeque<i64>>,
     persisted: Vec<TaskEventDto>,
     live: Mutex<Option<LiveEventStream>>,
     service: Mutex<Option<ServiceStateStream>>,
+    scheduler: Mutex<Option<TestSchedulerStateStream>>,
     current: ServiceStateControl,
+    current_scheduler: Arc<SchedulerStateDto>,
+}
+
+struct ScriptedSseConfig {
+    highs: Vec<i64>,
+    persisted: Vec<TaskEventDto>,
+    live: Vec<LiveEventItem>,
+    service: Vec<ServiceStateControl>,
+    current: ServiceStateControl,
+    current_scheduler: Arc<SchedulerStateDto>,
+    scheduler: Vec<coding_agent_api::ApiResult<Arc<SchedulerStateDto>>>,
+}
+
+impl ScriptedSseConfig {
+    fn standard(highs: Vec<i64>, persisted: Vec<TaskEventDto>) -> Self {
+        Self {
+            highs,
+            persisted,
+            live: Vec::new(),
+            service: Vec::new(),
+            current: ServiceStateControl::new(ServiceStateDto::Ready, 1),
+            current_scheduler: scheduler_at(0, 1, 0),
+            scheduler: Vec::new(),
+        }
+    }
 }
 
 impl ScriptedSse {
@@ -38,13 +79,22 @@ impl ScriptedSse {
         live: Vec<LiveEventItem>,
         service: Vec<ServiceStateControl>,
     ) -> Arc<Self> {
+        let mut config = ScriptedSseConfig::standard(highs.into_iter().collect(), persisted);
+        config.live = live;
+        config.service = service;
+        Self::configured(config)
+    }
+
+    fn configured(config: ScriptedSseConfig) -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
-            highs: Mutex::new(highs.into_iter().collect()),
-            persisted,
-            live: Mutex::new(Some(Box::pin(stream::iter(live)))),
-            service: Mutex::new(Some(Box::pin(stream::iter(service)))),
-            current: ServiceStateControl::new(ServiceStateDto::Ready, 1),
+            highs: Mutex::new(config.highs.into()),
+            persisted: config.persisted,
+            live: Mutex::new(Some(Box::pin(stream::iter(config.live)))),
+            service: Mutex::new(Some(Box::pin(stream::iter(config.service)))),
+            scheduler: Mutex::new(Some(Box::pin(stream::iter(config.scheduler)))),
+            current: config.current,
+            current_scheduler: config.current_scheduler,
         })
     }
 
@@ -55,7 +105,9 @@ impl ScriptedSse {
             persisted: Vec::new(),
             live: Mutex::new(Some(Box::pin(stream::pending()))),
             service: Mutex::new(Some(Box::pin(stream::pending()))),
+            scheduler: Mutex::new(Some(Box::pin(stream::pending()))),
             current: ServiceStateControl::new(ServiceStateDto::Ready, 1),
+            current_scheduler: scheduler_at(0, 1, 0),
         })
     }
 
@@ -88,9 +140,37 @@ impl SseBackend for ScriptedSse {
             .unwrap_or_else(|| Box::pin(stream::empty()))
     }
 
+    fn subscribe_scheduler_state(&self) -> TestSchedulerStateStream {
+        self.record("subscribe_scheduler_state");
+        self.scheduler
+            .lock()
+            .expect("scheduler lock")
+            .take()
+            .unwrap_or_else(|| Box::pin(stream::empty()))
+    }
+
     async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
         self.record("current_service_state");
         Ok(self.current.clone())
+    }
+
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        self.record("current_scheduler_state");
+        Ok(self.current_scheduler.clone())
+    }
+
+    async fn membership_watermark_through(
+        &self,
+        after_cursor: i64,
+    ) -> coding_agent_api::ApiResult<i64> {
+        self.record("membership_watermark_through");
+        Ok(self
+            .persisted
+            .iter()
+            .filter(|event| dto_id(event) <= after_cursor && is_membership_event(event))
+            .map(dto_id)
+            .max()
+            .unwrap_or(0))
     }
 
     async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
@@ -214,8 +294,26 @@ impl SseBackend for JoinSse {
         Box::pin(stream::empty())
     }
 
+    fn subscribe_scheduler_state(&self) -> TestSchedulerStateStream {
+        Box::pin(stream::empty())
+    }
+
     async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
         Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        Ok(scheduler_at(0, 0, 0))
+    }
+
+    async fn membership_watermark_through(
+        &self,
+        after_cursor: i64,
+    ) -> coding_agent_api::ApiResult<i64> {
+        Ok(membership_watermark(
+            &self.persisted.lock().expect("persisted lock"),
+            after_cursor,
+        ))
     }
 
     async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
@@ -316,6 +414,10 @@ impl SseBackend for ServiceRaceSse {
         }))
     }
 
+    fn subscribe_scheduler_state(&self) -> TestSchedulerStateStream {
+        Box::pin(stream::empty())
+    }
+
     async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
         self.current_entered.add_permits(1);
         self.resume_current.acquire().await.unwrap().forget();
@@ -324,7 +426,182 @@ impl SseBackend for ServiceRaceSse {
         Ok(captured)
     }
 
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        let service_generation = self
+            .current
+            .lock()
+            .expect("current service lock")
+            .generation;
+        Ok(scheduler_at(0, service_generation, 0))
+    }
+
+    async fn membership_watermark_through(&self, _: i64) -> coding_agent_api::ApiResult<i64> {
+        Ok(0)
+    }
+
     async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
+        Ok(0)
+    }
+
+    async fn events_between(
+        &self,
+        _: i64,
+        _: i64,
+        _: usize,
+    ) -> coding_agent_api::ApiResult<Vec<TaskEventDto>> {
+        Ok(Vec::new())
+    }
+}
+
+struct ControlRaceSse {
+    current_scheduler: Arc<SchedulerStateDto>,
+    live_sender: Mutex<Option<mpsc::UnboundedSender<LiveEventItem>>>,
+    live_receiver: Mutex<Option<mpsc::UnboundedReceiver<LiveEventItem>>>,
+    service_sender: Mutex<Option<mpsc::UnboundedSender<ServiceStateControl>>>,
+    service_receiver: Mutex<Option<mpsc::UnboundedReceiver<ServiceStateControl>>>,
+    scheduler_sender:
+        Mutex<Option<mpsc::UnboundedSender<coding_agent_api::ApiResult<Arc<SchedulerStateDto>>>>>,
+    scheduler_receiver:
+        Mutex<Option<mpsc::UnboundedReceiver<coding_agent_api::ApiResult<Arc<SchedulerStateDto>>>>>,
+    latest_calls: AtomicUsize,
+    pause_recovery: AtomicBool,
+    recovery_entered: Semaphore,
+    resume_recovery: Semaphore,
+}
+
+impl ControlRaceSse {
+    fn new(current_scheduler: Arc<SchedulerStateDto>) -> Arc<Self> {
+        let (live_sender, live_receiver) = mpsc::unbounded_channel();
+        let (service_sender, service_receiver) = mpsc::unbounded_channel();
+        let (scheduler_sender, scheduler_receiver) = mpsc::unbounded_channel();
+        Arc::new(Self {
+            current_scheduler,
+            live_sender: Mutex::new(Some(live_sender)),
+            live_receiver: Mutex::new(Some(live_receiver)),
+            service_sender: Mutex::new(Some(service_sender)),
+            service_receiver: Mutex::new(Some(service_receiver)),
+            scheduler_sender: Mutex::new(Some(scheduler_sender)),
+            scheduler_receiver: Mutex::new(Some(scheduler_receiver)),
+            latest_calls: AtomicUsize::new(0),
+            pause_recovery: AtomicBool::new(false),
+            recovery_entered: Semaphore::new(0),
+            resume_recovery: Semaphore::new(0),
+        })
+    }
+
+    fn publish_live(&self, event: TaskEventDto) {
+        self.live_sender
+            .lock()
+            .expect("live sender lock")
+            .as_ref()
+            .expect("open live sender")
+            .send(LiveEventItem::Event(event))
+            .expect("publish live event");
+    }
+
+    fn publish_lag(&self) {
+        self.live_sender
+            .lock()
+            .expect("live sender lock")
+            .as_ref()
+            .expect("open live sender")
+            .send(LiveEventItem::Lagged)
+            .expect("publish live lag");
+    }
+
+    fn publish_service(&self, state: ServiceStateDto, generation: u64) {
+        self.service_sender
+            .lock()
+            .expect("service sender lock")
+            .as_ref()
+            .expect("open service sender")
+            .send(ServiceStateControl::new(state, generation))
+            .expect("publish service state");
+    }
+
+    fn publish_scheduler(&self, snapshot: Arc<SchedulerStateDto>) {
+        self.scheduler_sender
+            .lock()
+            .expect("scheduler sender lock")
+            .as_ref()
+            .expect("open scheduler sender")
+            .send(Ok(snapshot))
+            .expect("publish scheduler state");
+    }
+
+    fn pause_recovery(&self) {
+        self.pause_recovery.store(true, Ordering::SeqCst);
+    }
+
+    fn close(&self) {
+        self.live_sender.lock().expect("live sender lock").take();
+        self.service_sender
+            .lock()
+            .expect("service sender lock")
+            .take();
+        self.scheduler_sender
+            .lock()
+            .expect("scheduler sender lock")
+            .take();
+    }
+}
+
+#[async_trait::async_trait]
+impl SseBackend for ControlRaceSse {
+    fn subscribe_live(&self) -> LiveEventStream {
+        let receiver = self
+            .live_receiver
+            .lock()
+            .expect("live receiver lock")
+            .take()
+            .expect("one live subscription");
+        Box::pin(stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|item| (item, receiver))
+        }))
+    }
+
+    fn subscribe_service_state(&self) -> ServiceStateStream {
+        let receiver = self
+            .service_receiver
+            .lock()
+            .expect("service receiver lock")
+            .take()
+            .expect("one service subscription");
+        Box::pin(stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|item| (item, receiver))
+        }))
+    }
+
+    fn subscribe_scheduler_state(&self) -> TestSchedulerStateStream {
+        let receiver = self
+            .scheduler_receiver
+            .lock()
+            .expect("scheduler receiver lock")
+            .take()
+            .expect("one scheduler subscription");
+        Box::pin(stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|item| (item, receiver))
+        }))
+    }
+
+    async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
+        Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        Ok(self.current_scheduler.clone())
+    }
+
+    async fn membership_watermark_through(&self, _: i64) -> coding_agent_api::ApiResult<i64> {
+        Ok(0)
+    }
+
+    async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
+        let call = self.latest_calls.fetch_add(1, Ordering::SeqCst);
+        if call == 1 && self.pause_recovery.swap(false, Ordering::SeqCst) {
+            self.recovery_entered.add_permits(1);
+            self.resume_recovery.acquire().await.unwrap().forget();
+        }
         Ok(0)
     }
 
@@ -352,6 +629,10 @@ struct LagPauseSse {
 
 struct HotLiveSse;
 
+struct HotSchedulerSse;
+
+struct HotServiceSse;
+
 #[async_trait::async_trait]
 impl SseBackend for HotLiveSse {
     fn subscribe_live(&self) -> LiveEventStream {
@@ -362,8 +643,20 @@ impl SseBackend for HotLiveSse {
         Box::pin(stream::pending())
     }
 
+    fn subscribe_scheduler_state(&self) -> TestSchedulerStateStream {
+        Box::pin(stream::pending())
+    }
+
     async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
         Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        Ok(scheduler_at(0, 0, 0))
+    }
+
+    async fn membership_watermark_through(&self, _: i64) -> coding_agent_api::ApiResult<i64> {
+        Ok(0)
     }
 
     async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
@@ -377,6 +670,96 @@ impl SseBackend for HotLiveSse {
         _: usize,
     ) -> coding_agent_api::ApiResult<Vec<TaskEventDto>> {
         Ok(Vec::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl SseBackend for HotSchedulerSse {
+    fn subscribe_live(&self) -> LiveEventStream {
+        Box::pin(stream::pending())
+    }
+
+    fn subscribe_service_state(&self) -> ServiceStateStream {
+        Box::pin(stream::pending())
+    }
+
+    fn subscribe_scheduler_state(&self) -> TestSchedulerStateStream {
+        Box::pin(stream::unfold(1_u64, |generation| async move {
+            Some((Ok(scheduler_at(0, 0, generation)), generation + 1))
+        }))
+    }
+
+    async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
+        Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        Ok(scheduler_at(0, 0, 0))
+    }
+
+    async fn membership_watermark_through(&self, _: i64) -> coding_agent_api::ApiResult<i64> {
+        Ok(0)
+    }
+
+    async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
+        Ok(0)
+    }
+
+    async fn events_between(
+        &self,
+        _: i64,
+        _: i64,
+        _: usize,
+    ) -> coding_agent_api::ApiResult<Vec<TaskEventDto>> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait::async_trait]
+impl SseBackend for HotServiceSse {
+    fn subscribe_live(&self) -> LiveEventStream {
+        Box::pin(stream::pending())
+    }
+
+    fn subscribe_service_state(&self) -> ServiceStateStream {
+        Box::pin(stream::unfold(1_u64, |generation| async move {
+            Some((
+                ServiceStateControl::new(ServiceStateDto::Ready, generation),
+                generation + 1,
+            ))
+        }))
+    }
+
+    fn subscribe_scheduler_state(&self) -> TestSchedulerStateStream {
+        Box::pin(stream::pending())
+    }
+
+    async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
+        Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        Ok(scheduler_at(0, 0, 0))
+    }
+
+    async fn membership_watermark_through(&self, _: i64) -> coding_agent_api::ApiResult<i64> {
+        Ok(0)
+    }
+
+    async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
+        Ok(1)
+    }
+
+    async fn events_between(
+        &self,
+        after: i64,
+        through: i64,
+        _: usize,
+    ) -> coding_agent_api::ApiResult<Vec<TaskEventDto>> {
+        Ok((after < 1 && through >= 1)
+            .then(|| queued(1))
+            .into_iter()
+            .collect())
     }
 }
 
@@ -455,8 +838,26 @@ impl SseBackend for LagPauseSse {
         }))
     }
 
+    fn subscribe_scheduler_state(&self) -> TestSchedulerStateStream {
+        Box::pin(stream::empty())
+    }
+
     async fn current_service_state(&self) -> coding_agent_api::ApiResult<ServiceStateControl> {
         Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn current_scheduler_state(&self) -> coding_agent_api::ApiResult<Arc<SchedulerStateDto>> {
+        Ok(scheduler_at(0, 0, 0))
+    }
+
+    async fn membership_watermark_through(
+        &self,
+        after_cursor: i64,
+    ) -> coding_agent_api::ApiResult<i64> {
+        Ok(membership_watermark(
+            &self.persisted.lock().expect("persisted lock"),
+            after_cursor,
+        ))
     }
 
     async fn latest_event_id(&self) -> coding_agent_api::ApiResult<i64> {
@@ -509,10 +910,18 @@ async fn heartbeat_remains_fair_while_lag_recovery_database_read_is_pending() {
     let mut body = response.into_body().into_data_stream();
     let initial = body.next().await.unwrap().unwrap();
     assert!(String::from_utf8_lossy(&initial).contains("service.state"));
+    let scheduler = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&scheduler).contains("scheduler.state"));
 
     let next = body.next();
     futures_util::pin_mut!(next);
-    assert!(poll!(next.as_mut()).is_pending());
+    for _ in 0..4 {
+        assert!(poll!(next.as_mut()).is_pending());
+        if sse.recovery_entered.available_permits() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert_eq!(sse.recovery_entered.available_permits(), 1);
 
     tokio::time::advance(Duration::from_secs(14)).await;
@@ -533,10 +942,18 @@ async fn service_control_remains_fair_while_lag_recovery_database_read_is_pendin
     let mut body = response.into_body().into_data_stream();
     let initial = body.next().await.unwrap().unwrap();
     assert!(String::from_utf8_lossy(&initial).contains("service.state"));
+    let scheduler = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&scheduler).contains("scheduler.state"));
 
     let next = body.next();
     futures_util::pin_mut!(next);
-    assert!(poll!(next.as_mut()).is_pending());
+    for _ in 0..4 {
+        assert!(poll!(next.as_mut()).is_pending());
+        if sse.recovery_entered.available_permits() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert_eq!(sse.recovery_entered.available_permits(), 1);
     sse.publish_service(ServiceStateDto::StoreDegraded, 1);
     let control = match poll!(next.as_mut()) {
@@ -554,10 +971,18 @@ async fn lag_injected_during_recovery_forces_another_fresh_high_watermark_read()
     let response = connect(sse.clone(), 0).await;
     let mut body = response.into_body().into_data_stream();
     body.next().await.unwrap().unwrap();
+    let scheduler = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&scheduler).contains("scheduler.state"));
 
     let next = body.next();
     futures_util::pin_mut!(next);
-    assert!(poll!(next.as_mut()).is_pending());
+    for _ in 0..4 {
+        assert!(poll!(next.as_mut()).is_pending());
+        if sse.recovery_entered.available_permits() == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert_eq!(sse.recovery_entered.available_permits(), 1);
     sse.persist(1);
     sse.push_lag();
@@ -577,6 +1002,8 @@ async fn continuously_ready_live_batches_still_yield_the_heartbeat_without_unbou
     let response = connect(Arc::new(HotLiveSse), 0).await;
     let mut body = response.into_body().into_data_stream();
     body.next().await.unwrap().unwrap();
+    let scheduler = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&scheduler).contains("scheduler.state"));
 
     let next = body.next();
     futures_util::pin_mut!(next);
@@ -595,6 +1022,54 @@ async fn continuously_ready_live_batches_still_yield_the_heartbeat_without_unbou
         }
     }
     assert_eq!(heartbeat.as_deref(), Some(": heartbeat\n\n"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuously_ready_scheduler_updates_do_not_starve_the_heartbeat() {
+    let response = connect(Arc::new(HotSchedulerSse), 0).await;
+    let mut body = response.into_body().into_data_stream();
+    let service = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&service).contains("service.state"));
+
+    let next = body.next();
+    futures_util::pin_mut!(next);
+    assert!(poll!(next.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(15)).await;
+
+    let mut heartbeat = None;
+    for _ in 0..128 {
+        match poll!(next.as_mut()) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                heartbeat = Some(String::from_utf8(bytes.to_vec()).unwrap());
+                break;
+            }
+            std::task::Poll::Pending => tokio::task::yield_now().await,
+            other => panic!("hot scheduler stream closed unexpectedly: {other:?}"),
+        }
+    }
+    assert_eq!(heartbeat.as_deref(), Some(": heartbeat\n\n"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuously_ready_service_updates_do_not_starve_heartbeat_or_replay() {
+    let response = connect(Arc::new(HotServiceSse), 0).await;
+    let mut body = response.into_body().into_data_stream();
+    let service = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&service).contains("service.state"));
+
+    tokio::time::advance(Duration::from_secs(15)).await;
+    let heartbeat = body.next().await.unwrap().unwrap();
+    assert_eq!(String::from_utf8_lossy(&heartbeat), ": heartbeat\n\n");
+
+    let mut replayed = false;
+    for _ in 0..32 {
+        let frame = body.next().await.unwrap().unwrap();
+        if String::from_utf8_lossy(&frame).contains("id: 1\n") {
+            replayed = true;
+            break;
+        }
+    }
+    assert!(replayed, "hot service updates must not starve Store replay");
 }
 
 #[tokio::test]
@@ -671,14 +1146,341 @@ async fn subscriptions_precede_snapshot_and_join_deduplicates_sorted_live_overla
     assert_eq!(persisted_ids(&body), vec![1, 2, 4, 5]);
     assert!(body.starts_with("event: service.state\n"));
     assert_eq!(
-        &sse.calls()[..4],
+        &sse.calls()[..7],
         &[
             "subscribe_live",
             "subscribe_service_state",
+            "subscribe_scheduler_state",
             "current_service_state",
+            "current_scheduler_state",
+            "membership_watermark_through",
             "latest_event_id",
         ]
     );
+}
+
+#[tokio::test]
+async fn current_quiescing_service_is_the_only_frame_and_skips_store_reads() {
+    let sse = ScriptedSse::configured(ScriptedSseConfig {
+        current: ServiceStateControl::new(ServiceStateDto::Quiescing, 8),
+        current_scheduler: scheduler_at(0, 8, 1),
+        ..ScriptedSseConfig::standard(vec![0], Vec::new())
+    });
+    let (_, body) = finite_body(connect(sse.clone(), 0).await).await;
+
+    assert_eq!(service_generations(&body), vec![8]);
+    assert!(!body.contains("event: scheduler.state\n"));
+    assert!(!body.contains("event: stream.reset\n"));
+    assert_eq!(
+        sse.calls(),
+        vec![
+            "subscribe_live",
+            "subscribe_service_state",
+            "subscribe_scheduler_state",
+            "current_service_state",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn future_scheduler_snapshot_waits_until_its_membership_event_was_yielded() {
+    let persisted = vec![
+        queued(1),
+        event(
+            2,
+            TaskEventPayload::PlanUpdated {
+                plan: PlanSnapshot::legacy(1, Vec::new()),
+            },
+        ),
+        event(
+            3,
+            TaskEventPayload::TaskStarted {
+                task: task_with_status(3, TaskStatus::Running),
+            },
+        ),
+    ];
+    let sse = ScriptedSse::configured(ScriptedSseConfig {
+        scheduler: vec![Ok(scheduler_at(3, 1, 1))],
+        ..ScriptedSseConfig::standard(vec![3], persisted)
+    });
+    let (_, body) = finite_body(connect(sse, 0).await).await;
+
+    assert_eq!(scheduler_generations(&body), vec![1]);
+    let started = body.find("id: 3\n").expect("started lifecycle frame");
+    let scheduler = body
+        .find("event: scheduler.state\n")
+        .expect("scheduler manifest");
+    assert!(
+        started < scheduler,
+        "scheduler state must follow the lifecycle frame that unlocks its watermark: {body}"
+    );
+}
+
+#[tokio::test]
+async fn ready_scheduler_updates_coalesce_to_only_the_latest_generation() {
+    let sse = ScriptedSse::configured(ScriptedSseConfig {
+        current_scheduler: scheduler_at(0, 1, 1),
+        scheduler: vec![Ok(scheduler_at(0, 1, 2)), Ok(scheduler_at(0, 1, 3))],
+        ..ScriptedSseConfig::standard(vec![0], Vec::new())
+    });
+    let (_, body) = finite_body(connect(sse, 0).await).await;
+
+    assert_eq!(scheduler_generations(&body), vec![3]);
+    let scheduler = body
+        .split("\n\n")
+        .find(|frame| frame.contains("event: scheduler.state\n"))
+        .expect("scheduler manifest");
+    assert!(!scheduler.lines().any(|line| line.starts_with("id:")));
+}
+
+#[tokio::test]
+async fn scheduler_burst_larger_than_the_drain_bound_still_emits_only_latest() {
+    let scheduler = (1..=130)
+        .map(|generation| Ok(scheduler_at(0, 1, generation)))
+        .collect();
+    let sse = ScriptedSse::configured(ScriptedSseConfig {
+        scheduler,
+        ..ScriptedSseConfig::standard(vec![0], Vec::new())
+    });
+    let (_, body) = finite_body(connect(sse, 0).await).await;
+
+    assert_eq!(scheduler_generations(&body), vec![130]);
+}
+
+#[tokio::test]
+async fn stale_scheduler_snapshot_is_dropped_without_resetting_the_stream() {
+    let sse = ScriptedSse::configured(ScriptedSseConfig {
+        current_scheduler: scheduler_at(0, 1, 1),
+        ..ScriptedSseConfig::standard(vec![1], vec![queued(1)])
+    });
+    let (_, body) = finite_body(connect(sse, 1).await).await;
+
+    assert!(scheduler_generations(&body).is_empty());
+    assert!(!body.contains("event: stream.reset\n"));
+}
+
+#[tokio::test]
+async fn conflicting_payload_for_the_same_scheduler_generation_forces_reset() {
+    let current = scheduler_at(0, 1, 1);
+    let mut conflicting = (*current).clone();
+    conflicting.admission_state = SchedulerAdmissionStateDto::Paused;
+    let sse = ScriptedSse::configured(ScriptedSseConfig {
+        current_scheduler: current,
+        scheduler: vec![Ok(Arc::new(conflicting))],
+        ..ScriptedSseConfig::standard(vec![0], Vec::new())
+    });
+    let (_, body) = finite_body(connect(sse, 0).await).await;
+
+    assert!(scheduler_generations(&body).is_empty());
+    assert!(body.contains("event: stream.reset\n"));
+}
+
+#[tokio::test]
+async fn invalid_scheduler_segmentation_emits_idless_reset_and_closes() {
+    let mut invalid = scheduler_snapshot(1, 0, 0);
+    invalid.as_of_event_id = 0;
+    invalid.service_state_generation = 1;
+    invalid.generation = 1;
+    invalid.queued_task_count = 0;
+    let sse = ScriptedSse::configured(ScriptedSseConfig {
+        current_scheduler: Arc::new(invalid),
+        ..ScriptedSseConfig::standard(vec![0], Vec::new())
+    });
+    let (_, body) = finite_body(connect(sse, 0).await).await;
+
+    assert!(!body.contains("event: scheduler.state\n"));
+    let reset = body
+        .split("\n\n")
+        .find(|frame| frame.contains("event: stream.reset"))
+        .expect("stream reset");
+    assert!(!reset.lines().any(|line| line.starts_with("id:")));
+}
+
+#[tokio::test]
+async fn service_generation_aborts_old_scheduler_chunks_before_the_replacement() {
+    let current = scheduler_with_items(129, 0, 0, 1);
+    let sse = ControlRaceSse::new(current);
+    let response = connect(sse.clone(), 0).await;
+    let mut body = response.into_body().into_data_stream();
+
+    let service = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&service).contains("event: service.state\n"));
+    let old_manifest = body.next().await.unwrap().unwrap();
+    let old_manifest = String::from_utf8(old_manifest.to_vec()).unwrap();
+    assert!(old_manifest.contains("event: scheduler.state\n"));
+    assert!(old_manifest.contains("\"generation\":1"));
+
+    sse.publish_scheduler(scheduler_at(0, 1, 2));
+    sse.publish_service(ServiceStateDto::Ready, 1);
+    sse.close();
+
+    let service = body.next().await.unwrap().unwrap();
+    let service = String::from_utf8(service.to_vec()).unwrap();
+    assert!(service.contains("event: service.state\n"));
+    assert!(service.contains("\"generation\":1"));
+    let replacement = body.next().await.unwrap().unwrap();
+    let replacement = String::from_utf8(replacement.to_vec()).unwrap();
+    assert!(replacement.contains("event: scheduler.state\n"));
+    assert!(replacement.contains("\"generation\":2"));
+    let tail = tokio::time::timeout(
+        Duration::from_secs(2),
+        futures_util::StreamExt::collect::<Vec<_>>(body),
+    )
+    .await
+    .expect("finite replacement stream");
+    let tail = tail
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("body");
+    let tail = tail
+        .into_iter()
+        .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+        .collect::<String>();
+    assert!(!tail.contains("\"generation\":1"));
+}
+
+#[tokio::test]
+async fn lag_recovery_starts_before_an_active_scheduler_segment_can_continue() {
+    let current = scheduler_with_items(129, 0, 0, 1);
+    let sse = ControlRaceSse::new(current);
+    sse.pause_recovery();
+    let response = connect(sse.clone(), 0).await;
+    let mut body = response.into_body().into_data_stream();
+
+    body.next().await.unwrap().unwrap();
+    let manifest = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&manifest).contains("scheduler.state"));
+    sse.publish_lag();
+
+    let next = body.next();
+    futures_util::pin_mut!(next);
+    for _ in 0..6 {
+        match poll!(next.as_mut()) {
+            std::task::Poll::Pending => {
+                if sse.recovery_entered.available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            std::task::Poll::Ready(Some(Ok(_))) => {
+                assert_eq!(sse.recovery_entered.available_permits(), 1);
+                break;
+            }
+            other => panic!("scheduler stream closed during lag recovery: {other:?}"),
+        }
+    }
+    assert_eq!(sse.recovery_entered.available_permits(), 1);
+
+    sse.resume_recovery.add_permits(1);
+    sse.close();
+}
+
+#[tokio::test]
+async fn interrupted_scheduler_group_without_replacement_forces_reset() {
+    let current = scheduler_with_items(129, 0, 0, 1);
+    let sse = ControlRaceSse::new(current);
+    let response = connect(sse.clone(), 0).await;
+    let mut body = response.into_body().into_data_stream();
+
+    body.next().await.unwrap().unwrap();
+    let manifest = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&manifest).contains("scheduler.state"));
+    sse.publish_service(ServiceStateDto::StoreDegraded, 1);
+    sse.close();
+
+    let service = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&service).contains("service.state"));
+    let reset = body.next().await.unwrap().unwrap();
+    let reset = String::from_utf8(reset.to_vec()).unwrap();
+    assert!(reset.contains("event: stream.reset\n"));
+    assert!(!reset.lines().any(|line| line.starts_with("id:")));
+}
+
+#[tokio::test]
+async fn stale_higher_candidate_cannot_hide_an_interrupted_scheduler_group() {
+    let current = scheduler_with_items(129, 0, 0, 1);
+    let sse = ControlRaceSse::new(current);
+    let response = connect(sse.clone(), 0).await;
+    let mut body = response.into_body().into_data_stream();
+
+    body.next().await.unwrap().unwrap();
+    let manifest = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&manifest).contains("\"generation\":1"));
+    sse.publish_scheduler(scheduler_at(1, 0, 2));
+    sse.publish_live(queued(2));
+    sse.close();
+
+    let membership = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&membership).contains("id: 2\n"));
+    let reset = body.next().await.unwrap().unwrap();
+    let reset = String::from_utf8(reset.to_vec()).unwrap();
+    assert!(reset.contains("event: stream.reset\n"));
+    assert!(!reset.contains("\"generation\":2"));
+}
+
+#[tokio::test]
+async fn quiescing_during_scheduler_segmentation_emits_service_then_closes() {
+    let current = scheduler_with_items(129, 0, 0, 1);
+    let sse = ControlRaceSse::new(current);
+    let response = connect(sse.clone(), 0).await;
+    let mut body = response.into_body().into_data_stream();
+
+    body.next().await.unwrap().unwrap();
+    let old_manifest = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&old_manifest).contains("\"generation\":1"));
+
+    sse.publish_service(ServiceStateDto::Quiescing, 1);
+    sse.close();
+
+    let quiescing = body.next().await.unwrap().unwrap();
+    let quiescing = String::from_utf8(quiescing.to_vec()).unwrap();
+    assert!(quiescing.contains("event: service.state\n"));
+    assert!(quiescing.contains("\"state\":\"quiescing\""));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("quiescing closes immediately")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn yielded_membership_event_aborts_old_chunks_and_unlocks_the_replacement() {
+    let current = scheduler_with_items(129, 0, 0, 1);
+    let sse = ControlRaceSse::new(current);
+    let response = connect(sse.clone(), 0).await;
+    let mut body = response.into_body().into_data_stream();
+
+    body.next().await.unwrap().unwrap();
+    let old_manifest = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&old_manifest).contains("\"generation\":1"));
+
+    sse.publish_scheduler(scheduler_at(1, 0, 2));
+    sse.publish_live(queued(1));
+    sse.close();
+
+    let membership = body.next().await.unwrap().unwrap();
+    let membership = String::from_utf8(membership.to_vec()).unwrap();
+    assert!(membership.contains("id: 1\n"));
+    let replacement = body.next().await.unwrap().unwrap();
+    let replacement = String::from_utf8(replacement.to_vec()).unwrap();
+    assert!(replacement.contains("event: scheduler.state\n"));
+    assert!(replacement.contains("\"generation\":2"));
+    let tail = tokio::time::timeout(
+        Duration::from_secs(2),
+        futures_util::StreamExt::collect::<Vec<_>>(body),
+    )
+    .await
+    .expect("finite replacement stream");
+    let tail = tail
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("body");
+    let tail = tail
+        .into_iter()
+        .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+        .collect::<String>();
+    assert!(!tail.contains("\"generation\":1"));
 }
 
 #[tokio::test]
@@ -773,6 +1575,12 @@ async fn heartbeat_arrives_at_fifteen_seconds_and_has_no_id() {
         .expect("initial service frame")
         .expect("body");
     assert!(String::from_utf8_lossy(&first).contains("service.state"));
+    let scheduler = body
+        .next()
+        .await
+        .expect("initial scheduler frame")
+        .expect("body");
+    assert!(String::from_utf8_lossy(&scheduler).contains("scheduler.state"));
 
     let heartbeat = body.next();
     futures_util::pin_mut!(heartbeat);
@@ -887,15 +1695,55 @@ fn service_generations(body: &str) -> Vec<u64> {
         .collect()
 }
 
+fn scheduler_generations(body: &str) -> Vec<u64> {
+    body.split("\n\n")
+        .filter(|frame| frame.contains("event: scheduler.state\n"))
+        .map(|frame| {
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data:").map(str::trim))
+                .expect("scheduler data");
+            serde_json::from_str::<serde_json::Value>(data).unwrap()["generation"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect()
+}
+
 fn dto_id(event: &TaskEventDto) -> i64 {
     serde_json::to_value(event).unwrap()["id"].as_i64().unwrap()
 }
 
+fn membership_watermark(events: &[TaskEventDto], after_cursor: i64) -> i64 {
+    events
+        .iter()
+        .filter(|event| dto_id(event) <= after_cursor && is_membership_event(event))
+        .map(dto_id)
+        .max()
+        .unwrap_or(0)
+}
+
+fn is_membership_event(event: &TaskEventDto) -> bool {
+    matches!(
+        event,
+        TaskEventDto::TaskQueued(_)
+            | TaskEventDto::TaskStarted(_)
+            | TaskEventDto::TaskCompleted(_)
+            | TaskEventDto::TaskFailed(_)
+            | TaskEventDto::TaskCancelled(_)
+            | TaskEventDto::TaskInterrupted(_)
+    )
+}
+
 fn queued(id: i64) -> TaskEventDto {
+    event(id, TaskEventPayload::TaskQueued { task: task(id) })
+}
+
+fn event(id: i64, payload: TaskEventPayload) -> TaskEventDto {
     TaskEventDto::from(TaskEvent::new(
         EventId::new(id).unwrap(),
         TaskId::new(),
-        TaskEventPayload::TaskQueued { task: task(id) },
+        payload,
         timestamp(),
     ))
 }
@@ -1016,6 +1864,260 @@ fn task_with_status(id: i64, status: TaskStatus) -> Task {
         last_event_id: EventId::new(id.max(1)).unwrap(),
         failure,
     }
+}
+
+#[test]
+fn scheduler_wire_empty_snapshot_emits_one_idless_manifest_and_no_chunks() {
+    let snapshot = scheduler_snapshot(0, 0, 0);
+    let frames = SchedulerStateFrames::try_from_snapshot(&snapshot).unwrap();
+
+    assert!(frames.chunks().is_empty());
+    assert_eq!(frames.manifest().item_count, 0);
+    assert_eq!(frames.manifest().chunk_count, 0);
+    assert_eq!(frames.manifest().queued_task_count, 0);
+    assert_eq!(frames.manifest().stopping_task_count, 0);
+    assert_eq!(frames.manifest().repository_storage_count, 0);
+    let value =
+        serde_json::to_value(SseMessage::SchedulerState(frames.manifest().clone())).unwrap();
+    assert_eq!(value["kind"], "scheduler.state");
+    assert!(value.get("id").is_none());
+    assert_eq!(
+        scheduler_state_frame_len(frames.manifest()).unwrap(),
+        format!(
+            "event: scheduler.state\ndata: {}\n\n",
+            serde_json::to_string(frames.manifest()).unwrap()
+        )
+        .len()
+    );
+    assert!(scheduler_state_frame_len(frames.manifest()).unwrap() <= MAX_SCHEDULER_FRAME_BYTES);
+}
+
+#[test]
+fn scheduler_wire_chunks_canonical_group_order_at_the_128_item_boundary() {
+    let snapshot = scheduler_snapshot(129, 2, 2);
+    let frames = SchedulerStateFrames::try_from_snapshot(&snapshot).unwrap();
+
+    assert_eq!(frames.manifest().item_count, 133);
+    assert_eq!(frames.manifest().chunk_count, 2);
+    assert_eq!(frames.chunks().len(), 2);
+    assert_eq!(
+        frames.chunks()[0].items.len(),
+        MAX_SCHEDULER_ITEMS_PER_CHUNK
+    );
+    assert_eq!(frames.chunks()[1].items.len(), 5);
+
+    let items = frames
+        .chunks()
+        .iter()
+        .flat_map(|chunk| chunk.items.iter())
+        .collect::<Vec<_>>();
+    assert!(
+        items[..129]
+            .iter()
+            .all(|item| matches!(item, SchedulerStateItemDto::QueuedTask(_)))
+    );
+    assert!(
+        items[129..131]
+            .iter()
+            .all(|item| matches!(item, SchedulerStateItemDto::StoppingTask(_)))
+    );
+    assert!(
+        items[131..]
+            .iter()
+            .all(|item| matches!(item, SchedulerStateItemDto::RepositoryStorage(_)))
+    );
+
+    for (index, chunk) in frames.chunks().iter().enumerate() {
+        assert_eq!(chunk.chunk_index, u32::try_from(index).unwrap());
+        assert_eq!(chunk.chunk_count, frames.manifest().chunk_count);
+        assert_eq!(
+            chunk.server_instance_id,
+            frames.manifest().server_instance_id
+        );
+        assert_eq!(chunk.generation, frames.manifest().generation);
+        assert_eq!(chunk.snapshot_digest, frames.manifest().snapshot_digest);
+        let value = serde_json::to_value(SseMessage::SchedulerStateChunk(chunk.clone())).unwrap();
+        assert_eq!(value["kind"], "scheduler.state.chunk");
+        assert!(value.get("id").is_none());
+        assert_eq!(
+            scheduler_state_chunk_frame_len(chunk).unwrap(),
+            format!(
+                "event: scheduler.state.chunk\ndata: {}\n\n",
+                serde_json::to_string(chunk).unwrap()
+            )
+            .len()
+        );
+        assert!(scheduler_state_chunk_frame_len(chunk).unwrap() <= MAX_SCHEDULER_FRAME_BYTES);
+    }
+}
+
+#[test]
+fn scheduler_wire_rejects_a_snapshot_whose_declared_count_is_not_exact() {
+    let mut snapshot = scheduler_snapshot(1, 0, 0);
+    snapshot.queued_task_count = 2;
+
+    assert!(matches!(
+        SchedulerStateFrames::try_from_snapshot(&snapshot),
+        Err(SchedulerWireError::QueuedTaskCountMismatch {
+            declared: 2,
+            actual: 1
+        })
+    ));
+}
+
+#[test]
+fn scheduler_wire_rejects_unsafe_integers_duplicates_and_noncanonical_repositories() {
+    let mut unsafe_integer = scheduler_snapshot(0, 0, 0);
+    unsafe_integer.generation = 9_007_199_254_740_992;
+    assert!(matches!(
+        SchedulerStateFrames::try_from_snapshot(&unsafe_integer),
+        Err(SchedulerWireError::UnsafeInteger {
+            field: "generation",
+            ..
+        })
+    ));
+
+    let mut duplicate_task = scheduler_snapshot(1, 1, 0);
+    duplicate_task.stopping_tasks[0].task_id = duplicate_task.queued_tasks[0].task_id;
+    assert!(matches!(
+        SchedulerStateFrames::try_from_snapshot(&duplicate_task),
+        Err(SchedulerWireError::DuplicateTaskId)
+    ));
+
+    let mut repositories = scheduler_snapshot(0, 0, 2);
+    repositories.storage.repositories.swap(0, 1);
+    assert!(matches!(
+        SchedulerStateFrames::try_from_snapshot(&repositories),
+        Err(SchedulerWireError::RepositoryStorageNotCanonical)
+    ));
+}
+
+#[test]
+fn scheduler_wire_frame_guard_counts_the_complete_sse_envelope() {
+    let frames = SchedulerStateFrames::try_from_snapshot(&scheduler_snapshot(0, 0, 0)).unwrap();
+    let mut oversized = frames.manifest().clone();
+    oversized.snapshot_digest = "a".repeat(MAX_SCHEDULER_FRAME_BYTES);
+
+    assert!(matches!(
+        ensure_scheduler_state_frame_size(&oversized),
+        Err(SchedulerWireError::FrameTooLarge {
+            kind: "scheduler.state",
+            encoded_bytes,
+        }) if encoded_bytes > MAX_SCHEDULER_FRAME_BYTES
+    ));
+}
+
+#[test]
+fn scheduler_wire_digest_uses_exact_rfc8785_bytes_and_lowercase_sha256() {
+    let snapshot = scheduler_snapshot(1, 1, 1);
+    let canonical = canonical_scheduler_state_bytes(&snapshot).unwrap();
+    let digest = scheduler_snapshot_digest(&snapshot).unwrap();
+    let frames = SchedulerStateFrames::try_from_snapshot(&snapshot).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../testdata/scheduler-state-rfc8785.json"
+    ))
+    .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&snapshot).unwrap(),
+        fixture["snapshot"]
+    );
+    assert_eq!(
+        String::from_utf8(canonical).unwrap(),
+        fixture["canonical_json"].as_str().unwrap()
+    );
+    assert_eq!(digest, fixture["sha256"].as_str().unwrap());
+    assert_eq!(frames.manifest().snapshot_digest, digest);
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+}
+
+fn scheduler_snapshot(
+    queued_task_count: usize,
+    stopping_task_count: usize,
+    repository_storage_count: usize,
+) -> SchedulerStateDto {
+    let queued_tasks = (0..queued_task_count)
+        .map(|index| SchedulerQueuedTaskDto {
+            task_id: indexed_uuid(0x1000 + index),
+            reason: SchedulerQueueReasonDto::RepositoryCapacity,
+        })
+        .collect::<Vec<_>>();
+    let stopping_tasks = (0..stopping_task_count)
+        .map(|index| SchedulerStoppingTaskDto {
+            task_id: indexed_uuid(0x2000 + index),
+            intent: SchedulerStopIntentDto::UserCancelled,
+        })
+        .collect::<Vec<_>>();
+    let repositories = (0..repository_storage_count)
+        .map(|index| SchedulerRepositoryStorageDto {
+            repository_id: indexed_uuid(0x3000 + index),
+            state: SchedulerStorageStateDto::Pressure,
+        })
+        .collect::<Vec<_>>();
+
+    SchedulerStateDto {
+        schema_version: 1,
+        server_instance_id: uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+        server_started_at: timestamp().into(),
+        generation: 9_007_199_254_740_991,
+        as_of_event_id: 41,
+        service_state_generation: 7,
+        admission_state: SchedulerAdmissionStateDto::Running,
+        limits: SchedulerLimitsDto {
+            global: 4,
+            per_repository: 2,
+            queued: 256,
+            cargo_jobs_per_task: 8,
+        },
+        active_task_count: u32::try_from(stopping_task_count).unwrap(),
+        queued_task_count: u32::try_from(queued_task_count).unwrap(),
+        queued_tasks,
+        stopping_tasks,
+        storage: SchedulerStorageDto {
+            state: SchedulerStorageStateDto::Unavailable,
+            data: SchedulerStorageScopeDto {
+                state: SchedulerStorageStateDto::Normal,
+            },
+            runtime: SchedulerStorageScopeDto {
+                state: SchedulerStorageStateDto::Unavailable,
+            },
+            repositories,
+        },
+    }
+}
+
+fn scheduler_at(
+    as_of_event_id: u64,
+    service_state_generation: u64,
+    generation: u64,
+) -> Arc<SchedulerStateDto> {
+    let mut snapshot = scheduler_snapshot(0, 0, 0);
+    snapshot.as_of_event_id = as_of_event_id;
+    snapshot.service_state_generation = service_state_generation;
+    snapshot.generation = generation;
+    Arc::new(snapshot)
+}
+
+fn scheduler_with_items(
+    queued_task_count: usize,
+    as_of_event_id: u64,
+    service_state_generation: u64,
+    generation: u64,
+) -> Arc<SchedulerStateDto> {
+    let mut snapshot = scheduler_snapshot(queued_task_count, 0, 0);
+    snapshot.as_of_event_id = as_of_event_id;
+    snapshot.service_state_generation = service_state_generation;
+    snapshot.generation = generation;
+    Arc::new(snapshot)
+}
+
+fn indexed_uuid(index: usize) -> uuid::Uuid {
+    uuid::Uuid::from_u128(0x123e_4567_e89b_42d3_a456_0000_0000_0000 + index as u128)
 }
 
 fn timestamp() -> UtcTimestamp {

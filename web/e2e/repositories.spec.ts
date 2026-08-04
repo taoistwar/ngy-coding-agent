@@ -35,7 +35,9 @@ test("adds two real repositories, reuses one identity, and switches the composer
   testInfo,
 ) => {
   const scenario: ProcessScenario = {
+    runtime_config: null,
     fake_scenarios: ["success", "success"],
+    storage_samples: [{ kind: "native" }],
     store_writer_faults: [],
     actor_pauses: [],
     virtual_release_signals: [],

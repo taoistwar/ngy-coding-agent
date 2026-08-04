@@ -7,10 +7,16 @@ import {
 } from "react";
 
 import type { Repository, Task } from "../api/types";
+import {
+  initialSchedulerProjection,
+  type SchedulerProjectionState,
+} from "../state/schedulerProjection";
+import { schedulerQueueReasonLabel } from "./SchedulerSummary";
 
 export interface SidebarProps {
   repositories: Repository[];
   tasks: Task[];
+  scheduler?: SchedulerProjectionState;
   selectedRepositoryId: string | null;
   selectedTaskId: string | null;
   onSelectRepository(repositoryId: string): void;
@@ -82,6 +88,7 @@ function sidebarError(error: unknown): SidebarError {
 export function Sidebar({
   repositories,
   tasks,
+  scheduler = initialSchedulerProjection,
   selectedRepositoryId,
   selectedTaskId,
   onSelectRepository,
@@ -134,6 +141,16 @@ export function Sidebar({
             left.id.localeCompare(right.id),
         ),
     [selectedRepositoryId, tasks],
+  );
+  const queuedReasonByTaskId = useMemo(
+    () =>
+      new Map(
+        (scheduler.snapshot?.queued_tasks ?? []).map((queued) => [
+          queued.task_id,
+          queued.reason,
+        ]),
+      ),
+    [scheduler.snapshot],
   );
 
   const addPath = async (event: FormEvent<HTMLFormElement>) => {
@@ -286,6 +303,11 @@ export function Sidebar({
                     {READINESS_LABEL[value.delivery_readiness]}
                   </span>
                 </span>
+                {value.status === "queued" && queuedReasonByTaskId.has(value.id) ? (
+                  <span className="task-queue-reason">
+                    {schedulerQueueReasonLabel(queuedReasonByTaskId.get(value.id)!)}
+                  </span>
+                ) : null}
                 {RETRYABLE_STATUSES.has(value.status) &&
                 !tasks.some((candidate) => candidate.retry_of === value.id) ? (
                   <button

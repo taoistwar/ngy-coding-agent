@@ -6,6 +6,33 @@ export type TaskDetail = components["schemas"]["TaskDetailDto"];
 export type TaskEvent = components["schemas"]["TaskEventDto"];
 export type TaskEventKind = components["schemas"]["TaskEventKindDto"];
 export type BootstrapResponse = components["schemas"]["BootstrapResponse"];
+export type SchedulerState = components["schemas"]["SchedulerStateDto"];
+export type SchedulerAdmissionState =
+  components["schemas"]["SchedulerAdmissionStateDto"];
+export type SchedulerLimits = components["schemas"]["SchedulerLimitsDto"];
+export type SchedulerQueueReason =
+  components["schemas"]["SchedulerQueueReasonDto"];
+export type SchedulerQueuedTask =
+  components["schemas"]["SchedulerQueuedTaskDto"];
+export type SchedulerRepositoryStorage =
+  components["schemas"]["SchedulerRepositoryStorageDto"];
+export type SchedulerStopIntent =
+  components["schemas"]["SchedulerStopIntentDto"];
+export type SchedulerStoppingTask =
+  components["schemas"]["SchedulerStoppingTaskDto"];
+export type SchedulerStorage = components["schemas"]["SchedulerStorageDto"];
+export type SchedulerStorageScope =
+  components["schemas"]["SchedulerStorageScopeDto"];
+export type SchedulerStorageState =
+  components["schemas"]["SchedulerStorageStateDto"];
+export type SchedulerControlStorage =
+  components["schemas"]["SchedulerControlStorageDto"];
+export type SchedulerStateControl =
+  components["schemas"]["SchedulerStateControl"];
+export type SchedulerStateChunkControl =
+  components["schemas"]["SchedulerStateChunkControl"];
+export type SchedulerStateItem =
+  components["schemas"]["SchedulerStateItemDto"];
 export type ApiErrorResponse = components["schemas"]["ApiErrorResponse"];
 export type AddRepositoryRequest = components["schemas"]["AddRepositoryRequest"];
 export type CreateTaskRequest = components["schemas"]["CreateTaskRequest"];

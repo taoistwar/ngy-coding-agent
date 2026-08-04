@@ -10,6 +10,7 @@ use coding_agent_domain::{
     WorkspaceDigest,
 };
 
+use crate::stop_intents::{ensure_no_stop_intent, validate_optional_stop_intent};
 use crate::tasks::{
     append_lifecycle_event, current_timestamp, ensure_exactly_one, insert_event, load_task,
 };
@@ -137,6 +138,7 @@ impl Store {
                 return Err(review_invariant());
             }
             validate_task_event_cursor(&mut transaction, &task).await?;
+            validate_optional_stop_intent(&mut transaction, &task).await?;
             transaction.commit().await?;
             return Ok(RecordReviewOutcome::Existing {
                 review: existing.review,
@@ -148,6 +150,7 @@ impl Store {
             .await?
             .ok_or(StoreError::TaskNotFound)?;
         validate_running_task(&task, expected_repository_id, expected_attempt)?;
+        ensure_no_stop_intent(&mut transaction, task_id).await?;
         validate_next_round(&mut transaction, task_id, &evidence).await?;
         validate_task_event_cursor(&mut transaction, &task).await?;
         ensure_no_delivery(&mut transaction, task_id).await?;
@@ -208,6 +211,7 @@ impl Store {
             let task = load_task(&mut transaction, task_id)
                 .await?
                 .ok_or(StoreError::TaskNotFound)?;
+            ensure_no_stop_intent(&mut transaction, task_id).await?;
             let terminal_event_id =
                 validate_existing_final(&mut transaction, &task, &existing).await?;
             transaction.commit().await?;
@@ -223,6 +227,7 @@ impl Store {
             .await?
             .ok_or(StoreError::TaskNotFound)?;
         validate_running_task(&task, expected_repository_id, expected_attempt)?;
+        ensure_no_stop_intent(&mut transaction, task_id).await?;
         validate_next_round(&mut transaction, task_id, &evidence).await?;
         validate_task_event_cursor(&mut transaction, &task).await?;
         ensure_no_delivery(&mut transaction, task_id).await?;

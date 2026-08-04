@@ -55,6 +55,7 @@ export type FakeScenario =
 
 export type StoreWriterFaultPoint =
   | "fail_before_execute"
+  | "fail_unknown_before_execute"
   | "busy_before_execute"
   | "pause_before_execute"
   | "pause_after_commit_before_wake"
@@ -64,7 +65,10 @@ export type StoreWriterOperation =
   | "register_repository"
   | "create_task"
   | "retry_task"
+  | "persist_stop_intent_batch"
+  | "finalize_stopped_task"
   | "start_task"
+  | "reconcile_claim_task"
   | "finish_task"
   | "cancel_task"
   | "interrupt_task"
@@ -74,6 +78,7 @@ export type StoreWriterOperation =
   | "reserve_attempt_artifact"
   | "mark_attempt_artifact_ready"
   | "mark_attempt_artifact_inconsistent"
+  | "interrupt_remaining_after_stops"
   | "recover_incomplete";
 
 export type ActorPausePoint =
@@ -81,6 +86,8 @@ export type ActorPausePoint =
   | "claim_permit_acquired"
   | "claim_handle_registered"
   | "claim_running_committed"
+  | "after_final_gate_before_spawn"
+  | "terminal_after_dispatch_before_scheduler_publish"
   | "create_before_write"
   | "retry_before_write"
   | "result_before_write"
@@ -93,12 +100,15 @@ export type ActorPausePoint =
 
 export type VirtualReleaseTarget =
   | "runner_next"
+  | "storage_next"
   | "store_writer_before_execute"
   | "store_writer_after_commit_before_wake"
   | "actor_cancel_enqueued"
   | "actor_claim_permit_acquired"
   | "actor_claim_handle_registered"
   | "actor_claim_running_committed"
+  | "actor_after_final_gate_before_spawn"
+  | "actor_terminal_after_dispatch_before_scheduler_publish"
   | "actor_create_before_write"
   | "actor_retry_before_write"
   | "actor_result_before_write"
@@ -117,8 +127,26 @@ export type LegacyV2Seed =
       task_prompt: string;
     };
 
+export type ProcessStorageSample =
+  | { kind: "native" }
+  | { kind: "available"; available_bytes: number }
+  | { kind: "unavailable" };
+
+export interface ProcessRuntimeConfig {
+  schema_version: 1;
+  max_concurrent_tasks: number;
+  max_concurrent_tasks_per_repository: number;
+  max_queued_tasks: number;
+  storage: {
+    data_control_reserve_bytes: number;
+    data_task_reservation_bytes: number;
+  };
+}
+
 export interface ProcessScenario {
+  runtime_config: ProcessRuntimeConfig | null;
   fake_scenarios: FakeScenario[];
+  storage_samples: ProcessStorageSample[];
   store_writer_faults: Array<{
     point: StoreWriterFaultPoint;
     operation: StoreWriterOperation | null;
@@ -162,7 +190,9 @@ export interface RepositorySnapshot {
 }
 
 export const successScenario = (): ProcessScenario => ({
+  runtime_config: null,
   fake_scenarios: ["success"],
+  storage_samples: [{ kind: "native" }],
   store_writer_faults: [],
   actor_pauses: [],
   virtual_release_signals: [],

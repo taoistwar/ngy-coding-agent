@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use std::num::{NonZeroU16, NonZeroU32};
@@ -8,19 +10,21 @@ use std::time::Duration;
 use axum::Router;
 #[cfg(feature = "test-support")]
 use coding_agent_app::{
-    ActorPausePoint, LegacyV2Seed, ProcessTestConfig, ProcessTestEnvironment, VirtualReleaseSignal,
-    VirtualReleaseTarget,
+    ActorPausePoint, FakeScenario, LegacyV2Seed, ProcessStorageSample, ProcessTestConfig,
+    ProcessTestEnvironment, VirtualReleaseSignal, VirtualReleaseTarget,
 };
 use coding_agent_app::{
-    InstanceLock, ProductionStartupRunnerFactory, RuntimeDescriptor, RuntimeDescriptorError,
-    SecurityManager, SecuritySeed, StartupError, StartupOutcome, StartupPhase,
-    StartupPhaseController, StartupRunnerContext, StartupRunnerFactory, StartupRunnerFactoryError,
-    StartupRunnerSelection, SystemSecurityClock, build_runtime_router, launch,
+    InstanceLock, PreActorStartupRunnerContext, ProductionStartupRunnerFactory, RuntimeDescriptor,
+    RuntimeDescriptorError, SecurityManager, SecuritySeed, StartupDependencies, StartupError,
+    StartupOutcome, StartupPhase, StartupPhaseController, StartupRunnerContext,
+    StartupRunnerFactory, StartupRunnerFactoryError, StartupRunnerSelection, SystemSecurityClock,
+    build_runtime_router, launch,
 };
 use coding_agent_domain::{
     CanonicalPath, ClientRequestId, DeliveryReadiness, NewRepository, NewTask, TaskEventKind,
     TaskStatus, UtcTimestamp,
 };
+use coding_agent_runtime::{HeldProcessLivenessTreeForTest, ProcessLivenessDirectory};
 use coding_agent_store::{CreateTaskOutcome, RegisterRepositoryOutcome, Store};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
@@ -36,6 +40,37 @@ impl StartupRunnerFactory for PanicStartupRunnerFactory {
         _context: StartupRunnerContext,
     ) -> Result<StartupRunnerSelection, StartupRunnerFactoryError> {
         panic!("a secondary instance must never initialize the task runner")
+    }
+}
+
+struct HeldPreActorTreeFactory {
+    held_tree: Arc<std::sync::Mutex<Option<HeldProcessLivenessTreeForTest>>>,
+    reached: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl StartupRunnerFactory for HeldPreActorTreeFactory {
+    async fn prepare_before_actors(
+        &self,
+        context: &PreActorStartupRunnerContext,
+    ) -> Result<Arc<dyn std::any::Any + Send + Sync>, StartupRunnerFactoryError> {
+        let held_tree = context
+            .process_liveness_scope()
+            .hold_tree_for_test()
+            .map_err(|_| StartupRunnerFactoryError::new("PROCESS_LIVENESS_UNAVAILABLE"))?;
+        *self
+            .held_tree
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(held_tree);
+        self.reached.notify_one();
+        std::future::pending().await
+    }
+
+    async fn create(
+        &self,
+        _context: StartupRunnerContext,
+    ) -> Result<StartupRunnerSelection, StartupRunnerFactoryError> {
+        panic!("pre-actor cancellation must not reach live runner construction")
     }
 }
 
@@ -234,7 +269,13 @@ async fn path_preparation_failure_reports_once_before_lock_store_or_listener() {
     assert_eq!(fixture.calls.listener_binds(), 0);
     assert_eq!(fixture.calls.browser_urls(), Vec::<String>::new());
     assert_eq!(fixture.calls.messages().len(), 1);
-    assert!(!fixture.paths.instance_lock.exists());
+    assert!(fixture.paths.instance_lock.exists());
+    assert!(
+        InstanceLock::try_acquire(&fixture.paths.instance_lock)
+            .expect("reopen lock after primary path preparation failure")
+            .is_some(),
+        "the failed primary releases the bootstrap lock"
+    );
     assert!(!fixture.paths.database_path.exists());
     assert!(!fixture.paths.instance_descriptor.exists());
 }
@@ -274,42 +315,10 @@ async fn database_open_or_migration_failure_stops_before_listener_publication() 
 }
 
 #[tokio::test]
-async fn primary_recovers_incomplete_tasks_before_publishing_ready_descriptor() {
+async fn primary_preserves_queued_tasks_before_publishing_ready_descriptor() {
     let fixture = support::StartupFixture::new();
     fixture.prepare();
-    let store = Store::open(&fixture.paths.database_path)
-        .await
-        .expect("open seed store");
-    store.migrate().await.expect("migrate seed store");
-    let repository_root = fixture.paths.data_dir.join("seed-repository");
-    std::fs::create_dir_all(&repository_root).expect("create seed repository paths");
-    let canonical =
-        CanonicalPath::try_from_canonical(repository_root).expect("construct canonical seed path");
-    let repository = match store
-        .register_repository(NewRepository {
-            selected_path: canonical.clone(),
-            display_name: "seed".to_owned(),
-            git_root: canonical.clone(),
-            cargo_workspace_root: canonical,
-        })
-        .await
-        .expect("register seed repository")
-    {
-        RegisterRepositoryOutcome::Created(repository) => repository,
-        RegisterRepositoryOutcome::Existing(_) => panic!("seed repository must be new"),
-    };
-    let queued = match store
-        .create_task(
-            NewTask::try_new(ClientRequestId::new(), repository.id, "recover this task")
-                .expect("construct queued task"),
-        )
-        .await
-        .expect("create queued seed task")
-    {
-        CreateTaskOutcome::Created { task, .. } => task,
-        CreateTaskOutcome::Existing { .. } => panic!("seed task must be new"),
-    };
-    drop(store);
+    let queued = seed_queued_task(&fixture, "recover this task").await;
 
     let outcome = launch(fixture.dependencies(support::StartupBehavior::default()))
         .await
@@ -327,21 +336,108 @@ async fn primary_recovers_incomplete_tasks_before_publishing_ready_descriptor() 
         .expect("read recovered task")
         .expect("recovered task exists");
 
-    assert_eq!(detail.task.status, TaskStatus::Interrupted);
-    assert_eq!(
-        detail
-            .task
-            .failure
-            .as_ref()
-            .map(|failure| failure.code.as_str()),
-        Some("APP_RESTARTED")
-    );
+    assert_eq!(detail.task.status, TaskStatus::Queued);
+    assert_eq!(detail.task.failure, None);
     assert_eq!(
         detail.timeline.last().map(|event| event.kind),
-        Some(TaskEventKind::TaskInterrupted)
+        Some(TaskEventKind::TaskQueued)
     );
     assert!(fixture.paths.instance_descriptor.exists());
     drop(primary);
+}
+
+#[tokio::test]
+async fn held_process_sentinel_retains_primary_lock_before_store_until_released() {
+    let fixture = support::StartupFixture::new();
+    fixture.prepare();
+    let liveness = ProcessLivenessDirectory::open(&fixture.paths.runtime_dir)
+        .expect("open held-sentinel fixture namespace");
+    let scope = liveness
+        .instance_scope(*uuid::Uuid::new_v4().as_bytes())
+        .expect("create held-sentinel fixture scope");
+    let held = scope
+        .hold_tree_for_test()
+        .expect("hold a previous-process sentinel");
+
+    let launch_task = tokio::spawn(launch(
+        fixture.dependencies(support::StartupBehavior::default()),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if InstanceLock::try_acquire(&fixture.paths.instance_lock)
+                .expect("probe startup lock")
+                .is_none()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocked startup acquires and retains the primary lock");
+    assert_eq!(fixture.calls.store_opens(), 0);
+    assert_eq!(fixture.calls.listener_binds(), 0);
+    assert!(!launch_task.is_finished());
+
+    drop(held);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), launch_task)
+        .await
+        .expect("startup continues after sentinel proof")
+        .expect("join held-sentinel launch")
+        .expect("held-sentinel launch succeeds");
+    let StartupOutcome::Primary(primary) = outcome else {
+        panic!("the retained lock owner must continue as primary");
+    };
+    assert_eq!(fixture.calls.store_opens(), 1);
+    assert_eq!(fixture.calls.listener_binds(), 1);
+    let _ = primary.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_process_sentinel_retains_primary_lock_before_store_until_removed() {
+    let fixture = support::StartupFixture::new();
+    fixture.prepare();
+    ProcessLivenessDirectory::open(&fixture.paths.runtime_dir)
+        .expect("open unknown-sentinel fixture namespace");
+    let malformed = fixture
+        .paths
+        .runtime_dir
+        .join("process-liveness")
+        .join("latest.sentinel");
+    std::fs::write(&malformed, b"forged").expect("install unknown sentinel entry");
+
+    let launch_task = tokio::spawn(launch(
+        fixture.dependencies(support::StartupBehavior::default()),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if InstanceLock::try_acquire(&fixture.paths.instance_lock)
+                .expect("probe startup lock")
+                .is_none()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unknown-sentinel startup retains the primary lock");
+    assert_eq!(fixture.calls.store_opens(), 0);
+    assert_eq!(fixture.calls.listener_binds(), 0);
+    assert!(!launch_task.is_finished());
+
+    std::fs::remove_file(&malformed).expect("remove unknown sentinel entry");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), launch_task)
+        .await
+        .expect("startup continues after unknown entry is removed")
+        .expect("join unknown-sentinel launch")
+        .expect("unknown-sentinel launch succeeds");
+    let StartupOutcome::Primary(primary) = outcome else {
+        panic!("the retained lock owner must continue as primary");
+    };
+    assert_eq!(fixture.calls.store_opens(), 1);
+    assert_eq!(fixture.calls.listener_binds(), 1);
+    let _ = primary.shutdown().await;
 }
 
 #[tokio::test]
@@ -364,6 +460,16 @@ async fn primary_composes_real_listener_and_stays_alive_when_browser_open_fails(
     let descriptor = RuntimeDescriptor::read(&fixture.paths.instance_descriptor)
         .expect("primary atomically publishes its descriptor");
     assert_eq!(descriptor.instance_id(), primary.instance_id());
+    let scheduler_instance_id = primary
+        .test_handles()
+        .task_manager
+        .scheduler_server_instance_id_for_test();
+    assert_eq!(scheduler_instance_id, primary.instance_id());
+    assert_eq!(
+        scheduler_instance_id.get_version(),
+        Some(uuid::Version::Random),
+        "descriptor, runtime router, and Scheduler must share one primary UUID v4"
+    );
     assert_eq!(descriptor.port().get(), primary.port());
     let urls = fixture.calls.browser_urls();
     assert_eq!(urls.len(), 1);
@@ -522,6 +628,36 @@ async fn secondary_waits_for_descriptor_and_ready_without_opening_store_or_liste
 }
 
 #[tokio::test]
+async fn secondary_does_not_read_or_validate_runtime_json() {
+    let fixture = support::StartupFixture::new();
+    fixture.prepare();
+    std::fs::write(
+        &fixture.paths.runtime_config,
+        br#"{"invalid-runtime-config":true}"#,
+    )
+    .expect("write invalid runtime config beside a live primary");
+    let primary = FakePrimary::start(&fixture).await;
+    primary.publish();
+    assert!(primary.phase.mark_ready());
+
+    let outcome = launch(fixture.dependencies(support::StartupBehavior {
+        panic_on_store_open: true,
+        ..support::StartupBehavior::default()
+    }))
+    .await
+    .expect("secondary ignores the primary-owned runtime config");
+
+    let StartupOutcome::Secondary(secondary) = outcome else {
+        panic!("the contending process must remain secondary");
+    };
+    assert_eq!(secondary.instance_id(), primary.descriptor.instance_id());
+    assert!(secondary.browser_opened());
+    assert_eq!(fixture.calls.store_opens(), 0);
+    assert_eq!(fixture.calls.listener_binds(), 0);
+    assert_eq!(fixture.calls.parallelism_probes(), 0);
+}
+
+#[tokio::test]
 async fn locked_primary_requires_private_valid_provider_config_before_binding_listener() {
     let fixture = support::StartupFixture::new();
     let mut dependencies = fixture.dependencies(support::StartupBehavior::default());
@@ -536,7 +672,7 @@ async fn locked_primary_requires_private_valid_provider_config_before_binding_li
         Err(error) => panic!("unexpected primary startup error: {error:?}"),
         Ok(_) => panic!("a primary without provider configuration must fail"),
     }
-    assert_eq!(fixture.calls.store_opens(), 1);
+    assert_eq!(fixture.calls.store_opens(), 0);
     assert_eq!(fixture.calls.listener_binds(), 0);
     assert!(!fixture.paths.instance_descriptor.exists());
     let messages = fixture.calls.messages();
@@ -657,11 +793,7 @@ async fn listener_binding_retries_are_finite_and_never_publish_a_descriptor() {
     assert_eq!(fixture.calls.browser_urls(), Vec::<String>::new());
     assert_eq!(fixture.calls.messages().len(), 1);
     assert!(!fixture.paths.instance_descriptor.exists());
-    assert!(
-        InstanceLock::try_acquire(&fixture.paths.instance_lock)
-            .expect("startup error releases lock")
-            .is_some()
-    );
+    wait_for_instance_lock(&fixture.paths.instance_lock).await;
 }
 
 #[cfg(feature = "test-support")]
@@ -670,12 +802,15 @@ async fn process_test_legacy_v2_seed_migrates_before_primary_store_projection() 
     let fixture = support::StartupFixture::new();
     fixture.prepare();
     let repository_path = fixture.paths.data_dir.join("legacy-repository");
-    std::fs::create_dir(&repository_path).expect("create legacy repository path");
+    std::fs::create_dir_all(repository_path.join(".git"))
+        .expect("create authenticated legacy repository identity");
     let scenario = fixture.paths.data_dir.join("legacy-v2-scenario.json");
     std::fs::write(
         &scenario,
         serde_json::to_vec(&ProcessTestConfig {
+            runtime_config: None,
             fake_scenarios: Vec::new(),
+            storage_samples: vec![ProcessStorageSample::Native],
             store_writer_faults: Vec::new(),
             actor_pauses: Vec::new(),
             virtual_release_signals: Vec::new(),
@@ -738,7 +873,15 @@ async fn process_test_legacy_v2_seed_migrates_before_primary_store_projection() 
             .fetch_all(store.pool())
             .await
             .expect("read migrated schema versions");
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
+    let stop_intent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_stop_intents")
+        .fetch_one(store.pool())
+        .await
+        .expect("read migrated stop intents");
+    assert_eq!(
+        stop_intent_count, 0,
+        "migration must not invent stop intents"
+    );
 
     let _ = primary.shutdown().await;
 }
@@ -748,42 +891,8 @@ async fn process_test_legacy_v2_seed_migrates_before_primary_store_projection() 
 async fn cancelling_launch_at_descriptor_pause_cleans_descriptor_lock_and_listener() {
     let fixture = support::StartupFixture::new();
     fixture.prepare();
-    let signals = fixture.paths.runtime_dir.join("signals");
-    std::fs::create_dir(&signals).expect("create actor signal directory");
-    let release = signals.join("descriptor-before-browser.release");
-    let mut reached_name = release
-        .file_name()
-        .expect("release has a file name")
-        .to_os_string();
-    reached_name.push(".reached");
-    let reached = release.with_file_name(reached_name);
-    let scenario = fixture.paths.data_dir.join("cancel-launch-scenario.json");
-    std::fs::write(
-        &scenario,
-        serde_json::to_vec(&ProcessTestConfig {
-            fake_scenarios: Vec::new(),
-            store_writer_faults: Vec::new(),
-            actor_pauses: vec![ActorPausePoint::DescriptorBeforeBrowser],
-            virtual_release_signals: vec![VirtualReleaseSignal {
-                name: "descriptor-before-browser".to_owned(),
-                path: release,
-                target: VirtualReleaseTarget::ActorDescriptorBeforeBrowser,
-            }],
-            legacy_v2_seed: LegacyV2Seed::None,
-            marker_write_failure: false,
-        })
-        .expect("serialize process-test scenario"),
-    )
-    .expect("write process-test scenario");
-    let environment = ProcessTestEnvironment::load(
-        &fixture.paths.data_dir,
-        &fixture.paths.runtime_dir,
-        &scenario,
-    )
-    .expect("load process-test environment");
-    let dependencies = environment
-        .apply(fixture.dependencies(Default::default()))
-        .expect("apply descriptor pause");
+    let (dependencies, reached) =
+        descriptor_pause_dependencies(&fixture, Vec::new(), "cancel-launch");
     let launch_task = tokio::spawn(launch(dependencies));
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -812,12 +921,7 @@ async fn cancelling_launch_at_descriptor_pause_cleans_descriptor_lock_and_listen
         !fixture.paths.instance_descriptor.exists(),
         "cancelling the launch removes its published descriptor"
     );
-    assert!(
-        InstanceLock::try_acquire(&fixture.paths.instance_lock)
-            .expect("probe instance lock after cancellation")
-            .is_some(),
-        "cancelling the launch releases its instance lock"
-    );
+    wait_for_instance_lock(&fixture.paths.instance_lock).await;
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -832,6 +936,116 @@ async fn cancelling_launch_at_descriptor_pause_cleans_descriptor_lock_and_listen
     .expect("cancelling the launch stops its listener");
 }
 
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cancelling_startup_with_a_held_runner_retains_lock_until_cleanup_proof() {
+    let fixture = support::StartupFixture::new();
+    fixture.prepare();
+    let queued = seed_queued_task(&fixture, "hold startup cleanup proof").await;
+    let (dependencies, reached) =
+        descriptor_pause_dependencies(&fixture, vec![FakeScenario::Blocking], "cancel-held-runner");
+    let launch_task = tokio::spawn(launch(dependencies));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !reached.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup reaches the descriptor pause");
+    let descriptor = RuntimeDescriptor::read(&fixture.paths.instance_descriptor)
+        .expect("descriptor is available at the pause");
+    let observer = Store::open(&fixture.paths.database_path)
+        .await
+        .expect("open startup cleanup observer");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = observer
+                .task_detail(queued.id)
+                .await
+                .expect("read startup cleanup task")
+                .expect("startup cleanup task exists")
+                .task
+                .status;
+            if status == TaskStatus::Running {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the recovered task starts before startup is cancelled");
+
+    let liveness = ProcessLivenessDirectory::open(&fixture.paths.runtime_dir)
+        .expect("open startup cleanup liveness namespace");
+    let instance_scope = liveness
+        .instance_scope(*descriptor.instance_id().as_bytes())
+        .expect("open startup instance process scope");
+    let held_tree = instance_scope
+        .task_scope(*queued.id.as_uuid().as_bytes())
+        .expect("open startup task process scope")
+        .hold_tree_for_test()
+        .expect("hold startup task process tree");
+
+    launch_task.abort();
+    let cancellation = match launch_task.await {
+        Err(error) => error,
+        Ok(_) => panic!("aborted startup cannot return an outcome"),
+    };
+    assert!(cancellation.is_cancelled());
+    assert!(!fixture.paths.instance_descriptor.exists());
+    assert!(
+        InstanceLock::try_acquire(&fixture.paths.instance_lock)
+            .expect("probe lock while startup process tree is held")
+            .is_none(),
+        "startup cancellation must retain the lock until every registered tree is proven clean"
+    );
+
+    drop(held_tree);
+    wait_for_instance_lock(&fixture.paths.instance_lock).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cancelling_startup_after_pre_actor_process_launch_retains_lock_until_cleanup_proof() {
+    let fixture = support::StartupFixture::new();
+    fixture.prepare();
+    let held_tree = Arc::new(std::sync::Mutex::new(None));
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let mut dependencies = fixture.dependencies(Default::default());
+    dependencies.runner_factory = Arc::new(HeldPreActorTreeFactory {
+        held_tree: Arc::clone(&held_tree),
+        reached: Arc::clone(&reached),
+    });
+    let launch_task = tokio::spawn(launch(dependencies));
+
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .expect("startup reaches the pre-actor process hold");
+    assert!(!launch_task.is_finished());
+
+    launch_task.abort();
+    let cancellation = match launch_task.await {
+        Err(error) => error,
+        Ok(_) => panic!("aborted pre-actor startup cannot return an outcome"),
+    };
+    assert!(cancellation.is_cancelled());
+    assert!(
+        InstanceLock::try_acquire(&fixture.paths.instance_lock)
+            .expect("probe lock while the pre-actor process tree is held")
+            .is_none(),
+        "pre-actor startup cancellation must retain the lock until cleanup is proven"
+    );
+
+    let held_tree = held_tree
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .expect("pre-actor factory published its held process tree");
+    drop(held_tree);
+    wait_for_instance_lock(&fixture.paths.instance_lock).await;
+}
+
 async fn drive_until_finished<T>(task: &tokio::task::JoinHandle<T>) {
     for _ in 0..80 {
         if task.is_finished() {
@@ -841,6 +1055,110 @@ async fn drive_until_finished<T>(task: &tokio::task::JoinHandle<T>) {
         tokio::task::yield_now().await;
     }
     assert!(task.is_finished(), "task did not finish under virtual time");
+}
+
+async fn wait_for_instance_lock(path: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if InstanceLock::try_acquire(path)
+                .expect("probe instance lock after proof-gated cleanup")
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("proof-gated cleanup releases the instance lock");
+}
+
+async fn seed_queued_task(
+    fixture: &support::StartupFixture,
+    prompt: &str,
+) -> coding_agent_domain::Task {
+    let store = Store::open(&fixture.paths.database_path)
+        .await
+        .expect("open seed store");
+    store.migrate().await.expect("migrate seed store");
+    let repository_root = fixture.paths.data_dir.join("seed-repository");
+    std::fs::create_dir_all(repository_root.join(".git"))
+        .expect("create authenticated seed repository identity");
+    let canonical =
+        CanonicalPath::try_from_canonical(repository_root).expect("construct canonical seed path");
+    let repository = match store
+        .register_repository(NewRepository {
+            selected_path: canonical.clone(),
+            display_name: "seed".to_owned(),
+            git_root: canonical.clone(),
+            cargo_workspace_root: canonical,
+        })
+        .await
+        .expect("register seed repository")
+    {
+        RegisterRepositoryOutcome::Created(repository) => repository,
+        RegisterRepositoryOutcome::Existing(_) => panic!("seed repository must be new"),
+    };
+    match store
+        .create_task(
+            NewTask::try_new(ClientRequestId::new(), repository.id, prompt)
+                .expect("construct queued task"),
+        )
+        .await
+        .expect("create queued seed task")
+    {
+        CreateTaskOutcome::Created { task, .. } => task,
+        CreateTaskOutcome::Existing { .. } => panic!("seed task must be new"),
+    }
+}
+
+fn descriptor_pause_dependencies(
+    fixture: &support::StartupFixture,
+    fake_scenarios: Vec<FakeScenario>,
+    scenario_name: &str,
+) -> (StartupDependencies, std::path::PathBuf) {
+    let signals = fixture.paths.runtime_dir.join("signals");
+    std::fs::create_dir(&signals).expect("create actor signal directory");
+    let release = signals.join("descriptor-before-browser.release");
+    let mut reached_name = release
+        .file_name()
+        .expect("release has a file name")
+        .to_os_string();
+    reached_name.push(".reached");
+    let reached = release.with_file_name(reached_name);
+    let scenario = fixture
+        .paths
+        .data_dir
+        .join(format!("{scenario_name}-scenario.json"));
+    std::fs::write(
+        &scenario,
+        serde_json::to_vec(&ProcessTestConfig {
+            runtime_config: None,
+            fake_scenarios,
+            storage_samples: vec![ProcessStorageSample::Native],
+            store_writer_faults: Vec::new(),
+            actor_pauses: vec![ActorPausePoint::DescriptorBeforeBrowser],
+            virtual_release_signals: vec![VirtualReleaseSignal {
+                name: "descriptor-before-browser".to_owned(),
+                path: release,
+                target: VirtualReleaseTarget::ActorDescriptorBeforeBrowser,
+            }],
+            legacy_v2_seed: LegacyV2Seed::None,
+            marker_write_failure: false,
+        })
+        .expect("serialize process-test scenario"),
+    )
+    .expect("write process-test scenario");
+    let environment = ProcessTestEnvironment::load(
+        &fixture.paths.data_dir,
+        &fixture.paths.runtime_dir,
+        &scenario,
+    )
+    .expect("load process-test environment");
+    let dependencies = environment
+        .apply(fixture.dependencies(Default::default()))
+        .expect("apply descriptor pause");
+    (dependencies, reached)
 }
 
 fn fragment_token(url: &str) -> &str {

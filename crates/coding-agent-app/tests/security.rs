@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use std::io::{self, Write};
@@ -7,8 +9,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use coding_agent_api::{
-    ApiError, AuthContext, BootstrapResponse, RequestSecurity, ServiceStateDto, SessionExchange,
-    SessionExchangeRequest,
+    ApiError, AuthContext, BootstrapResponse, RequestSecurity, SchedulerAdmissionStateDto,
+    SchedulerLimitsDto, SchedulerStateDto, SchedulerStorageDto, SchedulerStorageScopeDto,
+    SchedulerStorageStateDto, ServiceStateDto, SessionExchange, SessionExchangeRequest,
 };
 use coding_agent_app::{SecurityClock, SecurityManager, SecuritySeed};
 use http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, COOKIE, HOST, ORIGIN, SET_COOKIE};
@@ -579,15 +582,46 @@ async fn secret_debug_output_is_redacted_and_exchange_adds_no_cors_header() {
     let exchange_request = SessionExchangeRequest {
         token: token.as_str().to_owned(),
     };
+    let server_started_at = support::timestamp();
+    let server_instance_id = uuid::Uuid::new_v4();
     let bootstrap = BootstrapResponse {
         csrf_token: session.csrf.clone(),
         repositories: Vec::new(),
         tasks: Vec::new(),
         latest_event_id: 0,
-        server_started_at: support::timestamp().into(),
+        server_started_at: server_started_at.into(),
         service_state: ServiceStateDto::Ready,
         service_state_generation: 0,
         max_concurrent_tasks: 4,
+        scheduler: SchedulerStateDto {
+            schema_version: 1,
+            server_instance_id,
+            server_started_at: server_started_at.into(),
+            generation: 0,
+            as_of_event_id: 0,
+            service_state_generation: 0,
+            admission_state: SchedulerAdmissionStateDto::Running,
+            limits: SchedulerLimitsDto {
+                global: 4,
+                per_repository: 4,
+                queued: 256,
+                cargo_jobs_per_task: 1,
+            },
+            active_task_count: 0,
+            queued_task_count: 0,
+            queued_tasks: Vec::new(),
+            stopping_tasks: Vec::new(),
+            storage: SchedulerStorageDto {
+                state: SchedulerStorageStateDto::Normal,
+                data: SchedulerStorageScopeDto {
+                    state: SchedulerStorageStateDto::Normal,
+                },
+                runtime: SchedulerStorageScopeDto {
+                    state: SchedulerStorageStateDto::Normal,
+                },
+                repositories: Vec::new(),
+            },
+        },
     };
 
     let bytes = Arc::new(Mutex::new(Vec::new()));

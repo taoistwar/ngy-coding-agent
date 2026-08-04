@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -18,20 +19,22 @@ use coding_agent_domain::{
 };
 use coding_agent_provider::ChatCompletionsClient;
 use coding_agent_runtime::{
-    ATTEMPT_IDENTITY_MISMATCH, ProvisionedWorktree, RoleScopedEngineFactory, RuntimeSession,
-    RuntimeSessionLimits, ToolchainPaths, WorktreeArtifactState, WorktreeError, WorktreeIdentity,
-    WorktreeProvisioner, WorktreeReservation,
+    ATTEMPT_IDENTITY_MISMATCH, ProcessLivenessScope, ProvisionedWorktree, RoleScopedEngineFactory,
+    RuntimeSession, RuntimeSessionLimits, ToolchainPaths, WorktreeArtifactState, WorktreeError,
+    WorktreeIdentity, WorktreeProvisioner, WorktreeReservation,
 };
 use coding_agent_store::{
-    AttemptArtifactIdentity, AttemptArtifactState, ReserveAttemptArtifact, StoreError,
+    AttemptArtifactIdentity, AttemptArtifactState, ReserveAttemptArtifact, Store,
 };
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    RunContext, RunnerEvent, RunnerEventError, RunnerEventSink, RunnerOutcome, StoreWriterError,
-    StoreWriterHandle, TaskRunner, WallClock,
+    ArtifactMutationDisposition, LiveStoreWriterArtifactAdapter, RepositoryControlCoordinator,
+    RepositoryControlError, RepositoryControlLease, RepositoryControlPoisonReason,
+    RepositoryIdentityResolver, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink,
+    RunnerOutcome, StoreWriterHandle, TaskRunner, WallClock,
 };
 
 const DEFAULT_ARTIFACT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,9 +42,12 @@ const DEFAULT_DIFF_DEBOUNCE: Duration = Duration::from_millis(100);
 const MAX_ARTIFACT_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_DIFF_DEBOUNCE: Duration = Duration::from_secs(10);
 const ARTIFACT_STORE_FAILED: &str = "ARTIFACT_STORE_FAILED";
+const REPOSITORY_CONTROL_BUSY: &str = "REPOSITORY_CONTROL_BUSY";
 const EVENT_SINK_REJECTED: &str = "CODING_RUNNER_EVENT_REJECTED";
 const WORKTREE_STATE_INCONSISTENT: &str = "WORKTREE_STATE_INCONSISTENT";
+const WORKTREE_RESERVATION_ABANDONED: &str = "WORKTREE_RESERVATION_ABANDONED";
 const COMMAND_CANCELLED: &str = "COMMAND_CANCELLED";
+const PROCESS_TREE_CLEANUP_FAILED: &str = "PROCESS_TREE_CLEANUP_FAILED";
 const CODING_AGENT_FAILED: &str = "CODING_AGENT_FAILED";
 const EVENT_SINK_MESSAGE: &str = "task progress could not be persisted";
 const ISOLATION_CONTEXT: &str =
@@ -133,6 +139,7 @@ impl AttemptReservation {
 pub struct CodingAttemptError {
     code: String,
     retryable: bool,
+    repository_poison_required: bool,
 }
 
 impl CodingAttemptError {
@@ -140,7 +147,13 @@ impl CodingAttemptError {
         Self {
             code: code.into(),
             retryable,
+            repository_poison_required: false,
         }
+    }
+
+    pub fn with_repository_poison_required(mut self) -> Self {
+        self.repository_poison_required = true;
+        self
     }
 
     pub fn code(&self) -> &str {
@@ -150,6 +163,10 @@ impl CodingAttemptError {
     pub const fn retryable(&self) -> bool {
         self.retryable
     }
+
+    pub const fn repository_poison_required(&self) -> bool {
+        self.repository_poison_required
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,17 +175,36 @@ pub enum AttemptArtifactObservation {
     Partial,
     Ready,
     Inconsistent,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodingAttemptProvisionError {
     cause: CodingAttemptError,
     observation: AttemptArtifactObservation,
+    process_cleanup_unproven: bool,
+    repository_poison_required: bool,
 }
 
 impl CodingAttemptProvisionError {
     pub fn new(cause: CodingAttemptError, observation: AttemptArtifactObservation) -> Self {
-        Self { cause, observation }
+        let repository_poison_required = cause.repository_poison_required();
+        Self {
+            cause,
+            observation,
+            process_cleanup_unproven: false,
+            repository_poison_required,
+        }
+    }
+
+    pub fn with_unproven_process_cleanup(mut self) -> Self {
+        self.process_cleanup_unproven = true;
+        self
+    }
+
+    pub fn with_repository_poison_required(mut self) -> Self {
+        self.repository_poison_required = true;
+        self
     }
 
     pub const fn cause(&self) -> &CodingAttemptError {
@@ -177,6 +213,14 @@ impl CodingAttemptProvisionError {
 
     pub const fn observation(&self) -> AttemptArtifactObservation {
         self.observation
+    }
+
+    pub const fn process_cleanup_is_unproven(&self) -> bool {
+        self.process_cleanup_unproven
+    }
+
+    pub const fn repository_poison_required(&self) -> bool {
+        self.repository_poison_required
     }
 }
 
@@ -401,6 +445,16 @@ fn map_finalization_identity(
 pub trait CodingAgentAttempt: Send + 'static {
     fn reservation(&self) -> &AttemptReservation;
 
+    /// Re-opens an already durable ready artifact without replaying the Git
+    /// side effect. Production worktree attempts override this method with
+    /// capability-bound live validation.
+    async fn open_existing_ready(
+        &mut self,
+        _cancellation: CancellationToken,
+    ) -> Result<(), CodingAttemptError> {
+        Err(CodingAttemptError::new(WORKTREE_STATE_INCONSISTENT, false))
+    }
+
     async fn provision(
         &mut self,
         cancellation: CancellationToken,
@@ -420,6 +474,7 @@ pub trait CodingAgentAttemptFactory: Send + Sync + 'static {
         &self,
         identity: WorktreeIdentity,
         repository: Repository,
+        process_liveness_scope: ProcessLivenessScope,
         cancellation: CancellationToken,
     ) -> Result<Box<dyn CodingAgentAttempt>, CodingAttemptError>;
 }
@@ -428,12 +483,16 @@ pub trait RepositoryWorktreeProvisionerFactory: Send + Sync + 'static {
     fn create(
         &self,
         repository: &Repository,
+        process_liveness_scope: ProcessLivenessScope,
     ) -> Result<Arc<WorktreeProvisioner>, CodingAttemptError>;
 }
 
 impl<F> RepositoryWorktreeProvisionerFactory for F
 where
-    F: Fn(&Repository) -> Result<Arc<WorktreeProvisioner>, CodingAttemptError>
+    F: Fn(
+            &Repository,
+            ProcessLivenessScope,
+        ) -> Result<Arc<WorktreeProvisioner>, CodingAttemptError>
         + Send
         + Sync
         + 'static,
@@ -441,8 +500,9 @@ where
     fn create(
         &self,
         repository: &Repository,
+        process_liveness_scope: ProcessLivenessScope,
     ) -> Result<Arc<WorktreeProvisioner>, CodingAttemptError> {
-        self(repository)
+        self(repository, process_liveness_scope)
     }
 }
 
@@ -451,6 +511,7 @@ pub trait ProvisionedAgentRuntimeFactory: Send + Sync + 'static {
     async fn create(
         &self,
         worktree: &ProvisionedWorktree,
+        process_liveness_scope: ProcessLivenessScope,
         cancellation: CancellationToken,
     ) -> Result<TaskAgentRuntime, CodingAttemptError>;
 }
@@ -458,6 +519,7 @@ pub trait ProvisionedAgentRuntimeFactory: Send + Sync + 'static {
 pub struct Project2RuntimeSessionFactory {
     toolchain: ToolchainPaths,
     temporary_directory: PathBuf,
+    cargo_jobs_per_task: NonZeroU32,
     limits: RuntimeSessionLimits,
 }
 
@@ -465,11 +527,13 @@ impl Project2RuntimeSessionFactory {
     pub fn new(
         toolchain: ToolchainPaths,
         temporary_directory: impl Into<PathBuf>,
+        cargo_jobs_per_task: NonZeroU32,
         limits: RuntimeSessionLimits,
     ) -> Self {
         Self {
             toolchain,
             temporary_directory: temporary_directory.into(),
+            cargo_jobs_per_task,
             limits,
         }
     }
@@ -477,10 +541,12 @@ impl Project2RuntimeSessionFactory {
     pub fn project_2_defaults(
         toolchain: ToolchainPaths,
         temporary_directory: impl Into<PathBuf>,
+        cargo_jobs_per_task: NonZeroU32,
     ) -> Self {
         Self::new(
             toolchain,
             temporary_directory,
+            cargo_jobs_per_task,
             RuntimeSessionLimits::project_2_defaults(),
         )
     }
@@ -491,12 +557,15 @@ impl ProvisionedAgentRuntimeFactory for Project2RuntimeSessionFactory {
     async fn create(
         &self,
         worktree: &ProvisionedWorktree,
+        process_liveness_scope: ProcessLivenessScope,
         _cancellation: CancellationToken,
     ) -> Result<TaskAgentRuntime, CodingAttemptError> {
         let runtime = RuntimeSession::from_provisioned_worktree(
             worktree,
             &self.toolchain,
             &self.temporary_directory,
+            process_liveness_scope,
+            self.cargo_jobs_per_task,
             self.limits,
         )
         .map_err(|error| CodingAttemptError::new(error.code(), false))?;
@@ -527,6 +596,7 @@ impl WorktreeCodingAgentAttemptFactory {
 struct WorktreeCodingAgentAttempt {
     provisioner: Arc<WorktreeProvisioner>,
     runtime_factory: Arc<dyn ProvisionedAgentRuntimeFactory>,
+    process_liveness_scope: ProcessLivenessScope,
     reservation: AttemptReservation,
     runtime_reservation: Option<WorktreeReservation>,
     worktree: Option<ProvisionedWorktree>,
@@ -538,9 +608,12 @@ impl CodingAgentAttemptFactory for WorktreeCodingAgentAttemptFactory {
         &self,
         identity: WorktreeIdentity,
         repository: Repository,
+        process_liveness_scope: ProcessLivenessScope,
         cancellation: CancellationToken,
     ) -> Result<Box<dyn CodingAgentAttempt>, CodingAttemptError> {
-        let provisioner = self.provisioners.create(&repository)?;
+        let provisioner = self
+            .provisioners
+            .create(&repository, process_liveness_scope.clone())?;
         let runtime_reservation = provisioner
             .prepare(identity, cancellation)
             .await
@@ -554,6 +627,7 @@ impl CodingAgentAttemptFactory for WorktreeCodingAgentAttemptFactory {
         Ok(Box::new(WorktreeCodingAgentAttempt {
             provisioner,
             runtime_factory: Arc::clone(&self.runtimes),
+            process_liveness_scope,
             reservation,
             runtime_reservation: Some(runtime_reservation),
             worktree: None,
@@ -565,6 +639,25 @@ impl CodingAgentAttemptFactory for WorktreeCodingAgentAttemptFactory {
 impl CodingAgentAttempt for WorktreeCodingAgentAttempt {
     fn reservation(&self) -> &AttemptReservation {
         &self.reservation
+    }
+
+    async fn open_existing_ready(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<(), CodingAttemptError> {
+        let reservation = self
+            .runtime_reservation
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| CodingAttemptError::new(WORKTREE_STATE_INCONSISTENT, false))?;
+        let worktree = self
+            .provisioner
+            .open_ready(&reservation, cancellation)
+            .await
+            .map_err(|error| worktree_attempt_error(&error))?;
+        self.runtime_reservation = None;
+        self.worktree = Some(worktree);
+        Ok(())
     }
 
     async fn provision(
@@ -588,9 +681,19 @@ impl CodingAgentAttempt for WorktreeCodingAgentAttempt {
                 Ok(())
             }
             Err(error) => {
-                let observation = match error.artifact_state() {
-                    WorktreeArtifactState::Absent => AttemptArtifactObservation::Absent,
-                    WorktreeArtifactState::Partial => AttemptArtifactObservation::Partial,
+                let process_cleanup_unproven = error.process_cleanup_is_unproven();
+                let mut repository_poison_required = error.repository_poison_required();
+                let cause = worktree_attempt_error(error.cause());
+                if process_cleanup_unproven {
+                    return Err(CodingAttemptProvisionError::new(
+                        cause,
+                        AttemptArtifactObservation::Unavailable,
+                    )
+                    .with_unproven_process_cleanup());
+                }
+                let (observation, cause) = match error.artifact_state() {
+                    WorktreeArtifactState::Absent => (AttemptArtifactObservation::Absent, cause),
+                    WorktreeArtifactState::Partial => (AttemptArtifactObservation::Partial, cause),
                     WorktreeArtifactState::Ready => {
                         match self
                             .provisioner
@@ -599,19 +702,32 @@ impl CodingAgentAttempt for WorktreeCodingAgentAttempt {
                         {
                             Ok(worktree) => {
                                 self.worktree = Some(worktree);
-                                AttemptArtifactObservation::Ready
+                                (AttemptArtifactObservation::Ready, cause)
                             }
-                            Err(_) => AttemptArtifactObservation::Inconsistent,
+                            Err(open_error) => {
+                                repository_poison_required |=
+                                    open_error.requires_repository_poison();
+                                let state = open_error.artifact_state_after_failed_observation();
+                                (
+                                    attempt_artifact_observation(state),
+                                    prefer_unproven_cleanup_cause(&cause, &open_error),
+                                )
+                            }
                         }
                     }
-                    WorktreeArtifactState::Inconsistent => AttemptArtifactObservation::Inconsistent,
+                    WorktreeArtifactState::Inconsistent => {
+                        (AttemptArtifactObservation::Inconsistent, cause)
+                    }
+                    WorktreeArtifactState::Unavailable => {
+                        (AttemptArtifactObservation::Unavailable, cause)
+                    }
                 };
-                let cause = if observation == AttemptArtifactObservation::Inconsistent {
-                    CodingAttemptError::new(WORKTREE_STATE_INCONSISTENT, false)
+                let failure = CodingAttemptProvisionError::new(cause, observation);
+                Err(if repository_poison_required {
+                    failure.with_repository_poison_required()
                 } else {
-                    worktree_attempt_error(error.cause())
-                };
-                Err(CodingAttemptProvisionError::new(cause, observation))
+                    failure
+                })
             }
         }
     }
@@ -624,22 +740,50 @@ impl CodingAgentAttempt for WorktreeCodingAgentAttempt {
             .worktree
             .as_ref()
             .ok_or_else(|| CodingAttemptError::new(WORKTREE_STATE_INCONSISTENT, false))?;
-        self.runtime_factory.create(worktree, cancellation).await
+        self.runtime_factory
+            .create(worktree, self.process_liveness_scope.clone(), cancellation)
+            .await
+    }
+}
+
+fn attempt_artifact_observation(state: WorktreeArtifactState) -> AttemptArtifactObservation {
+    match state {
+        WorktreeArtifactState::Absent => AttemptArtifactObservation::Absent,
+        WorktreeArtifactState::Partial => AttemptArtifactObservation::Partial,
+        WorktreeArtifactState::Ready => AttemptArtifactObservation::Ready,
+        WorktreeArtifactState::Inconsistent => AttemptArtifactObservation::Inconsistent,
+        WorktreeArtifactState::Unavailable => AttemptArtifactObservation::Unavailable,
+    }
+}
+
+fn prefer_unproven_cleanup_cause(
+    original: &CodingAttemptError,
+    observed: &WorktreeError,
+) -> CodingAttemptError {
+    if original.code() == PROCESS_TREE_CLEANUP_FAILED {
+        original.clone()
+    } else {
+        worktree_attempt_error(observed)
     }
 }
 
 fn worktree_attempt_error(error: &WorktreeError) -> CodingAttemptError {
     let code = error.code();
-    CodingAttemptError::new(
+    let attempt_error = CodingAttemptError::new(
         code,
         matches!(
             code,
             "COMMAND_TIMED_OUT"
                 | "WORKTREE_CREATE_FAILED"
-                | "PROCESS_TREE_CLEANUP_FAILED"
+                | PROCESS_TREE_CLEANUP_FAILED
                 | "COMMAND_OUTPUT_LIMIT"
         ),
-    )
+    );
+    if error.requires_repository_poison() {
+        attempt_error.with_repository_poison_required()
+    } else {
+        attempt_error
+    }
 }
 
 pub struct TaskModelSession {
@@ -679,24 +823,73 @@ impl TaskModelProviderFactory for ChatCompletionsClient {
     }
 }
 
+pub struct CodingAgentPreparationControl {
+    artifacts: LiveStoreWriterArtifactAdapter,
+    repository_control: Arc<RepositoryControlCoordinator>,
+    repository_identity_resolver: Arc<dyn RepositoryIdentityResolver>,
+}
+
+impl CodingAgentPreparationControl {
+    pub fn new(
+        store: Store,
+        writer: StoreWriterHandle,
+        repository_control: Arc<RepositoryControlCoordinator>,
+        repository_identity_resolver: Arc<dyn RepositoryIdentityResolver>,
+    ) -> Self {
+        Self {
+            artifacts: LiveStoreWriterArtifactAdapter::new(store, writer),
+            repository_control,
+            repository_identity_resolver,
+        }
+    }
+}
+
 pub struct CodingAgentRunner {
-    writer: StoreWriterHandle,
+    artifacts: LiveStoreWriterArtifactAdapter,
+    repository_control: Arc<RepositoryControlCoordinator>,
+    repository_identity_resolver: Arc<dyn RepositoryIdentityResolver>,
     providers: Arc<dyn TaskModelProviderFactory>,
     attempts: Arc<dyn CodingAgentAttemptFactory>,
     clock: Arc<dyn WallClock>,
     config: CodingAgentRunnerConfig,
 }
 
+struct PreparedCodingAttempt {
+    context: RunContext,
+    attempt: Box<dyn CodingAgentAttempt>,
+}
+
+struct PreparationFailure(Box<RunnerOutcome>);
+
+impl From<RunnerOutcome> for PreparationFailure {
+    fn from(outcome: RunnerOutcome) -> Self {
+        Self(Box::new(outcome))
+    }
+}
+
+impl PreparationFailure {
+    fn into_outcome(self) -> RunnerOutcome {
+        *self.0
+    }
+}
+
 impl CodingAgentRunner {
     pub fn new(
-        writer: StoreWriterHandle,
+        preparation: CodingAgentPreparationControl,
         providers: Arc<dyn TaskModelProviderFactory>,
         attempts: Arc<dyn CodingAgentAttemptFactory>,
         clock: Arc<dyn WallClock>,
         config: CodingAgentRunnerConfig,
     ) -> Self {
+        let CodingAgentPreparationControl {
+            artifacts,
+            repository_control,
+            repository_identity_resolver,
+        } = preparation;
         Self {
-            writer,
+            artifacts,
+            repository_control,
+            repository_identity_resolver,
             providers,
             attempts,
             clock,
@@ -712,9 +905,8 @@ impl CodingAgentRunner {
         &self,
         identity: AttemptArtifactIdentity,
         reservation: &AttemptReservation,
-    ) -> Result<AttemptArtifactState, TaskFailure> {
-        let receipt = match self
-            .writer
+    ) -> ArtifactMutationDisposition {
+        self.artifacts
             .reserve_attempt_artifact(
                 ReserveAttemptArtifact {
                     identity,
@@ -725,93 +917,359 @@ impl CodingAgentRunner {
                 self.write_deadline(),
             )
             .await
-        {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                if matches!(
-                    &error,
-                    StoreWriterError::Store(StoreError::ArtifactIdentityConflict)
-                ) {
-                    let _ = self
-                        .mark_inconsistent(identity, WORKTREE_STATE_INCONSISTENT)
-                        .await;
-                }
-                return Err(artifact_write_failure(&error));
-            }
-        };
-        Ok(receipt.value.artifact().state)
     }
 
-    async fn mark_ready(&self, identity: AttemptArtifactIdentity) -> Result<(), TaskFailure> {
-        self.writer
+    async fn mark_ready(&self, identity: AttemptArtifactIdentity) -> ArtifactMutationDisposition {
+        self.artifacts
             .mark_attempt_artifact_ready(identity, self.write_deadline())
             .await
-            .map(|_| ())
-            .map_err(|error| artifact_write_failure(&error))
     }
 
     async fn mark_inconsistent(
         &self,
         identity: AttemptArtifactIdentity,
         code: &str,
-    ) -> Result<(), TaskFailure> {
-        self.writer
+    ) -> ArtifactMutationDisposition {
+        self.artifacts
             .mark_attempt_artifact_inconsistent(identity, safe_code(code), self.write_deadline())
             .await
-            .map(|_| ())
-            .map_err(|error| artifact_write_failure(&error))
     }
 
-    async fn finish_ready_provision_error(
+    async fn prepare_attempt(
         &self,
-        context: &RunContext,
-        sink: RunnerEventSink,
-        task_runtime: Option<TaskAgentRuntime>,
-        cause: CodingAttemptError,
-    ) -> RunnerOutcome {
-        let Some(task_runtime) = task_runtime else {
-            return outcome_for_attempt_error(cause, &context.cancellation);
-        };
-        let projection_cancellation = CancellationToken::new();
-        let events = AppRoleEventSink::new(
-            sink,
-            Arc::clone(&self.clock),
-            context.task.started_at.unwrap_or(context.task.created_at),
-            self.config.diff_debounce(),
+        mut context: RunContext,
+    ) -> Result<PreparedCodingAttempt, PreparationFailure> {
+        if context.cancellation.is_cancelled() {
+            return Err(RunnerOutcome::Cancelled.into());
+        }
+
+        let mut lease = context
+            .take_control_lease()
+            .map_err(|_| invariant_preparation_outcome())?;
+
+        if let Err(error) = self.repository_control.revalidate_repository(
+            context.repository.id,
+            self.repository_identity_resolver.as_ref(),
+        ) {
+            let _ = lease.poison(repository_poison_reason(error));
+            return Err(repository_control_outcome(error));
+        }
+
+        let identity = match WorktreeIdentity::try_new(
+            context.repository.id.to_string(),
             context.task.id.to_string(),
-            projection_cancellation.clone(),
-        );
-        let capture_cancellation = CancellationToken::new();
-        let terminal_snapshot = match timeout(
-            self.config.artifact_write_timeout(),
-            task_runtime.terminal_snapshot(0, capture_cancellation.clone()),
-        )
-        .await
-        {
-            Ok(Ok(snapshot)) => Some(snapshot),
-            Ok(Err(_)) => None,
-            Err(_) => {
-                capture_cancellation.cancel();
-                None
+            context.task.attempt,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(release_before_reservation(
+                    lease,
+                    RunnerOutcome::Failed(stable_failure(error.code(), false)),
+                ));
             }
         };
-        if let Some(snapshot) = terminal_snapshot
-            && timeout(
-                self.config.artifact_write_timeout(),
-                events.emit(
-                    RoleEvent::Diff(snapshot.diff),
-                    projection_cancellation.clone(),
-                ),
+        let mut attempt = match self
+            .attempts
+            .prepare(
+                identity,
+                context.repository.clone(),
+                context.process_liveness_scope().clone(),
+                context.cancellation.clone(),
             )
             .await
-            .is_err()
         {
-            projection_cancellation.cancel();
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let outcome = outcome_for_attempt_error(error.clone(), &context.cancellation);
+                if error.code() == PROCESS_TREE_CLEANUP_FAILED {
+                    let _ = lease
+                        .retain_fail_closed(RepositoryControlPoisonReason::GitChildOutcomeUnknown);
+                    return Err(outcome.into());
+                }
+                if preparation_error_requires_poison(&error) {
+                    let _ = lease.poison(preparation_error_poison_reason(&error));
+                    return Err(outcome.into());
+                }
+                return Err(release_before_reservation(lease, outcome));
+            }
+        };
+        if context.cancellation.is_cancelled() {
+            return Err(release_before_reservation(lease, RunnerOutcome::Cancelled));
         }
-        if events.finish().await.is_err() {
-            return event_failure_outcome(&context.cancellation);
+
+        let artifact_identity = AttemptArtifactIdentity {
+            task_id: context.task.id,
+            repository_id: context.repository.id,
+            attempt: context.task.attempt,
+        };
+        context
+            .record_artifact_identity(artifact_identity)
+            .map_err(|_| invariant_preparation_outcome())?;
+
+        let reservation = self
+            .reserve_artifact(artifact_identity, attempt.reservation())
+            .await;
+        match reservation {
+            ArtifactMutationDisposition::Confirmed(artifact) => match artifact.state {
+                AttemptArtifactState::Reserved => {}
+                AttemptArtifactState::Ready => {
+                    if let Err(error) = attempt.open_existing_ready(CancellationToken::new()).await
+                    {
+                        let _ = close_lease_after_validation_error(lease, error.code());
+                        return Err(outcome_for_attempt_error(error, &context.cancellation).into());
+                    }
+                    return self.finish_prepared(context, attempt, lease).await;
+                }
+                AttemptArtifactState::Inconsistent => {
+                    return Err(release_before_reservation(
+                        lease,
+                        RunnerOutcome::Failed(stable_failure(WORKTREE_STATE_INCONSISTENT, false)),
+                    ));
+                }
+            },
+            ArtifactMutationDisposition::Reconciled(evidence) => {
+                let state = evidence.state();
+                if lease
+                    .mark_poisoned(RepositoryControlPoisonReason::ReservationWriteFailed)
+                    .and_then(|()| lease.promote_to_reconciliation())
+                    .is_err()
+                {
+                    let _ = lease
+                        .retain_fail_closed(RepositoryControlPoisonReason::ReservationWriteFailed);
+                    return Err(invariant_preparation_outcome());
+                }
+                let proof =
+                    match lease.verify_artifact_reconciliation(artifact_identity, state, &evidence)
+                    {
+                        Ok(proof) => proof,
+                        Err(_) => {
+                            let _ = lease.retain_fail_closed(
+                                RepositoryControlPoisonReason::ReservationWriteFailed,
+                            );
+                            return Err(invariant_preparation_outcome());
+                        }
+                    };
+                if let Err(error) = self.repository_control.revalidate_repository(
+                    context.repository.id,
+                    self.repository_identity_resolver.as_ref(),
+                ) {
+                    return Err(self
+                        .finish_repository_revalidation_failure(lease, artifact_identity, error)
+                        .await);
+                }
+                match state {
+                    AttemptArtifactState::Reserved => {
+                        if lease.resume_operation_after_reconciliation(proof).is_err() {
+                            let _ = lease.retain_fail_closed(
+                                RepositoryControlPoisonReason::ReservationWriteFailed,
+                            );
+                            return Err(invariant_preparation_outcome());
+                        }
+                    }
+                    AttemptArtifactState::Ready => {
+                        if let Err(error) =
+                            attempt.open_existing_ready(CancellationToken::new()).await
+                        {
+                            let _ = close_lease_after_validation_error(lease, error.code());
+                            return Err(
+                                outcome_for_attempt_error(error, &context.cancellation).into()
+                            );
+                        }
+                        if let Err(error) = self.repository_control.revalidate_repository(
+                            context.repository.id,
+                            self.repository_identity_resolver.as_ref(),
+                        ) {
+                            return Err(self
+                                .finish_repository_revalidation_failure(
+                                    lease,
+                                    artifact_identity,
+                                    error,
+                                )
+                                .await);
+                        }
+                        if lease.clean_release_after_reconciliation(proof).is_err() {
+                            return Err(invariant_preparation_outcome());
+                        }
+                        return mark_context_prepared(context, attempt).await;
+                    }
+                    AttemptArtifactState::Inconsistent => {
+                        if lease.clean_release_after_reconciliation(proof).is_err() {
+                            return Err(invariant_preparation_outcome());
+                        }
+                        return Err(RunnerOutcome::Failed(stable_failure(
+                            WORKTREE_STATE_INCONSISTENT,
+                            false,
+                        ))
+                        .into());
+                    }
+                }
+            }
+            ArtifactMutationDisposition::Unresolved => {
+                let _ =
+                    lease.retain_fail_closed(RepositoryControlPoisonReason::ReservationWriteFailed);
+                return Err(
+                    RunnerOutcome::Failed(stable_failure(ARTIFACT_STORE_FAILED, true)).into(),
+                );
+            }
+            ArtifactMutationDisposition::Conflict => {
+                let _ =
+                    lease.retain_fail_closed(RepositoryControlPoisonReason::ReservationWriteFailed);
+                return Err(RunnerOutcome::Failed(stable_failure(
+                    WORKTREE_STATE_INCONSISTENT,
+                    false,
+                ))
+                .into());
+            }
         }
-        outcome_for_attempt_error(cause, &context.cancellation)
+
+        let provision = attempt.provision(context.cancellation.clone()).await;
+        let ready = match provision {
+            Ok(()) => true,
+            Err(error)
+                if error.process_cleanup_is_unproven()
+                    || error.cause().code() == PROCESS_TREE_CLEANUP_FAILED =>
+            {
+                let _ =
+                    lease.retain_fail_closed(RepositoryControlPoisonReason::GitChildOutcomeUnknown);
+                return Err(RunnerOutcome::ProcessCleanupUnproven.into());
+            }
+            Err(error) => {
+                let cause = error.cause().clone();
+                if cause.code() == "REPOSITORY_IDENTITY_MISMATCH"
+                    || error.repository_poison_required()
+                {
+                    let disposition = self
+                        .mark_inconsistent(artifact_identity, WORKTREE_STATE_INCONSISTENT)
+                        .await;
+                    if let Err(failure) = finish_identity_mismatch_mutation(lease, disposition) {
+                        return Err(RunnerOutcome::Failed(failure).into());
+                    }
+                    return Err(outcome_for_attempt_error(cause, &context.cancellation).into());
+                }
+                match error.observation() {
+                    AttemptArtifactObservation::Ready => true,
+                    AttemptArtifactObservation::Absent => {
+                        let disposition = self
+                            .mark_inconsistent(artifact_identity, WORKTREE_RESERVATION_ABANDONED)
+                            .await;
+                        if let Err(failure) = finish_terminal_artifact_mutation(
+                            lease,
+                            disposition,
+                            RepositoryControlPoisonReason::InconsistentWriteFailed,
+                        ) {
+                            return Err(RunnerOutcome::Failed(failure).into());
+                        }
+                        return Err(outcome_for_attempt_error(cause, &context.cancellation).into());
+                    }
+                    AttemptArtifactObservation::Partial => {
+                        let disposition = self
+                            .mark_inconsistent(artifact_identity, WORKTREE_STATE_INCONSISTENT)
+                            .await;
+                        if let Err(failure) = finish_terminal_artifact_mutation(
+                            lease,
+                            disposition,
+                            RepositoryControlPoisonReason::InconsistentWriteFailed,
+                        ) {
+                            return Err(RunnerOutcome::Failed(failure).into());
+                        }
+                        return Err(outcome_for_attempt_error(cause, &context.cancellation).into());
+                    }
+                    AttemptArtifactObservation::Inconsistent => {
+                        let disposition = self
+                            .mark_inconsistent(artifact_identity, WORKTREE_STATE_INCONSISTENT)
+                            .await;
+                        if let Err(failure) = finish_terminal_artifact_mutation(
+                            lease,
+                            disposition,
+                            RepositoryControlPoisonReason::InconsistentWriteFailed,
+                        ) {
+                            return Err(RunnerOutcome::Failed(failure).into());
+                        }
+                        return Err(outcome_for_attempt_error(cause, &context.cancellation).into());
+                    }
+                    AttemptArtifactObservation::Unavailable => {
+                        let _ = lease.poison(RepositoryControlPoisonReason::IdentityUnavailable);
+                        return Err(outcome_for_attempt_error(cause, &context.cancellation).into());
+                    }
+                }
+            }
+        };
+        debug_assert!(ready);
+
+        if let Err(error) = self.repository_control.revalidate_repository(
+            context.repository.id,
+            self.repository_identity_resolver.as_ref(),
+        ) {
+            return Err(self
+                .finish_repository_revalidation_failure(lease, artifact_identity, error)
+                .await);
+        }
+
+        let disposition = self.mark_ready(artifact_identity).await;
+        if let Err(failure) = finish_terminal_artifact_mutation(
+            lease,
+            disposition,
+            RepositoryControlPoisonReason::ReadyWriteFailed,
+        ) {
+            return Err(RunnerOutcome::Failed(failure).into());
+        }
+        mark_context_prepared(context, attempt).await
+    }
+
+    async fn finish_prepared(
+        &self,
+        context: RunContext,
+        attempt: Box<dyn CodingAgentAttempt>,
+        lease: RepositoryControlLease,
+    ) -> Result<PreparedCodingAttempt, PreparationFailure> {
+        if let Err(error) = self.repository_control.revalidate_repository(
+            context.repository.id,
+            self.repository_identity_resolver.as_ref(),
+        ) {
+            let artifact_identity = AttemptArtifactIdentity {
+                task_id: context.task.id,
+                repository_id: context.repository.id,
+                attempt: context.task.attempt,
+            };
+            return Err(self
+                .finish_repository_revalidation_failure(lease, artifact_identity, error)
+                .await);
+        }
+        if lease.clean_release().is_err() {
+            return Err(invariant_preparation_outcome());
+        }
+        mark_context_prepared(context, attempt).await
+    }
+
+    async fn finish_repository_revalidation_failure(
+        &self,
+        lease: RepositoryControlLease,
+        artifact_identity: AttemptArtifactIdentity,
+        error: RepositoryControlError,
+    ) -> PreparationFailure {
+        if matches!(
+            error,
+            RepositoryControlError::IdentityDrift | RepositoryControlError::AliasConflict
+        ) {
+            let disposition = self
+                .mark_inconsistent(artifact_identity, WORKTREE_STATE_INCONSISTENT)
+                .await;
+            return match finish_identity_mismatch_mutation(lease, disposition) {
+                Ok(()) => repository_control_outcome(error),
+                Err(failure) => RunnerOutcome::Failed(failure).into(),
+            };
+        }
+        let reason = repository_poison_reason(error);
+        let completion = if error == RepositoryControlError::IdentityUnavailable {
+            lease.poison(reason)
+        } else {
+            lease.retain_fail_closed(reason)
+        };
+        if completion.is_err() {
+            invariant_preparation_outcome()
+        } else {
+            repository_control_outcome(error)
+        }
     }
 
     async fn cleanup_terminal_events(
@@ -829,6 +1287,7 @@ impl CodingAgentRunner {
         .await
         {
             Ok(Ok(snapshot)) => Some(snapshot),
+            Ok(Err(error)) if error.code == PROCESS_TREE_CLEANUP_FAILED => return Err(error),
             Ok(Err(_)) => None,
             Err(_) => {
                 capture_cancellation.cancel();
@@ -891,89 +1350,200 @@ impl CodingAgentRunner {
     }
 }
 
+async fn mark_context_prepared(
+    mut context: RunContext,
+    attempt: Box<dyn CodingAgentAttempt>,
+) -> Result<PreparedCodingAttempt, PreparationFailure> {
+    if context.artifact_identity().is_none() {
+        return Err(invariant_preparation_outcome());
+    }
+    context
+        .mark_preparation_complete()
+        .await
+        .map_err(|_| invariant_preparation_outcome())?;
+    Ok(PreparedCodingAttempt { context, attempt })
+}
+
+fn release_before_reservation(
+    lease: RepositoryControlLease,
+    outcome: RunnerOutcome,
+) -> PreparationFailure {
+    if lease.clean_release().is_ok() {
+        outcome.into()
+    } else {
+        invariant_preparation_outcome()
+    }
+}
+
+fn finish_terminal_artifact_mutation(
+    mut lease: RepositoryControlLease,
+    disposition: ArtifactMutationDisposition,
+    poison_reason: RepositoryControlPoisonReason,
+) -> Result<(), TaskFailure> {
+    match disposition {
+        ArtifactMutationDisposition::Confirmed(artifact) => {
+            if !matches!(
+                artifact.state,
+                AttemptArtifactState::Ready | AttemptArtifactState::Inconsistent
+            ) {
+                let _ = lease.retain_fail_closed(poison_reason);
+                return Err(stable_failure(WORKTREE_STATE_INCONSISTENT, false));
+            }
+            lease
+                .clean_release()
+                .map_err(|_| stable_failure(REPOSITORY_CONTROL_BUSY, true))
+        }
+        ArtifactMutationDisposition::Reconciled(evidence) => {
+            let identity = evidence.identity();
+            let state = evidence.state();
+            if !matches!(
+                state,
+                AttemptArtifactState::Ready | AttemptArtifactState::Inconsistent
+            ) {
+                let _ = lease.retain_fail_closed(poison_reason);
+                return Err(stable_failure(WORKTREE_STATE_INCONSISTENT, false));
+            }
+            if lease
+                .mark_poisoned(poison_reason)
+                .and_then(|()| lease.promote_to_reconciliation())
+                .is_err()
+            {
+                let _ = lease.retain_fail_closed(poison_reason);
+                return Err(stable_failure(REPOSITORY_CONTROL_BUSY, true));
+            }
+            let proof = match lease.verify_artifact_reconciliation(identity, state, &evidence) {
+                Ok(proof) => proof,
+                Err(_) => {
+                    let _ = lease.retain_fail_closed(poison_reason);
+                    return Err(stable_failure(REPOSITORY_CONTROL_BUSY, true));
+                }
+            };
+            lease
+                .clean_release_after_reconciliation(proof)
+                .map_err(|_| stable_failure(REPOSITORY_CONTROL_BUSY, true))
+        }
+        ArtifactMutationDisposition::Unresolved => {
+            let _ = lease.retain_fail_closed(poison_reason);
+            Err(stable_failure(ARTIFACT_STORE_FAILED, true))
+        }
+        ArtifactMutationDisposition::Conflict => {
+            let _ = lease.retain_fail_closed(poison_reason);
+            Err(stable_failure(WORKTREE_STATE_INCONSISTENT, false))
+        }
+    }
+}
+
+fn finish_identity_mismatch_mutation(
+    lease: RepositoryControlLease,
+    disposition: ArtifactMutationDisposition,
+) -> Result<(), TaskFailure> {
+    match disposition {
+        ArtifactMutationDisposition::Confirmed(artifact)
+            if artifact.state == AttemptArtifactState::Inconsistent =>
+        {
+            lease
+                .poison(RepositoryControlPoisonReason::SideEffectIdentityMismatch)
+                .map_err(|_| stable_failure(REPOSITORY_CONTROL_BUSY, true))
+        }
+        ArtifactMutationDisposition::Reconciled(evidence)
+            if evidence.state() == AttemptArtifactState::Inconsistent =>
+        {
+            lease
+                .poison(RepositoryControlPoisonReason::SideEffectIdentityMismatch)
+                .map_err(|_| stable_failure(REPOSITORY_CONTROL_BUSY, true))
+        }
+        ArtifactMutationDisposition::Confirmed(_)
+        | ArtifactMutationDisposition::Reconciled(_)
+        | ArtifactMutationDisposition::Conflict => {
+            let _ =
+                lease.retain_fail_closed(RepositoryControlPoisonReason::SideEffectIdentityMismatch);
+            Err(stable_failure(WORKTREE_STATE_INCONSISTENT, false))
+        }
+        ArtifactMutationDisposition::Unresolved => {
+            let _ =
+                lease.retain_fail_closed(RepositoryControlPoisonReason::InconsistentWriteFailed);
+            Err(stable_failure(ARTIFACT_STORE_FAILED, true))
+        }
+    }
+}
+
+fn preparation_error_requires_poison(error: &CodingAttemptError) -> bool {
+    error.repository_poison_required()
+        || matches!(
+            error.code(),
+            "REPOSITORY_IDENTITY_MISMATCH" | "REPOSITORY_IDENTITY_UNAVAILABLE"
+        )
+}
+
+fn repository_poison_reason_for_code(code: &str) -> RepositoryControlPoisonReason {
+    match code {
+        PROCESS_TREE_CLEANUP_FAILED => RepositoryControlPoisonReason::GitChildOutcomeUnknown,
+        "REPOSITORY_IDENTITY_MISMATCH" => RepositoryControlPoisonReason::SideEffectIdentityMismatch,
+        _ => RepositoryControlPoisonReason::IdentityUnavailable,
+    }
+}
+
+fn preparation_error_poison_reason(error: &CodingAttemptError) -> RepositoryControlPoisonReason {
+    if error.repository_poison_required() {
+        RepositoryControlPoisonReason::SideEffectIdentityMismatch
+    } else {
+        repository_poison_reason_for_code(error.code())
+    }
+}
+
+fn close_lease_after_validation_error(
+    lease: RepositoryControlLease,
+    code: &str,
+) -> Result<(), RepositoryControlError> {
+    let reason = repository_poison_reason_for_code(code);
+    if reason == RepositoryControlPoisonReason::GitChildOutcomeUnknown {
+        lease.retain_fail_closed(reason)
+    } else {
+        lease.poison(reason)
+    }
+}
+
+fn repository_poison_reason(error: RepositoryControlError) -> RepositoryControlPoisonReason {
+    match error {
+        RepositoryControlError::IdentityDrift => RepositoryControlPoisonReason::IdentityDrift,
+        RepositoryControlError::AliasConflict => RepositoryControlPoisonReason::AliasConflict,
+        RepositoryControlError::IdentityUnavailable => {
+            RepositoryControlPoisonReason::IdentityUnavailable
+        }
+        RepositoryControlError::Busy
+        | RepositoryControlError::Poisoned
+        | RepositoryControlError::UnknownRepository
+        | RepositoryControlError::UnknownCoordinationKey
+        | RepositoryControlError::NotPoisoned
+        | RepositoryControlError::StaleLease
+        | RepositoryControlError::LeaseSpaceExhausted
+        | RepositoryControlError::InvalidReconciliationProof => {
+            RepositoryControlPoisonReason::AbnormalLeaseDrop
+        }
+    }
+}
+
+fn repository_control_outcome(error: RepositoryControlError) -> PreparationFailure {
+    let retryable = matches!(
+        error,
+        RepositoryControlError::Busy
+            | RepositoryControlError::Poisoned
+            | RepositoryControlError::IdentityUnavailable
+    );
+    RunnerOutcome::Failed(stable_failure(REPOSITORY_CONTROL_BUSY, retryable)).into()
+}
+
+fn invariant_preparation_outcome() -> PreparationFailure {
+    RunnerOutcome::Failed(stable_failure(WORKTREE_STATE_INCONSISTENT, false)).into()
+}
+
 #[async_trait::async_trait]
 impl TaskRunner for CodingAgentRunner {
     async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
-        if context.cancellation.is_cancelled() {
-            return RunnerOutcome::Cancelled;
-        }
-        let identity = match WorktreeIdentity::try_new(
-            context.repository.id.to_string(),
-            context.task.id.to_string(),
-            context.task.attempt,
-        ) {
-            Ok(identity) => identity,
-            Err(error) => return RunnerOutcome::Failed(stable_failure(error.code(), false)),
+        let PreparedCodingAttempt { context, attempt } = match self.prepare_attempt(context).await {
+            Ok(prepared) => prepared,
+            Err(failure) => return failure.into_outcome(),
         };
-        let mut attempt = match self
-            .attempts
-            .prepare(
-                identity,
-                context.repository.clone(),
-                context.cancellation.clone(),
-            )
-            .await
-        {
-            Ok(attempt) => attempt,
-            Err(error) => return outcome_for_attempt_error(error, &context.cancellation),
-        };
-        if context.cancellation.is_cancelled() {
-            return RunnerOutcome::Cancelled;
-        }
-
-        let artifact_identity = AttemptArtifactIdentity {
-            task_id: context.task.id,
-            repository_id: context.repository.id,
-            attempt: context.task.attempt,
-        };
-        let state = match self
-            .reserve_artifact(artifact_identity, attempt.reservation())
-            .await
-        {
-            Ok(state) => state,
-            Err(failure) => return RunnerOutcome::Failed(failure),
-        };
-        if state != AttemptArtifactState::Reserved {
-            return RunnerOutcome::Failed(stable_failure(WORKTREE_STATE_INCONSISTENT, false));
-        }
-        if context.cancellation.is_cancelled() {
-            let _ = self
-                .mark_inconsistent(artifact_identity, COMMAND_CANCELLED)
-                .await;
-            return RunnerOutcome::Cancelled;
-        }
-
-        if let Err(error) = attempt.provision(context.cancellation.clone()).await {
-            let cause = error.cause().clone();
-            let ready = error.observation() == AttemptArtifactObservation::Ready;
-            let artifact_update = match error.observation() {
-                AttemptArtifactObservation::Ready => self.mark_ready(artifact_identity).await,
-                AttemptArtifactObservation::Absent => {
-                    self.mark_inconsistent(artifact_identity, error.cause().code())
-                        .await
-                }
-                AttemptArtifactObservation::Partial | AttemptArtifactObservation::Inconsistent => {
-                    self.mark_inconsistent(artifact_identity, WORKTREE_STATE_INCONSISTENT)
-                        .await
-                }
-            };
-            if let Err(failure) = artifact_update {
-                if context.cancellation.is_cancelled() {
-                    return RunnerOutcome::Cancelled;
-                }
-                return RunnerOutcome::Failed(failure);
-            }
-            if ready {
-                let task_runtime = attempt.runtime(CancellationToken::new()).await.ok();
-                return self
-                    .finish_ready_provision_error(&context, sink, task_runtime, cause)
-                    .await;
-            }
-            return outcome_for_attempt_error(cause, &context.cancellation);
-        }
-        if let Err(failure) = self.mark_ready(artifact_identity).await {
-            return RunnerOutcome::Failed(failure);
-        }
 
         let loop_cancellation = context.cancellation.child_token();
         let events = AppRoleEventSink::new(
@@ -1045,7 +1615,7 @@ impl TaskRunner for CodingAgentRunner {
         if matches!(
             outcome,
             MultiRoleOutcome::Failed(_) | MultiRoleOutcome::Cancelled
-        ) && self
+        ) && let Err(error) = self
             .cleanup_terminal_events(
                 &task_runtime,
                 &events,
@@ -1053,10 +1623,9 @@ impl TaskRunner for CodingAgentRunner {
                 required_checks.as_ref(),
             )
             .await
-            .is_err()
         {
             let _ = events.finish().await;
-            return event_failure_outcome(&context.cancellation);
+            return outcome_for_runtime_error(error, &context.cancellation);
         }
         if events.finish().await.is_err() {
             return event_failure_outcome(&context.cancellation);
@@ -1070,7 +1639,9 @@ impl TaskRunner for CodingAgentRunner {
                 RunnerOutcome::Rejected(decision.evidence().clone())
             }
             MultiRoleOutcome::Cancelled => RunnerOutcome::Cancelled,
-            MultiRoleOutcome::Failed(failure) => RunnerOutcome::Failed(failure.failure().clone()),
+            MultiRoleOutcome::Failed(failure) => {
+                outcome_for_task_failure(failure.failure().clone())
+            }
         }
     }
 }
@@ -1079,10 +1650,20 @@ fn outcome_for_attempt_error(
     error: CodingAttemptError,
     cancellation: &CancellationToken,
 ) -> RunnerOutcome {
-    if cancellation.is_cancelled() || error.code() == COMMAND_CANCELLED {
+    if error.code() == PROCESS_TREE_CLEANUP_FAILED {
+        RunnerOutcome::ProcessCleanupUnproven
+    } else if cancellation.is_cancelled() || error.code() == COMMAND_CANCELLED {
         RunnerOutcome::Cancelled
     } else {
         RunnerOutcome::Failed(stable_failure(error.code(), error.retryable()))
+    }
+}
+
+fn outcome_for_task_failure(failure: TaskFailure) -> RunnerOutcome {
+    if failure.code == PROCESS_TREE_CLEANUP_FAILED {
+        RunnerOutcome::ProcessCleanupUnproven
+    } else {
+        RunnerOutcome::Failed(failure)
     }
 }
 
@@ -1091,17 +1672,6 @@ fn event_failure_outcome(cancellation: &CancellationToken) -> RunnerOutcome {
         RunnerOutcome::Cancelled
     } else {
         RunnerOutcome::Failed(stable_failure(EVENT_SINK_REJECTED, true))
-    }
-}
-
-fn artifact_write_failure(error: &StoreWriterError) -> TaskFailure {
-    match error {
-        StoreWriterError::Store(
-            StoreError::ArtifactIdentityConflict | StoreError::ArtifactStateConflict,
-        ) => stable_failure(WORKTREE_STATE_INCONSISTENT, false),
-        StoreWriterError::Busy | StoreWriterError::Closed | StoreWriterError::Store(_) => {
-            stable_failure(ARTIFACT_STORE_FAILED, true)
-        }
     }
 }
 
@@ -1596,7 +2166,9 @@ fn outcome_for_runtime_error(
     error: RuntimeError,
     cancellation: &CancellationToken,
 ) -> RunnerOutcome {
-    if cancellation.is_cancelled() || error.code == COMMAND_CANCELLED {
+    if error.code == PROCESS_TREE_CLEANUP_FAILED {
+        RunnerOutcome::ProcessCleanupUnproven
+    } else if cancellation.is_cancelled() || error.code == COMMAND_CANCELLED {
         RunnerOutcome::Cancelled
     } else {
         RunnerOutcome::Failed(stable_failure(&error.code, error.retryable))
@@ -1619,7 +2191,12 @@ mod tests {
     use coding_agent_core::{Role, RoleActivityEvent};
     use coding_agent_domain::{ActivityActor, UtcTimestamp};
 
-    use super::{CodingAgentRunnerConfig, EventProjection};
+    use coding_agent_runtime::{WorktreeArtifactState, WorktreeError};
+
+    use super::{
+        AttemptArtifactObservation, CodingAgentRunnerConfig, CodingAttemptError, EventProjection,
+        attempt_artifact_observation, prefer_unproven_cleanup_cause, worktree_attempt_error,
+    };
     use crate::{RunnerEvent, WallClock};
 
     struct FixedClock;
@@ -1642,6 +2219,54 @@ mod tests {
         assert!(
             CodingAgentRunnerConfig::try_new(Duration::from_secs(1), Duration::from_secs(11))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn production_worktree_bridge_preserves_exact_identity_and_unavailable_evidence() {
+        let mismatch = WorktreeError::CommonGitIdentityMismatch;
+        assert_eq!(
+            mismatch.artifact_state_after_failed_observation(),
+            WorktreeArtifactState::Inconsistent
+        );
+        assert_eq!(
+            attempt_artifact_observation(mismatch.artifact_state_after_failed_observation()),
+            AttemptArtifactObservation::Inconsistent
+        );
+        assert_eq!(
+            worktree_attempt_error(&mismatch).code(),
+            "REPOSITORY_IDENTITY_MISMATCH"
+        );
+
+        let unavailable = WorktreeError::CommonGitIdentityUnavailable;
+        assert_eq!(
+            unavailable.artifact_state_after_failed_observation(),
+            WorktreeArtifactState::Unavailable
+        );
+        assert_eq!(
+            attempt_artifact_observation(unavailable.artifact_state_after_failed_observation()),
+            AttemptArtifactObservation::Unavailable
+        );
+        assert_eq!(
+            worktree_attempt_error(&unavailable).code(),
+            "REPOSITORY_IDENTITY_UNAVAILABLE"
+        );
+
+        let cleanup = CodingAttemptError::new("PROCESS_TREE_CLEANUP_FAILED", true);
+        assert_eq!(
+            prefer_unproven_cleanup_cause(&cleanup, &mismatch).code(),
+            "PROCESS_TREE_CLEANUP_FAILED",
+            "secondary validation evidence cannot erase an unknown process tree"
+        );
+
+        assert!(
+            worktree_attempt_error(&WorktreeError::BranchConflict).repository_poison_required(),
+            "pre-reservation branch collision preserves typed external-control evidence"
+        );
+        assert!(
+            !worktree_attempt_error(&WorktreeError::WorktreeContentChanged)
+                .repository_poison_required(),
+            "ordinary content inconsistency does not invent repository identity drift"
         );
     }
 

@@ -43,14 +43,20 @@ async fn typed_status_and_diff_observe_a_real_repository_without_call_arguments(
     let git_directory = repository.join(".git").canonicalize().unwrap();
     let rustc = concrete_rustc();
     let git_executable = path_executable(if cfg!(windows) { "git.exe" } else { "git" });
-    let toolchain = discover_toolchain(&runtime_directory, Some(&rustc), Some(&git_executable))
-        .await
-        .unwrap();
+    let toolchain = discover_toolchain(
+        &runtime_directory,
+        support::instance_process_scope(&runtime_directory),
+        Some(&rustc),
+        Some(&git_executable),
+    )
+    .await
+    .unwrap();
     let tools = GitTools::from_trusted_capabilities(
         &toolchain,
         Arc::new(ExecutionDirectory::open(git_directory).unwrap()),
         Arc::new(ExecutionDirectory::open(&repository).unwrap()),
         &runtime_directory,
+        support::task_process_scope(&runtime_directory),
         ProcessLimits::try_new(
             128 * 1024,
             128 * 1024,

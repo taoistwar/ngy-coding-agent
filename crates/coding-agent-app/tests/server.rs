@@ -1,6 +1,9 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use std::io::{self, Write};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,15 +12,16 @@ use std::time::Duration;
 use axum::body::Body;
 use coding_agent_api::{
     ApiBackend, AuthContext, CancelResult, CreateResult, CreateTaskRequest, LiveEventItem,
-    RequestSecurity, SessionExchange, SseBackend, build_api_router,
+    RequestSecurity, SchedulerStateFrames, SessionExchange, SseBackend, build_api_router,
 };
 use coding_agent_app::{
-    ApplicationBackend, EventDispatcherHandle, MutationGate, RepositoryDiscovery, ServiceState,
-    ServiceStateController, StoreWriterHandle, TaskManagerHandle,
+    ApplicationBackend, EventDispatcherHandle, MutationGate, RepositoryDiscovery,
+    SchedulerRepositoryStorageState, SchedulerStorageNotification, ServiceState,
+    ServiceStateController, StorageState, StoreWriterHandle, TaskManagerHandle,
 };
 use coding_agent_domain::{
-    ClientRequestId, DiffFile, DiffFileStatus, DiffSnapshot, EventCursor, NewTask,
-    TaskEventPayload, TaskId, TaskStatus, TestCase, TestSnapshot, TestStatus,
+    ClientRequestId, DiffFile, DiffFileStatus, DiffSnapshot, EventCursor, TaskEventPayload, TaskId,
+    TaskStatus, TestCase, TestSnapshot, TestStatus,
 };
 use coding_agent_store::{
     AppendEventOutcome, CreateTaskOutcome, FinalizeReviewedTaskOutcome, RecordReviewOutcome,
@@ -36,21 +40,290 @@ fn application_backend(
     write_budget: Duration,
     quit_signal: Arc<AtomicBool>,
 ) -> Arc<ApplicationBackend> {
-    Arc::new(ApplicationBackend::new(
+    application_backend_with_queue_limit(
+        fixture,
+        security,
+        gate,
+        write_budget,
+        NonZeroU32::new(256).unwrap(),
+        quit_signal,
+    )
+}
+
+fn application_backend_with_queue_limit(
+    fixture: &support::TaskManagerFixture,
+    security: &support::SecurityFixture,
+    gate: MutationGate,
+    write_budget: Duration,
+    max_queued_tasks: NonZeroU32,
+    quit_signal: Arc<AtomicBool>,
+) -> Arc<ApplicationBackend> {
+    Arc::new(application_backend_value(
+        fixture,
+        security,
+        gate,
+        write_budget,
+        max_queued_tasks,
+        quit_signal,
+    ))
+}
+
+fn application_backend_value(
+    fixture: &support::TaskManagerFixture,
+    security: &support::SecurityFixture,
+    gate: MutationGate,
+    write_budget: Duration,
+    max_queued_tasks: NonZeroU32,
+    quit_signal: Arc<AtomicBool>,
+) -> ApplicationBackend {
+    ApplicationBackend::new_without_repository_runtime_for_test(
         fixture.store.clone(),
         fixture.writer.clone(),
         fixture.dispatcher.clone(),
         fixture.manager.clone(),
-        RepositoryDiscovery::new(std::env::temp_dir()),
+        RepositoryDiscovery::new_without_commands_for_test(std::env::temp_dir()),
         None,
         security.manager.clone(),
         fixture.state.clone(),
         gate,
         support::timestamp(),
-        4,
+        1,
+        max_queued_tasks,
         write_budget,
         Arc::new(move || quit_signal.store(true, Ordering::SeqCst)),
-    ))
+    )
+}
+
+#[tokio::test]
+async fn bootstrap_projects_the_exact_joined_store_and_service_fields() {
+    let fixture = support::task_manager_fixture(1).await;
+    fixture
+        .manager
+        .notify_scheduler_storage_for_test(SchedulerStorageNotification::new(
+            StorageState::Normal,
+            StorageState::Normal,
+            StorageState::Normal,
+            vec![SchedulerRepositoryStorageState::new(
+                fixture.repository.id,
+                StorageState::Normal,
+            )],
+        ));
+    let expected = fixture
+        .store
+        .scheduler_bootstrap_snapshot()
+        .await
+        .expect("load exact expected Store snapshot");
+    let security = support::SecurityFixture::production();
+    let backend = application_backend(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let bootstrap = backend
+        .bootstrap(&establish_session(&security).await.auth)
+        .await
+        .expect("join exact Bootstrap snapshot");
+
+    assert_eq!(bootstrap.latest_event_id, expected.latest_event_id.get());
+    assert_eq!(
+        bootstrap.service_state,
+        coding_agent_api::ServiceStateDto::Ready
+    );
+    assert_eq!(bootstrap.service_state_generation, 0);
+    assert_eq!(bootstrap.max_concurrent_tasks, 1);
+    assert_eq!(bootstrap.scheduler.limits.global, 1);
+    assert_eq!(bootstrap.scheduler.limits.per_repository, 1);
+    assert_eq!(bootstrap.scheduler.limits.queued, 256);
+    assert_eq!(bootstrap.scheduler.limits.cargo_jobs_per_task, 1);
+    assert_eq!(
+        bootstrap.scheduler.server_started_at,
+        bootstrap.server_started_at
+    );
+    assert_eq!(
+        bootstrap.scheduler.service_state_generation,
+        bootstrap.service_state_generation
+    );
+    assert_eq!(
+        bootstrap.scheduler.as_of_event_id,
+        u64::try_from(expected.membership_event_id.get()).unwrap()
+    );
+    assert_eq!(
+        bootstrap.scheduler.queued_task_count as usize,
+        bootstrap.scheduler.queued_tasks.len()
+    );
+    assert_eq!(
+        bootstrap.scheduler.storage.repositories.len(),
+        bootstrap.repositories.len()
+    );
+    assert_eq!(
+        bootstrap.scheduler.admission_state,
+        coding_agent_api::SchedulerAdmissionStateDto::Running
+    );
+    assert_eq!(bootstrap.scheduler.active_task_count, 0);
+    assert_eq!(
+        bootstrap.scheduler.storage.state,
+        coding_agent_api::SchedulerStorageStateDto::Normal
+    );
+    assert_eq!(bootstrap.repositories.len(), expected.repositories.len());
+    assert_eq!(bootstrap.tasks.len(), expected.tasks.len());
+    assert_eq!(
+        backend.scheduler_state_for_test(),
+        bootstrap.scheduler,
+        "Bootstrap and the future live Scheduler source share one exact DTO projection",
+    );
+    let event_high_before_wire = fixture.store.latest_event_id().await.unwrap();
+    let wire = SchedulerStateFrames::try_from_snapshot(&bootstrap.scheduler)
+        .expect("the exact joined Scheduler projection is segmentable");
+    assert_eq!(
+        wire.manifest().item_count,
+        bootstrap.scheduler.queued_tasks.len() as u32
+            + bootstrap.scheduler.stopping_tasks.len() as u32
+            + bootstrap.scheduler.storage.repositories.len() as u32,
+    );
+    assert_eq!(
+        fixture.store.latest_event_id().await.unwrap(),
+        event_high_before_wire,
+        "Scheduler control construction is non-persistent",
+    );
+    assert_eq!(
+        bootstrap
+            .repositories
+            .iter()
+            .map(|repository| repository.id)
+            .collect::<Vec<_>>(),
+        expected
+            .repositories
+            .iter()
+            .map(|repository| repository.id.as_uuid())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_scheduler_projects_service_pause_with_authoritative_queue_order() {
+    let fixture = support::task_manager_fixture(1).await;
+    fixture
+        .state
+        .set(ServiceState::StoreDegraded)
+        .expect("pause Scheduler admission");
+    let queued = match fixture
+        .store
+        .create_task(support::new_task(
+            fixture.repository.id,
+            "service-paused scheduler queue",
+        ))
+        .await
+        .expect("create a durable queued task while paused")
+    {
+        CreateTaskOutcome::Created { task, .. } | CreateTaskOutcome::Existing { task } => task,
+    };
+    fixture
+        .manager
+        .notify_scheduler_storage_for_test(SchedulerStorageNotification::new(
+            StorageState::Normal,
+            StorageState::Normal,
+            StorageState::Normal,
+            vec![SchedulerRepositoryStorageState::new(
+                fixture.repository.id,
+                StorageState::Normal,
+            )],
+        ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let projection = fixture.manager.scheduler_projection_for_test();
+            if projection.as_of_event_id.get() == queued.last_event_id.get()
+                && projection.tasks == vec![(queued.id, TaskStatus::Queued)]
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TaskManager publishes the paused queue before the API join");
+    let security = support::SecurityFixture::production();
+    let backend = application_backend(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let bootstrap = backend
+        .bootstrap(&establish_session(&security).await.auth)
+        .await
+        .expect("join paused Scheduler projection");
+
+    assert_eq!(
+        bootstrap.scheduler.admission_state,
+        coding_agent_api::SchedulerAdmissionStateDto::Paused
+    );
+    assert_eq!(bootstrap.scheduler.queued_task_count, 1);
+    assert_eq!(
+        bootstrap.scheduler.queued_tasks[0].task_id,
+        queued.id.as_uuid()
+    );
+    assert_eq!(
+        bootstrap.scheduler.queued_tasks[0].reason,
+        coding_agent_api::SchedulerQueueReasonDto::ServicePaused
+    );
+    assert_eq!(
+        bootstrap.scheduler.as_of_event_id,
+        u64::try_from(bootstrap.latest_event_id).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_fails_closed_when_scheduler_and_http_queue_limits_diverge() {
+    let fixture = support::task_manager_fixture(1).await;
+    let security = support::SecurityFixture::production();
+    let backend = application_backend_with_queue_limit(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        NonZeroU32::MIN,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let error = backend
+        .bootstrap(&establish_session(&security).await.auth)
+        .await
+        .expect_err("mismatched immutable queue limits must fail closed");
+
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.code, "BOOTSTRAP_SNAPSHOT_UNAVAILABLE");
+    assert!(error.retryable);
+}
+
+#[tokio::test]
+async fn bootstrap_join_budget_exhaustion_maps_to_exact_retryable_503() {
+    let fixture = support::task_manager_fixture(1).await;
+    let security = support::SecurityFixture::production();
+    let backend = Arc::new(
+        application_backend_value(
+            &fixture,
+            &security,
+            MutationGate::new(fixture.state.clone()),
+            Duration::from_secs(2),
+            NonZeroU32::new(256).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_bootstrap_join_budget_for_test(Duration::ZERO),
+    );
+
+    let error = backend
+        .bootstrap(&establish_session(&security).await.auth)
+        .await
+        .expect_err("an exhausted join budget must fail closed");
+
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.code, "BOOTSTRAP_SNAPSHOT_UNAVAILABLE");
+    assert!(error.retryable);
 }
 
 #[tokio::test]
@@ -101,6 +374,99 @@ async fn application_backend_adapts_dispatcher_and_service_watch_to_sse_ports() 
 }
 
 #[tokio::test]
+async fn application_backend_adapts_scheduler_watch_and_exact_membership_watermark() {
+    let fixture = support::task_manager_fixture(1).await;
+    let security = support::SecurityFixture::production();
+    let backend = application_backend(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let initial = backend
+        .current_scheduler_state()
+        .await
+        .expect("project current Scheduler state");
+    assert_eq!(initial.as_ref(), &backend.scheduler_state_for_test());
+    assert_eq!(backend.membership_watermark_through(0).await.unwrap(), 0);
+
+    let mut scheduler = backend.subscribe_scheduler_state();
+    fixture
+        .state
+        .set(ServiceState::StoreDegraded)
+        .expect("pause Scheduler admission");
+    let paused = tokio::time::timeout(Duration::from_secs(2), scheduler.next())
+        .await
+        .expect("Scheduler watch publishes the service transition")
+        .expect("Scheduler watch remains open")
+        .expect("Scheduler projection remains valid");
+    assert_eq!(
+        paused.admission_state,
+        coding_agent_api::SchedulerAdmissionStateDto::Paused
+    );
+    assert_eq!(paused.service_state_generation, 1);
+    assert!(paused.generation > initial.generation);
+
+    let queued = match fixture
+        .store
+        .create_task(support::new_task(
+            fixture.repository.id,
+            "bounded membership watermark",
+        ))
+        .await
+        .expect("create queued lifecycle event")
+    {
+        CreateTaskOutcome::Created { task, .. } | CreateTaskOutcome::Existing { task } => task,
+    };
+    let running = match fixture
+        .store
+        .transition_with_event(queued.id, TaskStatus::Queued, TaskTransition::Running)
+        .await
+        .expect("create started lifecycle event")
+    {
+        TransitionOutcome::Applied { task, .. } => task,
+        other => panic!("fixture transition must apply, got {other:?}"),
+    };
+    let panel_event_id = match fixture
+        .store
+        .append_running_event(
+            running.id,
+            TaskEventPayload::PlanUpdated {
+                plan: coding_agent_domain::PlanSnapshot::legacy(1, Vec::new()),
+            },
+        )
+        .await
+        .expect("create non-membership event")
+    {
+        AppendEventOutcome::Applied { event_id } => event_id,
+        AppendEventOutcome::NotRunning { .. } => panic!("fixture task must remain running"),
+    };
+
+    assert_eq!(
+        backend
+            .membership_watermark_through(queued.last_event_id.get())
+            .await
+            .unwrap(),
+        queued.last_event_id.get()
+    );
+    assert_eq!(
+        backend
+            .membership_watermark_through(running.last_event_id.get())
+            .await
+            .unwrap(),
+        running.last_event_id.get()
+    );
+    assert_eq!(
+        backend
+            .membership_watermark_through(panel_event_id.get())
+            .await
+            .unwrap(),
+        running.last_event_id.get()
+    );
+}
+
+#[tokio::test]
 async fn both_sse_sources_close_after_publishing_quiescing() {
     let fixture = support::task_manager_fixture(1).await;
     let security = support::SecurityFixture::production();
@@ -142,30 +508,34 @@ async fn production_sse_router_recovers_dispatcher_lag_from_sqlite_with_exact_fr
         .await
         .expect("spawn deliberately small SSE dispatcher");
     let writer = StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(dispatcher.clone()), 16);
-    let state = ServiceStateController::new(ServiceState::Ready);
+    // Keep the TaskManager admission loop paused so this test isolates dispatcher lag
+    // recovery from independently valid scheduler-generation preemption/reset behavior.
+    let state = ServiceStateController::new(ServiceState::StoreDegraded);
+    let launch_resources = support::task_manager_launch_resources(&fixture, 1, 1).await;
     let manager = TaskManagerHandle::spawn(
         fixture.store.clone(),
         writer.clone(),
         dispatcher.clone(),
         state.clone(),
         Arc::new(support::ControlledRunner::default()),
-        1,
+        launch_resources,
         16,
     );
     let security = support::SecurityFixture::production();
     let session = establish_session(&security).await;
-    let backend = Arc::new(ApplicationBackend::new(
+    let backend = Arc::new(ApplicationBackend::new_without_repository_runtime_for_test(
         fixture.store.clone(),
         writer.clone(),
         dispatcher.clone(),
         manager,
-        RepositoryDiscovery::new(std::env::temp_dir()),
+        RepositoryDiscovery::new_without_commands_for_test(std::env::temp_dir()),
         None,
         security.manager.clone(),
         state.clone(),
         MutationGate::new(state.clone()),
         support::timestamp(),
         1,
+        NonZeroU32::new(256).unwrap(),
         Duration::from_secs(2),
         Arc::new(|| {}),
     ));
@@ -625,6 +995,35 @@ async fn real_review_projection_is_identical_for_detail_rest_recovery_and_live_s
     assert_task_readiness(&listed_task, "completed", "review_approved");
 }
 
+#[tokio::test]
+async fn completed_task_cancel_maps_to_the_not_cancellable_api_contract() {
+    let fixture = support::task_manager_fixture(1).await;
+    let completion = fixture.runner.push_completion_gate();
+    let task = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture.wait_for_status(task.id, TaskStatus::Running).await;
+    completion.release.notify_one();
+    fixture
+        .wait_for_status(task.id, TaskStatus::Completed)
+        .await;
+
+    let security = support::SecurityFixture::production();
+    let backend = application_backend(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let error = backend
+        .cancel_task(&establish_session(&security).await.auth, task.id)
+        .await
+        .expect_err("a completed task cannot be cancelled");
+
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "TASK_NOT_CANCELLABLE");
+    assert!(!error.retryable);
+}
+
 fn assert_task_readiness(
     task: &coding_agent_api::TaskDto,
     expected_status: &str,
@@ -649,7 +1048,26 @@ async fn occupied_fixture() -> support::TaskManagerFixture {
     fixture
         .wait_for_status(occupied.id, TaskStatus::Running)
         .await;
+    fixture.wait_for_runner_start(occupied.id).await;
     fixture
+}
+
+async fn occupied_retry_fixture(
+    failure_code: &str,
+) -> (support::TaskManagerFixture, coding_agent_domain::Task) {
+    let fixture = support::task_manager_fixture(1).await;
+    fixture.runner.push_failure(support::failure(failure_code));
+    let source = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture.wait_for_status(source.id, TaskStatus::Failed).await;
+    let terminal = fixture.load(source.id).await;
+
+    fixture.runner.push_blocking(1);
+    let occupied = fixture.enqueue_tasks(1, true).await.remove(0);
+    fixture
+        .wait_for_status(occupied.id, TaskStatus::Running)
+        .await;
+    fixture.wait_for_runner_start(occupied.id).await;
+    (fixture, terminal)
 }
 
 #[tokio::test]
@@ -719,45 +1137,71 @@ async fn concurrent_same_request_id_commits_one_task_and_one_queued_event() {
 }
 
 #[tokio::test]
-async fn concurrent_retry_returns_one_direct_child_with_one_created_response() {
+async fn production_create_path_enforces_queue_cap_without_hiding_idempotency_results() {
     let fixture = occupied_fixture().await;
-    let source = match fixture
-        .store
+    let security = support::SecurityFixture::production();
+    let backend = application_backend_with_queue_limit(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        NonZeroU32::new(1).unwrap(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let auth = AuthContext {
+        session_id: "already-authorized".to_owned(),
+    };
+    let client_request_id = ClientRequestId::new();
+    let canonical = CreateTaskRequest {
+        client_request_id,
+        repository_id: fixture.repository.id,
+        prompt: "the only queued request".to_owned(),
+    };
+
+    assert!(matches!(
+        backend.create_task(&auth, canonical.clone()).await.unwrap(),
+        CreateResult::Created(_)
+    ));
+    assert!(matches!(
+        backend.create_task(&auth, canonical).await.unwrap(),
+        CreateResult::Existing(_)
+    ));
+
+    let conflict = backend
         .create_task(
-            NewTask::try_new(
-                ClientRequestId::new(),
-                fixture.repository.id,
-                "retry source",
-            )
-            .unwrap(),
+            &auth,
+            CreateTaskRequest {
+                client_request_id,
+                repository_id: fixture.repository.id,
+                prompt: "different input for the same request id".to_owned(),
+            },
         )
         .await
-        .unwrap()
-    {
-        CreateTaskOutcome::Created { task, .. } | CreateTaskOutcome::Existing { task } => task,
-    };
-    let running = match fixture
-        .store
-        .transition_with_event(source.id, TaskStatus::Queued, TaskTransition::Running)
-        .await
-        .unwrap()
-    {
-        TransitionOutcome::Applied { task, .. } => task,
-        TransitionOutcome::Conflict { .. } => panic!("source must start"),
-    };
-    let terminal = match fixture
-        .store
-        .transition_with_event(
-            running.id,
-            TaskStatus::Running,
-            TaskTransition::Failed(support::failure("RETRY_SOURCE_FAILED")),
+        .expect_err("idempotency conflict wins before queue capacity");
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.code, "IDEMPOTENCY_CONFLICT");
+
+    let full = backend
+        .create_task(
+            &auth,
+            CreateTaskRequest {
+                client_request_id: ClientRequestId::new(),
+                repository_id: fixture.repository.id,
+                prompt: "new request beyond queue capacity".to_owned(),
+            },
         )
         .await
-        .unwrap()
-    {
-        TransitionOutcome::Applied { task, .. } => task,
-        TransitionOutcome::Conflict { .. } => panic!("source must become retryable"),
-    };
+        .expect_err("production create must not bypass the queue cap");
+    assert_eq!(full.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(full.code, "TASK_QUEUE_FULL");
+    assert!(full.retryable);
+    assert_eq!(full.details["queued_tasks"], serde_json::json!(1));
+    assert_eq!(full.details["max_queued_tasks"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn concurrent_retry_returns_one_direct_child_with_one_created_response() {
+    let (fixture, terminal) = occupied_retry_fixture("RETRY_SOURCE_FAILED").await;
 
     let security = support::SecurityFixture::production();
     let backend = application_backend(
@@ -808,6 +1252,53 @@ async fn concurrent_retry_returns_one_direct_child_with_one_created_response() {
         .filter(|task| task.retry_of == Some(terminal.id))
         .collect::<Vec<_>>();
     assert_eq!(children.len(), 1);
+}
+
+#[tokio::test]
+async fn production_retry_path_enforces_queue_cap() {
+    let (fixture, terminal) = occupied_retry_fixture("QUEUE_LIMITED_RETRY_SOURCE").await;
+    fixture
+        .writer
+        .create_task(
+            support::new_task(fixture.repository.id, "fill the only queue slot"),
+            support::deadline(),
+        )
+        .await
+        .expect("fill queue through the sole writer");
+
+    let security = support::SecurityFixture::production();
+    let backend = application_backend_with_queue_limit(
+        &fixture,
+        &security,
+        MutationGate::new(fixture.state.clone()),
+        Duration::from_secs(2),
+        NonZeroU32::new(1).unwrap(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let error = backend
+        .retry_task(
+            &AuthContext {
+                session_id: "already-authorized".to_owned(),
+            },
+            terminal.id,
+        )
+        .await
+        .expect_err("production retry must not bypass the queue cap");
+    assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error.code, "TASK_QUEUE_FULL");
+    assert!(error.retryable);
+    assert_eq!(error.details["queued_tasks"], serde_json::json!(1));
+    assert_eq!(error.details["max_queued_tasks"], serde_json::json!(1));
+    assert!(
+        fixture
+            .store
+            .bootstrap_snapshot()
+            .await
+            .unwrap()
+            .tasks
+            .iter()
+            .all(|task| task.retry_of != Some(terminal.id))
+    );
 }
 
 #[tokio::test]

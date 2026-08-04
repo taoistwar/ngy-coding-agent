@@ -3,7 +3,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use coding_agent_store::Store;
+use coding_agent_store::{DATABASE_SCHEMA_UNSUPPORTED, Store};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Row, SqliteConnection};
 
@@ -36,7 +36,7 @@ async fn migrations_configure_connections_and_are_idempotent() {
             .fetch_all(fixture.store.pool())
             .await
             .unwrap();
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
 
     for table in [
         "schema_migrations",
@@ -46,6 +46,7 @@ async fn migrations_configure_connections_and_are_idempotent() {
         "task_attempt_artifacts",
         "task_review_evidence",
         "task_delivery_state",
+        "task_stop_intents",
     ] {
         let exists: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -93,6 +94,672 @@ async fn artifact_migration_has_exact_identity_and_state_constraints() {
     .await
     .unwrap();
     assert_eq!(parent_index, 1);
+}
+
+#[tokio::test]
+async fn v4_schema_has_strict_stop_intents_identity_fk_and_queued_partial_index() {
+    let fixture = support::file_store().await;
+    fixture.store.migrate().await.unwrap();
+    let pool = fixture.store.pool();
+
+    assert_eq!(strict_table_flag(pool, "task_stop_intents").await, 1);
+    let columns = table_columns(pool, "task_stop_intents").await;
+    for (name, data_type, primary_key_position) in [
+        ("task_id", "TEXT", 1),
+        ("repository_id", "TEXT", 0),
+        ("attempt", "INTEGER", 0),
+        ("kind", "TEXT", 0),
+        ("requested_at", "TEXT", 0),
+    ] {
+        assert_required_column(&columns, name, data_type, primary_key_position);
+    }
+
+    let stop_intent_foreign_keys = foreign_keys(pool, "task_stop_intents").await;
+    assert!(
+        stop_intent_foreign_keys.contains(&ForeignKey {
+            parent_table: "tasks".to_owned(),
+            columns: vec![
+                ("task_id".to_owned(), "id".to_owned()),
+                ("repository_id".to_owned(), "repository_id".to_owned()),
+                ("attempt".to_owned(), "attempt".to_owned()),
+            ],
+        }),
+        "missing exact task identity foreign key: {stop_intent_foreign_keys:?}"
+    );
+
+    let table_sql = normalized_schema_sql(pool, "table", "task_stop_intents").await;
+    for required in [
+        "strict",
+        "typeof(task_id)",
+        "typeof(repository_id)",
+        "typeof(attempt)",
+        "attempt > 0",
+        "typeof(kind)",
+        "user_cancelled",
+        "disk_pressure_critical",
+        "typeof(requested_at)",
+    ] {
+        assert!(
+            table_sql.contains(required),
+            "task_stop_intents is missing DDL term {required}: {table_sql}"
+        );
+    }
+
+    let trigger_names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'trigger' AND tbl_name = 'task_stop_intents' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        trigger_names,
+        vec![
+            "task_stop_intents_no_delete",
+            "task_stop_intents_no_replace",
+            "task_stop_intents_no_update",
+            "task_stop_intents_running_unreviewed_on_insert",
+        ]
+    );
+
+    let queued_index = normalized_schema_sql(pool, "index", "tasks_queued_created_at_id").await;
+    assert!(queued_index.contains("tasks (created_at, id)"));
+    assert!(queued_index.contains("where status = 'queued'"));
+    assert_foreign_keys_clean(pool).await;
+}
+
+#[tokio::test]
+async fn v4_stop_intent_insert_is_exact_running_unreviewed_and_rows_are_immutable() {
+    let fixture = support::file_store().await;
+    fixture.store.migrate().await.unwrap();
+    let pool = fixture.store.pool();
+    let parents = seed_review_parents(pool).await;
+
+    for (case, repository_id, attempt, kind, requested_at) in [
+        (
+            "wrong repository",
+            "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            1_i64,
+            "user_cancelled",
+            FIXTURE_TIMESTAMP,
+        ),
+        (
+            "zero attempt",
+            REVIEW_REPOSITORY_ID,
+            0,
+            "user_cancelled",
+            FIXTURE_TIMESTAMP,
+        ),
+        (
+            "unknown kind",
+            REVIEW_REPOSITORY_ID,
+            1,
+            "other",
+            FIXTURE_TIMESTAMP,
+        ),
+        (
+            "empty timestamp",
+            REVIEW_REPOSITORY_ID,
+            1,
+            "user_cancelled",
+            "",
+        ),
+    ] {
+        let result = insert_stop_intent(
+            pool,
+            FIRST_TASK_ID,
+            repository_id,
+            attempt,
+            kind,
+            requested_at,
+        )
+        .await;
+        assert_constraint_error(case, result);
+        assert_eq!(row_count(pool, "task_stop_intents").await, 0);
+    }
+
+    let real_attempt = sqlx::query(
+        "INSERT INTO task_stop_intents (
+             task_id, repository_id, attempt, kind, requested_at
+         ) VALUES (?, ?, 1.5, 'user_cancelled', ?)",
+    )
+    .bind(FIRST_TASK_ID)
+    .bind(REVIEW_REPOSITORY_ID)
+    .bind(FIXTURE_TIMESTAMP)
+    .execute(pool)
+    .await;
+    assert_constraint_error("real attempt", real_attempt.map(|_| ()));
+
+    insert_evidence(
+        pool,
+        EvidenceInsert::approved(FIRST_TASK_ID, parents.first_task_event_id, 1),
+    )
+    .await
+    .unwrap();
+    insert_delivery(pool, FIRST_TASK_ID, "review_approved", 1, "approved")
+        .await
+        .unwrap();
+    assert_constraint_error(
+        "reviewed task",
+        insert_stop_intent(
+            pool,
+            FIRST_TASK_ID,
+            REVIEW_REPOSITORY_ID,
+            1,
+            "user_cancelled",
+            FIXTURE_TIMESTAMP,
+        )
+        .await,
+    );
+
+    sqlx::query(
+        "INSERT INTO tasks (
+             id, client_request_id, repository_id, prompt, status, attempt,
+             retry_of, created_at, started_at, finished_at, last_event_id,
+             failure_json
+         ) VALUES (?, ?, ?, 'queued fixture', 'queued', 1, NULL, ?, NULL, NULL, 0, NULL)",
+    )
+    .bind(THIRD_TASK_ID)
+    .bind(THIRD_CLIENT_REQUEST_ID)
+    .bind(REVIEW_REPOSITORY_ID)
+    .bind(FIXTURE_TIMESTAMP)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_constraint_error(
+        "queued task",
+        insert_stop_intent(
+            pool,
+            THIRD_TASK_ID,
+            REVIEW_REPOSITORY_ID,
+            1,
+            "user_cancelled",
+            FIXTURE_TIMESTAMP,
+        )
+        .await,
+    );
+    sqlx::query(
+        "UPDATE tasks \
+         SET status = 'running', started_at = ?, finished_at = NULL, failure_json = NULL \
+         WHERE id = ?",
+    )
+    .bind(FIXTURE_TIMESTAMP.as_bytes())
+    .bind(THIRD_TASK_ID)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_constraint_error(
+        "running task with blob started_at",
+        insert_stop_intent(
+            pool,
+            THIRD_TASK_ID,
+            REVIEW_REPOSITORY_ID,
+            1,
+            "user_cancelled",
+            FIXTURE_TIMESTAMP,
+        )
+        .await,
+    );
+    for (case, started_at, finished_at, failure_json) in [
+        ("running task without started_at", None, None, None),
+        (
+            "running task with finished_at",
+            Some(FIXTURE_TIMESTAMP),
+            Some(FIXTURE_TIMESTAMP),
+            None,
+        ),
+        (
+            "running task with failure",
+            Some(FIXTURE_TIMESTAMP),
+            None,
+            Some(r#"{"code":"CORRUPT","message":"corrupt","retryable":true}"#),
+        ),
+    ] {
+        sqlx::query(
+            "UPDATE tasks \
+             SET status = 'running', started_at = ?, finished_at = ?, failure_json = ? \
+             WHERE id = ?",
+        )
+        .bind(started_at)
+        .bind(finished_at)
+        .bind(failure_json)
+        .bind(THIRD_TASK_ID)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_constraint_error(
+            case,
+            insert_stop_intent(
+                pool,
+                THIRD_TASK_ID,
+                REVIEW_REPOSITORY_ID,
+                1,
+                "user_cancelled",
+                FIXTURE_TIMESTAMP,
+            )
+            .await,
+        );
+    }
+
+    insert_stop_intent(
+        pool,
+        SECOND_TASK_ID,
+        REVIEW_REPOSITORY_ID,
+        1,
+        "user_cancelled",
+        FIXTURE_TIMESTAMP,
+    )
+    .await
+    .unwrap();
+    for (case, sql) in [
+        (
+            "duplicate insert",
+            "INSERT INTO task_stop_intents (
+                 task_id, repository_id, attempt, kind, requested_at
+             ) VALUES (
+                 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+                 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                 1, 'user_cancelled', '2026-07-23T00:00:01.000000000Z'
+             )",
+        ),
+        (
+            "insert or replace",
+            "INSERT OR REPLACE INTO task_stop_intents (
+                 task_id, repository_id, attempt, kind, requested_at
+             ) VALUES (
+                 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+                 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                 1, 'disk_pressure_critical', '2026-07-23T00:00:01.000000000Z'
+             )",
+        ),
+        (
+            "update upsert",
+            "INSERT INTO task_stop_intents (
+                 task_id, repository_id, attempt, kind, requested_at
+             ) VALUES (
+                 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+                 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                 1, 'disk_pressure_critical', '2026-07-23T00:00:01.000000000Z'
+             ) ON CONFLICT(task_id) DO UPDATE SET kind = excluded.kind",
+        ),
+        (
+            "update",
+            "UPDATE task_stop_intents SET requested_at =
+                 '2026-07-23T00:00:01.000000000Z'
+             WHERE task_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'",
+        ),
+        (
+            "delete",
+            "DELETE FROM task_stop_intents
+             WHERE task_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'",
+        ),
+    ] {
+        let result = sqlx::raw_sql(sql).execute(pool).await.map(|_| ());
+        assert_constraint_error(case, result);
+    }
+    let stored: (String, String, i64, String, String) = sqlx::query_as(
+        "SELECT task_id, repository_id, attempt, kind, requested_at \
+         FROM task_stop_intents",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        (
+            SECOND_TASK_ID.to_owned(),
+            REVIEW_REPOSITORY_ID.to_owned(),
+            1,
+            "user_cancelled".to_owned(),
+            FIXTURE_TIMESTAMP.to_owned(),
+        )
+    );
+    assert_foreign_keys_clean(pool).await;
+}
+
+#[tokio::test]
+async fn v4_cross_table_triggers_preserve_stop_winner_and_terminal_classification() {
+    let fixture = support::file_store().await;
+    fixture.store.migrate().await.unwrap();
+    let pool = fixture.store.pool();
+    let parents = seed_review_parents(pool).await;
+
+    insert_parent_event(pool, 105, FIRST_TASK_ID, "review.updated").await;
+    insert_evidence(
+        pool,
+        EvidenceInsert::approved(FIRST_TASK_ID, parents.first_task_event_id, 1),
+    )
+    .await
+    .unwrap();
+    insert_stop_intent(
+        pool,
+        FIRST_TASK_ID,
+        REVIEW_REPOSITORY_ID,
+        1,
+        "user_cancelled",
+        FIXTURE_TIMESTAMP,
+    )
+    .await
+    .unwrap();
+
+    assert_constraint_error(
+        "review evidence after intent",
+        insert_evidence(pool, EvidenceInsert::approved(FIRST_TASK_ID, 105, 2)).await,
+    );
+    assert_constraint_error(
+        "delivery state after intent",
+        insert_delivery(pool, FIRST_TASK_ID, "review_approved", 1, "approved").await,
+    );
+    assert_constraint_error(
+        "review marker event after intent",
+        sqlx::query(
+            "INSERT INTO task_events (
+                 id, schema_version, task_id, kind, payload_json, created_at
+             ) VALUES (106, 1, ?, 'review.updated', '{\"evidence_ref\":true}', ?)",
+        )
+        .bind(FIRST_TASK_ID)
+        .bind(FIXTURE_TIMESTAMP)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+    );
+    assert_constraint_error(
+        "existing event rewritten to review after intent",
+        sqlx::query(
+            "UPDATE task_events \
+             SET kind = 'review.updated', payload_json = '{\"evidence_ref\":true}' \
+             WHERE id = ?",
+        )
+        .bind(parents.first_task_plan_event_id)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+    );
+    assert_constraint_error(
+        "running start timestamp cannot be rewritten after intent",
+        sqlx::query("UPDATE tasks SET started_at = ? WHERE id = ?")
+            .bind("2026-07-23T00:00:02.000000000Z")
+            .bind(FIRST_TASK_ID)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+    );
+    sqlx::query("UPDATE tasks SET last_event_id = ? WHERE id = ?")
+        .bind(105_i64)
+        .bind(FIRST_TASK_ID)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    for (case, status, failure_json) in [
+        ("completed", "completed", None),
+        (
+            "ordinary failure",
+            "failed",
+            Some(r#"{"code":"RUNNER_FAILED","message":"runner failed","retryable":true}"#),
+        ),
+        (
+            "disk failure for user intent",
+            "failed",
+            Some(
+                r#"{"code":"DISK_PRESSURE_CRITICAL","message":"critical disk pressure stopped the task","retryable":true}"#,
+            ),
+        ),
+        (
+            "interrupted",
+            "interrupted",
+            Some(r#"{"code":"APP_RESTARTED","message":"restart","retryable":true}"#),
+        ),
+        (
+            "cancelled with failure",
+            "cancelled",
+            Some(r#"{"code":"WRONG","message":"wrong","retryable":false}"#),
+        ),
+    ] {
+        assert_constraint_error(
+            case,
+            update_task_terminal(pool, FIRST_TASK_ID, status, failure_json).await,
+        );
+        assert_eq!(task_status(pool, FIRST_TASK_ID).await, "running");
+    }
+    assert_constraint_error(
+        "user terminal timestamp stored as blob",
+        sqlx::query(
+            "UPDATE tasks SET status = 'cancelled', finished_at = ?, failure_json = NULL \
+             WHERE id = ?",
+        )
+        .bind(FIXTURE_TIMESTAMP.as_bytes())
+        .bind(FIRST_TASK_ID)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+    );
+    update_task_terminal(pool, FIRST_TASK_ID, "cancelled", None)
+        .await
+        .unwrap();
+    assert_eq!(task_status(pool, FIRST_TASK_ID).await, "cancelled");
+    assert_constraint_error(
+        "terminal user intent cannot return to running",
+        sqlx::query(
+            "UPDATE tasks SET status = 'running', finished_at = NULL, failure_json = NULL \
+             WHERE id = ?",
+        )
+        .bind(FIRST_TASK_ID)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+    );
+    sqlx::query("UPDATE tasks SET last_event_id = ? WHERE id = ?")
+        .bind(105_i64)
+        .bind(FIRST_TASK_ID)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_constraint_error(
+        "terminal user timestamp is immutable",
+        sqlx::query("UPDATE tasks SET finished_at = ? WHERE id = ?")
+            .bind("2026-07-23T00:00:02.000000000Z")
+            .bind(FIRST_TASK_ID)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+    );
+
+    insert_parent_task(pool, FOURTH_TASK_ID, FOURTH_CLIENT_REQUEST_ID).await;
+    insert_stop_intent(
+        pool,
+        FOURTH_TASK_ID,
+        REVIEW_REPOSITORY_ID,
+        1,
+        "user_cancelled",
+        FIXTURE_TIMESTAMP,
+    )
+    .await
+    .unwrap();
+    for (case, sql) in [
+        (
+            "task insert or replace",
+            "INSERT OR REPLACE INTO tasks (
+                 id, client_request_id, repository_id, prompt, status, attempt,
+                 retry_of, created_at, started_at, finished_at, last_event_id,
+                 failure_json
+             ) VALUES (
+                 '12121212-1212-4212-8212-121212121212',
+                 '34343434-3434-4434-8434-343434343434',
+                 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                 'replacement', 'interrupted', 1, NULL,
+                 '2026-07-23T00:00:00.000000000Z',
+                 '2026-07-23T00:00:00.000000000Z',
+                 '2026-07-23T00:00:01.000000000Z', 0,
+                 '{\"code\":\"WRONG\",\"message\":\"wrong\",\"retryable\":true}'
+             )",
+        ),
+        (
+            "task update upsert",
+            "INSERT INTO tasks (
+                 id, client_request_id, repository_id, prompt, status, attempt,
+                 retry_of, created_at, started_at, finished_at, last_event_id,
+                 failure_json
+             ) VALUES (
+                 '12121212-1212-4212-8212-121212121212',
+                 '34343434-3434-4434-8434-343434343434',
+                 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                 'upsert', 'running', 1, NULL,
+                 '2026-07-23T00:00:00.000000000Z',
+                 '2026-07-23T00:00:00.000000000Z',
+                 NULL, 0, NULL
+             ) ON CONFLICT(id) DO UPDATE SET
+                 status = 'interrupted',
+                 finished_at = '2026-07-23T00:00:01.000000000Z',
+                 failure_json =
+                     '{\"code\":\"WRONG\",\"message\":\"wrong\",\"retryable\":true}'",
+        ),
+    ] {
+        assert_constraint_error(case, sqlx::raw_sql(sql).execute(pool).await.map(|_| ()));
+        assert_eq!(task_status(pool, FOURTH_TASK_ID).await, "running");
+    }
+    insert_parent_task(pool, FIFTH_TASK_ID, FIFTH_CLIENT_REQUEST_ID).await;
+    assert_constraint_error(
+        "update or replace identity collision",
+        sqlx::query(
+            "UPDATE OR REPLACE tasks \
+             SET id = ?, status = 'interrupted', finished_at = ?, failure_json = ? \
+             WHERE id = ?",
+        )
+        .bind(FOURTH_TASK_ID)
+        .bind("2026-07-23T00:00:01.000000000Z")
+        .bind(r#"{"code":"WRONG","message":"wrong","retryable":true}"#)
+        .bind(FIFTH_TASK_ID)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+    );
+    assert_eq!(task_status(pool, FOURTH_TASK_ID).await, "running");
+    assert_eq!(task_status(pool, FIFTH_TASK_ID).await, "running");
+
+    insert_stop_intent(
+        pool,
+        SECOND_TASK_ID,
+        REVIEW_REPOSITORY_ID,
+        1,
+        "disk_pressure_critical",
+        FIXTURE_TIMESTAMP,
+    )
+    .await
+    .unwrap();
+    for (case, status, failure_json) in [
+        ("cancelled disk task", "cancelled", None),
+        (
+            "wrong disk code",
+            "failed",
+            Some(
+                r#"{"code":"OTHER","message":"critical disk pressure stopped the task","retryable":true}"#,
+            ),
+        ),
+        (
+            "non-retryable disk failure",
+            "failed",
+            Some(
+                r#"{"code":"DISK_PRESSURE_CRITICAL","message":"critical disk pressure stopped the task","retryable":false}"#,
+            ),
+        ),
+        (
+            "disk failure with extra field",
+            "failed",
+            Some(
+                r#"{"code":"DISK_PRESSURE_CRITICAL","message":"critical disk pressure stopped the task","retryable":true,"extra":1}"#,
+            ),
+        ),
+        ("malformed disk failure", "failed", Some("{")),
+        (
+            "disk failure missing message",
+            "failed",
+            Some(r#"{"code":"DISK_PRESSURE_CRITICAL","retryable":true}"#),
+        ),
+        (
+            "numeric disk retryable",
+            "failed",
+            Some(
+                r#"{"code":"DISK_PRESSURE_CRITICAL","message":"critical disk pressure stopped the task","retryable":1}"#,
+            ),
+        ),
+        (
+            "empty disk message",
+            "failed",
+            Some(r#"{"code":"DISK_PRESSURE_CRITICAL","message":"","retryable":true}"#),
+        ),
+    ] {
+        assert_constraint_error(
+            case,
+            update_task_terminal(pool, SECOND_TASK_ID, status, failure_json).await,
+        );
+        assert_eq!(task_status(pool, SECOND_TASK_ID).await, "running");
+    }
+    assert_constraint_error(
+        "disk failure stored as blob",
+        sqlx::query(
+            "UPDATE tasks SET status = 'failed', finished_at = ?, failure_json = ? \
+             WHERE id = ?",
+        )
+        .bind(FIXTURE_TIMESTAMP)
+        .bind(
+            br#"{"code":"DISK_PRESSURE_CRITICAL","message":"critical disk pressure stopped the task","retryable":true}"#
+                .as_slice(),
+        )
+        .bind(SECOND_TASK_ID)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+    );
+    assert_constraint_error(
+        "disk terminal timestamp stored as blob",
+        sqlx::query(
+            "UPDATE tasks SET status = 'failed', finished_at = ?, failure_json = ? \
+             WHERE id = ?",
+        )
+        .bind(FIXTURE_TIMESTAMP.as_bytes())
+        .bind(
+            r#"{"code":"DISK_PRESSURE_CRITICAL","message":"critical disk pressure stopped the task","retryable":true}"#,
+        )
+        .bind(SECOND_TASK_ID)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+    );
+    update_task_terminal(
+        pool,
+        SECOND_TASK_ID,
+        "failed",
+        Some(
+            r#"{"code":"DISK_PRESSURE_CRITICAL","message":"critical disk pressure stopped the task","retryable":true}"#,
+        ),
+    )
+    .await
+    .unwrap();
+    let disk_terminal: (String, String) =
+        sqlx::query_as("SELECT status, failure_json FROM tasks WHERE id = ?")
+            .bind(SECOND_TASK_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(disk_terminal.0, "failed");
+    assert_eq!(
+        disk_terminal.1,
+        r#"{"code":"DISK_PRESSURE_CRITICAL","message":"critical disk pressure stopped the task","retryable":true}"#
+    );
+    assert_constraint_error(
+        "terminal disk failure bytes are immutable",
+        sqlx::query("UPDATE tasks SET failure_json = ? WHERE id = ?")
+            .bind(
+                r#"{"retryable":true,"message":"critical disk pressure stopped the task","code":"DISK_PRESSURE_CRITICAL"}"#,
+            )
+            .bind(SECOND_TASK_ID)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+    );
+    assert_eq!(row_count(pool, "task_stop_intents").await, 3);
+    assert_foreign_keys_clean(pool).await;
 }
 
 #[tokio::test]
@@ -743,7 +1410,7 @@ async fn failed_migration_rolls_back_without_replacing_the_database() {
 }
 
 #[tokio::test]
-async fn version_one_database_upgrades_to_v3_and_repeat_is_a_no_op() {
+async fn version_one_database_upgrades_to_v4_and_repeat_is_a_no_op() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("v1.sqlite3");
     seed_v1(&path, false).await;
@@ -757,17 +1424,19 @@ async fn version_one_database_upgrades_to_v3_and_repeat_is_a_no_op() {
             .fetch_all(store.pool())
             .await
             .unwrap();
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
     for table in [
         "task_attempt_artifacts",
         "task_review_evidence",
         "task_delivery_state",
+        "task_stop_intents",
     ] {
         assert_eq!(schema_object_count(store.pool(), "table", table).await, 1);
     }
     assert_eq!(row_count(store.pool(), "task_attempt_artifacts").await, 0);
     assert_eq!(row_count(store.pool(), "task_review_evidence").await, 0);
     assert_eq!(row_count(store.pool(), "task_delivery_state").await, 0);
+    assert_eq!(row_count(store.pool(), "task_stop_intents").await, 0);
     assert_legacy_rows_preserved(store.pool()).await;
     assert_foreign_keys_clean(store.pool()).await;
 }
@@ -806,7 +1475,7 @@ async fn failed_v2_upgrade_rolls_back_every_v2_statement_and_preserves_v1() {
 }
 
 #[tokio::test]
-async fn version_two_database_upgrades_to_v3_without_rewriting_existing_rows() {
+async fn version_two_database_upgrades_to_v4_without_rewriting_existing_rows() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("v2.sqlite3");
     seed_v2(&path, false).await;
@@ -820,10 +1489,11 @@ async fn version_two_database_upgrades_to_v3_without_rewriting_existing_rows() {
             .fetch_all(store.pool())
             .await
             .unwrap();
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
     assert_eq!(row_count(store.pool(), "task_attempt_artifacts").await, 1);
     assert_eq!(row_count(store.pool(), "task_review_evidence").await, 0);
     assert_eq!(row_count(store.pool(), "task_delivery_state").await, 0);
+    assert_eq!(row_count(store.pool(), "task_stop_intents").await, 0);
 
     let artifact: (String, String, i64, String) = sqlx::query_as(
         "SELECT task_id, repository_id, attempt, state \
@@ -899,6 +1569,286 @@ async fn failed_v3_upgrade_rolls_back_every_v3_statement_and_preserves_v2() {
     assert_eq!(v3_trigger_count, 0);
     assert_legacy_rows_preserved(store.pool()).await;
     assert_foreign_keys_clean(store.pool()).await;
+}
+
+#[tokio::test]
+async fn version_three_database_upgrades_to_v4_without_rewriting_quality_or_event_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v3.sqlite3");
+    seed_v3(&path).await;
+    let store = Store::open(&path).await.unwrap();
+    let parents = seed_review_parents(store.pool()).await;
+    seed_all_persisted_event_kinds(store.pool(), FIRST_TASK_ID).await;
+    insert_evidence(
+        store.pool(),
+        EvidenceInsert::approved(FIRST_TASK_ID, parents.first_task_event_id, 1),
+    )
+    .await
+    .unwrap();
+    insert_delivery(
+        store.pool(),
+        FIRST_TASK_ID,
+        "review_approved",
+        1,
+        "approved",
+    )
+    .await
+    .unwrap();
+    insert_evidence(
+        store.pool(),
+        EvidenceInsert::changes_requested(SECOND_TASK_ID, parents.second_task_event_id),
+    )
+    .await
+    .unwrap();
+
+    let quality_before = quality_rows_snapshot(store.pool()).await;
+    let events_before = event_rows_snapshot(store.pool()).await;
+    let event_kinds_before: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT kind FROM task_events ORDER BY kind")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(event_kinds_before, persisted_event_kinds());
+    let event_schema_versions_before: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT schema_version FROM task_events ORDER BY schema_version",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(event_schema_versions_before, vec![1]);
+    store.migrate().await.unwrap();
+    let schema_after_first = schema_snapshot(store.pool()).await;
+    store.close().await;
+
+    let store = Store::open(&path).await.unwrap();
+    store.migrate().await.unwrap();
+
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(quality_rows_snapshot(store.pool()).await, quality_before);
+    assert_eq!(event_rows_snapshot(store.pool()).await, events_before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_events WHERE schema_version != 1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(schema_snapshot(store.pool()).await, schema_after_first);
+    assert_eq!(row_count(store.pool(), "task_stop_intents").await, 0);
+    assert_foreign_keys_clean(store.pool()).await;
+}
+
+#[tokio::test]
+async fn every_v4_statement_failure_rolls_back_the_entire_upgrade() {
+    let conflicts = [
+        ("table", "task_stop_intents"),
+        ("trigger", "task_stop_intents_running_unreviewed_on_insert"),
+        ("trigger", "task_stop_intents_no_replace"),
+        ("trigger", "task_stop_intents_no_update"),
+        ("trigger", "task_stop_intents_no_delete"),
+        ("trigger", "tasks_stop_intent_no_replace"),
+        ("trigger", "tasks_stop_intent_identity_collision_on_update"),
+        ("trigger", "tasks_stop_intent_terminal_on_update"),
+        ("trigger", "task_review_evidence_stop_intent_on_insert"),
+        ("trigger", "task_delivery_state_stop_intent_on_insert"),
+        ("trigger", "task_events_stop_intent_review_on_insert"),
+        ("trigger", "task_events_stop_intent_review_on_update"),
+        ("index", "tasks_queued_created_at_id"),
+        ("migration_receipt", "reject_v4_migration_receipt"),
+        ("migration_receipt_ignore", "ignore_v4_migration_receipt"),
+        ("migration_receipt_delete", "delete_v4_migration_receipt"),
+    ];
+
+    for (kind, name) in conflicts {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(format!("v4-conflict-{name}.sqlite3"));
+        seed_v3(&path).await;
+        seed_schema_conflict(&path, kind, name).await;
+        let store = Store::open(&path).await.unwrap();
+        let before = schema_snapshot(store.pool()).await;
+
+        let error = store
+            .migrate()
+            .await
+            .expect_err("conflicting v4 object unexpectedly migrated");
+
+        assert_eq!(
+            schema_snapshot(store.pool()).await,
+            before,
+            "{kind} {name} left partial v4 schema after {error}"
+        );
+        let versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(versions, vec![1, 2, 3], "{kind} {name}");
+        assert_legacy_rows_preserved(store.pool()).await;
+        assert!(
+            !error.to_string().contains(&path.display().to_string()),
+            "migration error leaked database path: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_migration_histories_fail_closed_before_any_schema_write() {
+    let cases = [
+        ("empty existing history", CANONICAL_HISTORY_SCHEMA, ""),
+        (
+            "future version",
+            CANONICAL_HISTORY_SCHEMA,
+            "INSERT INTO schema_migrations VALUES
+                 (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');",
+        ),
+        (
+            "zero version",
+            CANONICAL_HISTORY_SCHEMA,
+            "INSERT INTO schema_migrations VALUES (0, 'zero');",
+        ),
+        (
+            "negative version",
+            CANONICAL_HISTORY_SCHEMA,
+            "INSERT INTO schema_migrations VALUES (-1, 'negative');",
+        ),
+        (
+            "missing version one",
+            CANONICAL_HISTORY_SCHEMA,
+            "INSERT INTO schema_migrations VALUES (2, 'two');",
+        ),
+        (
+            "internal gap",
+            CANONICAL_HISTORY_SCHEMA,
+            "INSERT INTO schema_migrations VALUES (1, 'one'), (3, 'three');",
+        ),
+        (
+            "duplicate version",
+            "CREATE TABLE schema_migrations (version INTEGER, applied_at TEXT NOT NULL);",
+            "INSERT INTO schema_migrations VALUES (1, 'first'), (1, 'duplicate');",
+        ),
+        (
+            "text version",
+            "CREATE TABLE schema_migrations (version TEXT, applied_at TEXT NOT NULL);",
+            "INSERT INTO schema_migrations VALUES ('1', 'text');",
+        ),
+        (
+            "mixed case history name",
+            "CREATE TABLE Schema_Migrations (
+                 version INTEGER PRIMARY KEY,
+                 applied_at TEXT NOT NULL
+             );",
+            "INSERT INTO Schema_Migrations VALUES (99, 'future');",
+        ),
+        (
+            "null version",
+            "CREATE TABLE schema_migrations (version INTEGER, applied_at TEXT NOT NULL);",
+            "INSERT INTO schema_migrations VALUES (NULL, 'null');",
+        ),
+    ];
+
+    for (case, schema, rows) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(format!(
+            "invalid-history-{}.sqlite3",
+            case.replace(' ', "-")
+        ));
+        seed_migration_history(&path, schema, rows).await;
+        let store = Store::open(&path).await.unwrap();
+        let schema_before = schema_snapshot(store.pool()).await;
+        let history_before = migration_history_snapshot(store.pool()).await;
+
+        let error = store
+            .migrate()
+            .await
+            .expect_err("invalid migration history unexpectedly accepted");
+
+        assert_eq!(
+            error.to_string(),
+            DATABASE_SCHEMA_UNSUPPORTED,
+            "{case} returned an unstable error: {error:?}"
+        );
+        assert_eq!(
+            schema_snapshot(store.pool()).await,
+            schema_before,
+            "{case} changed schema before rejecting history"
+        );
+        assert_eq!(
+            migration_history_snapshot(store.pool()).await,
+            history_before,
+            "{case} rewrote migration history"
+        );
+        assert_eq!(
+            schema_object_count(store.pool(), "table", "repositories").await,
+            0,
+            "{case} created application schema"
+        );
+        assert!(
+            !error.to_string().contains(&path.display().to_string()),
+            "{case} leaked database path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn temporary_migration_table_cannot_shadow_main_history() {
+    let store = Store::open(":memory:").await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TEMP TABLE schema_migrations (
+             version INTEGER PRIMARY KEY,
+             applied_at TEXT NOT NULL
+         );
+         INSERT INTO temp.schema_migrations VALUES (99, 'temporary');",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    store.migrate().await.unwrap();
+
+    let main_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM main.schema_migrations ORDER BY version")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    let temporary_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM temp.schema_migrations ORDER BY version")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(main_versions, vec![1, 2, 3, 4]);
+    assert_eq!(temporary_versions, vec![99]);
+}
+
+#[tokio::test]
+async fn v4_upgrade_checks_existing_foreign_keys_before_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v3-corrupt-foreign-key.sqlite3");
+    seed_v3(&path).await;
+    corrupt_v3_foreign_key(&path).await;
+    let store = Store::open(&path).await.unwrap();
+    let before = schema_snapshot(store.pool()).await;
+
+    store
+        .migrate()
+        .await
+        .expect_err("foreign-key corruption unexpectedly migrated");
+
+    assert_eq!(schema_snapshot(store.pool()).await, before);
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(
+        schema_object_count(store.pool(), "table", "task_stop_intents").await,
+        0
+    );
 }
 
 async fn seed_v1(path: &Path, conflicting_v2_table: bool) {
@@ -1004,6 +1954,96 @@ async fn seed_v2(path: &Path, conflicting_v3_table: bool) {
     connection.close().await.unwrap();
 }
 
+async fn seed_v3(path: &Path) {
+    seed_v2(path, false).await;
+
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0003_multi_role_quality.sql"))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)")
+        .bind("2026-07-23T00:00:00.000000000Z")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+}
+
+async fn seed_schema_conflict(path: &Path, kind: &str, name: &str) {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    let sql = match kind {
+        "table" => format!("CREATE TABLE {name} (preserve_marker TEXT NOT NULL)"),
+        "trigger" => format!(
+            "CREATE TRIGGER {name} BEFORE UPDATE ON repositories \
+             BEGIN SELECT 1; END"
+        ),
+        "index" => format!("CREATE INDEX {name} ON repositories(created_at)"),
+        "migration_receipt" => format!(
+            "CREATE TRIGGER {name} BEFORE INSERT ON schema_migrations \
+             WHEN NEW.version = 4 \
+             BEGIN SELECT RAISE(ABORT, 'injected v4 receipt failure'); END"
+        ),
+        "migration_receipt_ignore" => format!(
+            "CREATE TRIGGER {name} BEFORE INSERT ON schema_migrations \
+             WHEN NEW.version = 4 \
+             BEGIN SELECT RAISE(IGNORE); END"
+        ),
+        "migration_receipt_delete" => format!(
+            "CREATE TRIGGER {name} AFTER INSERT ON schema_migrations \
+             WHEN NEW.version = 4 \
+             BEGIN DELETE FROM schema_migrations WHERE version = 4; END"
+        ),
+        other => panic!("unsupported conflict kind {other}"),
+    };
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+}
+
+async fn seed_migration_history(path: &Path, schema: &str, rows: &str) {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(schema.to_owned()))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    if !rows.is_empty() {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(rows.to_owned()))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    }
+    connection.close().await.unwrap();
+}
+
+async fn corrupt_v3_foreign_key(path: &Path) {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .foreign_keys(false);
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    sqlx::query(
+        "UPDATE task_attempt_artifacts \
+         SET repository_id = 'ffffffff-ffff-4fff-8fff-ffffffffffff' \
+         WHERE task_id = '22222222-2222-4222-8222-222222222222'",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+}
+
 async fn assert_legacy_rows_preserved(pool: &sqlx::SqlitePool) {
     let task: (String, String, i64, i64) = sqlx::query_as(
         "SELECT repository_id, status, attempt, last_event_id \
@@ -1044,6 +2084,68 @@ async fn assert_foreign_keys_clean(pool: &sqlx::SqlitePool) {
     );
 }
 
+async fn schema_snapshot(pool: &sqlx::SqlitePool) -> Vec<(String, String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT type, name, tbl_name, sql \
+         FROM sqlite_master \
+         WHERE name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn migration_history_snapshot(
+    pool: &sqlx::SqlitePool,
+) -> Vec<(Option<String>, String, String)> {
+    sqlx::query_as(
+        "SELECT CAST(version AS TEXT), typeof(version), applied_at \
+         FROM schema_migrations ORDER BY rowid",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn quality_rows_snapshot(pool: &sqlx::SqlitePool) -> (Vec<String>, Vec<String>) {
+    let evidence = sqlx::query_scalar(
+        "SELECT json_array(
+             task_id, repository_id, attempt, review_round,
+             workspace_generation, digest_algorithm, workspace_digest,
+             decision_source, verdict, summary, findings_json,
+             added_checks_json, required_checks_json, check_evidence_json,
+             coverage_json, created_at, event_id, event_kind
+         )
+         FROM task_review_evidence ORDER BY task_id, review_round",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let delivery = sqlx::query_scalar(
+        "SELECT json_array(
+             task_id, readiness, final_review_round, final_verdict, decided_at
+         )
+         FROM task_delivery_state ORDER BY task_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (evidence, delivery)
+}
+
+async fn event_rows_snapshot(pool: &sqlx::SqlitePool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT json_array(
+             id, schema_version, task_id, kind, payload_json, created_at
+         )
+         FROM task_events ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 async fn schema_object_count(pool: &sqlx::SqlitePool, kind: &str, name: &str) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = ? AND name = ?")
         .bind(kind)
@@ -1058,14 +2160,82 @@ async fn row_count(pool: &sqlx::SqlitePool, table: &str) -> i64 {
         "task_attempt_artifacts" => "SELECT COUNT(*) FROM task_attempt_artifacts",
         "task_review_evidence" => "SELECT COUNT(*) FROM task_review_evidence",
         "task_delivery_state" => "SELECT COUNT(*) FROM task_delivery_state",
+        "task_stop_intents" => "SELECT COUNT(*) FROM task_stop_intents",
         other => panic!("unsupported fixture table {other}"),
     };
     sqlx::query_scalar(query).fetch_one(pool).await.unwrap()
 }
 
+async fn insert_stop_intent(
+    pool: &sqlx::SqlitePool,
+    task_id: &str,
+    repository_id: &str,
+    attempt: i64,
+    kind: &str,
+    requested_at: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO task_stop_intents (
+             task_id, repository_id, attempt, kind, requested_at
+         ) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(task_id)
+    .bind(repository_id)
+    .bind(attempt)
+    .bind(kind)
+    .bind(requested_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn update_task_terminal(
+    pool: &sqlx::SqlitePool,
+    task_id: &str,
+    status: &str,
+    failure_json: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE tasks SET status = ?, finished_at = ?, failure_json = ? \
+         WHERE id = ?",
+    )
+    .bind(status)
+    .bind(FIXTURE_TIMESTAMP)
+    .bind(failure_json)
+    .bind(task_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn task_status(pool: &sqlx::SqlitePool, task_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM tasks WHERE id = ?")
+        .bind(task_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+fn assert_constraint_error(case: &str, result: Result<(), sqlx::Error>) {
+    let error = match result {
+        Ok(()) => panic!("{case} unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, sqlx::Error::Database(_)),
+        "{case} failed for a non-constraint reason: {error}"
+    );
+}
+
 const REVIEW_REPOSITORY_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const FIRST_TASK_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const SECOND_TASK_ID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const THIRD_TASK_ID: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+const THIRD_CLIENT_REQUEST_ID: &str = "99999999-9999-4999-8999-999999999999";
+const FOURTH_TASK_ID: &str = "12121212-1212-4212-8212-121212121212";
+const FOURTH_CLIENT_REQUEST_ID: &str = "34343434-3434-4434-8434-343434343434";
+const FIFTH_TASK_ID: &str = "56565656-5656-4656-8656-565656565656";
+const FIFTH_CLIENT_REQUEST_ID: &str = "78787878-7878-4878-8878-787878787878";
 const FIXTURE_TIMESTAMP: &str = "2026-07-23T00:00:00.000000000Z";
 const WORKSPACE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const REQUIRED_CHECKS_JSON: &str =
@@ -1073,6 +2243,10 @@ const REQUIRED_CHECKS_JSON: &str =
 const CHECK_EVIDENCE_JSON: &str = r#"[{"check_id":"tests","actor":"executor","role_run":1,"workspace_generation":0,"workspace_digest":{"algorithm":"workspace_fingerprint_v1","value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"status":"passed","duration_ms":1,"summary":"ok","truncated":false}]"#;
 const BLOCKING_FINDINGS_JSON: &str = r#"[{"id":"review-1-finding-1","severity":"blocking","message":"fix required","path":null,"line":null}]"#;
 const COMPLETE_COVERAGE_JSON: &str = r#"{"generation":0,"workspace_digest":{"algorithm":"workspace_fingerprint_v1","value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","covered_chunks":[0],"total_chunks":1}"#;
+const CANONICAL_HISTORY_SCHEMA: &str = "CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);";
 
 #[derive(Debug)]
 struct ReviewParents {
@@ -1155,6 +2329,48 @@ async fn insert_parent_event(pool: &sqlx::SqlitePool, event_id: i64, task_id: &s
     .execute(pool)
     .await
     .unwrap();
+}
+
+async fn seed_all_persisted_event_kinds(pool: &sqlx::SqlitePool, task_id: &str) {
+    for (offset, kind) in persisted_event_kinds().into_iter().enumerate() {
+        let payload = if kind == "review.updated" {
+            r#"{"evidence_ref":true}"#
+        } else {
+            r#"{"preserve":"event-bytes"}"#
+        };
+        sqlx::query(
+            "INSERT INTO task_events (
+                 id, schema_version, task_id, kind, payload_json, created_at
+             ) VALUES (?, 1, ?, ?, ?, ?)",
+        )
+        .bind(200_i64 + i64::try_from(offset).unwrap())
+        .bind(task_id)
+        .bind(kind)
+        .bind(payload)
+        .bind(FIXTURE_TIMESTAMP)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+fn persisted_event_kinds() -> Vec<String> {
+    [
+        "activity.appended",
+        "diff.updated",
+        "plan.updated",
+        "review.updated",
+        "task.cancelled",
+        "task.completed",
+        "task.failed",
+        "task.interrupted",
+        "task.queued",
+        "task.started",
+        "test.updated",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1311,6 +2527,10 @@ async fn table_columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<ColumnInfo> 
             "SELECT name, type AS data_type, \"notnull\" AS not_null, pk \
              FROM pragma_table_info('task_delivery_state') ORDER BY cid"
         }
+        "task_stop_intents" => {
+            "SELECT name, type AS data_type, \"notnull\" AS not_null, pk \
+             FROM pragma_table_info('task_stop_intents') ORDER BY cid"
+        }
         other => panic!("unsupported fixture table {other}"),
     };
     sqlx::query(query)
@@ -1416,6 +2636,12 @@ async fn foreign_keys(pool: &sqlx::SqlitePool, table: &str) -> Vec<ForeignKey> {
              FROM pragma_foreign_key_list('task_delivery_state') \
              ORDER BY id, seq"
         }
+        "task_stop_intents" => {
+            "SELECT id, seq, \"table\" AS parent_table, \
+                    \"from\" AS child_column, \"to\" AS parent_column \
+             FROM pragma_foreign_key_list('task_stop_intents') \
+             ORDER BY id, seq"
+        }
         other => panic!("unsupported fixture table {other}"),
     };
     let mut keys: BTreeMap<i64, (String, SequencedForeignKeyColumns)> = BTreeMap::new();
@@ -1459,11 +2685,19 @@ async fn normalized_schema_sql(pool: &sqlx::SqlitePool, kind: &str, name: &str) 
 }
 
 async fn assert_immutable_trigger_shape(pool: &sqlx::SqlitePool, table: &str) {
+    let no_replace = format!("{table}_no_replace");
+    let no_update = format!("{table}_no_update");
+    let no_delete = format!("{table}_no_delete");
     let triggers: Vec<String> = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master \
-         WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
+         WHERE type = 'trigger' AND tbl_name = ? \
+           AND name IN (?, ?, ?) \
+         ORDER BY name",
     )
     .bind(table)
+    .bind(no_replace)
+    .bind(no_update)
+    .bind(no_delete)
     .fetch_all(pool)
     .await
     .unwrap();

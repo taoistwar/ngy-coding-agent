@@ -33,18 +33,31 @@ interface TaskView {
 
 const emptyScenario = (): ProcessScenario => ({
   ...successScenario(),
+  runtime_config: null,
   fake_scenarios: [],
 });
 
-test("UI quit bounds a runner that ignores cancellation and preserves Interrupted recovery", async (
+test("UI quit retains ownership past the budget for a runner that ignores cancellation", async (
   { context, page },
   testInfo,
 ) => {
+  let runnerReleasePath = "";
   await withLocalApp(
     testInfo,
-    {
-      ...successScenario(),
-      fake_scenarios: ["ignores_cancellation"],
+    (roots): ProcessScenario => {
+      runnerReleasePath = roots.releaseSignalPath("shutdown-ignores-cancellation");
+      return {
+        ...successScenario(),
+        runtime_config: null,
+        fake_scenarios: ["ignores_cancellation"],
+        virtual_release_signals: [
+          {
+            name: "shutdown-ignores-cancellation",
+            path: runnerReleasePath,
+            target: "runner_next",
+          },
+        ],
+      };
     },
     async (app) => {
       await openWorkspace(page, app);
@@ -61,8 +74,29 @@ test("UI quit bounds a runner that ignores cancellation and preserves Interrupte
       );
       await expect(page.locator(".task-status-label")).toHaveText("Execution status: running");
 
-      const cleanExitElapsedMs = await quitThroughUi(page, app, CLEAN_EXIT_BUDGET_MS);
-      expect(cleanExitElapsedMs).toBeLessThan(CLEAN_EXIT_BUDGET_MS);
+      if (runnerReleasePath.length === 0) {
+        throw new Error("the cancellation-ignoring runner release was not configured");
+      }
+      const shuttingDownInstance = await app.runtimeIdentity();
+      const markerPath = path.join(
+        app.appDataDir,
+        `unclean-shutdown.json.${shuttingDownInstance.instanceId}.marker`,
+      );
+
+      await quitThroughUiUntilBarrier(page, app);
+      await expect(app.waitForExitCode(0, CLEAN_EXIT_BUDGET_MS)).rejects.toThrow(
+        "coding-agent did not exit within",
+      );
+      await expect
+        .poll(() => pathExists(app.descriptorPath), {
+          message: "the dead HTTP endpoint must no longer be advertised",
+        })
+        .toBe(false);
+      expect(await pathExists(markerPath)).toBe(false);
+
+      await publishUncoordinatedReleaseSignal(app.runtimeDir, runnerReleasePath);
+      await app.waitForExitCode(1, CLEAN_EXIT_BUDGET_MS);
+      expect(await pathExists(markerPath)).toBe(true);
 
       await app.restart(emptyScenario());
       await openWorkspace(page, app);
@@ -74,7 +108,7 @@ test("UI quit bounds a runner that ignores cancellation and preserves Interrupte
         (task) => task.status === "interrupted",
         "the task to remain Interrupted after restart",
       );
-      expect(recovered.failure?.code).toBe("APP_SHUTDOWN");
+      expect(recovered.failure?.code).toBe("APP_RESTARTED");
 
       const tasks = await listTasks(context.request, app.origin);
       expect(tasks).toHaveLength(1);
@@ -112,6 +146,7 @@ test("replays a live completion exactly once after a paused TaskDetail snapshot"
       runnerReleasePath = roots.releaseSignalPath("complete-during-task-detail");
       return {
         ...successScenario(),
+        runtime_config: null,
         fake_scenarios: ["blocking"],
         actor_pauses: ["task_detail_after_snapshot"],
         virtual_release_signals: [
@@ -175,11 +210,12 @@ for (const markerWriteFailure of [false, true]) {
       testInfo,
       {
         ...successScenario(),
+        runtime_config: null,
         fake_scenarios: ["blocking"],
         store_writer_faults: [
           {
             point: "fail_before_execute",
-            operation: "recover_incomplete",
+            operation: "interrupt_remaining_after_stops",
             count: 1,
           },
         ],
@@ -240,6 +276,7 @@ test("the UI quit barrier rejects late create and retry before durable interrupt
       quiesceReleasePath = roots.releaseSignalPath("quiesce-before-recovery");
       return {
         ...successScenario(),
+        runtime_config: null,
         fake_scenarios: ["failure", "blocking"],
         actor_pauses: ["quiesce_before_recovery"],
         virtual_release_signals: [
@@ -328,6 +365,7 @@ test("the quit barrier drains in-flight create and retry before interrupting bot
     testInfo,
     {
       ...successScenario(),
+      runtime_config: null,
       fake_scenarios: ["failure"],
     },
     async (app) => {
@@ -351,6 +389,7 @@ test("the quit barrier drains in-flight create and retry before interrupting bot
         retryReleasePath = roots.releaseSignalPath("inflight-retry-before-write");
         return {
           ...successScenario(),
+          runtime_config: null,
           fake_scenarios: ["blocking", "blocking"],
           actor_pauses: ["create_before_write", "retry_before_write"],
           virtual_release_signals: [
@@ -450,6 +489,7 @@ test("the quit barrier interrupts a claim paused after handle registration", asy
       claimReleasePath = roots.releaseSignalPath("quit-during-claim-registration");
       return {
         ...successScenario(),
+        runtime_config: null,
         fake_scenarios: ["blocking"],
         actor_pauses: ["claim_handle_registered"],
         virtual_release_signals: [
@@ -545,6 +585,7 @@ test("a runner result paused before its write commits before the quit interrupti
       resultReleasePath = roots.releaseSignalPath("quit-before-result-write");
       return {
         ...successScenario(),
+        runtime_config: null,
         fake_scenarios: ["success"],
         actor_pauses: ["result_before_write"],
         virtual_release_signals: [

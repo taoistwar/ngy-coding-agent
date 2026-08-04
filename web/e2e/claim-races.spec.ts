@@ -78,7 +78,9 @@ for (const race of CLAIM_RACES) {
         actorReleasePath = roots.releaseSignalPath(race.pause);
         cancelEnqueuedReleasePath = roots.releaseSignalPath("cancel-enqueued");
         return {
+          runtime_config: null,
           fake_scenarios: ["blocking"],
+          storage_samples: [{ kind: "native" }],
           store_writer_faults: [],
           actor_pauses: [race.pause, "cancel_enqueued"],
           virtual_release_signals: [
@@ -149,11 +151,17 @@ for (const race of CLAIM_RACES) {
         await publishReleaseSignal(cancelEnqueuedReached);
 
         const response = await within(cancelResponse, "the cancel response after releasing the actor");
-        const accepted = await cancellationAccepted(response);
-        expect(accepted).toEqual({
-          cancellation_requested: true,
-          task: expect.objectContaining({ id: created.id, status: "running" }),
-        });
+        const cancellation = await cancellationOutcome(response);
+        if (cancellation.kind === "accepted") {
+          expect(cancellation.task).toEqual(
+            expect.objectContaining({ id: created.id, status: "running" }),
+          );
+        } else {
+          expect(race.statusAtPause).toBe("queued");
+          expect(cancellation.task).toEqual(
+            expect.objectContaining({ id: created.id, status: "cancelled" }),
+          );
+        }
 
         const terminal = await waitForTaskStatus(
           context.request,
@@ -171,7 +179,10 @@ for (const race of CLAIM_RACES) {
         expect(tasks.some((task) => task.status === "queued" || task.status === "running"))
           .toBe(false);
 
-        const expectedTimeline = ["task.queued", "task.started", "task.cancelled"];
+        const expectedTimeline =
+          cancellation.kind === "accepted"
+            ? ["task.queued", "task.started", "task.cancelled"]
+            : ["task.queued", "task.cancelled"];
         expect(await taskEventKinds(context.request, app.origin, created.id))
           .toEqual(expectedTimeline);
         for (const kind of expectedTimeline) {
@@ -199,7 +210,9 @@ test("completion committed at result_before_write wins over an already-sent UI c
       actorReleasePath = roots.releaseSignalPath("result-before-write");
       cancelEnqueuedReleasePath = roots.releaseSignalPath("cancel-enqueued");
       return {
+        runtime_config: null,
         fake_scenarios: ["success"],
+        storage_samples: [{ kind: "native" }],
         store_writer_faults: [],
         actor_pauses: ["result_before_write", "cancel_enqueued"],
         virtual_release_signals: [
@@ -351,12 +364,14 @@ async function beginTaskCreationThroughUi(
   return { response };
 }
 
-async function cancellationAccepted(response: Response): Promise<{
-  cancellation_requested: true;
-  task: TaskView;
-}> {
-  expect(response.status()).toBe(202);
+async function cancellationOutcome(
+  response: Response,
+): Promise<{ kind: "accepted" | "finished"; task: TaskView }> {
   const candidate = (await response.json()) as unknown;
+  if (response.status() === 200) {
+    return { kind: "finished", task: parseTask(candidate) };
+  }
+  expect(response.status()).toBe(202);
   if (
     !isRecord(candidate) ||
     candidate.cancellation_requested !== true ||
@@ -365,7 +380,7 @@ async function cancellationAccepted(response: Response): Promise<{
     throw new Error("cancel response was not the exact accepted shape");
   }
   return {
-    cancellation_requested: true,
+    kind: "accepted",
     task: parseTask(candidate.task),
   };
 }

@@ -1,0 +1,52 @@
+{
+  "snapshot": {
+    "schema_version": 1,
+    "server_instance_id": "123e4567-e89b-42d3-a456-426614174000",
+    "server_started_at": "2026-07-15T00:00:00.000000000Z",
+    "generation": 9007199254740991,
+    "as_of_event_id": 41,
+    "service_state_generation": 7,
+    "admission_state": "running",
+    "limits": {
+      "global": 4,
+      "per_repository": 2,
+      "queued": 256,
+      "cargo_jobs_per_task": 8
+    },
+    "active_task_count": 1,
+    "queued_task_count": 1,
+    "queued_tasks": [
+      {
+        "task_id": "123e4567-e89b-42d3-a456-000000001000",
+        "reason": "repository_capacity"
+      }
+    ],
+    "stopping_tasks": [
+      {
+        "task_id": "123e4567-e89b-42d3-a456-000000002000",
+        "intent": "user_cancelled"
+      }
+    ],
+    "storage": {
+      "state": "unavailable",
+      "data": {
+        "state": "normal"
+      },
+      "runtime": {
+        "state": "unavailable"
+      },
+      "repositories": [
+        {
+          "repository_id": "123e4567-e89b-42d3-a456-000000003000",
+          "state": "pressure"
+        }
+      ]
+    }
+  },
+  "canonical_json": "{\"active_task_count\":1,\"admission_state\":\"running\",\"as_of_event_id\":41,\"generation\":9007199254740991,\"limits\":{\"cargo_jobs_per_task\":8,\"global\":4,\"per_repository\":2,\"queued\":256},\"queued_task_count\":1,\"queued_tasks\":[{\"reason\":\"repository_capacity\",\"task_id\":\"123e4567-e89b-42d3-a456-000000001000\"}],\"schema_version\":1,\"server_instance_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"server_started_at\":\"2026-07-15T00:00:00.000000000Z\",\"service_state_generation\":7,\"stopping_tasks\":[{\"intent\":\"user_cancelled\",\"task_id\":\"123e4567-e89b-42d3-a456-000000002000\"}],\"storage\":{\"data\":{\"state\":\"normal\"},\"repositories\":[{\"repository_id\":\"123e4567-e89b-42d3-a456-000000003000\",\"state\":\"pressure\"}],\"runtime\":{\"state\":\"unavailable\"},\"state\":\"unavailable\"}}",
+  "sha256": "ddf15bcd7ba6fad08f1b64b124cf5996b8306725eac4a3a29c1da2e19d8f6a00",
+  "unicode_string": {
+    "source": "并发🚀/\b\t\n\f\r\"\\",
+    "canonical_json": "\"并发🚀/\\b\\t\\n\\f\\r\\\"\\\\\""
+  }
+}

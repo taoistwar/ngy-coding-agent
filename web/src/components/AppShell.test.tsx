@@ -12,9 +12,19 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { CreateTaskCommand } from "../api/client";
-import type { Repository, Task, TaskDetail } from "../api/types";
+import type {
+  Repository,
+  SchedulerQueueReason,
+  SchedulerState,
+  Task,
+  TaskDetail,
+} from "../api/types";
 import { initialAgentState, type AgentState } from "../state/model";
 import type { UseAgentStateResult } from "../state/useAgentState";
+import {
+  initialSchedulerProjection,
+  type SchedulerProjectionState,
+} from "../state/schedulerProjection";
 import { AppShell } from "./AppShell";
 import { ConnectionBanner } from "./ConnectionBanner";
 import { ErrorBoundary } from "./ErrorBoundary";
@@ -75,6 +85,41 @@ function detail(value: Task): TaskDetail {
     tests: null,
     timeline: [],
     reviews: [],
+  };
+}
+
+function schedulerProjection(
+  queued: Array<{ task_id: string; reason: SchedulerQueueReason }>,
+  freshness: SchedulerProjectionState["freshness"] = "fresh",
+): SchedulerProjectionState {
+  const snapshot: SchedulerState = {
+    schema_version: 1,
+    server_instance_id: "123e4567-e89b-42d3-a456-426614174000",
+    server_started_at: LATER,
+    generation: 1,
+    as_of_event_id: 1,
+    service_state_generation: 0,
+    admission_state: "running",
+    limits: { global: 2, per_repository: 2, queued: 32, cargo_jobs_per_task: 2 },
+    active_task_count: 0,
+    queued_task_count: queued.length,
+    queued_tasks: queued,
+    stopping_tasks: [],
+    storage: {
+      state: "normal",
+      data: { state: "normal" },
+      runtime: { state: "normal" },
+      repositories: [],
+    },
+  };
+  return {
+    snapshot,
+    freshness,
+    staleReason: freshness === "stale" ? "transport_reconnecting" : null,
+    digest: "a".repeat(64),
+    canonicalJson: "{}",
+    pending: null,
+    recoveryReason: null,
   };
 }
 
@@ -218,6 +263,52 @@ describe("Sidebar", () => {
     expect(within(rejectedItem!).getByText("Review rejected")).toBeVisible();
   });
 
+  it("shows only server-projected queue reasons and never invents position or ETA", () => {
+    const reasons: SchedulerQueueReason[] = [
+      "service_paused",
+      "storage_pressure",
+      "global_capacity",
+      "repository_capacity",
+      "repository_control_busy",
+    ];
+    const queued = reasons.map((reason, index) =>
+      task(`queued-${index}`, "repo-new", LATER, "queued"),
+    );
+    const withoutProjection = task("queued-without-projection", "repo-new", EARLIER, "queued");
+    render(
+      <Sidebar
+        repositories={[repository("repo-new")]}
+        tasks={[...queued, withoutProjection]}
+        scheduler={schedulerProjection(
+          queued.map((value, index) => ({ task_id: value.id, reason: reasons[index]! })),
+        )}
+        selectedRepositoryId="repo-new"
+        selectedTaskId={queued[0]!.id}
+        onSelectRepository={vi.fn()}
+        onSelectTask={vi.fn()}
+        onAddRepository={vi.fn()}
+        onPickRepository={vi.fn()}
+        onRetry={vi.fn()}
+      />,
+    );
+
+    for (const label of [
+      "Waiting for the service",
+      "Waiting for storage",
+      "Waiting for global capacity",
+      "Waiting for repository capacity",
+      "Waiting for repository coordination",
+    ]) {
+      expect(screen.getByText(label)).toBeVisible();
+    }
+    const unprojectedItem = screen
+      .getByText(withoutProjection.prompt)
+      .closest("li");
+    expect(unprojectedItem).not.toBeNull();
+    expect(unprojectedItem).not.toHaveTextContent("Waiting for");
+    expect(screen.getByRole("navigation")).not.toHaveTextContent(/position|ETA/iu);
+  });
+
   it("supports direct path registration, the native picker, retry, and empty states", async () => {
     const user = userEvent.setup();
     const onSelectRepository = vi.fn();
@@ -349,6 +440,8 @@ describe("TaskComposer", () => {
     render(
       <TaskComposer
         repositoryId="repo"
+        scheduler={initialSchedulerProjection}
+        queueFullReplay={null}
         onCreateTask={vi.fn()}
         onCreated={vi.fn()}
       />,
@@ -368,6 +461,8 @@ describe("TaskComposer", () => {
     render(
       <TaskComposer
         repositoryId="repo"
+        scheduler={initialSchedulerProjection}
+        queueFullReplay={null}
         onCreateTask={onCreateTask}
         onCreated={vi.fn()}
       />,
@@ -410,6 +505,8 @@ describe("TaskComposer", () => {
     render(
       <TaskComposer
         repositoryId="repo"
+        scheduler={initialSchedulerProjection}
+        queueFullReplay={null}
         onCreateTask={onCreateTask}
         onCreated={onCreated}
       />,
@@ -447,6 +544,8 @@ describe("TaskComposer", () => {
     const { rerender } = render(
       <TaskComposer
         repositoryId="repo-first"
+        scheduler={initialSchedulerProjection}
+        queueFullReplay={null}
         onCreateTask={onCreateTask}
         onCreated={onCreated}
       />,
@@ -459,6 +558,8 @@ describe("TaskComposer", () => {
     rerender(
       <TaskComposer
         repositoryId="repo-second"
+        scheduler={initialSchedulerProjection}
+        queueFullReplay={null}
         onCreateTask={onCreateTask}
         onCreated={onCreated}
       />,
@@ -494,6 +595,8 @@ describe("TaskComposer", () => {
     const { rerender } = render(
       <TaskComposer
         repositoryId="repo-first"
+        scheduler={initialSchedulerProjection}
+        queueFullReplay={null}
         onCreateTask={onCreateTask}
         onCreated={onCreated}
       />,
@@ -504,6 +607,8 @@ describe("TaskComposer", () => {
     rerender(
       <TaskComposer
         repositoryId="repo-second"
+        scheduler={initialSchedulerProjection}
+        queueFullReplay={null}
         onCreateTask={onCreateTask}
         onCreated={onCreated}
       />,
@@ -571,6 +676,8 @@ describe("AppShell", () => {
 
     expect(screen.getByRole("banner")).toBeVisible();
     expect(screen.getByRole("heading", { name: "NGY Coding Agent", level: 1 })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Controlled concurrency" })).toBeVisible();
+    expect(screen.getByText("Scheduler state is unavailable")).toBeVisible();
     expect(screen.getByRole("navigation", { name: "Repositories and tasks" })).toBeVisible();
     expect(screen.getByRole("main", { name: "Task workspace" })).toBeVisible();
     expect(screen.getByRole("complementary", { name: "Results and evidence" })).toBeVisible();

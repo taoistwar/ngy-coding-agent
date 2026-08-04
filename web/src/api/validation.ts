@@ -11,6 +11,12 @@ import type {
   TaskDetail,
   TaskEvent,
 } from "./types";
+import {
+  ValidationError,
+  validateSchedulerStateForBootstrap,
+} from "./schedulerValidation";
+
+export { ValidationError } from "./schedulerValidation";
 
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const MAX_U32 = 0xffff_ffff;
@@ -48,16 +54,6 @@ const TASK_EVENT_KINDS = [
 
 const TASK_EVENT_KIND_SET = new Set<string>(TASK_EVENT_KINDS);
 const encoder = new TextEncoder();
-
-export class ValidationError extends Error {
-  readonly path: string;
-
-  constructor(path: string, message: string) {
-    super(`${path}: ${message}`);
-    this.name = "ValidationError";
-    this.path = path;
-  }
-}
 
 export function validateTask(value: unknown): Task {
   return readTask(value, "$");
@@ -245,6 +241,7 @@ export function validateBootstrapResponse(value: unknown): BootstrapResponse {
       "service_state",
       "service_state_generation",
       "max_concurrent_tasks",
+      "scheduler",
     ],
   );
   nonEmptyString(bootstrap.csrf_token, "$.csrf_token");
@@ -280,21 +277,33 @@ export function validateBootstrapResponse(value: unknown): BootstrapResponse {
       );
     }
   }
-  utcTimestamp(bootstrap.server_started_at, "$.server_started_at");
-  enumValue(
+  const serverStartedAt = utcTimestamp(
+    bootstrap.server_started_at,
+    "$.server_started_at",
+  );
+  const serviceState = enumValue(
     bootstrap.service_state,
     "$.service_state",
     ["ready", "store_degraded", "quiescing"],
   );
-  nonNegativeSafeInteger(
+  const serviceStateGeneration = nonNegativeSafeInteger(
     bootstrap.service_state_generation,
     "$.service_state_generation",
   );
-  positiveIntegerAtMost(
+  const maxConcurrentTasks = positiveIntegerAtMost(
     bootstrap.max_concurrent_tasks,
     "$.max_concurrent_tasks",
     MAX_U32,
   );
+  validateSchedulerStateForBootstrap(bootstrap.scheduler, {
+    repositories,
+    tasks,
+    latestEventId,
+    serverStartedAt,
+    serviceState,
+    serviceStateGeneration,
+    maxConcurrentTasks,
+  });
   return value as BootstrapResponse;
 }
 

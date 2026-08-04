@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::ProcessLivenessScope;
 use crate::command_policy::{
     CommandPolicyError, ExecutionDirectory, GitCommandBinding, ValidatedCommand,
 };
@@ -76,6 +77,7 @@ impl GitTools {
         git_directory: Arc<ExecutionDirectory>,
         work_tree: Arc<ExecutionDirectory>,
         temporary_directory: impl AsRef<Path>,
+        process_liveness_scope: ProcessLivenessScope,
         process_limits: ProcessLimits,
         limits: GitToolLimits,
     ) -> Result<Self, GitToolError> {
@@ -83,7 +85,7 @@ impl GitTools {
             .map_err(GitToolError::CommandPolicy)?;
         let platform = platform_environment(temporary_directory.as_ref())?;
         Ok(Self::from_parts(
-            ProcessSupervisor::new(process_limits),
+            ProcessSupervisor::new(process_limits, process_liveness_scope),
             toolchain.git(),
             binding,
             ChildEnvironment::for_git(&platform),

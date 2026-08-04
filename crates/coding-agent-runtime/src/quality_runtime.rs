@@ -44,6 +44,7 @@ impl ValidationRuntime for RuntimeSession {
             RequiredCheckKind::CargoCheck => {
                 self.cargo
                     .check(
+                        self.cargo_jobs_per_task,
                         check.package(),
                         self.validation_timeout,
                         cancellation.clone(),
@@ -53,6 +54,7 @@ impl ValidationRuntime for RuntimeSession {
             RequiredCheckKind::CargoTest => {
                 self.cargo
                     .test(
+                        self.cargo_jobs_per_task,
                         check.package(),
                         check.integration_test(),
                         self.validation_timeout,

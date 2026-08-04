@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,9 +11,12 @@ use crate::native_fs::open_child_file;
 #[cfg(windows)]
 use crate::native_fs::reopen_file_read_lease;
 use crate::process_supervisor::ChildEnvironment;
+pub(crate) use crate::root_capability::DirectoryIdentityMarker;
+#[cfg(windows)]
+use crate::root_capability::directory_identity_marker;
 #[cfg(windows)]
 use crate::root_capability::ensure_plain_directory;
-use crate::root_capability::{RootCapability, ensure_plain_file};
+use crate::root_capability::{DirectoryIdentityError, RootCapability, ensure_plain_file};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommandPolicyError {
@@ -30,6 +34,8 @@ pub enum CommandPolicyError {
     InvalidTimeout,
     #[error("Cargo package or test selection is not allowed")]
     InvalidCargoSelection,
+    #[error("Cargo parallelism environment overrides are not allowed")]
+    InvalidCargoEnvironment,
     #[error("Git metadata and work-tree bindings are invalid")]
     InvalidGitBinding,
     #[error("the Git diff path is not a safe work-tree-relative path")]
@@ -51,18 +57,6 @@ struct FileIdentity {
     modified_nanoseconds: i64,
     changed_seconds: i64,
     changed_nanoseconds: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DirectoryIdentityMarker {
-    first: u64,
-    second: u64,
-}
-
-impl FileIdentity {
-    fn same_object(self, other: Self) -> bool {
-        self.first == other.first && self.second == other.second
-    }
 }
 
 /// An absolute, no-follow executable whose filesystem identity is retained.
@@ -130,9 +124,9 @@ impl PinnedExecutable {
 #[derive(Debug)]
 pub struct ExecutionDirectory {
     path: PathBuf,
-    _directory: RootCapability,
+    directory: RootCapability,
     spawn_directory: File,
-    identity: FileIdentity,
+    identity: DirectoryIdentityMarker,
 }
 
 impl ExecutionDirectory {
@@ -145,10 +139,12 @@ impl ExecutionDirectory {
         let handle = directory
             .try_clone_root()
             .map_err(CommandPolicyError::OpenFailed)?;
-        let identity = file_identity(&handle).map_err(CommandPolicyError::OpenFailed)?;
+        let identity = directory
+            .identity_marker()
+            .map_err(directory_identity_policy_error)?;
         Ok(Self {
             path: path.to_owned(),
-            _directory: directory,
+            directory,
             spawn_directory: handle,
             identity,
         })
@@ -168,14 +164,7 @@ impl ExecutionDirectory {
     }
 
     pub(crate) fn has_same_identity(&self, other: &Self) -> bool {
-        self.identity.same_object(other.identity)
-    }
-
-    pub(crate) fn identity_marker(&self) -> DirectoryIdentityMarker {
-        DirectoryIdentityMarker {
-            first: self.identity.first,
-            second: self.identity.second,
-        }
+        self.identity == other.identity
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -189,7 +178,7 @@ impl ExecutionDirectory {
     }
 
     pub(crate) fn cloned_root_capability(&self) -> Result<RootCapability, CommandPolicyError> {
-        self._directory
+        self.directory
             .try_clone_capability()
             .map_err(CommandPolicyError::OpenFailed)
     }
@@ -203,11 +192,21 @@ impl ExecutionDirectory {
                 "execution directory has no leaseable component",
             ))
         })?;
-        let leased_identity = file_identity(final_lease).map_err(CommandPolicyError::OpenFailed)?;
-        if !leased_identity.same_object(self.identity) {
+        let leased_identity =
+            directory_identity_marker(final_lease).map_err(directory_identity_policy_error)?;
+        if leased_identity != self.identity {
             return Err(CommandPolicyError::IdentityChanged);
         }
         Ok(leases)
+    }
+}
+
+fn directory_identity_policy_error(error: DirectoryIdentityError) -> CommandPolicyError {
+    match error {
+        DirectoryIdentityError::Unavailable => {
+            CommandPolicyError::OpenFailed(io::Error::other(error))
+        }
+        DirectoryIdentityError::Mismatch => CommandPolicyError::IdentityChanged,
     }
 }
 
@@ -403,19 +402,62 @@ impl ValidatedCommand {
         )
     }
 
+    pub(crate) fn repository_git_root(
+        executable: Arc<PinnedExecutable>,
+        working_directory: Arc<ExecutionDirectory>,
+        environment: ChildEnvironment,
+        timeout: Duration,
+    ) -> Result<Self, CommandPolicyError> {
+        Self::build(
+            executable,
+            working_directory,
+            vec![
+                OsString::from("rev-parse"),
+                OsString::from("--show-toplevel"),
+            ],
+            environment,
+            timeout,
+        )
+    }
+
+    pub(crate) fn repository_cargo_workspace_manifest(
+        executable: Arc<PinnedExecutable>,
+        working_directory: Arc<ExecutionDirectory>,
+        environment: ChildEnvironment,
+        timeout: Duration,
+    ) -> Result<Self, CommandPolicyError> {
+        Self::cargo(
+            executable,
+            working_directory,
+            vec![
+                OsString::from("locate-project"),
+                OsString::from("--workspace"),
+                OsString::from("--manifest-path"),
+                OsString::from("Cargo.toml"),
+                OsString::from("--message-format"),
+                OsString::from("plain"),
+            ],
+            environment,
+            timeout,
+        )
+    }
+
     pub(crate) fn cargo_check(
         executable: Arc<PinnedExecutable>,
         working_directory: Arc<ExecutionDirectory>,
         environment: ChildEnvironment,
+        cargo_jobs_per_task: NonZeroU32,
         package: Option<&str>,
         timeout: Duration,
     ) -> Result<Self, CommandPolicyError> {
+        validate_cargo_parallelism_environment(&environment)?;
         let mut arguments = vec![
             OsString::from("check"),
             OsString::from("--offline"),
             OsString::from("--color=never"),
             OsString::from("--message-format=json-render-diagnostics"),
         ];
+        append_trusted_cargo_jobs(&mut arguments, cargo_jobs_per_task)?;
         append_package_selection(&mut arguments, package)?;
         Self::cargo(
             executable,
@@ -430,10 +472,12 @@ impl ValidatedCommand {
         executable: Arc<PinnedExecutable>,
         working_directory: Arc<ExecutionDirectory>,
         environment: ChildEnvironment,
+        cargo_jobs_per_task: NonZeroU32,
         package: Option<&str>,
         test: Option<&str>,
         timeout: Duration,
     ) -> Result<Self, CommandPolicyError> {
+        validate_cargo_parallelism_environment(&environment)?;
         let mut arguments = vec![
             OsString::from("test"),
             OsString::from("--offline"),
@@ -441,6 +485,7 @@ impl ValidatedCommand {
             OsString::from("--no-fail-fast"),
             OsString::from("--message-format=json-render-diagnostics"),
         ];
+        append_trusted_cargo_jobs(&mut arguments, cargo_jobs_per_task)?;
         if test.is_some() && package.is_none() {
             return Err(CommandPolicyError::InvalidCargoSelection);
         }
@@ -1015,6 +1060,42 @@ fn append_package_selection(
     }
 }
 
+fn append_trusted_cargo_jobs(
+    arguments: &mut Vec<OsString>,
+    cargo_jobs_per_task: NonZeroU32,
+) -> Result<(), CommandPolicyError> {
+    if arguments.iter().any(|argument| {
+        argument.to_str().is_some_and(|argument| {
+            argument == "--jobs"
+                || argument.starts_with("--jobs=")
+                || argument == "-j"
+                || (argument.starts_with("-j") && argument.len() > 2)
+        })
+    }) {
+        return Err(CommandPolicyError::InvalidCargoSelection);
+    }
+    arguments.push(OsString::from(format!(
+        "--jobs={}",
+        cargo_jobs_per_task.get()
+    )));
+    Ok(())
+}
+
+fn validate_cargo_parallelism_environment(
+    environment: &ChildEnvironment,
+) -> Result<(), CommandPolicyError> {
+    let has_override = environment.entries().keys().any(|key| {
+        key.to_str().is_some_and(|key| {
+            key.eq_ignore_ascii_case("CARGO_BUILD_JOBS")
+                || key.eq_ignore_ascii_case("RUST_TEST_THREADS")
+        })
+    });
+    if has_override {
+        return Err(CommandPolicyError::InvalidCargoEnvironment);
+    }
+    Ok(())
+}
+
 fn prefixed_path_argument(prefix: &str, path: &Path) -> OsString {
     let mut argument = OsString::from(prefix);
     let path = child_visible_path(path);
@@ -1270,6 +1351,8 @@ fn file_identity(file: &File) -> io::Result<FileIdentity> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
     use crate::process_supervisor::{ProcessError, ProcessLimits, ProcessSupervisor};
     use tokio_util::sync::CancellationToken;
@@ -1291,6 +1374,10 @@ mod tests {
         let executable = Arc::new(PinnedExecutable::open(&tool).unwrap());
         let directory = Arc::new(ExecutionDirectory::open(root).unwrap());
         (temporary, executable, directory)
+    }
+
+    fn cargo_jobs_per_task() -> NonZeroU32 {
+        NonZeroU32::new(3).expect("test Cargo jobs are nonzero")
     }
 
     #[cfg(unix)]
@@ -1482,6 +1569,7 @@ mod tests {
             Arc::clone(&executable),
             Arc::clone(&directory),
             ChildEnvironment::default(),
+            cargo_jobs_per_task(),
             Some("safe-package"),
             Duration::from_secs(10),
         )
@@ -1493,6 +1581,7 @@ mod tests {
                 "--offline",
                 "--color=never",
                 "--message-format=json-render-diagnostics",
+                "--jobs=3",
                 "--package",
                 "safe-package",
             ]
@@ -1501,6 +1590,7 @@ mod tests {
             Arc::clone(&executable),
             Arc::clone(&directory),
             ChildEnvironment::default(),
+            cargo_jobs_per_task(),
             None,
             Duration::from_secs(10),
         )
@@ -1512,6 +1602,7 @@ mod tests {
                 "--offline",
                 "--color=never",
                 "--message-format=json-render-diagnostics",
+                "--jobs=3",
                 "--workspace",
             ]
         );
@@ -1520,6 +1611,7 @@ mod tests {
             Arc::clone(&executable),
             Arc::clone(&directory),
             ChildEnvironment::default(),
+            cargo_jobs_per_task(),
             Some("safe-package"),
             Some("integration_test"),
             Duration::from_secs(10),
@@ -1533,6 +1625,7 @@ mod tests {
                 "--color=never",
                 "--no-fail-fast",
                 "--message-format=json-render-diagnostics",
+                "--jobs=3",
                 "--package",
                 "safe-package",
                 "--test",
@@ -1543,6 +1636,7 @@ mod tests {
             Arc::clone(&executable),
             Arc::clone(&directory),
             ChildEnvironment::default(),
+            cargo_jobs_per_task(),
             None,
             None,
             Duration::from_secs(10),
@@ -1556,14 +1650,37 @@ mod tests {
                 "--color=never",
                 "--no-fail-fast",
                 "--message-format=json-render-diagnostics",
+                "--jobs=3",
                 "--workspace",
             ]
         );
+        for command in [&check, &workspace_check, &test, &workspace_test] {
+            assert_eq!(
+                arguments(command)
+                    .into_iter()
+                    .filter(|argument| argument.starts_with("--jobs="))
+                    .collect::<Vec<_>>(),
+                ["--jobs=3"]
+            );
+            assert!(
+                !command
+                    .environment()
+                    .entries()
+                    .contains_key(&OsString::from("CARGO_BUILD_JOBS"))
+            );
+            assert!(
+                !command
+                    .environment()
+                    .entries()
+                    .contains_key(&OsString::from("RUST_TEST_THREADS"))
+            );
+        }
         assert!(matches!(
             ValidatedCommand::cargo_test(
                 Arc::clone(&executable),
                 Arc::clone(&directory),
                 ChildEnvironment::default(),
+                cargo_jobs_per_task(),
                 None,
                 Some("integration_test"),
                 Duration::from_secs(10),
@@ -1574,6 +1691,7 @@ mod tests {
         for invalid in [
             "",
             "--config",
+            "--jobs=999",
             "../escape",
             "name=value",
             "with space",
@@ -1584,6 +1702,7 @@ mod tests {
                     Arc::clone(&executable),
                     Arc::clone(&directory),
                     ChildEnvironment::default(),
+                    cargo_jobs_per_task(),
                     Some(invalid),
                     Duration::from_secs(10),
                 ),
@@ -1592,15 +1711,46 @@ mod tests {
         }
         assert!(matches!(
             ValidatedCommand::cargo_test(
-                executable,
-                directory,
+                Arc::clone(&executable),
+                Arc::clone(&directory),
                 ChildEnvironment::default(),
+                cargo_jobs_per_task(),
                 Some("safe-package"),
                 Some("--manifest-path"),
                 Duration::from_secs(10),
             ),
             Err(CommandPolicyError::InvalidCargoSelection)
         ));
+
+        for key in [
+            "CARGO_BUILD_JOBS",
+            "cargo_build_jobs",
+            "RUST_TEST_THREADS",
+            "rust_test_threads",
+        ] {
+            let environment =
+                ChildEnvironment::from_entries([(OsString::from(key), OsString::from("999"))]);
+            assert!(matches!(
+                ValidatedCommand::cargo_test(
+                    Arc::clone(&executable),
+                    Arc::clone(&directory),
+                    environment,
+                    cargo_jobs_per_task(),
+                    None,
+                    None,
+                    Duration::from_secs(10),
+                ),
+                Err(CommandPolicyError::InvalidCargoEnvironment)
+            ));
+        }
+
+        for existing in ["--jobs", "--jobs=9", "-j", "-j9", "-j=9"] {
+            let mut arguments = vec![OsString::from("test"), OsString::from(existing)];
+            assert!(matches!(
+                append_trusted_cargo_jobs(&mut arguments, cargo_jobs_per_task()),
+                Err(CommandPolicyError::InvalidCargoSelection)
+            ));
+        }
     }
 
     #[test]
@@ -1742,7 +1892,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        let error = ProcessSupervisor::new(limits)
+        let error = ProcessSupervisor::new(limits, crate::process_liveness::test_process_scope())
             .run(command, CancellationToken::new())
             .await
             .unwrap_err();

@@ -1,5 +1,7 @@
 mod support;
 
+use std::sync::Arc;
+
 use coding_agent_domain::{
     CheckActor, CheckEvidence, CheckEvidenceStatus, DeliveryReadiness, EventCursor, EventId,
     FindingSeverity, NewReviewEvidence, PlanItem, PlanItemStatus, PlanSnapshot, RequiredCheck,
@@ -8,11 +10,251 @@ use coding_agent_domain::{
     WorkspaceDigest,
 };
 use coding_agent_store::{
-    FinalizeReviewedTaskOutcome, RecordReviewOutcome, RetryTaskOutcome, Store, StoreError,
-    TaskTransition, TransitionOutcome,
+    FinalizeReviewedTaskOutcome, FinalizeStoppedTaskOutcome, FinalizeStoppedTaskRequest,
+    PersistStopIntentOutcome, RecordReviewOutcome, RetryTaskOutcome, StopIntentKind,
+    StopIntentRequest, Store, StoreError, TaskTransition, TransitionOutcome,
 };
+use tokio::sync::Barrier;
 
 const REVIEW_MARKER: &str = r#"{"evidence_ref":true}"#;
+
+#[tokio::test]
+async fn a_durable_stop_intent_blocks_new_review_and_finalization_writes() {
+    let store = support::seeded_store().await;
+    let task = running_project3_task(&store).await;
+    assert!(matches!(
+        store
+            .persist_stop_intent(stop_request(&task, StopIntentKind::UserCancelled))
+            .await
+            .unwrap(),
+        PersistStopIntentOutcome::Applied(_)
+    ));
+    let before = support::durable_task_event_snapshot(&store).await;
+
+    assert_invariant_conflict(
+        store
+            .record_review(
+                task.id,
+                task.repository_id,
+                task.attempt,
+                changes_requested(1, "late review"),
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(support::durable_task_event_snapshot(&store).await, before);
+    assert_invariant_conflict(
+        store
+            .finalize_reviewed_task(task.id, task.repository_id, task.attempt, approved(1))
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(support::durable_task_event_snapshot(&store).await, before);
+}
+
+#[tokio::test]
+async fn an_existing_intermediate_review_remains_replayable_after_stop_wins() {
+    let store = support::seeded_store().await;
+    let task = running_project3_task(&store).await;
+    let request = changes_requested(1, "committed before stop");
+    let (review, event_id) = applied_record(
+        store
+            .record_review(task.id, task.repository_id, task.attempt, request.clone())
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        store
+            .persist_stop_intent(stop_request(&task, StopIntentKind::DiskPressureCritical,))
+            .await
+            .unwrap(),
+        PersistStopIntentOutcome::Applied(_)
+    ));
+    let before = support::durable_task_event_snapshot(&store).await;
+
+    assert!(matches!(
+        store
+            .record_review(task.id, task.repository_id, task.attempt, request)
+            .await
+            .unwrap(),
+        RecordReviewOutcome::Existing {
+            review: existing_review,
+            event_id: existing_event_id,
+        } if existing_review == review && existing_event_id == event_id
+    ));
+    assert_eq!(support::durable_task_event_snapshot(&store).await, before);
+}
+
+#[tokio::test]
+async fn reviewed_finalization_and_stop_intent_respect_writer_order() {
+    let reviewed_store = support::seeded_store().await;
+    let reviewed_task = running_project3_task(&reviewed_store).await;
+    let reviewed = applied_final(
+        reviewed_store
+            .finalize_reviewed_task(
+                reviewed_task.id,
+                reviewed_task.repository_id,
+                reviewed_task.attempt,
+                approved(1),
+            )
+            .await
+            .unwrap(),
+    )
+    .0;
+    assert!(matches!(
+        reviewed_store
+            .persist_stop_intent(stop_request(
+                &reviewed_task,
+                StopIntentKind::UserCancelled,
+            ))
+            .await
+            .unwrap(),
+        PersistStopIntentOutcome::TerminalWon { current } if current == reviewed
+    ));
+
+    let stopped_store = support::seeded_store().await;
+    let stopped_task = running_project3_task(&stopped_store).await;
+    assert!(matches!(
+        stopped_store
+            .persist_stop_intent(stop_request(&stopped_task, StopIntentKind::UserCancelled,))
+            .await
+            .unwrap(),
+        PersistStopIntentOutcome::Applied(_)
+    ));
+    let before = support::durable_task_event_snapshot(&stopped_store).await;
+    assert_invariant_conflict(
+        stopped_store
+            .finalize_reviewed_task(
+                stopped_task.id,
+                stopped_task.repository_id,
+                stopped_task.attempt,
+                approved(1),
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(
+        support::durable_task_event_snapshot(&stopped_store).await,
+        before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reviewed_finalization_and_stop_intent_have_one_terminal_winner() {
+    let fixture = support::store_fixture().await;
+    support::register_repository(&fixture.store, "review-stop-race").await;
+    let task = running_project3_task(&fixture.store).await;
+    let review_store = Store::open(&fixture.database_path).await.unwrap();
+    let stop_store = Store::open(&fixture.database_path).await.unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+
+    let review_barrier = barrier.clone();
+    let review_task = task.clone();
+    let review = tokio::spawn(async move {
+        review_barrier.wait().await;
+        review_store
+            .finalize_reviewed_task(
+                review_task.id,
+                review_task.repository_id,
+                review_task.attempt,
+                approved(1),
+            )
+            .await
+    });
+    let stop_barrier = barrier.clone();
+    let stop_task = task.clone();
+    let stop = tokio::spawn(async move {
+        stop_barrier.wait().await;
+        stop_store
+            .persist_stop_intent(stop_request(&stop_task, StopIntentKind::UserCancelled))
+            .await
+    });
+    barrier.wait().await;
+
+    let review = review.await.unwrap();
+    let stop = stop.await.unwrap().unwrap();
+    match review {
+        Ok(FinalizeReviewedTaskOutcome::Applied { task: reviewed, .. }) => {
+            assert!(matches!(
+                stop,
+                PersistStopIntentOutcome::TerminalWon { current } if current == reviewed
+            ));
+            assert_eq!(delivery_count(&fixture.store, task.id).await, 1);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM task_stop_intents WHERE task_id = ?",
+                )
+                .bind(task.id.to_string())
+                .fetch_one(fixture.store.pool())
+                .await
+                .unwrap(),
+                0
+            );
+        }
+        Err(StoreError::InvariantViolation(_)) => {
+            assert!(matches!(stop, PersistStopIntentOutcome::Applied(_)));
+            assert_eq!(delivery_count(&fixture.store, task.id).await, 0);
+            assert_eq!(
+                fixture
+                    .store
+                    .task_detail(task.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task
+                    .status,
+                TaskStatus::Running
+            );
+        }
+        other => panic!("review/stop race returned an unexpected review outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn intermediate_review_plus_partial_final_stop_is_a_typed_invariant_conflict() {
+    let store = support::seeded_store().await;
+    let task = running_project3_task(&store).await;
+    store
+        .record_review(
+            task.id,
+            task.repository_id,
+            task.attempt,
+            changes_requested(1, "preserved intermediate review"),
+        )
+        .await
+        .unwrap();
+    store
+        .persist_stop_intent(stop_request(&task, StopIntentKind::UserCancelled))
+        .await
+        .unwrap();
+    let request = FinalizeStoppedTaskRequest {
+        task_id: task.id,
+        expected_repository_id: task.repository_id,
+        expected_attempt: task.attempt,
+        expected_intent: StopIntentKind::UserCancelled,
+    };
+    let terminal_event_id = match store.finalize_stopped_task(request).await.unwrap() {
+        FinalizeStoppedTaskOutcome::Applied(receipt) => receipt.terminal_event_id,
+        other => panic!("fixture final stop must apply, got {other:?}"),
+    };
+    sqlx::query(
+        "INSERT INTO task_events \
+             (schema_version, task_id, kind, payload_json, created_at) \
+         SELECT schema_version, task_id, kind, payload_json, created_at \
+         FROM task_events WHERE id = ?",
+    )
+    .bind(terminal_event_id.get())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let before = support::durable_task_event_snapshot(&store).await;
+
+    assert!(matches!(
+        store.finalize_stopped_task(request).await.unwrap(),
+        FinalizeStoppedTaskOutcome::InvariantConflict
+    ));
+    assert_eq!(support::durable_task_event_snapshot(&store).await, before);
+}
 
 #[tokio::test]
 async fn round_one_and_two_reviews_are_immutable_nonterminal_events() {
@@ -1135,6 +1377,15 @@ async fn running_project3_task(store: &Store) -> Task {
         .await
         .unwrap();
     store.task_detail(task.id).await.unwrap().unwrap().task
+}
+
+fn stop_request(task: &Task, kind: StopIntentKind) -> StopIntentRequest {
+    StopIntentRequest {
+        task_id: task.id,
+        expected_repository_id: task.repository_id,
+        expected_attempt: task.attempt,
+        kind,
+    }
 }
 
 async fn seed_prior_rounds(store: &Store, task: &Task, final_round: u8) {

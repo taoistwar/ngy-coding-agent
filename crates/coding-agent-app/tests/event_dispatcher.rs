@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use std::time::Duration;
@@ -390,6 +392,24 @@ async fn startup_high_watermark_is_not_replayed_as_a_live_event() {
     tokio::task::yield_now().await;
 
     assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn explicit_startup_cursor_must_equal_the_durable_high_watermark() {
+    let fixture = support::store_fixture().await;
+    let high_watermark = fixture
+        .store
+        .latest_event_id()
+        .await
+        .expect("read durable high watermark");
+    let mismatched = cursor_after(high_watermark, 1);
+
+    let error = match EventDispatcherHandle::spawn_at(fixture.store, 16, mismatched).await {
+        Ok(_) => panic!("reject a cursor not returned by the recovery transaction"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, EventDispatcherError::StartupCursorMismatch));
 }
 
 #[tokio::test]

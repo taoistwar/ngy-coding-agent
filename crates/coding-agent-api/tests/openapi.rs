@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use coding_agent_api::{
-    ApiDoc, CanonicalPathDto, QuitAcceptance, ServiceStateControl, ServiceStateDto,
+    ApiDoc, CanonicalPathDto, QuitAcceptance, SchedulerAdmissionStateDto, SchedulerLimitsDto,
+    SchedulerQueueReasonDto, SchedulerQueuedTaskDto, SchedulerRepositoryStorageDto,
+    SchedulerStateDto, SchedulerStopIntentDto, SchedulerStoppingTaskDto, SchedulerStorageDto,
+    SchedulerStorageScopeDto, SchedulerStorageStateDto, ServiceStateControl, ServiceStateDto,
     StreamResetControl, TaskEventDto, UtcTimestampDto, api_openapi,
 };
 use coding_agent_domain::{
@@ -41,6 +44,13 @@ fn property_set(schema: &Value) -> BTreeSet<String> {
 
 fn set(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn assert_exact_required_object(schema: &Value, fields: &[&str]) {
+    let fields = set(fields);
+    assert_eq!(property_set(schema), fields);
+    assert_eq!(string_set(&schema["required"]), fields);
+    assert_eq!(schema["additionalProperties"], false);
 }
 
 fn schema_accepts_null(schema: &Value) -> bool {
@@ -167,6 +177,17 @@ fn openapi_contains_every_approved_top_level_component_and_no_task_12_paths() {
         "BootstrapResponse",
         "StreamResetControl",
         "ServiceStateControl",
+        "SchedulerStateDto",
+        "SchedulerAdmissionStateDto",
+        "SchedulerLimitsDto",
+        "SchedulerQueuedTaskDto",
+        "SchedulerQueueReasonDto",
+        "SchedulerStoppingTaskDto",
+        "SchedulerStopIntentDto",
+        "SchedulerStorageDto",
+        "SchedulerStorageScopeDto",
+        "SchedulerRepositoryStorageDto",
+        "SchedulerStorageStateDto",
         "SseMessage",
         "ApiErrorResponse",
         "CancellationAcceptedResponse",
@@ -547,6 +568,251 @@ fn diff_file_exposes_a_required_truncation_marker() {
 }
 
 #[test]
+fn bootstrap_requires_scheduler_and_bounded_alias_watermarks() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+    let bootstrap = &schemas["BootstrapResponse"];
+
+    assert_eq!(
+        property_set(bootstrap),
+        set(&[
+            "csrf_token",
+            "repositories",
+            "tasks",
+            "latest_event_id",
+            "server_started_at",
+            "service_state",
+            "service_state_generation",
+            "max_concurrent_tasks",
+            "scheduler",
+        ])
+    );
+    assert_eq!(string_set(&bootstrap["required"]), property_set(bootstrap));
+    assert_eq!(
+        bootstrap["properties"]["scheduler"]["$ref"],
+        "#/components/schemas/SchedulerStateDto"
+    );
+    assert_eq!(bootstrap["properties"]["latest_event_id"]["minimum"], 0);
+    assert_eq!(
+        bootstrap["properties"]["latest_event_id"]["maximum"],
+        9_007_199_254_740_991_u64
+    );
+    assert_eq!(
+        bootstrap["properties"]["service_state_generation"]["minimum"],
+        0
+    );
+    assert_eq!(
+        bootstrap["properties"]["service_state_generation"]["maximum"],
+        9_007_199_254_740_991_u64
+    );
+    assert_eq!(
+        bootstrap["properties"]["max_concurrent_tasks"]["minimum"],
+        1
+    );
+    assert_eq!(
+        bootstrap["properties"]["max_concurrent_tasks"]["maximum"],
+        4
+    );
+}
+
+#[test]
+fn scheduler_state_schema_is_exact_and_bounded() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+    let scheduler = &schemas["SchedulerStateDto"];
+    assert_exact_required_object(
+        scheduler,
+        &[
+            "schema_version",
+            "server_instance_id",
+            "server_started_at",
+            "generation",
+            "as_of_event_id",
+            "service_state_generation",
+            "admission_state",
+            "limits",
+            "active_task_count",
+            "queued_task_count",
+            "queued_tasks",
+            "stopping_tasks",
+            "storage",
+        ],
+    );
+    assert_eq!(scheduler["properties"]["schema_version"]["minimum"], 1);
+    assert_eq!(scheduler["properties"]["schema_version"]["maximum"], 1);
+    assert_eq!(
+        scheduler["properties"]["server_instance_id"]["format"],
+        "uuid"
+    );
+    assert_eq!(
+        scheduler["properties"]["server_instance_id"]["pattern"],
+        "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    );
+    for field in ["generation", "as_of_event_id", "service_state_generation"] {
+        assert_eq!(scheduler["properties"][field]["minimum"], 0);
+        assert_eq!(
+            scheduler["properties"][field]["maximum"],
+            9_007_199_254_740_991_u64
+        );
+    }
+    assert_eq!(scheduler["properties"]["active_task_count"]["minimum"], 0);
+    assert_eq!(scheduler["properties"]["active_task_count"]["maximum"], 4);
+    assert_eq!(scheduler["properties"]["queued_task_count"]["minimum"], 0);
+    assert_eq!(
+        scheduler["properties"]["queued_task_count"]["maximum"],
+        u32::MAX
+    );
+    assert_eq!(scheduler["properties"]["stopping_tasks"]["maxItems"], 4);
+}
+
+#[test]
+fn scheduler_nested_schemas_are_exact_and_bounded() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+    let limits = &schemas["SchedulerLimitsDto"];
+    assert_exact_required_object(
+        limits,
+        &["global", "per_repository", "queued", "cargo_jobs_per_task"],
+    );
+    for (field, maximum) in [
+        ("global", 4),
+        ("per_repository", 4),
+        ("queued", 256),
+        ("cargo_jobs_per_task", 8),
+    ] {
+        assert_eq!(limits["properties"][field]["minimum"], 1);
+        assert_eq!(limits["properties"][field]["maximum"], maximum);
+    }
+
+    let queued = &schemas["SchedulerQueuedTaskDto"];
+    assert_exact_required_object(queued, &["task_id", "reason"]);
+    assert_eq!(
+        queued["properties"]["task_id"]["pattern"],
+        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    );
+    assert_eq!(
+        schemas["SchedulerQueueReasonDto"]["enum"],
+        json!([
+            "service_paused",
+            "storage_pressure",
+            "global_capacity",
+            "repository_capacity",
+            "repository_control_busy",
+        ])
+    );
+
+    let stopping = &schemas["SchedulerStoppingTaskDto"];
+    assert_exact_required_object(stopping, &["task_id", "intent"]);
+    assert_eq!(
+        schemas["SchedulerStopIntentDto"]["enum"],
+        json!(["user_cancelled", "disk_pressure_critical"])
+    );
+
+    assert_exact_required_object(
+        &schemas["SchedulerStorageDto"],
+        &["state", "data", "runtime", "repositories"],
+    );
+    assert_exact_required_object(&schemas["SchedulerStorageScopeDto"], &["state"]);
+    assert_exact_required_object(
+        &schemas["SchedulerRepositoryStorageDto"],
+        &["repository_id", "state"],
+    );
+    assert_eq!(
+        schemas["SchedulerStorageStateDto"]["enum"],
+        json!(["normal", "pressure", "critical", "unavailable"])
+    );
+    assert_eq!(
+        schemas["SchedulerAdmissionStateDto"]["enum"],
+        json!(["running", "paused"])
+    );
+}
+
+#[test]
+fn scheduler_state_serializes_the_exact_path_private_wire_shape() {
+    let queued_task_id = uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174001").unwrap();
+    let stopping_task_id = uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174002").unwrap();
+    let repository_id = uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174003").unwrap();
+    let state = SchedulerStateDto {
+        schema_version: 1,
+        server_instance_id: uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+        server_started_at: UtcTimestamp::parse_rfc3339("2026-07-15T00:00:00Z")
+            .unwrap()
+            .into(),
+        generation: 7,
+        as_of_event_id: 41,
+        service_state_generation: 3,
+        admission_state: SchedulerAdmissionStateDto::Running,
+        limits: SchedulerLimitsDto {
+            global: 2,
+            per_repository: 2,
+            queued: 32,
+            cargo_jobs_per_task: 4,
+        },
+        active_task_count: 1,
+        queued_task_count: 1,
+        queued_tasks: vec![SchedulerQueuedTaskDto {
+            task_id: queued_task_id,
+            reason: SchedulerQueueReasonDto::StoragePressure,
+        }],
+        stopping_tasks: vec![SchedulerStoppingTaskDto {
+            task_id: stopping_task_id,
+            intent: SchedulerStopIntentDto::DiskPressureCritical,
+        }],
+        storage: SchedulerStorageDto {
+            state: SchedulerStorageStateDto::Pressure,
+            data: SchedulerStorageScopeDto {
+                state: SchedulerStorageStateDto::Pressure,
+            },
+            runtime: SchedulerStorageScopeDto {
+                state: SchedulerStorageStateDto::Normal,
+            },
+            repositories: vec![SchedulerRepositoryStorageDto {
+                repository_id,
+                state: SchedulerStorageStateDto::Normal,
+            }],
+        },
+    };
+
+    assert_eq!(
+        serde_json::to_value(state).unwrap(),
+        json!({
+            "schema_version": 1,
+            "server_instance_id": "123e4567-e89b-42d3-a456-426614174000",
+            "server_started_at": "2026-07-15T00:00:00.000000000Z",
+            "generation": 7,
+            "as_of_event_id": 41,
+            "service_state_generation": 3,
+            "admission_state": "running",
+            "limits": {
+                "global": 2,
+                "per_repository": 2,
+                "queued": 32,
+                "cargo_jobs_per_task": 4,
+            },
+            "active_task_count": 1,
+            "queued_task_count": 1,
+            "queued_tasks": [{
+                "task_id": queued_task_id,
+                "reason": "storage_pressure",
+            }],
+            "stopping_tasks": [{
+                "task_id": stopping_task_id,
+                "intent": "disk_pressure_critical",
+            }],
+            "storage": {
+                "state": "pressure",
+                "data": {"state": "pressure"},
+                "runtime": {"state": "normal"},
+                "repositories": [{
+                    "repository_id": repository_id,
+                    "state": "normal",
+                }],
+            },
+        })
+    );
+}
+
+#[test]
 fn control_components_are_exact_required_shapes_without_persisted_ids() {
     let value = openapi_value();
     let schemas = &value["components"]["schemas"];
@@ -562,6 +828,117 @@ fn control_components_are_exact_required_shapes_without_persisted_ids() {
     assert_eq!(property_set(service_state), service_fields);
     assert_eq!(string_set(&service_state["required"]), service_fields);
     assert!(service_state["properties"].get("id").is_none());
+}
+
+#[test]
+fn scheduler_control_components_are_exact_idless_shapes_and_sse_union_members() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+
+    assert_exact_required_object(
+        &schemas["SchedulerStateControl"],
+        &[
+            "schema_version",
+            "kind",
+            "server_instance_id",
+            "server_started_at",
+            "generation",
+            "as_of_event_id",
+            "service_state_generation",
+            "admission_state",
+            "limits",
+            "active_task_count",
+            "queued_task_count",
+            "stopping_task_count",
+            "repository_storage_count",
+            "storage",
+            "item_count",
+            "chunk_count",
+            "snapshot_digest",
+        ],
+    );
+    assert_exact_required_object(
+        &schemas["SchedulerStateChunkControl"],
+        &[
+            "schema_version",
+            "kind",
+            "server_instance_id",
+            "generation",
+            "snapshot_digest",
+            "chunk_index",
+            "chunk_count",
+            "items",
+        ],
+    );
+    assert_exact_required_object(
+        &schemas["SchedulerControlStorageDto"],
+        &["state", "data", "runtime"],
+    );
+    for schema in ["SchedulerStateControl", "SchedulerStateChunkControl"] {
+        assert!(schemas[schema]["properties"].get("id").is_none());
+    }
+    assert_eq!(
+        schemas["SchedulerStateControl"]["properties"]["snapshot_digest"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+    assert_eq!(
+        schemas["SchedulerStateChunkControl"]["properties"]["items"]["maxItems"],
+        128
+    );
+
+    let members = schemas["SseMessage"]["oneOf"]
+        .as_array()
+        .expect("SseMessage oneOf")
+        .iter()
+        .map(|member| {
+            member["$ref"]
+                .as_str()
+                .expect("component ref")
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        members,
+        set(&[
+            "TaskEventDto",
+            "StreamResetControl",
+            "ServiceStateControl",
+            "SchedulerStateControl",
+            "SchedulerStateChunkControl",
+        ])
+    );
+}
+
+#[test]
+fn scheduler_item_schema_is_an_exact_discriminated_union() {
+    let value = openapi_value();
+    let schemas = &value["components"]["schemas"];
+    let item = &schemas["SchedulerStateItemDto"];
+
+    assert_eq!(item["discriminator"]["propertyName"], "kind");
+    assert_eq!(
+        item["discriminator"]["mapping"],
+        json!({
+            "queued_task": "#/components/schemas/SchedulerQueuedTaskItemDto",
+            "stopping_task": "#/components/schemas/SchedulerStoppingTaskItemDto",
+            "repository_storage": "#/components/schemas/SchedulerRepositoryStorageItemDto",
+        })
+    );
+    assert_exact_required_object(
+        &schemas["SchedulerQueuedTaskItemDto"],
+        &["kind", "task_id", "reason"],
+    );
+    assert_exact_required_object(
+        &schemas["SchedulerStoppingTaskItemDto"],
+        &["kind", "task_id", "intent"],
+    );
+    assert_exact_required_object(
+        &schemas["SchedulerRepositoryStorageItemDto"],
+        &["kind", "repository_id", "state"],
+    );
 }
 
 #[test]

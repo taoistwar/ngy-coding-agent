@@ -15,6 +15,10 @@ use utoipa::openapi::Ref;
 use utoipa::openapi::schema::{Discriminator, ObjectBuilder, OneOfBuilder, Schema, Type};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
+mod scheduler_contract;
+
+pub use scheduler_contract::*;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(transparent)]
 #[schema(value_type = String, format = DateTime)]
@@ -1280,6 +1284,8 @@ pub enum SseMessage {
     TaskEvent(TaskEventDto),
     StreamReset(StreamResetControl),
     ServiceState(ServiceStateControl),
+    SchedulerState(crate::scheduler_wire::SchedulerStateControl),
+    SchedulerStateChunk(crate::scheduler_wire::SchedulerStateChunkControl),
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -1287,11 +1293,15 @@ pub struct BootstrapResponse {
     pub csrf_token: String,
     pub repositories: Vec<RepositoryDto>,
     pub tasks: Vec<TaskDto>,
+    #[schema(minimum = 0, maximum = 9_007_199_254_740_991_u64)]
     pub latest_event_id: i64,
     pub server_started_at: UtcTimestampDto,
     pub service_state: ServiceStateDto,
+    #[schema(minimum = 0, maximum = 9_007_199_254_740_991_u64)]
     pub service_state_generation: u64,
+    #[schema(minimum = 1, maximum = 4)]
     pub max_concurrent_tasks: u32,
+    pub scheduler: SchedulerStateDto,
 }
 
 impl fmt::Debug for BootstrapResponse {
@@ -1415,6 +1425,29 @@ impl QuitResponse {
     ServiceStateKind,
     ServiceStateDto,
     ServiceStateControl,
+    SchedulerStateDto,
+    SchedulerAdmissionStateDto,
+    SchedulerLimitsDto,
+    SchedulerQueuedTaskDto,
+    SchedulerQueueReasonDto,
+    SchedulerStoppingTaskDto,
+    SchedulerStopIntentDto,
+    SchedulerStorageDto,
+    SchedulerStorageScopeDto,
+    SchedulerRepositoryStorageDto,
+    SchedulerStorageStateDto,
+    crate::scheduler_wire::SchedulerStateKind,
+    crate::scheduler_wire::SchedulerControlStorageDto,
+    crate::scheduler_wire::SchedulerStateControl,
+    crate::scheduler_wire::SchedulerStateChunkKind,
+    crate::scheduler_wire::SchedulerQueuedTaskItemKind,
+    crate::scheduler_wire::SchedulerQueuedTaskItemDto,
+    crate::scheduler_wire::SchedulerStoppingTaskItemKind,
+    crate::scheduler_wire::SchedulerStoppingTaskItemDto,
+    crate::scheduler_wire::SchedulerRepositoryStorageItemKind,
+    crate::scheduler_wire::SchedulerRepositoryStorageItemDto,
+    crate::scheduler_wire::SchedulerStateItemDto,
+    crate::scheduler_wire::SchedulerStateChunkControl,
     SseMessage,
     BootstrapResponse,
     crate::ApiErrorResponse,

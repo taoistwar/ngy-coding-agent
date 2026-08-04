@@ -19,6 +19,7 @@ impl WallClock for SystemWallClock {
 pub struct PlatformPaths {
     pub data_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    pub runtime_config: PathBuf,
     pub database_path: PathBuf,
     pub instance_lock: PathBuf,
     pub instance_descriptor: PathBuf,
@@ -43,6 +44,7 @@ impl PlatformPaths {
         let data_dir = data_dir.into();
         let runtime_dir = runtime_dir.into();
         Self {
+            runtime_config: data_dir.join("runtime.json"),
             database_path: data_dir.join("coding-agent.sqlite3"),
             instance_lock: runtime_dir.join("instance.lock"),
             instance_descriptor: runtime_dir.join("instance.json"),
@@ -53,7 +55,15 @@ impl PlatformPaths {
     }
 
     pub fn prepare(&self) -> io::Result<()> {
-        create_private_directory(&self.data_dir)?;
+        self.prepare_data_directory()?;
+        self.prepare_runtime_directory()
+    }
+
+    pub(crate) fn prepare_data_directory(&self) -> io::Result<()> {
+        create_private_directory(&self.data_dir)
+    }
+
+    pub(crate) fn prepare_runtime_directory(&self) -> io::Result<()> {
         create_private_directory(&self.runtime_dir)
     }
 }
@@ -148,7 +158,7 @@ pub(crate) fn read_private_file_bounded(
     {
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        options.custom_flags(private_read_custom_flags());
     }
     #[cfg(windows)]
     {
@@ -178,6 +188,11 @@ pub(crate) fn read_private_file_bounded(
         return Err(PrivateFileReadError::TooLarge);
     }
     Ok(encoded)
+}
+
+#[cfg(unix)]
+const fn private_read_custom_flags() -> i32 {
+    libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
 }
 
 pub(crate) fn validate_private_file(file: &File) -> io::Result<()> {
@@ -718,6 +733,16 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_read_flags_are_nonblocking_cloexec_and_nofollow() {
+        let flags = private_read_custom_flags();
+
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+        assert_ne!(flags & libc::O_CLOEXEC, 0);
+        assert_ne!(flags & libc::O_NOFOLLOW, 0);
+    }
 
     #[test]
     fn browser_backend_failure_returns_the_exact_url_that_was_delegated() {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
 import type { CreateTaskCommand } from "../api/client";
+import type { SchedulerSnapshotCandidate } from "../api/schedulerSnapshot";
 import { SseClient } from "../api/sse";
 import type { SseClientOptions, SseClientState } from "../api/sse";
 import type {
@@ -33,6 +34,7 @@ export interface AgentApiAdapter {
 
 export interface AgentStreamCallbacks {
   onTaskEvent(event: TaskEvent): void;
+  onSchedulerSnapshot(candidate: SchedulerSnapshotCandidate): void;
   onUnknownEvent(id: number, kind: string, schemaVersion: number): void;
   onServiceState(
     state: BootstrapResponse["service_state"],
@@ -115,11 +117,37 @@ function isSessionExpired(error: unknown): boolean {
   );
 }
 
+function isTaskQueueFull(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "status" in error &&
+    error.status === 429 &&
+    "code" in error &&
+    error.code === "TASK_QUEUE_FULL"
+  );
+}
+
 class ReviewProjectionProtocolError extends Error {
   constructor(reason: string) {
     super(`review projection conflict: ${reason}`);
     this.name = "ReviewProjectionProtocolError";
   }
+}
+
+class SchedulerProjectionProtocolError extends Error {
+  constructor(reason: string) {
+    super(`scheduler projection conflict: ${reason}`);
+    this.name = "SchedulerProjectionProtocolError";
+  }
+}
+
+function assertSchedulerProjectionAccepted(state: AgentState): AgentState {
+  const reason = state.scheduler.recoveryReason;
+  if (reason !== null) {
+    throw new SchedulerProjectionProtocolError(reason);
+  }
+  return state;
 }
 
 function appendRecoveryEvent(events: TaskEvent[], event: TaskEvent): TaskEvent[] {
@@ -190,6 +218,8 @@ export function createSseAgentStreamFactory(
           }
           callbacks.onTaskEvent(message);
         },
+        onSchedulerSnapshot: (candidate) =>
+          callbacks.onSchedulerSnapshot(candidate),
         onDiagnostic: (diagnostic) =>
           callbacks.onUnknownEvent(
             diagnostic.persistedId,
@@ -295,7 +325,9 @@ export function useAgentState(
         if (disposed) {
           return;
         }
-        dispatchStreamAction({ type: "bootstrap.received", bootstrap });
+        assertSchedulerProjectionAccepted(
+          dispatchStreamAction({ type: "bootstrap.received", bootstrap }),
+        );
         stream = createStream({
           onTaskEvent: (event) => {
             const recovery = projectionRecoveryRef.current;
@@ -312,7 +344,9 @@ export function useAgentState(
                 recovery.bufferedEvents,
                 event,
               );
-              dispatchStreamAction({ type: "event.received", event });
+              assertSchedulerProjectionAccepted(
+                dispatchStreamAction({ type: "event.received", event }),
+              );
               throw new ReviewProjectionProtocolError(
                 stateRef.current.snapshotRecovery?.reason ??
                   "review_projection_recovery_pending",
@@ -323,48 +357,69 @@ export function useAgentState(
             if (conflict !== null) {
               recovery.active = true;
               recovery.bufferedEvents = [event];
-              dispatchStreamAction({
-                type: "event.conflicted",
-                event: event as Extract<
-                  TaskEvent,
-                  { kind: "review.updated" }
-                >,
-                reason: conflict.reason,
-              });
+              assertSchedulerProjectionAccepted(
+                dispatchStreamAction({
+                  type: "event.conflicted",
+                  event: event as Extract<
+                    TaskEvent,
+                    { kind: "review.updated" }
+                  >,
+                  reason: conflict.reason,
+                }),
+              );
               throw new ReviewProjectionProtocolError(conflict.reason);
             }
-            dispatchStreamAction({ type: "event.received", event });
+            assertSchedulerProjectionAccepted(
+              dispatchStreamAction({ type: "event.received", event }),
+            );
           },
-          onUnknownEvent: (id, kind, schemaVersion) =>
-            dispatchStreamAction({
-              type: "event.unknown",
-              id,
-              kind,
-              schemaVersion,
-            }),
-          onServiceState: (serviceState, generation) =>
-            dispatchStreamAction({
-              type: "service.received",
-              state: serviceState,
-              generation,
-            }),
+          onSchedulerSnapshot: (candidate) =>
+            assertSchedulerProjectionAccepted(
+              dispatchStreamAction({
+                type: "scheduler.received",
+                candidate,
+              }),
+            ),
+          onUnknownEvent: (id, kind, schemaVersion) => {
+            assertSchedulerProjectionAccepted(
+              dispatchStreamAction({
+                type: "event.unknown",
+                id,
+                kind,
+                schemaVersion,
+              }),
+            );
+          },
+          onServiceState: (serviceState, generation) => {
+            assertSchedulerProjectionAccepted(
+              dispatchStreamAction({
+                type: "service.received",
+                state: serviceState,
+                generation,
+              }),
+            );
+          },
           onBootstrap: (nextBootstrap) => {
             const recovery = projectionRecoveryRef.current;
             if (!recovery.active) {
-              dispatchStreamAction({
-                type: "bootstrap.received",
-                bootstrap: nextBootstrap,
-              });
+              assertSchedulerProjectionAccepted(
+                dispatchStreamAction({
+                  type: "bootstrap.received",
+                  bootstrap: nextBootstrap,
+                }),
+              );
               return nextBootstrap.latest_event_id;
             }
 
             const bufferedEvents = recovery.bufferedEvents;
             const cursor = recoveryCursor(nextBootstrap, bufferedEvents);
-            const recovered = dispatchStreamAction({
-              type: "recovery.received",
-              bootstrap: nextBootstrap,
-              bufferedEvents,
-            });
+            const recovered = assertSchedulerProjectionAccepted(
+              dispatchStreamAction({
+                type: "recovery.received",
+                bootstrap: nextBootstrap,
+                bufferedEvents,
+              }),
+            );
             if (
               recovered.snapshotRecovery !== null ||
               recovered.appliedEventId !== cursor
@@ -542,10 +597,24 @@ export function useAgentState(
           try {
             const task = await command.execute();
             dispatch({ type: "task.upserted", task });
+            dispatch({
+              type: "create.succeeded",
+              clientRequestId: command.clientRequestId,
+            });
             return task;
           } catch (error) {
             if (isSessionExpired(error)) {
               expireSession();
+            } else if (isTaskQueueFull(error)) {
+              dispatch({
+                type: "create.queue_full",
+                replay: {
+                  repositoryId,
+                  prompt,
+                  clientRequestId: command.clientRequestId,
+                  requestId: commandError(error).requestId,
+                },
+              });
             }
             throw error;
           }

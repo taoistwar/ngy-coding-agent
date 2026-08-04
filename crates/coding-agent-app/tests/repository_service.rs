@@ -1,12 +1,57 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use coding_agent_app::{PickerError, RepositoryDiscovery};
+use coding_agent_app::{
+    CommandRunner, FilesystemRepositoryIdentityResolver, PickerError, RepositoryDiscovery,
+    RepositoryIdentityResolutionError, RepositoryIdentityResolver,
+};
+use coding_agent_domain::{CanonicalPath, RepositoryId};
+use coding_agent_store::RepositoryIdentityLookup;
 use support::{LockState, RealRepositoryFixture, RecordingRunner};
+use tokio::time::{Instant, timeout_at};
+
+fn deadline() -> Instant {
+    Instant::now() + Duration::from_secs(5)
+}
+
+struct RealCommandRunner;
+
+#[async_trait::async_trait]
+impl CommandRunner for RealCommandRunner {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[OsString],
+        current_dir: &Path,
+        deadline: Instant,
+    ) -> io::Result<Vec<u8>> {
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(args)
+            .current_dir(current_dir)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = timeout_at(deadline, command.output()).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "test repository command deadline elapsed",
+            )
+        })??;
+        if !output.status.success() {
+            return Err(io::Error::other("test repository command failed"));
+        }
+        Ok(output.stdout)
+    }
+}
 
 #[tokio::test]
 async fn invalid_selected_paths_fail_with_stable_codes_before_any_command() {
@@ -17,7 +62,7 @@ async fn invalid_selected_paths_fail_with_stable_codes_before_any_command() {
     let discovery = RepositoryDiscovery::with_runner(runtime, runner.clone());
 
     let missing = discovery
-        .discover(&temp.path().join("missing"))
+        .discover(&temp.path().join("missing"), deadline())
         .await
         .expect_err("missing selection fails");
     assert_eq!(missing.code(), "REPOSITORY_PATH_NOT_FOUND");
@@ -25,7 +70,7 @@ async fn invalid_selected_paths_fail_with_stable_codes_before_any_command() {
     let file = temp.path().join("ordinary-file");
     std::fs::write(&file, b"not a directory").expect("create ordinary file");
     let not_directory = discovery
-        .discover(&file)
+        .discover(&file, deadline())
         .await
         .expect_err("file selection fails");
     assert_eq!(not_directory.code(), "REPOSITORY_PATH_NOT_DIRECTORY");
@@ -51,9 +96,10 @@ async fn discovery_runs_only_approved_commands_and_uses_the_nearest_manifest() {
         Ok(format!("{}\n", workspace.join("Cargo.toml").display()).into_bytes()),
     ]));
     let discovery = RepositoryDiscovery::with_runner(runtime.clone(), runner.clone());
+    let absolute_deadline = deadline();
 
     let found = discovery
-        .discover(&selected)
+        .discover(&selected, absolute_deadline)
         .await
         .expect("discover repository");
 
@@ -66,24 +112,25 @@ async fn discovery_runs_only_approved_commands_and_uses_the_nearest_manifest() {
     let calls = runner.calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].program, "git");
-    assert_eq!(
-        calls[0].args,
-        os_args([
-            "-C",
-            selected.to_str().unwrap(),
-            "rev-parse",
-            "--show-toplevel",
-        ])
-    );
+    assert_eq!(calls[0].args, os_args(["rev-parse", "--show-toplevel"]));
+    assert_eq!(calls[0].current_dir, selected);
     assert_eq!(calls[1].program, "cargo");
-    assert_eq!(calls[1].current_dir, runtime);
+    assert_eq!(calls[1].current_dir, workspace);
+    assert_eq!(
+        calls[0].deadline, absolute_deadline,
+        "Git consumes the caller's absolute deadline"
+    );
+    assert_eq!(
+        calls[1].deadline, absolute_deadline,
+        "both supervised queries consume one absolute discovery deadline"
+    );
     assert_eq!(
         calls[1].args,
         os_args([
             "locate-project",
             "--workspace",
             "--manifest-path",
-            workspace.join("Cargo.toml").to_str().unwrap(),
+            "Cargo.toml",
             "--message-format",
             "plain",
         ])
@@ -111,15 +158,15 @@ async fn a_symlinked_selection_is_normalized_before_commands_and_results() {
     let discovery = RepositoryDiscovery::with_runner(runtime, runner.clone());
 
     let found = discovery
-        .discover(&selected_link)
+        .discover(&selected_link, deadline())
         .await
         .expect("discover through symlink");
     let normalized = selected_target.canonicalize().unwrap();
     assert_eq!(found.selected_path, normalized);
     assert_eq!(
-        runner.calls()[0].args[1],
-        normalized.as_os_str(),
-        "Git receives the normalized target rather than the symlink spelling"
+        runner.calls()[0].current_dir,
+        normalized,
+        "Git runs in the normalized target rather than the symlink spelling"
     );
 }
 
@@ -138,7 +185,7 @@ async fn missing_manifest_outside_workspace_and_command_failures_have_safe_stabl
     )
     .into_bytes())]));
     let missing = RepositoryDiscovery::with_runner(runtime.clone(), missing_runner.clone())
-        .discover(&selected)
+        .discover(&selected, deadline())
         .await
         .expect_err("missing manifest fails");
     assert_eq!(missing.code(), "CARGO_WORKSPACE_NOT_FOUND");
@@ -158,14 +205,14 @@ async fn missing_manifest_outside_workspace_and_command_failures_have_safe_stabl
         Ok(format!("{}\n", outside.join("Cargo.toml").display()).into_bytes()),
     ]));
     let outside_error = RepositoryDiscovery::with_runner(runtime.clone(), outside_runner)
-        .discover(&selected)
+        .discover(&selected, deadline())
         .await
         .expect_err("outside workspace fails");
     assert_eq!(outside_error.code(), "CARGO_WORKSPACE_OUTSIDE_GIT_ROOT");
 
     let command_runner = Arc::new(RecordingRunner::scripted([Err(io::ErrorKind::NotFound)]));
     let command_error = RepositoryDiscovery::with_runner(runtime.clone(), command_runner)
-        .discover(&selected)
+        .discover(&selected, deadline())
         .await
         .expect_err("spawn failure is mapped");
     assert_eq!(command_error.code(), "REPOSITORY_COMMAND_FAILED");
@@ -173,7 +220,7 @@ async fn missing_manifest_outside_workspace_and_command_failures_have_safe_stabl
 
     let utf8_runner = Arc::new(RecordingRunner::scripted([Ok(vec![0xff, 0xfe])]));
     let utf8_error = RepositoryDiscovery::with_runner(runtime, utf8_runner)
-        .discover(&selected)
+        .discover(&selected, deadline())
         .await
         .expect_err("invalid UTF-8 is mapped");
     assert_eq!(utf8_error.code(), "REPOSITORY_COMMAND_FAILED");
@@ -185,10 +232,11 @@ async fn real_discovery_is_read_only_for_lock_states_and_ignores_unavailable_too
         let fixture = RealRepositoryFixture::new(lock_state);
         let before = fixture.fingerprint();
 
-        let found = RepositoryDiscovery::new(fixture.runtime.clone())
-            .discover(&fixture.selected)
-            .await
-            .unwrap_or_else(|error| panic!("discover {lock_state:?} fixture: {error}"));
+        let found =
+            RepositoryDiscovery::with_runner(fixture.runtime.clone(), Arc::new(RealCommandRunner))
+                .discover(&fixture.selected, deadline())
+                .await
+                .unwrap_or_else(|error| panic!("discover {lock_state:?} fixture: {error}"));
 
         assert_eq!(found.git_root, fixture.git_root.canonicalize().unwrap());
         assert_eq!(
@@ -206,6 +254,117 @@ async fn real_discovery_is_read_only_for_lock_states_and_ignores_unavailable_too
 #[test]
 fn picker_error_code_is_stable() {
     assert_eq!(PickerError::AlreadyOpen.code(), "PICKER_ALREADY_OPEN");
+}
+
+#[test]
+fn filesystem_identity_resolver_uses_the_authenticated_common_git_object() {
+    let temp = tempfile::tempdir().expect("create identity resolver fixture");
+    let repository = temp.path().join("repository");
+    let common_git = repository.join(".git");
+    let retained = repository.join(".git-retained");
+    std::fs::create_dir_all(&common_git).expect("create common Git directory");
+    let canonical_repository = repository.canonicalize().expect("canonicalize repository");
+    let identity = repository_identity_lookup(&canonical_repository);
+    let seed = identity.git_identity_key.clone();
+    let resolver = FilesystemRepositoryIdentityResolver;
+
+    let first = resolver
+        .resolve(&identity)
+        .expect("resolve original identity");
+    assert_eq!(
+        resolver.resolve(&identity),
+        Ok(first),
+        "the same authenticated object has a stable marker"
+    );
+
+    std::fs::rename(&common_git, &retained).expect("retain original common Git object");
+    std::fs::create_dir(&common_git).expect("install replacement common Git object");
+    let replacement = resolver
+        .resolve(&identity)
+        .expect("observe replacement object without path fallback");
+    assert_ne!(first, replacement);
+
+    std::fs::remove_dir(&common_git).expect("remove replacement common Git directory");
+    assert_eq!(
+        resolver.resolve(&identity),
+        Err(RepositoryIdentityResolutionError::Unavailable),
+        "a missing common Git directory fails closed"
+    );
+    std::fs::write(&common_git, b"gitdir: elsewhere").expect("install file impersonator");
+    assert_eq!(
+        resolver.resolve(&identity),
+        Err(RepositoryIdentityResolutionError::Unavailable),
+        "a common Git file is not a directory capability"
+    );
+    std::fs::remove_file(&common_git).expect("remove file impersonator");
+    if create_directory_symlink(&retained, &common_git).is_ok() {
+        assert_eq!(
+            resolver.resolve(&identity),
+            Err(RepositoryIdentityResolutionError::Unavailable),
+            "a common Git link/reparse replacement fails closed"
+        );
+    }
+
+    let rendered = RepositoryIdentityResolutionError::Unavailable.to_string();
+    assert_eq!(
+        rendered,
+        "the registered repository identity is unavailable"
+    );
+    assert!(!rendered.contains(&seed));
+}
+
+#[cfg(windows)]
+#[test]
+fn filesystem_identity_resolver_keeps_exact_git_root_separate_from_lowercase_identity_key() {
+    let temp = tempfile::tempdir().expect("create mixed-case identity resolver fixture");
+    let repository = temp.path().join("MixedCaseRepository");
+    std::fs::create_dir_all(repository.join(".git"))
+        .expect("create mixed-case common Git directory");
+    let canonical_repository = repository
+        .canonicalize()
+        .expect("canonicalize mixed-case repository");
+    let identity = repository_identity_lookup(&canonical_repository);
+    let exact_root = identity
+        .git_root
+        .as_path()
+        .display()
+        .to_string()
+        .replace('/', "\\");
+
+    assert!(
+        exact_root.contains("MixedCaseRepository"),
+        "the durable Git root retains its filesystem spelling"
+    );
+    assert_eq!(identity.git_identity_key, exact_root.to_lowercase());
+    assert_ne!(
+        identity.git_identity_key, exact_root,
+        "the normalized alias key is not a filesystem path"
+    );
+
+    FilesystemRepositoryIdentityResolver
+        .resolve(&identity)
+        .expect("resolve through the exact-case durable Git root");
+}
+
+fn repository_identity_lookup(path: &Path) -> RepositoryIdentityLookup {
+    RepositoryIdentityLookup {
+        repository_id: RepositoryId::new(),
+        git_root: CanonicalPath::try_from_canonical(path.to_path_buf())
+            .expect("construct canonical repository identity root"),
+        git_identity_key: durable_identity_seed(path),
+    }
+}
+
+fn durable_identity_seed(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        path.display().to_string().replace('/', "\\").to_lowercase()
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
 }
 
 fn os_args<const N: usize>(values: [&str; N]) -> Vec<OsString> {

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -9,8 +10,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::command_policy::{
-    CommandPolicyError, DirectoryIdentityMarker, ExecutionDirectory, GitCommandBinding,
-    ValidatedCommand, child_visible_path,
+    CommandPolicyError, ExecutionDirectory, GitCommandBinding, ValidatedCommand, child_visible_path,
 };
 use crate::native_fs::read_directory_names;
 use crate::process_supervisor::{
@@ -19,8 +19,8 @@ use crate::process_supervisor::{
 };
 use crate::root_capability::DirectoryPathGuard;
 use crate::{
-    CargoCatalog, CargoToolLimits, CargoTools, GitTools, RelativePath, RootCapability,
-    ToolchainPaths,
+    CargoCatalog, CargoToolLimits, CargoTools, DirectoryIdentityError, DirectoryIdentityMarker,
+    GitTools, ProcessLivenessScope, RelativePath, RootCapability, ToolchainPaths,
 };
 
 const ADMIN_FILE_LIMIT: u64 = 16 * 1024;
@@ -99,17 +99,50 @@ impl WorktreeLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitSideEffectKind {
+    WorktreeAdd,
+    Reset,
+}
+
+impl GitSideEffectKind {
+    #[cfg(feature = "test-support")]
+    const fn test_label(self) -> &'static str {
+        match self {
+            Self::WorktreeAdd => "worktree-add",
+            Self::Reset => "reset",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GitSideEffectConditions<'a> {
+    binding: &'a GitCommandBinding,
+    expected_head: &'a str,
+    expected_symbolic_head: Option<&'a str>,
+}
+
 /// Deterministic control-plane values that must be persisted as `reserved`
 /// before any Git worktree side effect is allowed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WorktreeReservation {
     identity: WorktreeIdentity,
     base_commit: String,
     branch_name: String,
     worktree_path: PathBuf,
-    source_common_git_path: PathBuf,
     source_common_git_identity: DirectoryIdentityMarker,
     cargo_workspace_offset: PathBuf,
+}
+
+impl fmt::Debug for WorktreeReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorktreeReservation")
+            .field("identity", &self.identity)
+            .field("base_commit", &self.base_commit)
+            .field("branch_name", &self.branch_name)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +153,44 @@ pub enum WorktreeObservation {
     CheckoutPartial,
     Ready,
     Inconsistent,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorktreeObservationOutcome {
+    observation: WorktreeObservation,
+    process_cleanup_unproven: bool,
+    repository_poison_required: bool,
+}
+
+impl WorktreeObservationOutcome {
+    fn exact(observation: WorktreeObservation) -> Self {
+        Self {
+            observation,
+            process_cleanup_unproven: false,
+            repository_poison_required: observation == WorktreeObservation::Inconsistent,
+        }
+    }
+
+    fn positive_evidence(observation: WorktreeObservation, error: &WorktreeError) -> Self {
+        Self {
+            observation,
+            process_cleanup_unproven: false,
+            repository_poison_required: error.requires_repository_poison(),
+        }
+    }
+
+    pub const fn observation(self) -> WorktreeObservation {
+        self.observation
+    }
+
+    pub const fn process_cleanup_is_unproven(self) -> bool {
+        self.process_cleanup_unproven
+    }
+
+    pub const fn repository_poison_required(self) -> bool {
+        self.repository_poison_required
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +199,7 @@ pub enum WorktreeArtifactState {
     Partial,
     Ready,
     Inconsistent,
+    Unavailable,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,22 +207,25 @@ pub enum WorktreeArtifactState {
 pub struct WorktreeProvisionError {
     cause: WorktreeError,
     observation: WorktreeObservation,
+    process_cleanup_unproven: bool,
+    repository_poison_required: bool,
 }
 
 impl WorktreeProvisionError {
-    fn absent(cause: WorktreeError) -> Self {
-        Self {
-            cause,
-            observation: WorktreeObservation::Absent,
-        }
-    }
-
     pub fn cause(&self) -> &WorktreeError {
         &self.cause
     }
 
     pub const fn observation(&self) -> WorktreeObservation {
         self.observation
+    }
+
+    pub const fn process_cleanup_is_unproven(&self) -> bool {
+        self.process_cleanup_unproven
+    }
+
+    pub const fn repository_poison_required(&self) -> bool {
+        self.repository_poison_required
     }
 
     pub const fn artifact_state(&self) -> WorktreeArtifactState {
@@ -161,6 +236,7 @@ impl WorktreeProvisionError {
             | WorktreeObservation::CheckoutPartial => WorktreeArtifactState::Partial,
             WorktreeObservation::Ready => WorktreeArtifactState::Ready,
             WorktreeObservation::Inconsistent => WorktreeArtifactState::Inconsistent,
+            WorktreeObservation::Unavailable => WorktreeArtifactState::Unavailable,
         }
     }
 
@@ -265,6 +341,7 @@ impl ProvisionedWorktree {
         &self,
         toolchain: &ToolchainPaths,
         temporary_directory: impl AsRef<Path>,
+        process_liveness_scope: ProcessLivenessScope,
         process_limits: ProcessLimits,
         limits: crate::GitToolLimits,
     ) -> Result<GitTools, crate::GitToolError> {
@@ -273,6 +350,7 @@ impl ProvisionedWorktree {
             self.git_directory(),
             self.work_tree(),
             temporary_directory,
+            process_liveness_scope,
             process_limits,
             limits,
         )
@@ -284,7 +362,9 @@ impl ProvisionedWorktree {
 /// its dirty files are never copied or inspected by this type.
 pub struct WorktreeProvisioner {
     supervisor: ProcessSupervisor,
+    repository_id: String,
     toolchain: ToolchainPaths,
+    process_liveness_scope: ProcessLivenessScope,
     process_limits: ProcessLimits,
     temporary_directory: PathBuf,
     git: Arc<crate::PinnedExecutable>,
@@ -298,27 +378,57 @@ pub struct WorktreeProvisioner {
     cargo_workspace_offset: PathBuf,
     environment: ChildEnvironment,
     limits: WorktreeLimits,
+    #[cfg(feature = "test-support")]
+    side_effect_boundary_hook:
+        Option<Arc<dyn Fn(&'static str, &'static str) + Send + Sync + 'static>>,
+    #[cfg(feature = "test-support")]
+    side_effect_outcome_for_tests: Option<WorktreeSideEffectTestOutcome>,
+}
+
+/// Deterministic command outcomes used to prove the common-Git postcondition
+/// gate precedence, including the fail-closed exception for unproven cleanup.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum WorktreeSideEffectTestOutcome {
+    NonZero,
+    TimedOut,
+    ProcessError,
+    CleanupUnproven,
+    BuildError,
 }
 
 impl WorktreeProvisioner {
     #[allow(clippy::too_many_arguments)]
     pub fn from_trusted_paths(
         toolchain: &ToolchainPaths,
+        repository_id: impl Into<String>,
         registered_git_root: impl AsRef<Path>,
         registered_cargo_workspace: impl AsRef<Path>,
         artifact_root: impl AsRef<Path>,
         temporary_directory: impl AsRef<Path>,
+        process_liveness_scope: ProcessLivenessScope,
         process_limits: ProcessLimits,
         limits: WorktreeLimits,
     ) -> Result<Self, WorktreeError> {
+        let repository_id = repository_id.into();
+        if !is_safe_identity_component(&repository_id) {
+            return Err(WorktreeError::InvalidIdentity);
+        }
         let (original_git_root, original_root_directory) =
             validated_directory(registered_git_root.as_ref())?;
         let common_git_path = original_git_root.join(".git");
         let (common_git_directory, common_git_execution_directory) =
             validated_directory(&common_git_path).map_err(|_| WorktreeError::InvalidRepository)?;
-        let common_git_capability =
-            RootCapability::open(&common_git_directory).map_err(WorktreeError::Io)?;
-        let common_git_identity = common_git_execution_directory.identity_marker();
+        // The execution directory, retained capability, and marker must all
+        // originate from one authenticated directory object. Reopening the
+        // path here would introduce a replacement window between them.
+        let common_git_capability = common_git_execution_directory
+            .cloned_root_capability()
+            .map_err(WorktreeError::CommandPolicy)?;
+        let common_git_identity = common_git_capability
+            .identity_marker()
+            .map_err(map_common_git_identity_error)?;
 
         let (cargo_workspace_path, cargo_workspace_directory) =
             validated_directory(registered_cargo_workspace.as_ref())?;
@@ -345,8 +455,10 @@ impl WorktreeProvisioner {
         .map_err(WorktreeError::CommandPolicy)?;
 
         Ok(Self {
-            supervisor: ProcessSupervisor::new(process_limits),
+            supervisor: ProcessSupervisor::new(process_limits, process_liveness_scope.clone()),
+            repository_id,
             toolchain: toolchain.clone(),
+            process_liveness_scope,
             process_limits,
             temporary_directory,
             git: toolchain.git(),
@@ -360,7 +472,49 @@ impl WorktreeProvisioner {
             cargo_workspace_offset,
             environment: worktree_environment(&platform),
             limits,
+            #[cfg(feature = "test-support")]
+            side_effect_boundary_hook: None,
+            #[cfg(feature = "test-support")]
+            side_effect_outcome_for_tests: None,
         })
+    }
+
+    /// Returns the authenticated common-Git object identity without exposing
+    /// its directory path or platform identity components.
+    pub const fn common_git_identity_marker(&self) -> DirectoryIdentityMarker {
+        self.common_git_identity
+    }
+
+    /// Clones the retained, authenticated common-Git directory capability for
+    /// read-only physical-volume sampling.
+    ///
+    /// The clone comes from the same directory object used by Git command
+    /// binding and is revalidated before it crosses the runtime boundary. No
+    /// repository path is reopened by the caller.
+    pub fn clone_common_git_capability_for_volume_sampling(
+        &self,
+    ) -> Result<RootCapability, WorktreeError> {
+        self.validate_common_git_identity()?;
+        self.common_git_capability
+            .try_clone_capability()
+            .map_err(|_| WorktreeError::CommonGitIdentityUnavailable)
+    }
+
+    /// Installs a deterministic side-effect boundary hook for integration
+    /// tests. Production builds do not contain this seam.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_side_effect_boundary_hook_for_tests(
+        &mut self,
+        hook: impl Fn(&'static str, &'static str) + Send + Sync + 'static,
+    ) {
+        self.side_effect_boundary_hook = Some(Arc::new(hook));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn set_side_effect_outcome_for_tests(&mut self, outcome: WorktreeSideEffectTestOutcome) {
+        self.side_effect_outcome_for_tests = Some(outcome);
     }
 
     /// Computes and validates the exact artifact identity without creating a
@@ -371,9 +525,13 @@ impl WorktreeProvisioner {
         identity: WorktreeIdentity,
         cancellation: CancellationToken,
     ) -> Result<WorktreeReservation, WorktreeError> {
+        if identity.repository_id() != self.repository_id.as_str() {
+            return Err(WorktreeError::InvalidReservation);
+        }
         self.artifact_root_directory
             .revalidate()
             .map_err(WorktreeError::CommandPolicy)?;
+        self.validate_common_git_identity()?;
         self.original_binding
             .revalidate()
             .map_err(WorktreeError::CommandPolicy)?;
@@ -394,7 +552,6 @@ impl WorktreeProvisioner {
             base_commit,
             branch_name,
             worktree_path: target,
-            source_common_git_path: self.common_git_directory.clone(),
             source_common_git_identity: self.common_git_identity,
             cargo_workspace_offset: self.cargo_workspace_offset.clone(),
         })
@@ -415,7 +572,6 @@ impl WorktreeProvisioner {
             base_commit: base_commit.into(),
             branch_name: branch_name.into(),
             worktree_path: worktree_path.into(),
-            source_common_git_path: self.common_git_directory.clone(),
             source_common_git_identity: self.common_git_identity,
             cargo_workspace_offset: self.cargo_workspace_offset.clone(),
         };
@@ -430,77 +586,102 @@ impl WorktreeProvisioner {
         reservation: WorktreeReservation,
         cancellation: CancellationToken,
     ) -> Result<ProvisionedWorktree, WorktreeProvisionError> {
-        self.validate_reservation(&reservation)
-            .map_err(WorktreeProvisionError::absent)?;
-        self.artifact_root_directory
-            .revalidate()
-            .map_err(WorktreeError::CommandPolicy)
-            .map_err(WorktreeProvisionError::absent)?;
-        self.original_binding
-            .revalidate()
-            .map_err(WorktreeError::CommandPolicy)
-            .map_err(WorktreeProvisionError::absent)?;
+        macro_rules! before_add {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(cause) => {
+                        return Err(self
+                            .classify_provision_failure(&reservation, cause, false)
+                            .await);
+                    }
+                }
+            };
+        }
+
+        before_add!(self.validate_reservation(&reservation));
+        before_add!(
+            self.artifact_root_directory
+                .revalidate()
+                .map_err(WorktreeError::CommandPolicy)
+        );
+        before_add!(self.validate_common_git_identity());
+        before_add!(
+            self.original_binding
+                .revalidate()
+                .map_err(WorktreeError::CommandPolicy)
+        );
 
         // Configuration and identity are rechecked after persistence so a
         // host-side change cannot silently alter the reserved checkout.
-        self.reject_unsafe_local_configuration(cancellation.clone())
-            .await
-            .map_err(WorktreeProvisionError::absent)?;
-        if self
-            .branch_exists(reservation.branch_name(), cancellation.clone())
-            .await
-            .map_err(WorktreeProvisionError::absent)?
-        {
-            return Err(WorktreeProvisionError::absent(
-                WorktreeError::BranchConflict,
-            ));
+        before_add!(
+            self.reject_unsafe_local_configuration(cancellation.clone())
+                .await
+        );
+        if before_add!(
+            self.branch_exists(reservation.branch_name(), cancellation.clone())
+                .await
+        ) {
+            return Err(self
+                .classify_provision_failure(&reservation, WorktreeError::BranchConflict, false)
+                .await);
         }
 
         let identity_path = reservation.identity.relative_path();
-        let parent_path = identity_path
-            .parent()
-            .ok_or(WorktreeError::InvalidIdentity)
-            .map_err(WorktreeProvisionError::absent)?;
-        let parent_relative =
-            relative_path_from_path(parent_path).map_err(WorktreeProvisionError::absent)?;
-        let artifact_parent_guard = self
-            .artifact_root_capability
-            .ensure_directory_path(&parent_relative)
-            .map_err(|_| WorktreeError::ArtifactPathInvalid)
-            .map_err(WorktreeProvisionError::absent)?;
-        let _artifact_parent_handle = artifact_parent_guard
-            .try_clone_final()
-            .map_err(WorktreeError::Io)
-            .map_err(WorktreeProvisionError::absent)?;
+        let parent_path = before_add!(identity_path.parent().ok_or(WorktreeError::InvalidIdentity));
+        let parent_relative = before_add!(relative_path_from_path(parent_path));
+        let artifact_parent_guard = before_add!(
+            self.artifact_root_capability
+                .ensure_directory_path(&parent_relative)
+                .map_err(|_| WorktreeError::ArtifactPathInvalid)
+        );
+        let _artifact_parent_handle = before_add!(
+            artifact_parent_guard
+                .try_clone_final()
+                .map_err(WorktreeError::Io)
+        );
         let attempt_name = OsString::from(reservation.identity.attempt().to_string());
-        if !artifact_parent_guard
-            .child_is_absent(&attempt_name)
-            .map_err(WorktreeError::Io)
-            .map_err(WorktreeProvisionError::absent)?
-        {
-            return Err(WorktreeProvisionError::absent(
-                WorktreeError::DestinationConflict,
-            ));
+        if !before_add!(
+            artifact_parent_guard
+                .child_is_absent(&attempt_name)
+                .map_err(WorktreeError::Io)
+        ) {
+            return Err(self
+                .classify_provision_failure(&reservation, WorktreeError::DestinationConflict, false)
+                .await);
         }
-        self.artifact_root_directory
-            .revalidate()
-            .map_err(WorktreeError::CommandPolicy)
-            .map_err(WorktreeProvisionError::absent)?;
+        before_add!(
+            self.artifact_root_directory
+                .revalidate()
+                .map_err(WorktreeError::CommandPolicy)
+        );
 
-        let before_admin_entries = list_worktree_admin_entries(&self.common_git_capability)
-            .map_err(WorktreeProvisionError::absent)?;
-        let add = ValidatedCommand::git_worktree_add(
-            Arc::clone(&self.git),
-            &self.original_binding,
-            self.environment.clone(),
-            reservation.branch_name(),
-            reservation.worktree_path(),
-            reservation.base_commit(),
-            self.limits.command_timeout,
-        )
-        .map_err(WorktreeError::CommandPolicy)
-        .map_err(WorktreeProvisionError::absent)?;
-        let add_result = match self.run(add, cancellation.clone()).await {
+        let before_admin_entries =
+            before_add!(list_worktree_admin_entries(&self.common_git_capability));
+        let add_result = match self
+            .run_git_side_effect(
+                GitSideEffectKind::WorktreeAdd,
+                GitSideEffectConditions {
+                    binding: &self.original_binding,
+                    expected_head: reservation.base_commit(),
+                    expected_symbolic_head: None,
+                },
+                cancellation.clone(),
+                || {
+                    ValidatedCommand::git_worktree_add(
+                        Arc::clone(&self.git),
+                        &self.original_binding,
+                        self.environment.clone(),
+                        reservation.branch_name(),
+                        reservation.worktree_path(),
+                        reservation.base_commit(),
+                        self.limits.command_timeout,
+                    )
+                    .map_err(WorktreeError::CommandPolicy)
+                },
+            )
+            .await
+        {
             Ok(result) => result,
             Err(cause) => {
                 return Err(self
@@ -545,17 +726,15 @@ impl WorktreeProvisioner {
         let branch_name = reservation.branch_name.clone();
         let target = reservation.worktree_path.clone();
 
-        let (worktree_path, work_tree) =
-            validated_directory(&target).map_err(|_| WorktreeError::PostconditionFailed)?;
+        let (worktree_path, work_tree) = validated_directory(&target)?;
         let linked_git_directory =
             self.find_linked_git_directory(before_admin_entries, &worktree_path, &branch_name)?;
-        let (_, linked_git_execution_directory) = validated_directory(&linked_git_directory)
-            .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
+        let (_, linked_git_execution_directory) = validated_directory(&linked_git_directory)?;
         let linked_binding = GitCommandBinding::try_new(
             Arc::new(linked_git_execution_directory),
             Arc::new(work_tree),
         )
-        .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
+        .map_err(WorktreeError::CommandPolicy)?;
 
         let actual_head = self
             .resolve_bound_head(&linked_binding, cancellation.clone())
@@ -584,29 +763,33 @@ impl WorktreeProvisioner {
             return Err(WorktreeError::PostconditionFailed);
         }
 
-        let reset = ValidatedCommand::git_worktree_reset(
-            Arc::clone(&self.git),
-            &linked_binding,
-            self.environment.clone(),
-            &base_commit,
-            self.limits.command_timeout,
-        )
-        .map_err(WorktreeError::CommandPolicy)?;
-        let reset_result = self.run(reset, cancellation.clone()).await?;
+        let expected_symbolic_head = format!("refs/heads/{branch_name}");
+        let reset_result = self
+            .run_git_side_effect(
+                GitSideEffectKind::Reset,
+                GitSideEffectConditions {
+                    binding: &linked_binding,
+                    expected_head: &base_commit,
+                    expected_symbolic_head: Some(&expected_symbolic_head),
+                },
+                cancellation.clone(),
+                || {
+                    ValidatedCommand::git_worktree_reset(
+                        Arc::clone(&self.git),
+                        &linked_binding,
+                        self.environment.clone(),
+                        &base_commit,
+                        self.limits.command_timeout,
+                    )
+                    .map_err(WorktreeError::CommandPolicy)
+                },
+            )
+            .await?;
         require_success(&reset_result)?;
 
-        // Reset must neither detach/move HEAD nor leave checkout debris.
-        if self
-            .resolve_bound_head(&linked_binding, cancellation.clone())
-            .await?
-            != base_commit
-            || self
-                .resolve_symbolic_head(&linked_binding, cancellation.clone())
-                .await?
-                != format!("refs/heads/{branch_name}")
-        {
-            return Err(WorktreeError::PostconditionFailed);
-        }
+        // The shared side-effect wrapper already proved that reset neither
+        // detached nor moved HEAD. The remaining checks cover checkout and
+        // common-side administrative postconditions.
         self.validate_clean_worktree(&linked_binding, cancellation.clone())
             .await?;
         self.validate_common_worktree_record(
@@ -656,11 +839,11 @@ impl WorktreeProvisioner {
 
     fn validate_reservation(&self, reservation: &WorktreeReservation) -> Result<(), WorktreeError> {
         if reservation.branch_name != reservation.identity.branch_name()
+            || reservation.identity.repository_id() != self.repository_id.as_str()
             || reservation.worktree_path
                 != self
                     .artifact_root
                     .join(reservation.identity.relative_path())
-            || reservation.source_common_git_path != self.common_git_directory
             || reservation.source_common_git_identity != self.common_git_identity
             || reservation.cargo_workspace_offset != self.cargo_workspace_offset
             || parse_commit_output(reservation.base_commit.as_bytes()).is_err()
@@ -677,9 +860,39 @@ impl WorktreeProvisioner {
         reservation: &WorktreeReservation,
         cancellation: CancellationToken,
     ) -> WorktreeObservation {
+        self.observe_with_safety(reservation, cancellation)
+            .await
+            .observation()
+    }
+
+    /// Preserves process-cleanup provenance for control-plane callers. A plain
+    /// `Unavailable` observation is safe to retry only when this outcome says
+    /// every observation child process was proven stopped.
+    pub async fn observe_with_safety(
+        &self,
+        reservation: &WorktreeReservation,
+        cancellation: CancellationToken,
+    ) -> WorktreeObservationOutcome {
         match self.observe_inner(reservation, cancellation).await {
-            Ok(observation) => observation,
-            Err(_) => WorktreeObservation::Inconsistent,
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let observation = match error.artifact_state_after_failed_observation() {
+                    WorktreeArtifactState::Inconsistent => WorktreeObservation::Inconsistent,
+                    WorktreeArtifactState::Unavailable => WorktreeObservation::Unavailable,
+                    WorktreeArtifactState::Absent
+                    | WorktreeArtifactState::Partial
+                    | WorktreeArtifactState::Ready => {
+                        unreachable!(
+                            "failed observation only classifies exact or unavailable state"
+                        )
+                    }
+                };
+                WorktreeObservationOutcome {
+                    observation,
+                    process_cleanup_unproven: error.process_cleanup_is_unproven(),
+                    repository_poison_required: error.requires_repository_poison(),
+                }
+            }
         }
     }
 
@@ -696,6 +909,7 @@ impl WorktreeProvisioner {
         if self
             .observe_inner(reservation, cancellation.clone())
             .await?
+            .observation()
             != WorktreeObservation::Ready
         {
             return Err(WorktreeError::InconsistentArtifact);
@@ -759,8 +973,9 @@ impl WorktreeProvisioner {
         &self,
         reservation: &WorktreeReservation,
         cancellation: CancellationToken,
-    ) -> Result<WorktreeObservation, WorktreeError> {
+    ) -> Result<WorktreeObservationOutcome, WorktreeError> {
         self.validate_reservation(reservation)?;
+        self.validate_common_git_identity()?;
         self.original_binding
             .revalidate()
             .map_err(WorktreeError::CommandPolicy)?;
@@ -775,7 +990,9 @@ impl WorktreeProvisioner {
             .as_ref()
             .is_some_and(|commit| commit != reservation.base_commit())
         {
-            return Ok(WorktreeObservation::Inconsistent);
+            return Ok(WorktreeObservationOutcome::exact(
+                WorktreeObservation::Inconsistent,
+            ));
         }
 
         let target_relative = relative_path_from_path(&reservation.identity.relative_path())?;
@@ -785,22 +1002,40 @@ impl WorktreeProvisioner {
         {
             Ok(directory) => Some(directory),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(_) => return Ok(WorktreeObservation::Inconsistent),
+            Err(error) => return Err(WorktreeError::Io(error)),
         };
         let admin = self.find_reserved_git_directory(reservation)?;
 
         match (branch.is_some(), admin.as_ref(), target_directory.as_ref()) {
-            (false, None, None) => return Ok(WorktreeObservation::Absent),
-            (true, None, None) => return Ok(WorktreeObservation::BranchOnly),
-            (true, Some(_), None) => return Ok(WorktreeObservation::AdministrativeCreated),
+            (false, None, None) => {
+                return Ok(WorktreeObservationOutcome::exact(
+                    WorktreeObservation::Absent,
+                ));
+            }
+            (true, None, None) => {
+                return Ok(WorktreeObservationOutcome::exact(
+                    WorktreeObservation::BranchOnly,
+                ));
+            }
+            (true, Some(_), None) => {
+                return Ok(WorktreeObservationOutcome::exact(
+                    WorktreeObservation::AdministrativeCreated,
+                ));
+            }
             (true, Some(_), Some(_)) => {}
-            _ => return Ok(WorktreeObservation::Inconsistent),
+            _ => {
+                return Ok(WorktreeObservationOutcome::exact(
+                    WorktreeObservation::Inconsistent,
+                ));
+            }
         }
         if target_directory
             .as_ref()
             .is_some_and(directory_contains_only_git_pointer)
         {
-            return Ok(WorktreeObservation::AdministrativeCreated);
+            return Ok(WorktreeObservationOutcome::exact(
+                WorktreeObservation::AdministrativeCreated,
+            ));
         }
 
         let git_directory_path = admin.expect("matched observation has an admin directory");
@@ -816,50 +1051,85 @@ impl WorktreeProvisioner {
                 .resolve_symbolic_head(&binding, cancellation.clone())
                 .await?
                 != format!("refs/heads/{}", reservation.branch_name())
-            || self
-                .validate_common_worktree_record(
-                    reservation.worktree_path(),
-                    reservation.base_commit(),
-                    reservation.branch_name(),
-                    cancellation.clone(),
-                )
-                .await
-                .is_err()
         {
-            return Ok(WorktreeObservation::Inconsistent);
+            return Ok(WorktreeObservationOutcome::exact(
+                WorktreeObservation::Inconsistent,
+            ));
+        }
+        if let Err(error) = self
+            .validate_common_worktree_record(
+                reservation.worktree_path(),
+                reservation.base_commit(),
+                reservation.branch_name(),
+                cancellation.clone(),
+            )
+            .await
+        {
+            if error.is_positive_artifact_evidence() {
+                return Ok(WorktreeObservationOutcome::positive_evidence(
+                    WorktreeObservation::Inconsistent,
+                    &error,
+                ));
+            }
+            return Err(error);
         }
 
-        if self
+        if let Err(error) = self
             .validate_clean_worktree(&binding, cancellation.clone())
             .await
-            .is_err()
         {
-            return Ok(WorktreeObservation::CheckoutPartial);
+            if error.is_positive_artifact_evidence() {
+                return Ok(WorktreeObservationOutcome::positive_evidence(
+                    WorktreeObservation::CheckoutPartial,
+                    &error,
+                ));
+            }
+            return Err(error);
         }
-        if self
+        if let Err(error) = self
             .validate_existing_cargo_workspace(reservation, cancellation.clone())
             .await
-            .is_err()
         {
-            return Ok(WorktreeObservation::CheckoutPartial);
+            if error.is_positive_artifact_evidence() {
+                return Ok(WorktreeObservationOutcome::positive_evidence(
+                    WorktreeObservation::CheckoutPartial,
+                    &error,
+                ));
+            }
+            return Err(error);
         }
-        if self
+        if let Err(error) = self
             .validate_clean_worktree(&binding, cancellation.clone())
             .await
-            .is_err()
-            || self
-                .validate_common_worktree_record(
-                    reservation.worktree_path(),
-                    reservation.base_commit(),
-                    reservation.branch_name(),
-                    cancellation,
-                )
-                .await
-                .is_err()
         {
-            return Ok(WorktreeObservation::CheckoutPartial);
+            if error.is_positive_artifact_evidence() {
+                return Ok(WorktreeObservationOutcome::positive_evidence(
+                    WorktreeObservation::CheckoutPartial,
+                    &error,
+                ));
+            }
+            return Err(error);
         }
-        Ok(WorktreeObservation::Ready)
+        if let Err(error) = self
+            .validate_common_worktree_record(
+                reservation.worktree_path(),
+                reservation.base_commit(),
+                reservation.branch_name(),
+                cancellation,
+            )
+            .await
+        {
+            if error.is_positive_artifact_evidence() {
+                return Ok(WorktreeObservationOutcome::positive_evidence(
+                    WorktreeObservation::CheckoutPartial,
+                    &error,
+                ));
+            }
+            return Err(error);
+        }
+        Ok(WorktreeObservationOutcome::exact(
+            WorktreeObservation::Ready,
+        ))
     }
 
     async fn resolve_optional_branch(
@@ -901,15 +1171,31 @@ impl WorktreeProvisioner {
         let cargo_path = reservation
             .worktree_path
             .join(&reservation.cargo_workspace_offset);
-        let (_, cargo_directory) = validated_directory(&cargo_path)?;
+        let (_, cargo_directory) = match validated_directory(&cargo_path) {
+            Ok(directory) => directory,
+            Err(error) if error_is_not_found(&error) => {
+                return Err(WorktreeError::NestedWorkspaceMissing);
+            }
+            Err(error) => return Err(error),
+        };
         let cargo_directory = Arc::new(cargo_directory);
         let cargo_capability = RootCapability::open(&cargo_path).map_err(WorktreeError::Io)?;
         let target_relative = RelativePath::parse("target".to_owned())
             .map_err(|_| WorktreeError::ArtifactPathInvalid)?;
-        cargo_capability
-            .open_directory(&target_relative)
-            .map_err(WorktreeError::Io)?;
-        let (_, target_directory) = validated_directory(&cargo_path.join("target"))?;
+        match cargo_capability.open_directory(&target_relative) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(WorktreeError::PartialCreation);
+            }
+            Err(error) => return Err(WorktreeError::Io(error)),
+        }
+        let (_, target_directory) = match validated_directory(&cargo_path.join("target")) {
+            Ok(directory) => directory,
+            Err(error) if error_is_not_found(&error) => {
+                return Err(WorktreeError::PartialCreation);
+            }
+            Err(error) => return Err(error),
+        };
         let target_directory = Arc::new(target_directory);
         let catalog = self
             .validate_cargo_metadata(
@@ -936,8 +1222,13 @@ impl WorktreeProvisioner {
         WorktreeError,
     > {
         let cargo_path = worktree_path.join(&self.cargo_workspace_offset);
-        let (_, cargo_directory) =
-            validated_directory(&cargo_path).map_err(|_| WorktreeError::NestedWorkspaceMissing)?;
+        let (_, cargo_directory) = match validated_directory(&cargo_path) {
+            Ok(directory) => directory,
+            Err(error) if error_is_not_found(&error) => {
+                return Err(WorktreeError::NestedWorkspaceMissing);
+            }
+            Err(error) => return Err(error),
+        };
         let cargo_directory = Arc::new(cargo_directory);
         let cargo_capability = RootCapability::open(&cargo_path).map_err(WorktreeError::Io)?;
         let target_relative = RelativePath::parse("target".to_owned())
@@ -973,6 +1264,7 @@ impl WorktreeProvisioner {
             cargo_directory,
             target_directory,
             &self.temporary_directory,
+            self.process_liveness_scope.clone(),
             self.process_limits,
             limits,
         )
@@ -1142,7 +1434,7 @@ impl WorktreeProvisioner {
         if complete_stdout(&result)?.is_empty() {
             Ok(())
         } else {
-            Err(WorktreeError::PostconditionFailed)
+            Err(WorktreeError::WorktreeContentChanged)
         }
     }
 
@@ -1170,6 +1462,92 @@ impl WorktreeProvisioner {
         )
     }
 
+    fn validate_common_git_identity(&self) -> Result<(), WorktreeError> {
+        self.common_git_capability
+            .require_identity(self.common_git_identity)
+            .map_err(map_common_git_identity_error)?;
+        let live = RootCapability::open(&self.common_git_directory)
+            .map_err(|_| WorktreeError::CommonGitIdentityUnavailable)?;
+        live.require_identity(self.common_git_identity)
+            .map_err(map_common_git_identity_error)
+    }
+
+    async fn validate_git_side_effect_boundary(
+        &self,
+        conditions: GitSideEffectConditions<'_>,
+    ) -> Result<(), WorktreeError> {
+        self.validate_common_git_identity()?;
+        conditions
+            .binding
+            .revalidate()
+            .map_err(WorktreeError::CommandPolicy)?;
+        if self
+            .resolve_bound_head(conditions.binding, CancellationToken::new())
+            .await?
+            != conditions.expected_head
+        {
+            return Err(WorktreeError::PostconditionFailed);
+        }
+        if let Some(expected_symbolic_head) = conditions.expected_symbolic_head
+            && self
+                .resolve_symbolic_head(conditions.binding, CancellationToken::new())
+                .await?
+                != expected_symbolic_head
+        {
+            return Err(WorktreeError::PostconditionFailed);
+        }
+        Ok(())
+    }
+
+    /// Executes every common-Git mutation through one fail-closed boundary.
+    ///
+    /// Post-validation runs after every process-clean command outcome,
+    /// including cancellation, timeout, and non-zero exit. If process cleanup
+    /// is unproven, no further Git command may start and that safety fact keeps
+    /// absolute precedence over secondary identity evidence.
+    async fn run_git_side_effect(
+        &self,
+        _kind: GitSideEffectKind,
+        conditions: GitSideEffectConditions<'_>,
+        cancellation: CancellationToken,
+        build: impl FnOnce() -> Result<ValidatedCommand, WorktreeError>,
+    ) -> Result<CommandResult, WorktreeError> {
+        self.validate_git_side_effect_boundary(conditions).await?;
+
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &self.side_effect_boundary_hook {
+            hook(_kind.test_label(), "before-command");
+        }
+
+        #[cfg(feature = "test-support")]
+        let command_result = match self.side_effect_outcome_for_tests {
+            Some(outcome) => injected_side_effect_outcome(outcome),
+            None => match build() {
+                Ok(command) => self.run(command, cancellation).await,
+                Err(error) => Err(error),
+            },
+        };
+        #[cfg(not(feature = "test-support"))]
+        let command_result = match build() {
+            Ok(command) => self.run(command, cancellation).await,
+            Err(error) => Err(error),
+        };
+
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &self.side_effect_boundary_hook {
+            hook(_kind.test_label(), "after-command");
+        }
+
+        if command_result
+            .as_ref()
+            .is_err_and(WorktreeError::process_cleanup_is_unproven)
+        {
+            return command_result;
+        }
+        self.validate_git_side_effect_boundary(conditions).await?;
+        command_result
+    }
+
     async fn run(
         &self,
         command: ValidatedCommand,
@@ -1187,11 +1565,33 @@ impl WorktreeProvisioner {
         cause: WorktreeError,
         add_reported_success: bool,
     ) -> WorktreeProvisionError {
-        let mut observation = self.observe(reservation, CancellationToken::new()).await;
-        if add_reported_success && observation == WorktreeObservation::Absent {
+        if cause.process_cleanup_is_unproven() {
+            return WorktreeProvisionError {
+                repository_poison_required: cause.requires_repository_poison(),
+                cause,
+                observation: WorktreeObservation::Unavailable,
+                process_cleanup_unproven: true,
+            };
+        }
+        let fresh_observation = self
+            .observe_with_safety(reservation, CancellationToken::new())
+            .await;
+        let process_cleanup_unproven = fresh_observation.process_cleanup_is_unproven();
+        let repository_poison_required =
+            cause.requires_repository_poison() || fresh_observation.repository_poison_required();
+        let mut observation = fresh_observation.observation();
+        if (add_reported_success && observation == WorktreeObservation::Absent)
+            || (observation == WorktreeObservation::Unavailable
+                && cause.is_positive_artifact_evidence())
+        {
             observation = WorktreeObservation::Inconsistent;
         }
-        WorktreeProvisionError { cause, observation }
+        WorktreeProvisionError {
+            cause,
+            observation,
+            process_cleanup_unproven,
+            repository_poison_required,
+        }
     }
 
     fn find_linked_git_directory(
@@ -1201,8 +1601,13 @@ impl WorktreeProvisioner {
         branch_name: &str,
     ) -> Result<PathBuf, WorktreeError> {
         let current = list_worktree_admin_entries(&self.common_git_capability)?;
-        let expected_pointer = std::fs::canonicalize(worktree_path.join(".git"))
-            .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
+        let expected_pointer = match std::fs::canonicalize(worktree_path.join(".git")) {
+            Ok(pointer) => pointer,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(WorktreeError::LinkedMetadataInvalid);
+            }
+            Err(error) => return Err(WorktreeError::Io(error)),
+        };
         let mut matches = Vec::new();
         for name in current.difference(previous) {
             let Some(name) = name.to_str() else {
@@ -1212,8 +1617,10 @@ impl WorktreeProvisioner {
                 continue;
             }
             let pointer = read_admin_gitdir(&self.common_git_capability, name)?;
-            let Ok(pointer) = std::fs::canonicalize(pointer) else {
-                continue;
+            let pointer = match std::fs::canonicalize(pointer) {
+                Ok(pointer) => pointer,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(WorktreeError::Io(error)),
             };
             if pointer == expected_pointer {
                 let expected_head = format!("ref: refs/heads/{branch_name}");
@@ -1253,9 +1660,10 @@ impl WorktreeProvisioner {
             }
             let pointer = match read_admin_gitdir(&self.common_git_capability, name) {
                 Ok(pointer) => pointer,
-                Err(_) => continue,
+                Err(WorktreeError::LinkedMetadataInvalid) => continue,
+                Err(error) => return Err(error),
             };
-            if !admin_backlink_matches(&pointer, reservation.worktree_path()) {
+            if !admin_backlink_matches(&pointer, reservation.worktree_path())? {
                 continue;
             }
             if read_admin_line(&self.common_git_capability, name, "HEAD")?
@@ -1279,14 +1687,20 @@ impl WorktreeProvisioner {
     }
 }
 
-fn admin_backlink_matches(pointer: &Path, worktree_path: &Path) -> bool {
+fn admin_backlink_matches(pointer: &Path, worktree_path: &Path) -> Result<bool, WorktreeError> {
     let expected = child_visible_path(worktree_path).join(".git");
     match (
         std::fs::canonicalize(pointer),
         std::fs::canonicalize(&expected),
     ) {
-        (Ok(pointer), Ok(expected)) => pointer == expected,
-        _ => pointer == expected,
+        (Ok(pointer), Ok(expected)) => Ok(pointer == expected),
+        (Err(pointer_error), _) if pointer_error.kind() != io::ErrorKind::NotFound => {
+            Err(WorktreeError::Io(pointer_error))
+        }
+        (_, Err(expected_error)) if expected_error.kind() != io::ErrorKind::NotFound => {
+            Err(WorktreeError::Io(expected_error))
+        }
+        _ => Ok(pointer == expected),
     }
 }
 
@@ -1316,6 +1730,47 @@ fn validated_directory(path: &Path) -> Result<(PathBuf, ExecutionDirectory), Wor
         return Err(WorktreeError::InvalidRepository);
     }
     Ok((canonical, canonical_directory))
+}
+
+#[cfg(feature = "test-support")]
+fn injected_side_effect_outcome(
+    outcome: WorktreeSideEffectTestOutcome,
+) -> Result<CommandResult, WorktreeError> {
+    match outcome {
+        WorktreeSideEffectTestOutcome::NonZero => Ok(test_command_result(Some(17), false)),
+        WorktreeSideEffectTestOutcome::TimedOut => Ok(test_command_result(None, true)),
+        WorktreeSideEffectTestOutcome::ProcessError => {
+            Err(WorktreeError::Process(ProcessError::InvalidCommand))
+        }
+        WorktreeSideEffectTestOutcome::CleanupUnproven => {
+            Err(WorktreeError::Process(ProcessError::CleanupTimedOut))
+        }
+        WorktreeSideEffectTestOutcome::BuildError => Err(WorktreeError::CommandPolicy(
+            CommandPolicyError::InvalidGitBinding,
+        )),
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn test_command_result(exit_code: Option<i32>, timed_out: bool) -> CommandResult {
+    let stream = || crate::CapturedStream {
+        head: Vec::new(),
+        tail: Vec::new(),
+        observed_bytes: 0,
+        omitted_observed_bytes: 0,
+        truncated: false,
+        complete: true,
+    };
+    CommandResult {
+        exit_code,
+        signal: None,
+        timed_out,
+        cancelled: false,
+        stdout: stream(),
+        stderr: stream(),
+        truncated: false,
+        duration_ms: 0,
+    }
 }
 
 fn validate_relative_directory_mapping(
@@ -1353,10 +1808,10 @@ fn list_worktree_admin_entries(
     let mut directory = match capability.open_directory(&relative) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(_) => return Err(WorktreeError::LinkedMetadataInvalid),
+        Err(error) => return Err(WorktreeError::Io(error)),
     };
-    let names = read_directory_names(&mut directory, MAX_ADMIN_ENTRIES)
-        .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
+    let names =
+        read_directory_names(&mut directory, MAX_ADMIN_ENTRIES).map_err(WorktreeError::Io)?;
     Ok(names
         .into_iter()
         .filter(|name| name != "." && name != "..")
@@ -1380,9 +1835,13 @@ fn read_admin_line(
 ) -> Result<String, WorktreeError> {
     let relative = RelativePath::parse(format!("worktrees/{name}/{file_name}"))
         .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
-    let mut file = capability
-        .open_file_for_read(&relative)
-        .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
+    let mut file = match capability.open_file_for_read(&relative) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(WorktreeError::LinkedMetadataInvalid);
+        }
+        Err(error) => return Err(WorktreeError::Io(error)),
+    };
     let mut bytes = Vec::new();
     file.by_ref()
         .take(ADMIN_FILE_LIMIT + 1)
@@ -1414,13 +1873,16 @@ fn admin_commondir_matches(
     if commondir != "../.." {
         return Ok(false);
     }
-    let resolved = std::fs::canonicalize(
+    let resolved = match std::fs::canonicalize(
         common_git_directory
             .join("worktrees")
             .join(name)
             .join(&commondir),
-    )
-    .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(WorktreeError::Io(error)),
+    };
     Ok(resolved == common_git_directory)
 }
 
@@ -1430,8 +1892,13 @@ fn validate_worktree_list_record(
     base_commit: &str,
     branch_name: &str,
 ) -> Result<(), WorktreeError> {
-    let expected_path =
-        std::fs::canonicalize(expected_path).map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
+    let expected_path = match std::fs::canonicalize(expected_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(WorktreeError::LinkedMetadataInvalid);
+        }
+        Err(error) => return Err(WorktreeError::Io(error)),
+    };
     let expected_branch = format!("refs/heads/{branch_name}");
     let mut matches = 0usize;
     let mut path: Option<PathBuf> = None;
@@ -1441,7 +1908,11 @@ fn validate_worktree_list_record(
     for field in output.split(|byte| *byte == 0) {
         if field.is_empty() {
             if let Some(candidate) = path.take() {
-                let canonical = std::fs::canonicalize(candidate).ok();
+                let canonical = match std::fs::canonicalize(candidate) {
+                    Ok(path) => Some(path),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(WorktreeError::Io(error)),
+                };
                 if canonical.as_deref() == Some(expected_path.as_path())
                     && head == Some(base_commit)
                     && branch == Some(expected_branch.as_str())
@@ -1598,6 +2069,13 @@ fn worktree_environment(platform: &PlatformEnvironment) -> ChildEnvironment {
     ChildEnvironment::from_entries(entries)
 }
 
+fn map_common_git_identity_error(error: DirectoryIdentityError) -> WorktreeError {
+    match error {
+        DirectoryIdentityError::Unavailable => WorktreeError::CommonGitIdentityUnavailable,
+        DirectoryIdentityError::Mismatch => WorktreeError::CommonGitIdentityMismatch,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeError {
     #[error("worktree identity is invalid")]
@@ -1606,6 +2084,10 @@ pub enum WorktreeError {
     InvalidLimits,
     #[error("persisted worktree reservation does not match this provisioner")]
     InvalidReservation,
+    #[error("the authenticated common Git directory identity is unavailable")]
+    CommonGitIdentityUnavailable,
+    #[error("the authenticated common Git directory identity changed")]
+    CommonGitIdentityMismatch,
     #[error("the registered repository is invalid or is not a primary worktree")]
     InvalidRepository,
     #[error("the registered Cargo workspace is outside the repository")]
@@ -1634,6 +2116,8 @@ pub enum WorktreeError {
     LinkedMetadataInvalid,
     #[error("the created branch or worktree did not match its reservation")]
     PostconditionFailed,
+    #[error("the reserved worktree content changed before it became ready")]
+    WorktreeContentChanged,
     #[error("Git left an exact but incomplete artifact for this attempt")]
     PartialCreation,
     #[error("Git left an artifact whose identity cannot be proven")]
@@ -1651,6 +2135,85 @@ pub enum WorktreeError {
 }
 
 impl WorktreeError {
+    pub fn process_cleanup_is_unproven(&self) -> bool {
+        match self {
+            Self::Process(error) => error.process_cleanup_is_unproven(),
+            Self::Cargo(error) => error.process_cleanup_is_unproven(),
+            _ => false,
+        }
+    }
+
+    /// Identifies positive evidence that the repository/worktree control
+    /// identity changed outside this operation. Ordinary partial creation and
+    /// content/tool failures still become durable `inconsistent`, but do not
+    /// permanently poison every alias.
+    pub fn requires_repository_poison(&self) -> bool {
+        match self {
+            Self::CommonGitIdentityMismatch
+            | Self::DestinationConflict
+            | Self::BranchConflict
+            | Self::LinkedMetadataInvalid
+            | Self::PostconditionFailed
+            | Self::InconsistentArtifact => true,
+            Self::CommandPolicy(
+                CommandPolicyError::IdentityChanged | CommandPolicyError::InvalidGitBinding,
+            ) => true,
+            Self::Cargo(error) => matches!(
+                error,
+                crate::CargoToolError::WorkspaceRootMismatch
+                    | crate::CargoToolError::MetadataPathOutsideWorkspace
+                    | crate::CargoToolError::CommandPolicy(
+                        CommandPolicyError::IdentityChanged | CommandPolicyError::InvalidGitBinding
+                    )
+            ),
+            _ => false,
+        }
+    }
+
+    /// Classifies a failed read-only artifact observation without inventing
+    /// positive evidence. Callers must retain a reservation for `Unavailable`;
+    /// only `Inconsistent` proves that the observed artifact cannot be trusted.
+    pub fn artifact_state_after_failed_observation(&self) -> WorktreeArtifactState {
+        if self.is_positive_artifact_evidence() {
+            WorktreeArtifactState::Inconsistent
+        } else {
+            WorktreeArtifactState::Unavailable
+        }
+    }
+
+    fn is_positive_artifact_evidence(&self) -> bool {
+        match self {
+            Self::InvalidIdentity
+            | Self::InvalidReservation
+            | Self::CommonGitIdentityMismatch
+            | Self::InvalidRepository
+            | Self::CargoWorkspaceOutsideRepository
+            | Self::DestinationConflict
+            | Self::ArtifactPathInvalid
+            | Self::BranchConflict
+            | Self::LinkedMetadataInvalid
+            | Self::PostconditionFailed
+            | Self::WorktreeContentChanged
+            | Self::PartialCreation
+            | Self::InconsistentArtifact
+            | Self::NestedWorkspaceMissing => true,
+            Self::CommandPolicy(
+                CommandPolicyError::IdentityChanged | CommandPolicyError::InvalidGitBinding,
+            ) => true,
+            Self::Cargo(error) => matches!(
+                error,
+                crate::CargoToolError::MetadataCommandFailed
+                    | crate::CargoToolError::WorkspaceRootMismatch
+                    | crate::CargoToolError::MetadataPathOutsideWorkspace
+                    | crate::CargoToolError::CatalogTooLarge
+                    | crate::CargoToolError::CommandPolicy(
+                        CommandPolicyError::IdentityChanged | CommandPolicyError::InvalidGitBinding
+                    )
+            ),
+            _ => false,
+        }
+    }
+
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidIdentity
@@ -1661,15 +2224,24 @@ impl WorktreeError {
             | Self::OutputInvalid
             | Self::LinkedMetadataInvalid
             | Self::PostconditionFailed
+            | Self::WorktreeContentChanged
             | Self::InconsistentArtifact => "WORKTREE_STATE_INCONSISTENT",
+            Self::CommonGitIdentityUnavailable => "REPOSITORY_IDENTITY_UNAVAILABLE",
+            Self::CommonGitIdentityMismatch => "REPOSITORY_IDENTITY_MISMATCH",
             Self::InvalidRepository => "REPOSITORY_INVALID",
             Self::DestinationConflict
             | Self::BranchConflict
             | Self::GitCommandFailed
             | Self::PartialCreation
             | Self::NestedWorkspaceMissing
-            | Self::Cargo(_)
             | Self::Io(_) => "WORKTREE_CREATE_FAILED",
+            Self::Cargo(error) => {
+                if error.process_cleanup_is_unproven() {
+                    "PROCESS_TREE_CLEANUP_FAILED"
+                } else {
+                    "WORKTREE_CREATE_FAILED"
+                }
+            }
             Self::UnbornHead => "GIT_HEAD_UNBORN",
             Self::UnsafeGitConfiguration => "UNSAFE_GIT_CONFIGURATION",
             Self::Cancelled => "COMMAND_CANCELLED",
@@ -1677,5 +2249,15 @@ impl WorktreeError {
             Self::CommandPolicy(error) => error.code(),
             Self::Process(error) => error.code(),
         }
+    }
+}
+
+fn error_is_not_found(error: &WorktreeError) -> bool {
+    match error {
+        WorktreeError::Io(error)
+        | WorktreeError::CommandPolicy(CommandPolicyError::OpenFailed(error)) => {
+            error.kind() == io::ErrorKind::NotFound
+        }
+        _ => false,
     }
 }

@@ -1,21 +1,26 @@
 #![allow(dead_code)]
 
+#[cfg(feature = "test-support")]
+pub mod concurrent_e2e;
+
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coding_agent_app::{
-    BrowserLaunchError, BrowserLauncher, BrowserOpener, CancelOutcome, CommandRunner,
-    DegradedRecoveryResult, EventDispatcherHandle, EventWake, FakeRunnerConfig, FakeTaskRunner,
-    FixedStartupRunnerFactory, LaunchToken, ListenerFactory, NativeMessageSink, PlatformPaths,
-    RunContext, RunnerEvent, RunnerEventError, RunnerEventSink, RunnerOutcome, SecurityClock,
-    SecurityManager, SecuritySeed, ServiceState, ServiceStateController, StartupDependencies,
-    StartupPaths, StoreFactory, StoreWriterHandle, TaskManagerHandle, TaskRunner, WallClock,
+    AvailableParallelismProbe, BrowserLaunchError, BrowserLauncher, BrowserOpener, CancelOutcome,
+    CommandRunner, DegradedRecoveryResult, EventDispatcherHandle, EventWake, FakeRunnerConfig,
+    FakeTaskRunner, FilesystemRepositoryIdentityResolver, FixedStartupRunnerFactory, LaunchToken,
+    ListenerFactory, NativeMessageSink, PlatformPaths, RepositoryControlCoordinator,
+    RepositoryIdentityResolver, RunContext, RunnerEvent, RunnerEventError, RunnerEventSink,
+    RunnerOutcome, SchedulerConcurrencyLimits, SecurityClock, SecurityManager, SecuritySeed,
+    ServiceState, ServiceStateController, StartupDependencies, StartupPaths, StoreFactory,
+    StoreWriterHandle, TaskManagerHandle, TaskManagerLaunchResources, TaskRunner, WallClock,
 };
 #[cfg(feature = "test-support")]
 use coding_agent_app::{
@@ -31,6 +36,7 @@ use coding_agent_domain::{
     TaskEventKind, TaskEventPayload, TaskFailure, TaskId, TaskStatus, TestSnapshot, TestStatus,
     UtcTimestamp, WorkspaceDigest,
 };
+use coding_agent_runtime::{ProcessLivenessDirectory, ProcessLivenessScope};
 use coding_agent_store::{
     AppendEventOutcome, CreateTaskOutcome, RegisterRepositoryOutcome, Store, TaskTransition,
     TransitionOutcome,
@@ -38,8 +44,150 @@ use coding_agent_store::{
 use sqlx::pool::PoolConnection;
 use sqlx::{Sqlite, Transaction};
 use tempfile::TempDir;
+#[cfg(feature = "test-support")]
+use tokio::sync::watch;
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::time::{Duration, Instant};
+
+pub fn instance_process_scope(runtime_directory: &Path) -> ProcessLivenessScope {
+    let liveness_runtime = private_liveness_runtime(runtime_directory);
+    let mut instance_id = [0x15; 16];
+    instance_id[6] = 0x45;
+    instance_id[8] = 0x95;
+    ProcessLivenessDirectory::open(&liveness_runtime)
+        .expect("open process-liveness test directory")
+        .instance_scope(instance_id)
+        .expect("create process-liveness test instance scope")
+}
+
+fn private_liveness_runtime(runtime_directory: &Path) -> PathBuf {
+    let liveness_runtime = runtime_directory.join(".process-liveness-test-runtime");
+    std::fs::create_dir_all(&liveness_runtime)
+        .expect("create private process-liveness test runtime");
+    harden_private_liveness_runtime(&liveness_runtime)
+        .expect("harden private process-liveness test runtime");
+    liveness_runtime
+}
+
+#[cfg(unix)]
+fn harden_private_liveness_runtime(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(windows)]
+fn harden_private_liveness_runtime(path: &Path) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::fs::OpenOptions;
+    use std::mem::size_of;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+        SetSecurityInfo, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL, WRITE_DAC,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let directory = options.open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process-liveness test runtime is not a plain directory",
+        ));
+    }
+
+    let mut token: HANDLE = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut required = 0u32;
+        unsafe {
+            GetTokenInformation(token, TokenUser, null_mut(), 0, &mut required);
+        }
+        if required == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let words = (required as usize).div_ceil(size_of::<usize>());
+        let mut buffer = vec![0usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut trustee = TRUSTEE_W::default();
+        unsafe { BuildTrusteeWithSidW(&mut trustee, user.User.Sid) };
+        let access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: trustee,
+        };
+        let mut acl = null_mut();
+        let acl_status = unsafe { SetEntriesInAclW(1, &access, null(), &mut acl) };
+        if acl_status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(acl_status as i32));
+        }
+        let status = unsafe {
+            SetSecurityInfo(
+                directory.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null(),
+            )
+        };
+        unsafe {
+            LocalFree(acl.cast());
+        }
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    })();
+    unsafe {
+        CloseHandle(token);
+    }
+    result
+}
+
+pub fn task_process_scope(runtime_directory: &Path) -> ProcessLivenessScope {
+    let mut task_id = [0x25; 16];
+    task_id[6] = 0x45;
+    task_id[8] = 0xa5;
+    instance_process_scope(runtime_directory)
+        .task_scope(task_id)
+        .expect("create process-liveness test task scope")
+}
 
 #[derive(Clone)]
 pub struct FakeSecurityClock {
@@ -104,6 +252,7 @@ pub struct StartupBehavior {
 pub struct StartupCalls {
     store_opens: AtomicUsize,
     listener_binds: AtomicUsize,
+    parallelism_probes: AtomicUsize,
     browser_urls: Mutex<Vec<String>>,
     messages: Mutex<Vec<(String, String)>>,
 }
@@ -117,6 +266,10 @@ impl StartupCalls {
         self.listener_binds.load(Ordering::SeqCst)
     }
 
+    pub fn parallelism_probes(&self) -> usize {
+        self.parallelism_probes.load(Ordering::SeqCst)
+    }
+
     pub fn browser_urls(&self) -> Vec<String> {
         self.browser_urls
             .lock()
@@ -126,6 +279,17 @@ impl StartupCalls {
 
     pub fn messages(&self) -> Vec<(String, String)> {
         self.messages.lock().expect("lock startup messages").clone()
+    }
+}
+
+struct CountingAvailableParallelismProbe {
+    calls: Arc<StartupCalls>,
+}
+
+impl AvailableParallelismProbe for CountingAvailableParallelismProbe {
+    fn available_parallelism(&self) -> Option<NonZeroUsize> {
+        self.calls.parallelism_probes.fetch_add(1, Ordering::SeqCst);
+        NonZeroUsize::new(8)
     }
 }
 
@@ -182,6 +346,9 @@ impl StartupFixture {
         });
         dependencies.wall_clock = Arc::new(FixedWallClock);
         dependencies.security_clock = Arc::new(FakeSecurityClock::new());
+        dependencies.available_parallelism = Arc::new(CountingAvailableParallelismProbe {
+            calls: self.calls.clone(),
+        });
         dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new(
             Arc::new(FakeTaskRunner::default()),
             NonZeroU32::new(4).expect("test concurrency is nonzero"),
@@ -220,6 +387,15 @@ impl ShutdownFixture {
         .await
         .expect("shutdown fixture runner starts");
         task
+    }
+
+    pub fn hold_task_process_tree(
+        &self,
+        task_id: TaskId,
+    ) -> coding_agent_runtime::HeldProcessLivenessTreeForTest {
+        self.handles
+            .hold_task_process_tree_for_test(task_id)
+            .expect("hold the exact shutdown task process tree")
     }
 
     pub async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
@@ -268,6 +444,12 @@ impl ShutdownFixture {
     }
 
     pub fn make_marker_creation_fail(&self) -> PathBuf {
+        let instance_path = self.instance_shutdown_marker_path();
+        std::fs::create_dir(&instance_path).expect("occupy instance marker path with a directory");
+        instance_path
+    }
+
+    pub fn instance_shutdown_marker_path(&self) -> PathBuf {
         let file_name = self
             .startup
             .paths
@@ -278,13 +460,10 @@ impl ShutdownFixture {
         instance_name.push(".");
         instance_name.push(self.primary.instance_id().hyphenated().to_string());
         instance_name.push(".marker");
-        let instance_path = self
-            .startup
+        self.startup
             .paths
             .unclean_shutdown
-            .with_file_name(instance_name);
-        std::fs::create_dir(&instance_path).expect("occupy instance marker path with a directory");
-        instance_path
+            .with_file_name(instance_name)
     }
 
     pub async fn reopen_task(&self, task_id: TaskId) -> Task {
@@ -299,6 +478,22 @@ impl ShutdownFixture {
             .task;
         store.pool().close().await;
         task
+    }
+
+    pub async fn reopen_event_kinds(&self, task_id: TaskId) -> Vec<TaskEventKind> {
+        let store = Store::open(&self.startup.paths.database_path)
+            .await
+            .expect("reopen shutdown fixture store for task events");
+        let event_kinds = store
+            .task_events_after(task_id, EventCursor::ZERO, usize::MAX)
+            .await
+            .expect("load reopened shutdown fixture task events")
+            .events
+            .into_iter()
+            .map(|event| event.payload.kind())
+            .collect();
+        store.close().await;
+        event_kinds
     }
 
     pub async fn assert_runtime_cleanup(&self) {
@@ -345,6 +540,10 @@ struct FixedStartupPaths {
 impl StartupPaths for FixedStartupPaths {
     fn discover(&self) -> io::Result<PlatformPaths> {
         Ok(self.paths.clone())
+    }
+
+    fn prepare_lock_parent(&self, paths: &PlatformPaths) -> io::Result<()> {
+        std::fs::create_dir_all(&paths.runtime_dir)
     }
 
     fn prepare(&self, paths: &PlatformPaths) -> io::Result<()> {
@@ -454,6 +653,15 @@ pub struct StoreFixture {
     _temp_dir: TempDir,
 }
 
+impl StoreFixture {
+    pub fn instance_process_scope(&self) -> ProcessLivenessScope {
+        let runtime_directory = self.root.join("runtime");
+        std::fs::create_dir_all(&runtime_directory)
+            .expect("create store-fixture runtime directory");
+        instance_process_scope(&runtime_directory)
+    }
+}
+
 pub struct WriterFixture {
     pub store: Store,
     pub repository: Repository,
@@ -503,6 +711,7 @@ pub struct CommandCall {
     pub program: String,
     pub args: Vec<OsString>,
     pub current_dir: PathBuf,
+    pub deadline: tokio::time::Instant,
 }
 
 #[derive(Default)]
@@ -531,6 +740,7 @@ impl CommandRunner for RecordingRunner {
         program: &str,
         args: &[OsString],
         current_dir: &Path,
+        deadline: tokio::time::Instant,
     ) -> io::Result<Vec<u8>> {
         self.calls
             .lock()
@@ -539,6 +749,7 @@ impl CommandRunner for RecordingRunner {
                 program: program.to_owned(),
                 args: args.to_vec(),
                 current_dir: current_dir.to_path_buf(),
+                deadline,
             });
         self.results
             .lock()
@@ -712,8 +923,15 @@ pub struct ScriptedFakeRunnerFixture {
 #[cfg(feature = "test-support")]
 struct ReversePollingRunner {
     inner: Arc<ScriptedFakeRunner>,
-    first_task_id: Mutex<Option<TaskId>>,
-    later_entered: Notify,
+    registered_pair: watch::Sender<Option<ReversePollingPair>>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct ReversePollingPair {
+    first_task_id: TaskId,
+    later_task_id: TaskId,
+    later_entered: Arc<Notify>,
 }
 
 struct RunnerFixtureCore {
@@ -758,6 +976,50 @@ pub async fn store_fixture() -> StoreFixture {
         root,
         _temp_dir: temp_dir,
     }
+}
+
+pub async fn repository_control_fixture(
+    store: &Store,
+) -> (
+    Arc<RepositoryControlCoordinator>,
+    Arc<dyn RepositoryIdentityResolver>,
+) {
+    let lookups = store
+        .list_repository_identity_lookups()
+        .await
+        .expect("load repository identity lookups");
+    for lookup in &lookups {
+        let common_git = lookup.git_root.as_path().join(".git");
+        if !common_git.exists() {
+            std::fs::create_dir_all(&common_git)
+                .expect("create fixture common Git identity directory");
+        }
+    }
+    let resolver: Arc<dyn RepositoryIdentityResolver> =
+        Arc::new(FilesystemRepositoryIdentityResolver);
+    let coordinator = Arc::new(RepositoryControlCoordinator::new());
+    coordinator
+        .register_aliases(lookups, resolver.as_ref())
+        .expect("register fixture repository identities");
+    (coordinator, resolver)
+}
+
+pub async fn task_manager_launch_resources(
+    fixture: &StoreFixture,
+    global: usize,
+    per_repository: usize,
+) -> TaskManagerLaunchResources {
+    let (repository_control, _) = repository_control_fixture(&fixture.store).await;
+    TaskManagerLaunchResources::new_for_test(
+        SchedulerConcurrencyLimits::try_new(
+            u32::try_from(global).expect("test global concurrency fits u32"),
+            u32::try_from(per_repository).expect("test repository concurrency fits u32"),
+        )
+        .expect("valid task-manager fixture concurrency"),
+        repository_control,
+        fixture.instance_process_scope(),
+    )
+    .with_critical_stop_persistence_budget_for_test(Duration::from_secs(30))
 }
 
 pub async fn writer_fixture() -> WriterFixture {
@@ -813,6 +1075,7 @@ pub async fn dispatcher_fixture() -> DispatcherFixture {
 
 pub async fn task_manager_fixture(concurrency: usize) -> TaskManagerFixture {
     let fixture = store_fixture().await;
+    let launch_resources = task_manager_launch_resources(&fixture, concurrency, concurrency).await;
     let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
         .await
         .expect("spawn task-manager fixture dispatcher");
@@ -825,7 +1088,7 @@ pub async fn task_manager_fixture(concurrency: usize) -> TaskManagerFixture {
         dispatcher.clone(),
         state.clone(),
         runner.clone(),
-        concurrency,
+        launch_resources,
         64,
     );
     TaskManagerFixture {
@@ -842,9 +1105,105 @@ pub async fn task_manager_fixture(concurrency: usize) -> TaskManagerFixture {
 }
 
 #[cfg(feature = "test-support")]
+pub async fn gated_two_repository_task_manager_fixture(
+    global: usize,
+    per_repository: usize,
+) -> (TaskManagerFixture, Repository) {
+    let fixture = store_fixture().await;
+    let second_repository = match fixture
+        .store
+        .register_repository(repository_input_at(&fixture.root, "second"))
+        .await
+        .expect("register second task-manager fixture repository")
+    {
+        RegisterRepositoryOutcome::Created(repository)
+        | RegisterRepositoryOutcome::Existing(repository) => repository,
+    };
+    let launch_resources = task_manager_launch_resources(&fixture, global, per_repository).await;
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
+        .await
+        .expect("spawn gated task-manager fixture dispatcher");
+    let writer = StoreWriterHandle::spawn(fixture.store.clone(), Arc::new(dispatcher.clone()), 64);
+    let state = ServiceStateController::new(ServiceState::StoreDegraded);
+    let runner = Arc::new(ControlledRunner::default());
+    let manager = TaskManagerHandle::spawn(
+        fixture.store.clone(),
+        writer.clone(),
+        dispatcher.clone(),
+        state.clone(),
+        runner.clone(),
+        launch_resources,
+        64,
+    );
+    (
+        TaskManagerFixture {
+            store: fixture.store,
+            repository: fixture.repository,
+            writer,
+            dispatcher,
+            manager,
+            runner,
+            state,
+            busy_lock: AsyncMutex::new(None),
+            _temp_dir: fixture._temp_dir,
+        },
+        second_repository,
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub async fn task_manager_fixture_with_writer_faults(
+    global: usize,
+    per_repository: usize,
+    faults: impl IntoIterator<Item = StoreWriterFaultSpec>,
+) -> (TaskManagerFixture, Arc<StoreWriterTestController>) {
+    let fixture = store_fixture().await;
+    let launch_resources = task_manager_launch_resources(&fixture, global, per_repository).await;
+    let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
+        .await
+        .expect("spawn faulted task-manager fixture dispatcher");
+    let controller = Arc::new(
+        StoreWriterTestController::try_new(faults)
+            .expect("construct task-manager StoreWriter controller"),
+    );
+    let writer = StoreWriterHandle::spawn_with_test_controller(
+        fixture.store.clone(),
+        Arc::new(dispatcher.clone()),
+        64,
+        controller.clone(),
+    );
+    let state = ServiceStateController::new(ServiceState::Ready);
+    let runner = Arc::new(ControlledRunner::default());
+    let manager = TaskManagerHandle::spawn(
+        fixture.store.clone(),
+        writer.clone(),
+        dispatcher.clone(),
+        state.clone(),
+        runner.clone(),
+        launch_resources,
+        64,
+    );
+    (
+        TaskManagerFixture {
+            store: fixture.store,
+            repository: fixture.repository,
+            writer,
+            dispatcher,
+            manager,
+            runner,
+            state,
+            busy_lock: AsyncMutex::new(None),
+            _temp_dir: fixture._temp_dir,
+        },
+        controller,
+    )
+}
+
+#[cfg(feature = "test-support")]
 pub async fn paused_finalize_task_manager_fixture()
 -> (TaskManagerFixture, Arc<StoreWriterTestController>) {
     let fixture = store_fixture().await;
+    let launch_resources = task_manager_launch_resources(&fixture, 1, 1).await;
     let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
         .await
         .expect("spawn paused-finalize fixture dispatcher");
@@ -870,7 +1229,7 @@ pub async fn paused_finalize_task_manager_fixture()
         dispatcher.clone(),
         state.clone(),
         runner.clone(),
-        1,
+        launch_resources,
         64,
     );
     (
@@ -891,6 +1250,7 @@ pub async fn paused_finalize_task_manager_fixture()
 
 pub async fn degraded_fixture_with_concurrency(concurrency: usize) -> DegradedFixture {
     let fixture = store_fixture().await;
+    let launch_resources = task_manager_launch_resources(&fixture, concurrency, concurrency).await;
     let database_path = fixture.root.join("store.sqlite3");
     let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
         .await
@@ -904,7 +1264,7 @@ pub async fn degraded_fixture_with_concurrency(concurrency: usize) -> DegradedFi
         dispatcher.clone(),
         state.clone(),
         runner.clone(),
-        concurrency,
+        launch_resources,
         64,
     );
     let recovery_results = manager.subscribe_degraded_recovery();
@@ -930,6 +1290,7 @@ pub async fn degraded_fixture_with_writer_faults(
     faults: impl IntoIterator<Item = StoreWriterFaultSpec>,
 ) -> (DegradedFixture, Arc<StoreWriterTestController>) {
     let fixture = store_fixture().await;
+    let launch_resources = task_manager_launch_resources(&fixture, concurrency, concurrency).await;
     let database_path = fixture.root.join("store.sqlite3");
     let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
         .await
@@ -952,7 +1313,7 @@ pub async fn degraded_fixture_with_writer_faults(
         dispatcher.clone(),
         state.clone(),
         runner.clone(),
-        concurrency,
+        launch_resources,
         64,
     );
     let recovery_results = manager.subscribe_degraded_recovery();
@@ -994,12 +1355,13 @@ pub async fn shutdown_fixture(
         StartupOutcome::Secondary(_) => panic!("shutdown fixture must own the primary lock"),
     };
     let handles = primary.test_handles();
+    let repository_input = repository_input_at(startup._temp.path(), "shutdown");
+    std::fs::create_dir_all(repository_input.git_root.as_path().join(".git"))
+        .expect("create authenticated shutdown repository identity");
+    let registration_deadline = deadline();
     let repository = match handles
         .writer
-        .register_repository(
-            repository_input_at(startup._temp.path(), "shutdown"),
-            deadline(),
-        )
+        .register_repository(repository_input, registration_deadline)
         .await
         .expect("register shutdown fixture repository")
         .value
@@ -1007,6 +1369,10 @@ pub async fn shutdown_fixture(
         RegisterRepositoryOutcome::Created(repository)
         | RegisterRepositoryOutcome::Existing(repository) => repository,
     };
+    handles
+        .attach_repository_runtime_for_test(&repository, registration_deadline)
+        .await
+        .expect("attach shutdown fixture repository runtime");
 
     ShutdownFixture {
         primary,
@@ -1053,10 +1419,10 @@ pub async fn reverse_polled_scripted_fake_runner_fixture(
         FakeRunnerConfig::default(),
         scenarios,
     ));
+    let (registered_pair, _) = watch::channel(None);
     let reverse_poll = Arc::new(ReversePollingRunner {
         inner: runner.clone(),
-        first_task_id: Mutex::new(None),
-        later_entered: Notify::new(),
+        registered_pair,
     });
     ScriptedFakeRunnerFixture {
         core: runner_fixture(reverse_poll.clone(), concurrency).await,
@@ -1068,23 +1434,53 @@ pub async fn reverse_polled_scripted_fake_runner_fixture(
 #[cfg(feature = "test-support")]
 #[async_trait::async_trait]
 impl TaskRunner for ReversePollingRunner {
-    async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
-        let is_first = self
-            .first_task_id
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some_and(|task_id| task_id == context.task.id);
+    async fn run(&self, mut context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+        context.complete_preparation_for_test().await;
+        let (is_first, later_entered) = self.registered_pair_for(context.task.id).await;
         if is_first {
-            self.later_entered.notified().await;
+            later_entered.notified().await;
         } else {
-            self.later_entered.notify_one();
+            later_entered.notify_one();
         }
-        self.inner.run(context, sink).await
+        self.inner
+            .run_after_preparation_for_test(context, sink)
+            .await
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ReversePollingRunner {
+    fn register_pair(&self, first_task_id: TaskId, later_task_id: TaskId) {
+        self.registered_pair.send_replace(Some(ReversePollingPair {
+            first_task_id,
+            later_task_id,
+            later_entered: Arc::new(Notify::new()),
+        }));
+    }
+
+    async fn registered_pair_for(&self, task_id: TaskId) -> (bool, Arc<Notify>) {
+        let mut registered_pair = self.registered_pair.subscribe();
+        loop {
+            let pair = registered_pair.borrow_and_update().clone();
+            if let Some(pair) = pair {
+                if pair.first_task_id == task_id {
+                    return (true, pair.later_entered);
+                }
+                if pair.later_task_id == task_id {
+                    return (false, pair.later_entered);
+                }
+            }
+            registered_pair
+                .changed()
+                .await
+                .expect("reverse-poll pair registration remains alive");
+        }
     }
 }
 
 async fn runner_fixture(runner: Arc<dyn TaskRunner>, concurrency: usize) -> RunnerFixtureCore {
     let fixture = store_fixture().await;
+    let launch_resources = task_manager_launch_resources(&fixture, concurrency, concurrency).await;
     let dispatcher = EventDispatcherHandle::spawn(fixture.store.clone(), 1_024)
         .await
         .expect("spawn runner fixture dispatcher");
@@ -1095,7 +1491,7 @@ async fn runner_fixture(runner: Arc<dyn TaskRunner>, concurrency: usize) -> Runn
         dispatcher,
         ServiceStateController::new(ServiceState::Ready),
         runner,
-        concurrency,
+        launch_resources,
         64,
     );
     RunnerFixtureCore {
@@ -1165,7 +1561,17 @@ impl RunnerFixtureCore {
     }
 
     async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        self.wait_for_status_with_timeout(task_id, expected, Duration::from_secs(5))
+            .await;
+    }
+
+    async fn wait_for_status_with_timeout(
+        &self,
+        task_id: TaskId,
+        expected: TaskStatus,
+        timeout: Duration,
+    ) {
+        tokio::time::timeout(timeout, async {
             loop {
                 if self.load(task_id).await.status == expected {
                     return;
@@ -1270,11 +1676,10 @@ impl ScriptedFakeRunnerFixture {
     pub async fn enqueue(&self, prompts: &[&str]) -> Vec<Task> {
         let tasks = self.core.create_tasks(prompts).await;
         if let Some(reverse_poll) = &self.reverse_poll {
-            *reverse_poll
-                .first_task_id
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                tasks.first().map(|task| task.id);
+            let [first, later] = tasks.as_slice() else {
+                panic!("reverse-poll fixture requires exactly two tasks per registered pair");
+            };
+            reverse_poll.register_pair(first.id, later.id);
         }
         self.core.notify_tasks(&tasks).await;
         tasks
@@ -1311,6 +1716,17 @@ impl ScriptedFakeRunnerFixture {
 
     pub async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
         self.core.wait_for_status(task_id, expected).await;
+    }
+
+    pub async fn wait_for_status_with_timeout(
+        &self,
+        task_id: TaskId,
+        expected: TaskStatus,
+        timeout: Duration,
+    ) {
+        self.core
+            .wait_for_status_with_timeout(task_id, expected, timeout)
+            .await;
     }
 
     pub async fn wait_for_runner_start(&self, task_id: TaskId) {
@@ -1400,6 +1816,27 @@ impl TaskManagerFixture {
         tasks
     }
 
+    pub async fn enqueue_tasks_for_repository(
+        &self,
+        repository_id: RepositoryId,
+        prompt_prefix: &str,
+        count: usize,
+    ) -> Vec<Task> {
+        let mut tasks = Vec::with_capacity(count);
+        for index in 0..count {
+            let receipt = self
+                .writer
+                .create_task(
+                    new_task(repository_id, &format!("{prompt_prefix} {index}")),
+                    deadline(),
+                )
+                .await
+                .expect("create task for explicit fixture repository");
+            tasks.push(receipt.value.task().clone());
+        }
+        tasks
+    }
+
     pub async fn load(&self, task_id: TaskId) -> Task {
         self.load_detail(task_id).await.task
     }
@@ -1410,6 +1847,17 @@ impl TaskManagerFixture {
             .await
             .expect("load manager fixture task")
             .expect("manager fixture task exists")
+    }
+
+    pub async fn event_kinds(&self, task_id: TaskId) -> Vec<TaskEventKind> {
+        self.store
+            .task_events_after(task_id, EventCursor::ZERO, usize::MAX)
+            .await
+            .expect("load manager fixture task events")
+            .events
+            .into_iter()
+            .map(|event| event.payload.kind())
+            .collect()
     }
 
     pub async fn wait_for_status(&self, task_id: TaskId, expected: TaskStatus) {
@@ -1423,6 +1871,16 @@ impl TaskManagerFixture {
         })
         .await
         .unwrap_or_else(|_| panic!("task {task_id} did not reach {expected:?} before the timeout"));
+    }
+
+    pub async fn wait_for_runner_start(&self, task_id: TaskId) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.runner.started_count(task_id) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("runner did not start task {task_id} before the timeout"));
     }
 
     pub async fn wait_for_running(&self, expected: usize) {
@@ -1455,12 +1913,49 @@ impl TaskManagerFixture {
     }
 
     pub async fn set_created_at(&self, task_id: TaskId, timestamp: &str) {
-        sqlx::query("UPDATE tasks SET created_at = ? WHERE id = ?")
+        let mut transaction = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .expect("begin task creation-time override");
+        let task = sqlx::query("UPDATE tasks SET created_at = ? WHERE id = ?")
             .bind(timestamp)
             .bind(task_id.to_string())
-            .execute(self.store.pool())
+            .execute(&mut *transaction)
             .await
             .expect("override task creation time");
+        let queued = sqlx::query(
+            "UPDATE task_events \
+             SET created_at = ?, \
+                 payload_json = json_set(payload_json, '$.task.created_at', ?) \
+             WHERE task_id = ? AND kind = 'task.queued'",
+        )
+        .bind(timestamp)
+        .bind(timestamp)
+        .bind(task_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .expect("override queued-event creation time");
+        assert_eq!(task.rows_affected(), 1, "fixture task exists exactly once");
+        assert_eq!(
+            queued.rows_affected(),
+            1,
+            "fixture queued event exists exactly once"
+        );
+        transaction
+            .commit()
+            .await
+            .expect("commit task creation-time override");
+        let expected = UtcTimestamp::parse_rfc3339(timestamp)
+            .expect("fixture override uses a valid RFC 3339 timestamp");
+        let detail = self
+            .store
+            .task_detail(task_id)
+            .await
+            .expect("validate creation-time override aggregate")
+            .expect("creation-time override task still exists");
+        assert_eq!(detail.task.created_at, expected);
     }
 
     pub async fn fail_started_event_inserts(&self, enabled: bool) {
@@ -1542,6 +2037,17 @@ impl TaskManagerFixture {
 }
 
 impl DegradedFixture {
+    pub async fn start_cleanup_unproven_task(&self) -> (TaskId, CleanupUnprovenGate) {
+        let gate = self.runner.push_cleanup_unproven_gate();
+        let task = self.create_task("degraded cleanup-unproven task").await;
+        self.manager
+            .notify_queued(task.id)
+            .await
+            .expect("notify cleanup-unproven task");
+        self.wait_for_status(task.id, TaskStatus::Running).await;
+        (task.id, gate)
+    }
+
     pub async fn start_success_task(&self) -> TaskId {
         let gate = self.runner.push_completion_gate();
         let task = self.create_task("degraded running task").await;
@@ -1579,6 +2085,17 @@ impl DegradedFixture {
             .notify_queued(task.id)
             .await
             .expect("notify degraded fixture event task");
+        self.wait_for_status(task.id, TaskStatus::Running).await;
+        (task.id, gate)
+    }
+
+    pub async fn start_review_task(&self, evidence: NewReviewEvidence) -> (TaskId, EventGate) {
+        let gate = self.runner.push_review_gate(evidence);
+        let task = self.create_task("degraded review task").await;
+        self.manager
+            .notify_queued(task.id)
+            .await
+            .expect("notify degraded fixture review task");
         self.wait_for_status(task.id, TaskStatus::Running).await;
         (task.id, gate)
     }
@@ -1771,6 +2288,8 @@ pub struct ControlledRunner {
     started: Mutex<HashMap<TaskId, usize>>,
     started_order: Mutex<Vec<TaskId>>,
     releases: Mutex<HashMap<TaskId, Arc<Notify>>>,
+    held_process_trees:
+        Mutex<HashMap<TaskId, coding_agent_runtime::HeldProcessLivenessTreeForTest>>,
 }
 
 type EventAppendResult = Result<coding_agent_domain::EventId, RunnerEventError>;
@@ -1778,6 +2297,8 @@ type SharedEventResultReceiver = Arc<AsyncMutex<Option<oneshot::Receiver<EventAp
 
 enum RunnerScenario {
     Blocking(Arc<Notify>),
+    CleanupUnprovenGate(Arc<Notify>),
+    Failure(TaskFailure),
     Panic,
     LateEvent {
         release: Arc<Notify>,
@@ -1791,6 +2312,11 @@ enum RunnerScenario {
     EventGate {
         release: Arc<Notify>,
         event: RunnerEvent,
+        result: oneshot::Sender<EventAppendResult>,
+    },
+    ReviewGate {
+        release: Arc<Notify>,
+        evidence: NewReviewEvidence,
         result: oneshot::Sender<EventAppendResult>,
     },
     DurableThenLateEvent {
@@ -1807,6 +2333,10 @@ pub struct LateEventGate {
 }
 
 pub struct CompletionGate {
+    pub release: Arc<Notify>,
+}
+
+pub struct CleanupUnprovenGate {
     pub release: Arc<Notify>,
 }
 
@@ -1836,6 +2366,10 @@ impl ControlledRunner {
         self.push(RunnerScenario::Panic);
     }
 
+    pub fn push_failure(&self, failure: TaskFailure) {
+        self.push(RunnerScenario::Failure(failure));
+    }
+
     pub fn push_late_event(&self) -> LateEventGate {
         let release = Arc::new(Notify::new());
         let (result, receiver) = oneshot::channel();
@@ -1861,12 +2395,47 @@ impl ControlledRunner {
         CompletionGate { release }
     }
 
+    pub fn push_cleanup_unproven_gate(&self) -> CleanupUnprovenGate {
+        let release = Arc::new(Notify::new());
+        self.push(RunnerScenario::CleanupUnprovenGate(release.clone()));
+        CleanupUnprovenGate { release }
+    }
+
+    pub fn cleanup_tree_is_held(&self, task_id: TaskId) -> bool {
+        self.held_process_trees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&task_id)
+    }
+
+    pub fn release_cleanup_tree(&self, task_id: TaskId) -> bool {
+        self.held_process_trees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&task_id)
+            .is_some()
+    }
+
     pub fn push_event_gate(&self, event: RunnerEvent) -> EventGate {
         let release = Arc::new(Notify::new());
         let (result, receiver) = oneshot::channel();
         self.push(RunnerScenario::EventGate {
             release: release.clone(),
             event,
+            result,
+        });
+        EventGate {
+            release,
+            result: receiver,
+        }
+    }
+
+    pub fn push_review_gate(&self, evidence: NewReviewEvidence) -> EventGate {
+        let release = Arc::new(Notify::new());
+        let (result, receiver) = oneshot::channel();
+        self.push(RunnerScenario::ReviewGate {
+            release: release.clone(),
+            evidence,
             result,
         });
         EventGate {
@@ -1959,7 +2528,8 @@ impl ControlledRunner {
 
 #[async_trait::async_trait]
 impl TaskRunner for ControlledRunner {
-    async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+    async fn run(&self, mut context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+        context.complete_preparation_for_test().await;
         let scenario = self
             .scenarios
             .lock()
@@ -1987,6 +2557,23 @@ impl TaskRunner for ControlledRunner {
                 () = context.cancellation.cancelled() => RunnerOutcome::Cancelled,
                 () = release.notified() => approved_outcome(&sink).await,
             },
+            RunnerScenario::CleanupUnprovenGate(release) => {
+                let held = context
+                    .process_liveness_scope()
+                    .hold_tree_for_test()
+                    .expect("hold the exact cleanup-unproven task process tree");
+                assert!(
+                    self.held_process_trees
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(context.task.id, held)
+                        .is_none(),
+                    "a cleanup-unproven task owns one held process tree"
+                );
+                release.notified().await;
+                RunnerOutcome::ProcessCleanupUnproven
+            }
+            RunnerScenario::Failure(failure) => RunnerOutcome::Failed(failure),
             RunnerScenario::Panic => panic!("injected runner panic"),
             RunnerScenario::LateEvent { release, result } => {
                 if let Err(outcome) = persist_review_plan(&sink).await {
@@ -2034,6 +2621,24 @@ impl TaskRunner for ControlledRunner {
                     approved_outcome(&sink).await
                 }
             }
+            RunnerScenario::ReviewGate {
+                release,
+                evidence,
+                result,
+            } => {
+                if let Err(outcome) = persist_review_plan(&sink).await {
+                    return outcome;
+                }
+                release.notified().await;
+                let review = sink.record_review(evidence).await;
+                let rejected = review.is_err();
+                let _ = result.send(review);
+                if rejected {
+                    RunnerOutcome::Failed(failure("RUNNER_REVIEW_REJECTED"))
+                } else {
+                    RunnerOutcome::Cancelled
+                }
+            }
             RunnerScenario::DurableThenLateEvent {
                 durable,
                 release,
@@ -2043,7 +2648,11 @@ impl TaskRunner for ControlledRunner {
                 sink.append(durable)
                     .await
                     .expect("append durable runner event before the gate");
-                release.notified().await;
+                tokio::select! {
+                    biased;
+                    () = context.cancellation.cancelled() => {}
+                    () = release.notified() => {}
+                }
                 let append = sink.append(late).await;
                 let rejected = append.is_err();
                 let _ = result.send(append);
@@ -2140,6 +2749,13 @@ pub fn approved_review_round_with_summary(
 }
 
 pub fn changes_requested_review(round: u8) -> NewReviewEvidence {
+    changes_requested_review_with_summary(round, format!("fixture round {round} changes requested"))
+}
+
+pub fn changes_requested_review_with_summary(
+    round: u8,
+    summary: impl Into<String>,
+) -> NewReviewEvidence {
     let generation = u64::from(round);
     let digit = char::from(b'a' + round - 1);
     let digest = WorkspaceDigest::try_new(digit.to_string().repeat(64))
@@ -2163,7 +2779,7 @@ pub fn changes_requested_review(round: u8) -> NewReviewEvidence {
         generation,
         digest,
         ReviewVerdict::ChangesRequested,
-        format!("fixture round {round} changes requested"),
+        summary,
         vec![
             ReviewFinding::try_for_review(
                 round,

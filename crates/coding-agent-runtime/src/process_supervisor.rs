@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::command_policy::{CommandPolicyError, ValidatedCommand};
+use crate::process_liveness::{
+    ProcessCleanupProof, ProcessLivenessError, ProcessLivenessScope, ProcessLivenessSentinel,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedStream {
@@ -98,6 +101,10 @@ impl ProcessLimits {
     pub(crate) const fn max_command_timeout(self) -> Duration {
         self.max_command_timeout
     }
+
+    pub(crate) const fn cleanup_timeout(self) -> Duration {
+        self.cleanup_timeout
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -156,14 +163,22 @@ pub enum ProcessError {
     SpawnFailed(#[source] io::Error),
     #[error("process tree setup failed before user code could run")]
     TreeSetupFailed(#[source] io::Error),
+    #[error("process-liveness setup failed before user code could run")]
+    LivenessSetupFailed(#[source] ProcessLivenessError),
     #[error("spawned process did not expose both output pipes")]
     MissingOutputPipe,
     #[error("waiting for the process failed")]
     WaitFailed(#[source] io::Error),
+    #[error("process tree identity was lost before cleanup could be proven")]
+    TreeControlLost(#[source] io::Error),
     #[error("process tree termination failed")]
     TreeCleanupFailed(#[source] io::Error),
     #[error("bounded process tree cleanup timed out")]
     CleanupTimedOut,
+    #[error("process-liveness cleanup could not be proven")]
+    LivenessCleanupUnproven,
+    #[error("process-liveness cleanup proof failed")]
+    LivenessCleanupFailed(#[source] ProcessLivenessError),
     #[error("draining process output failed")]
     OutputDrainFailed(#[source] io::Error),
     #[error("process supervisor worker failed")]
@@ -175,11 +190,30 @@ impl ProcessError {
         match self {
             Self::InvalidCommand | Self::TimeoutOutsideLimit => "COMMAND_NOT_ALLOWED",
             Self::CommandPolicy(error) => error.code(),
-            Self::SpawnFailed(_) | Self::TreeSetupFailed(_) => "COMMAND_SPAWN_FAILED",
+            Self::SpawnFailed(_) | Self::TreeSetupFailed(_) | Self::LivenessSetupFailed(_) => {
+                "COMMAND_SPAWN_FAILED"
+            }
             Self::MissingOutputPipe | Self::OutputDrainFailed(_) => "COMMAND_OUTPUT_FAILED",
-            Self::WaitFailed(_) | Self::WorkerFailed => "COMMAND_WAIT_FAILED",
-            Self::TreeCleanupFailed(_) | Self::CleanupTimedOut => "PROCESS_TREE_CLEANUP_FAILED",
+            Self::WaitFailed(_) => "COMMAND_WAIT_FAILED",
+            Self::TreeControlLost(_)
+            | Self::TreeCleanupFailed(_)
+            | Self::CleanupTimedOut
+            | Self::LivenessCleanupUnproven
+            | Self::LivenessCleanupFailed(_)
+            | Self::WorkerFailed => "PROCESS_TREE_CLEANUP_FAILED",
         }
+    }
+
+    pub const fn process_cleanup_is_unproven(&self) -> bool {
+        matches!(
+            self,
+            Self::TreeControlLost(_)
+                | Self::TreeCleanupFailed(_)
+                | Self::CleanupTimedOut
+                | Self::LivenessCleanupUnproven
+                | Self::LivenessCleanupFailed(_)
+                | Self::WorkerFailed
+        )
     }
 }
 
@@ -487,15 +521,79 @@ impl ChildEnvironment {
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessSupervisor {
     limits: ProcessLimits,
+    liveness_scope: ProcessLivenessScope,
     tasks: TaskTracker,
+    #[cfg(test)]
+    supervision_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    proof_continuation_started: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    supervision_fault: Option<SupervisionFault>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisionFault {
+    AttachAndResume,
+    AnchorLost,
+    KillNow,
+    AttachedCleanupWaitAfterReap,
+}
+
+#[cfg(test)]
+fn injected_supervision_error(fault: SupervisionFault) -> io::Error {
+    io::Error::other(format!("injected process-supervisor fault: {fault:?}"))
 }
 
 impl ProcessSupervisor {
-    pub(crate) fn new(limits: ProcessLimits) -> Self {
+    pub(crate) fn new(limits: ProcessLimits, liveness_scope: ProcessLivenessScope) -> Self {
         Self {
             limits,
+            liveness_scope,
             tasks: TaskTracker::new(),
+            #[cfg(test)]
+            supervision_gate: None,
+            #[cfg(test)]
+            proof_continuation_started: None,
+            #[cfg(test)]
+            supervision_fault: None,
         }
+    }
+
+    #[cfg(test)]
+    fn new_paused_for_test(
+        limits: ProcessLimits,
+        liveness_scope: ProcessLivenessScope,
+    ) -> (Self, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut supervisor = Self::new(limits, liveness_scope);
+        supervisor.supervision_gate = Some(gate.clone());
+        (supervisor, gate)
+    }
+
+    #[cfg(test)]
+    fn new_faulted_for_test(
+        limits: ProcessLimits,
+        liveness_scope: ProcessLivenessScope,
+        fault: SupervisionFault,
+    ) -> Self {
+        let mut supervisor = Self::new(limits, liveness_scope);
+        supervisor.supervision_fault = Some(fault);
+        supervisor
+    }
+
+    #[cfg(test)]
+    fn new_faulted_paused_for_test(
+        limits: ProcessLimits,
+        liveness_scope: ProcessLivenessScope,
+        fault: SupervisionFault,
+    ) -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let proof_continuation_started = Arc::new(tokio::sync::Notify::new());
+        let mut supervisor = Self::new_faulted_for_test(limits, liveness_scope, fault);
+        supervisor.supervision_gate = Some(gate.clone());
+        supervisor.proof_continuation_started = Some(proof_continuation_started.clone());
+        (supervisor, gate, proof_continuation_started)
     }
 
     pub(crate) async fn run(
@@ -591,14 +689,23 @@ impl ProcessSupervisor {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        let mut liveness = self
+            .liveness_scope
+            .begin_tree()
+            .map_err(ProcessError::LivenessSetupFailed)?;
         #[cfg(unix)]
         let prepared = platform::prepare(
             &mut process,
             executable,
             working_directory,
             dependent_directories,
+            liveness.raw_descriptor(),
         )
         .map_err(ProcessError::TreeSetupFailed)?;
+        #[cfg(windows)]
+        liveness
+            .make_parent_handle_inheritable()
+            .map_err(ProcessError::LivenessSetupFailed)?;
         #[cfg(windows)]
         let prepared = platform::prepare(
             &mut process,
@@ -610,21 +717,54 @@ impl ProcessSupervisor {
         )
         .map_err(ProcessError::TreeSetupFailed)?;
         let mut child = process.spawn().map_err(ProcessError::SpawnFailed)?;
+        liveness.mark_spawned();
+        let liveness = SpawnedLivenessOwner::new(
+            liveness,
+            self.tasks.clone(),
+            #[cfg(test)]
+            self.proof_continuation_started.clone(),
+        );
         drop(spawn_guard);
-        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-            cleanup_failed_spawn(child, self.limits.cleanup_timeout, self.tasks.clone()).await?;
-            return Err(ProcessError::MissingOutputPipe);
-        };
 
-        let tree = match prepared.attach_and_resume(&child) {
+        let attached = prepared.attach_and_resume(&child);
+        let tree = match attached {
             Ok(attached) => attached,
             Err(error) => {
-                drop(stdout);
-                drop(stderr);
                 cleanup_failed_spawn(child, self.limits.cleanup_timeout, self.tasks.clone())
                     .await?;
-                return Err(ProcessError::TreeSetupFailed(error));
+                return Err(ProcessError::TreeControlLost(error));
             }
+        };
+        #[cfg(test)]
+        if self.supervision_fault == Some(SupervisionFault::AttachAndResume) {
+            if let Some(gate) = &self.supervision_gate {
+                gate.notified().await;
+            }
+            handoff_tree_reap(self.tasks.clone(), child, tree.0, tree.1, liveness);
+            return Err(ProcessError::TreeControlLost(injected_supervision_error(
+                SupervisionFault::AttachAndResume,
+            )));
+        }
+        #[cfg(test)]
+        if self.supervision_fault == Some(SupervisionFault::AttachedCleanupWaitAfterReap) {
+            if let Some(gate) = &self.supervision_gate {
+                gate.notified().await;
+            }
+            drop(child.stdout.take());
+        }
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            cleanup_attached_spawn_failure(
+                child,
+                tree.0,
+                tree.1,
+                liveness,
+                self.limits.cleanup_timeout,
+                self.tasks.clone(),
+                #[cfg(test)]
+                self.supervision_fault,
+            )
+            .await?;
+            return Err(ProcessError::MissingOutputPipe);
         };
         let stdout_task = tokio::spawn(drain_stream(stdout, self.limits.stdout_bytes));
         let stderr_task = tokio::spawn(drain_stream(stderr, self.limits.stderr_bytes));
@@ -634,19 +774,30 @@ impl ProcessSupervisor {
         let timeout = command.timeout();
         let worker_tasks = self.tasks.clone();
         let worker_abandonment = abandonment.clone();
+        #[cfg(test)]
+        let supervision_gate = self.supervision_gate.clone();
+        #[cfg(test)]
+        let supervision_fault = self.supervision_fault;
         let worker = self.tasks.spawn(async move {
+            #[cfg(test)]
+            if let Some(gate) = supervision_gate {
+                gate.notified().await;
+            }
             supervise_child(
                 child,
                 stdout_task,
                 stderr_task,
                 tree.0,
                 tree.1,
+                liveness,
                 limits,
                 timeout,
                 cancellation,
                 worker_abandonment,
                 worker_tasks,
                 started,
+                #[cfg(test)]
+                supervision_fault,
             )
             .await
         });
@@ -661,6 +812,83 @@ impl ProcessSupervisor {
     pub(crate) async fn shutdown(&self) {
         self.tasks.close();
         self.tasks.wait().await;
+    }
+}
+
+/// Single-use owner for a sentinel whose child spawn has committed.
+///
+/// Every exit path must either prove cleanup through this owner, transfer a
+/// tree-proof continuation, or remain permanently fail-closed. Only a positive
+/// OS tree-exit proof authorizes sentinel completion retries.
+struct SpawnedLivenessOwner {
+    liveness: Option<ProcessLivenessSentinel>,
+    tasks: TaskTracker,
+    fallback: SpawnedLivenessFallback,
+    #[cfg(test)]
+    proof_continuation_started: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnedLivenessFallback {
+    PermanentFailClosed,
+    RetryAfterTreeProof,
+}
+
+impl SpawnedLivenessOwner {
+    fn new(
+        liveness: ProcessLivenessSentinel,
+        tasks: TaskTracker,
+        #[cfg(test)] proof_continuation_started: Option<Arc<tokio::sync::Notify>>,
+    ) -> Self {
+        Self {
+            liveness: Some(liveness),
+            tasks,
+            fallback: SpawnedLivenessFallback::PermanentFailClosed,
+            #[cfg(test)]
+            proof_continuation_started,
+        }
+    }
+
+    fn liveness_mut(&mut self) -> &mut ProcessLivenessSentinel {
+        self.liveness
+            .as_mut()
+            .expect("spawned liveness ownership is present")
+    }
+
+    fn confirm_completed(&mut self) {
+        self.liveness
+            .take()
+            .expect("confirmed liveness ownership is present");
+    }
+
+    fn authorize_retry_after_tree_proof(&mut self) {
+        self.fallback = SpawnedLivenessFallback::RetryAfterTreeProof;
+    }
+
+    #[cfg(test)]
+    fn acknowledge_proof_continuation_started(&mut self) {
+        if let Some(started) = self.proof_continuation_started.take() {
+            started.notify_one();
+        }
+    }
+
+    fn handoff_once(&mut self) {
+        if let Some(liveness) = self.liveness.take() {
+            match self.fallback {
+                SpawnedLivenessFallback::PermanentFailClosed => {
+                    handoff_liveness_fail_closed(self.tasks.clone(), liveness);
+                }
+                SpawnedLivenessFallback::RetryAfterTreeProof => {
+                    handoff_liveness_retry(self.tasks.clone(), liveness);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SpawnedLivenessOwner {
+    fn drop(&mut self) {
+        self.handoff_once();
     }
 }
 
@@ -721,15 +949,38 @@ async fn supervise_child(
     stderr_task: JoinHandle<io::Result<CapturedStream>>,
     tree: TreeKillHandle,
     mut leader_exit: platform::LeaderExit,
+    mut liveness: SpawnedLivenessOwner,
     limits: ProcessLimits,
     timeout: Duration,
     cancellation: CancellationToken,
     abandonment: CancellationToken,
     tasks: TaskTracker,
     started: Instant,
+    #[cfg(test)] supervision_fault: Option<SupervisionFault>,
 ) -> Result<CommandResult, ProcessError> {
     let _worker_guard = TreeWorkerGuard(tree.clone());
     let deadline = TokioInstant::now() + timeout;
+    #[cfg(test)]
+    let observed = if supervision_fault == Some(SupervisionFault::AnchorLost) {
+        ObservedTermination::AnchorLost(injected_supervision_error(SupervisionFault::AnchorLost))
+    } else {
+        tokio::select! {
+            biased;
+
+            _ = cancellation.cancelled() => ObservedTermination::Cancelled,
+            _ = abandonment.cancelled() => ObservedTermination::Cancelled,
+            status = leader_exit.wait(&mut child) => match status {
+                Ok(_status) if cancellation.is_cancelled() => ObservedTermination::Cancelled,
+                Ok(status) => ObservedTermination::Exited(status),
+                Err(error) if platform::leader_anchor_lost(&error) => {
+                    ObservedTermination::AnchorLost(error)
+                }
+                Err(error) => ObservedTermination::WaitFailed(error),
+            },
+            _ = time::sleep_until(deadline) => deadline_observation(&cancellation),
+        }
+    };
+    #[cfg(not(test))]
     let observed = tokio::select! {
         biased;
 
@@ -754,7 +1005,8 @@ async fn supervise_child(
             tree.disarm_without_kill();
             let _ = child.start_kill();
             abort_and_join_drains(stdout_task, stderr_task).await;
-            return Err(ProcessError::WaitFailed(error));
+            handoff_anchor_proof(tasks, tree, leader_exit, liveness);
+            return Err(ProcessError::TreeControlLost(error));
         }
         observed => observed,
     };
@@ -764,31 +1016,52 @@ async fn supervise_child(
     // filters SZOMB members while resolving a negative-PID kill, so a group with
     // only the waitable leader left can report EPERM. In that exact macOS case,
     // an EOF sentinel proves that every protocol-participating process exited.
-    #[cfg(target_os = "macos")]
+    #[cfg(test)]
+    let kill_error = if supervision_fault == Some(SupervisionFault::KillNow) {
+        tree.inject_kill_failure_for_test(injected_supervision_error(SupervisionFault::KillNow))
+            .err()
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            if should_use_exited_tree_kill(&observed) {
+                tree.kill_now_after_observed_exit(&leader_exit).err()
+            } else {
+                tree.kill_now().err()
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tree.kill_now().err()
+        }
+    };
+    #[cfg(all(not(test), target_os = "macos"))]
     let kill_error = if should_use_exited_tree_kill(&observed) {
         tree.kill_now_after_observed_exit(&leader_exit).err()
     } else {
         tree.kill_now().err()
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(test), not(target_os = "macos")))]
     let kill_error = tree.kill_now().err();
     if kill_error.is_some() {
         let _ = child.start_kill();
     }
     let cleanup_deadline = TokioInstant::now() + limits.cleanup_timeout;
-    if kill_error.is_none() {
-        match time::timeout_at(cleanup_deadline, leader_exit.wait_tree_before_reap()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                abort_and_join_drains(stdout_task, stderr_task).await;
-                handoff_tree_reap(tasks, child, tree.clone(), leader_exit);
-                return Err(ProcessError::TreeCleanupFailed(error));
-            }
-            Err(_) => {
-                abort_and_join_drains(stdout_task, stderr_task).await;
-                handoff_tree_reap(tasks, child, tree.clone(), leader_exit);
-                return Err(ProcessError::CleanupTimedOut);
-            }
+    if let Some(error) = kill_error {
+        abort_and_join_drains(stdout_task, stderr_task).await;
+        handoff_tree_reap(tasks, child, tree.clone(), leader_exit, liveness);
+        return Err(ProcessError::TreeCleanupFailed(error));
+    }
+    match time::timeout_at(cleanup_deadline, leader_exit.wait_tree_before_reap()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            abort_and_join_drains(stdout_task, stderr_task).await;
+            handoff_tree_reap(tasks, child, tree.clone(), leader_exit, liveness);
+            return Err(ProcessError::TreeCleanupFailed(error));
+        }
+        Err(_) => {
+            abort_and_join_drains(stdout_task, stderr_task).await;
+            handoff_tree_reap(tasks, child, tree.clone(), leader_exit, liveness);
+            return Err(ProcessError::CleanupTimedOut);
         }
     }
     let status = match &observed {
@@ -797,36 +1070,38 @@ async fn supervise_child(
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
                 abort_and_join_drains(stdout_task, stderr_task).await;
-                handoff_child_reap(tasks, child, tree.clone());
-                return Err(ProcessError::WaitFailed(error));
+                handoff_tree_reap(tasks, child, tree.clone(), leader_exit, liveness);
+                return Err(ProcessError::TreeControlLost(error));
             }
             Err(_) => {
                 abort_and_join_drains(stdout_task, stderr_task).await;
-                handoff_child_reap(tasks, child, tree.clone());
+                handoff_tree_reap(tasks, child, tree.clone(), leader_exit, liveness);
                 return Err(ProcessError::CleanupTimedOut);
             }
         },
     };
 
-    if kill_error.is_none() {
-        match time::timeout_at(cleanup_deadline, leader_exit.wait_tree_after_reap()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                abort_and_join_drains(stdout_task, stderr_task).await;
-                return Err(ProcessError::TreeCleanupFailed(error));
-            }
-            Err(_) => {
-                abort_and_join_drains(stdout_task, stderr_task).await;
-                return Err(ProcessError::CleanupTimedOut);
-            }
+    match time::timeout_at(cleanup_deadline, leader_exit.wait_tree_after_reap()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            abort_and_join_drains(stdout_task, stderr_task).await;
+            handoff_tree_proof(tasks, tree.clone(), leader_exit, liveness);
+            return Err(ProcessError::TreeCleanupFailed(error));
+        }
+        Err(_) => {
+            abort_and_join_drains(stdout_task, stderr_task).await;
+            handoff_tree_proof(tasks, tree.clone(), leader_exit, liveness);
+            return Err(ProcessError::CleanupTimedOut);
         }
     }
 
+    liveness.authorize_retry_after_tree_proof();
+    if let Err(error) = complete_liveness_with_deadline(&mut liveness, cleanup_deadline).await {
+        abort_and_join_drains(stdout_task, stderr_task).await;
+        return Err(error);
+    }
     let (stdout, stderr) = collect_drains_until(cleanup_deadline, stdout_task, stderr_task).await?;
 
-    if let Some(error) = kill_error {
-        return Err(ProcessError::TreeCleanupFailed(error));
-    }
     if let ObservedTermination::WaitFailed(error) = observed {
         return Err(ProcessError::WaitFailed(error));
     }
@@ -882,26 +1157,212 @@ async fn abort_and_join_drains(
     let _ = tokio::join!(stdout_task, stderr_task);
 }
 
-fn handoff_child_reap(tasks: TaskTracker, mut child: Child, tree: TreeKillHandle) {
-    tasks.spawn(async move {
-        let _guard = TreeWorkerGuard(tree);
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    });
-}
-
 fn handoff_tree_reap(
     tasks: TaskTracker,
     mut child: Child,
     tree: TreeKillHandle,
     mut leader_exit: platform::LeaderExit,
+    mut liveness: SpawnedLivenessOwner,
 ) {
     tasks.spawn(async move {
+        #[cfg(test)]
+        liveness.acknowledge_proof_continuation_started();
         let _guard = TreeWorkerGuard(tree);
-        let _ = leader_exit.wait_tree_before_reap().await;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        while leader_exit.wait_tree_before_reap().await.is_err() {
+            time::sleep(Duration::from_millis(2)).await;
+        }
+        loop {
+            let _ = child.start_kill();
+            if child.wait().await.is_ok() {
+                break;
+            }
+            time::sleep(Duration::from_millis(2)).await;
+        }
+        while leader_exit.wait_tree_after_reap().await.is_err() {
+            time::sleep(Duration::from_millis(2)).await;
+        }
+        liveness.authorize_retry_after_tree_proof();
+        complete_owned_liveness_eventually(&mut liveness).await;
     });
+}
+
+fn handoff_tree_proof(
+    tasks: TaskTracker,
+    tree: TreeKillHandle,
+    mut leader_exit: platform::LeaderExit,
+    mut liveness: SpawnedLivenessOwner,
+) {
+    tasks.spawn(async move {
+        #[cfg(test)]
+        liveness.acknowledge_proof_continuation_started();
+        let _guard = TreeWorkerGuard(tree);
+        while leader_exit.wait_tree_after_reap().await.is_err() {
+            time::sleep(Duration::from_millis(2)).await;
+        }
+        liveness.authorize_retry_after_tree_proof();
+        complete_owned_liveness_eventually(&mut liveness).await;
+    });
+}
+
+fn handoff_anchor_proof(
+    tasks: TaskTracker,
+    tree: TreeKillHandle,
+    mut leader_exit: platform::LeaderExit,
+    mut liveness: SpawnedLivenessOwner,
+) {
+    tasks.spawn(async move {
+        #[cfg(test)]
+        liveness.acknowledge_proof_continuation_started();
+        let _guard = TreeWorkerGuard(tree);
+        while leader_exit.wait_tree_before_reap().await.is_err() {
+            time::sleep(Duration::from_millis(2)).await;
+        }
+        while leader_exit.wait_tree_after_reap().await.is_err() {
+            time::sleep(Duration::from_millis(2)).await;
+        }
+        liveness.authorize_retry_after_tree_proof();
+        complete_owned_liveness_eventually(&mut liveness).await;
+    });
+}
+
+async fn complete_liveness_with_deadline(
+    liveness: &mut SpawnedLivenessOwner,
+    deadline: TokioInstant,
+) -> Result<(), ProcessError> {
+    loop {
+        match liveness.liveness_mut().try_complete_after_tree_exit() {
+            Ok(ProcessCleanupProof::Confirmed) => {
+                liveness.confirm_completed();
+                return Ok(());
+            }
+            Ok(ProcessCleanupProof::Unknown) => {
+                return Err(ProcessError::LivenessCleanupUnproven);
+            }
+            Err(error) => return Err(ProcessError::LivenessCleanupFailed(error)),
+            Ok(ProcessCleanupProof::Held) => {
+                if TokioInstant::now() >= deadline {
+                    return Err(ProcessError::CleanupTimedOut);
+                }
+                time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+async fn complete_liveness_eventually(mut liveness: ProcessLivenessSentinel) {
+    loop {
+        match liveness.try_complete_after_tree_exit() {
+            Ok(ProcessCleanupProof::Confirmed) => return,
+            Ok(ProcessCleanupProof::Held | ProcessCleanupProof::Unknown) | Err(_) => {
+                time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+async fn complete_owned_liveness_eventually(liveness: &mut SpawnedLivenessOwner) {
+    loop {
+        match liveness.liveness_mut().try_complete_after_tree_exit() {
+            Ok(ProcessCleanupProof::Confirmed) => {
+                liveness.confirm_completed();
+                return;
+            }
+            Ok(ProcessCleanupProof::Held | ProcessCleanupProof::Unknown) | Err(_) => {
+                time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+fn handoff_liveness_fail_closed(tasks: TaskTracker, liveness: ProcessLivenessSentinel) {
+    tasks.spawn(async move {
+        // No tree proof exists, so neither an exclusive sentinel probe nor a
+        // shutdown request may convert this registration into "confirmed".
+        std::future::pending::<()>().await;
+        drop(liveness);
+    });
+}
+
+fn handoff_liveness_retry(tasks: TaskTracker, liveness: ProcessLivenessSentinel) {
+    tasks.spawn(async move {
+        complete_liveness_eventually(liveness).await;
+    });
+}
+
+async fn cleanup_attached_spawn_failure(
+    mut child: Child,
+    tree: TreeKillHandle,
+    mut leader_exit: platform::LeaderExit,
+    mut liveness: SpawnedLivenessOwner,
+    cleanup_timeout: Duration,
+    tasks: TaskTracker,
+    #[cfg(test)] supervision_fault: Option<SupervisionFault>,
+) -> Result<(), ProcessError> {
+    let _guard = TreeWorkerGuard(tree.clone());
+    #[cfg(test)]
+    let _kill_result = if supervision_fault == Some(SupervisionFault::AttachedCleanupWaitAfterReap)
+    {
+        tree.inject_kill_failure_for_test(injected_supervision_error(
+            SupervisionFault::AttachedCleanupWaitAfterReap,
+        ))
+    } else {
+        tree.kill_now()
+    };
+    #[cfg(not(test))]
+    let _kill_result = tree.kill_now();
+    #[cfg(all(test, unix))]
+    if supervision_fault == Some(SupervisionFault::AttachedCleanupWaitAfterReap) {
+        // Unix must await inherited-pipe EOF before it can reach the injected
+        // after-reap failure. The spawned test task is already the proof
+        // continuation here and owns every capability needed to finish it.
+        liveness.acknowledge_proof_continuation_started();
+    }
+    let deadline = TokioInstant::now() + cleanup_timeout;
+    match time::timeout_at(deadline, leader_exit.wait_tree_before_reap()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            handoff_tree_reap(tasks, child, tree, leader_exit, liveness);
+            return Err(ProcessError::TreeCleanupFailed(error));
+        }
+        Err(_) => {
+            handoff_tree_reap(tasks, child, tree, leader_exit, liveness);
+            return Err(ProcessError::CleanupTimedOut);
+        }
+    }
+    match time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            handoff_tree_reap(tasks, child, tree, leader_exit, liveness);
+            return Err(ProcessError::TreeControlLost(error));
+        }
+        Err(_) => {
+            handoff_tree_reap(tasks, child, tree, leader_exit, liveness);
+            return Err(ProcessError::CleanupTimedOut);
+        }
+    }
+    let wait_after_reap = async {
+        #[cfg(test)]
+        if supervision_fault == Some(SupervisionFault::AttachedCleanupWaitAfterReap) {
+            return Err(injected_supervision_error(
+                SupervisionFault::AttachedCleanupWaitAfterReap,
+            ));
+        }
+        leader_exit.wait_tree_after_reap().await
+    };
+    match time::timeout_at(deadline, wait_after_reap).await {
+        Ok(Ok(())) => {
+            liveness.authorize_retry_after_tree_proof();
+            complete_liveness_with_deadline(&mut liveness, deadline).await
+        }
+        Ok(Err(error)) => {
+            handoff_tree_proof(tasks, tree, leader_exit, liveness);
+            Err(ProcessError::TreeCleanupFailed(error))
+        }
+        Err(_) => {
+            handoff_tree_proof(tasks, tree, leader_exit, liveness);
+            Err(ProcessError::CleanupTimedOut)
+        }
+    }
 }
 
 fn process_spawn_lock() -> &'static std::sync::Mutex<()> {
@@ -917,7 +1378,7 @@ async fn cleanup_failed_spawn(
     let _ = child.start_kill();
     match time::timeout(cleanup_timeout, child.wait()).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(ProcessError::WaitFailed(error)),
+        Ok(Err(error)) => Err(ProcessError::TreeControlLost(error)),
         Err(_) => {
             tasks.spawn(async move {
                 let _ = child.start_kill();
@@ -1050,6 +1511,12 @@ impl TreeKillHandle {
         let _ = self.inner.outcome.set(Ok(()));
     }
 
+    #[cfg(test)]
+    fn inject_kill_failure_for_test(&self, error: io::Error) -> io::Result<()> {
+        let _ = self.inner.outcome.set(Err(KillFailure::from(error)));
+        self.kill_now()
+    }
+
     #[cfg(all(test, windows))]
     fn active_processes_for_test(&self) -> io::Result<u32> {
         self.inner.platform.active_processes()
@@ -1159,6 +1626,7 @@ mod platform {
         executable: Executable,
         working_directory: File,
         dependent_directories: Vec<File>,
+        process_liveness_descriptor: std::os::fd::RawFd,
     ) -> io::Result<Prepared> {
         let sigchld = tokio::signal::unix::signal(SignalKind::child())?;
         let (liveness_read, liveness_write) = create_liveness_pipe()?;
@@ -1184,7 +1652,8 @@ mod platform {
                 }
                 #[cfg(not(target_os = "macos"))]
                 clear_close_on_exec(executable_descriptor)?;
-                clear_close_on_exec(inherited_write)
+                clear_close_on_exec(inherited_write)?;
+                clear_close_on_exec(process_liveness_descriptor)
             });
         }
         command.process_group(0);
@@ -1653,9 +2122,13 @@ mod tests {
     use tokio::io::ReadBuf;
 
     use super::*;
+    use crate::{ProcessCleanupProof, ProcessLivenessDirectory};
 
     const HELPER_ENV: &str = "CODING_AGENT_PROCESS_HELPER";
     const HELPER_PID_FILE: &str = "CODING_AGENT_PROCESS_HELPER_PID_FILE";
+    const HELPER_LEADER_PID_FILE: &str = "CODING_AGENT_PROCESS_HELPER_LEADER_PID_FILE";
+    const HELPER_RELEASE_FILE: &str = "CODING_AGENT_PROCESS_HELPER_RELEASE_FILE";
+    const HELPER_RUNTIME_DIRECTORY: &str = "CODING_AGENT_PROCESS_HELPER_RUNTIME_DIRECTORY";
     const HELPER_TEST: &str = "process_supervisor::tests::process_helper_entrypoint";
 
     #[test]
@@ -1703,11 +2176,17 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(60));
                 std::process::exit(0);
             }
-            "leader" | "leader-closed-pipe" | "leader-sleep" => {
+            "leader" | "leader-closed-pipe" | "leader-sleep" | "leader-release" => {
+                write_optional_helper_pid(HELPER_LEADER_PID_FILE);
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-                child
-                    .args(["--exact", HELPER_TEST, "--nocapture"])
-                    .env(HELPER_ENV, "grandchild");
+                child.args(["--exact", HELPER_TEST, "--nocapture"]).env(
+                    HELPER_ENV,
+                    if mode == "leader-release" {
+                        "grandchild-release"
+                    } else {
+                        "grandchild"
+                    },
+                );
                 if mode == "leader-closed-pipe" {
                     child.stdout(Stdio::null()).stderr(Stdio::null());
                 }
@@ -1718,12 +2197,68 @@ mod tests {
                 }
                 std::process::exit(0);
             }
-            "grandchild" => {
+            "grandchild" | "grandchild-release" => {
                 write_helper_pid();
                 println!("grandchild-ready");
                 std::io::stdout().flush().unwrap();
+                if mode == "grandchild-release" {
+                    wait_for_release_file_sync();
+                    std::process::exit(0);
+                }
                 std::thread::sleep(Duration::from_secs(60));
                 std::process::exit(0);
+            }
+            "primary-crash" => {
+                let runtime_directory = PathBuf::from(
+                    std::env::var_os(HELPER_RUNTIME_DIRECTORY)
+                        .expect("primary-crash runtime directory is configured"),
+                );
+                let pid_file = PathBuf::from(
+                    std::env::var_os(HELPER_PID_FILE)
+                        .expect("primary-crash grandchild pid file is configured"),
+                );
+                let release_file = PathBuf::from(
+                    std::env::var_os(HELPER_RELEASE_FILE)
+                        .expect("primary-crash release file is configured"),
+                );
+                let leader_pid_file = runtime_directory.join("primary-crash-leader-pid");
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let directory = ProcessLivenessDirectory::open(&runtime_directory).unwrap();
+                    let task = directory
+                        .instance_scope(test_uuid(41))
+                        .unwrap()
+                        .task_scope(test_uuid(42))
+                        .unwrap();
+                    let limits = ProcessLimits::try_new(
+                        1_024,
+                        1_024,
+                        Duration::from_secs(10),
+                        Duration::from_secs(2),
+                    )
+                    .unwrap();
+                    let (supervisor, _gate) = ProcessSupervisor::new_paused_for_test(limits, task);
+                    let command = helper_command_for_directory(
+                        "leader-release",
+                        &runtime_directory,
+                        &pid_file,
+                        Some(&leader_pid_file),
+                        Some(&release_file),
+                        Duration::from_secs(10),
+                    );
+                    let _execution = supervisor
+                        .start(command, CancellationToken::new())
+                        .await
+                        .unwrap();
+                    wait_for_helper_pid(&pid_file).await;
+                    let leader_id = wait_for_helper_pid(&leader_pid_file).await;
+                    wait_until_process_not_running(leader_id).await;
+                    std::process::exit(0);
+                });
             }
             "environment" => {
                 for key in [
@@ -1741,6 +2276,8 @@ mod tests {
                     "GOOGLE_APPLICATION_CREDENTIALS",
                     "GIT_ASKPASS",
                     "CARGO_REGISTRY_TOKEN",
+                    "CARGO_BUILD_JOBS",
+                    "RUST_TEST_THREADS",
                     "RUSTC_WRAPPER",
                     "RUSTFLAGS",
                     "LD_PRELOAD",
@@ -1832,6 +2369,140 @@ mod tests {
         assert!(!platform::liveness_pipe_has_no_writers(&read).unwrap());
         drop(write);
         assert!(platform::liveness_pipe_has_no_writers(&read).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_fault_retains_the_sentinel_until_tree_proof() {
+        assert_fault_retains_sentinel_until_tree_proof(SupervisionFault::AttachAndResume, 51).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anchor_loss_retains_the_sentinel_until_tree_proof() {
+        assert_fault_retains_sentinel_until_tree_proof(SupervisionFault::AnchorLost, 52).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_failure_retains_the_sentinel_until_tree_proof() {
+        assert_fault_retains_sentinel_until_tree_proof(SupervisionFault::KillNow, 53).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attached_cleanup_wait_failure_retains_the_sentinel_until_tree_proof() {
+        assert_fault_retains_sentinel_until_tree_proof(
+            SupervisionFault::AttachedCleanupWaitAfterReap,
+            54,
+        )
+        .await;
+    }
+
+    async fn assert_fault_retains_sentinel_until_tree_proof(fault: SupervisionFault, seed: u8) {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+        let instance = directory.instance_scope(test_uuid(seed)).unwrap();
+        let task = instance
+            .task_scope(test_uuid(seed.wrapping_add(32)))
+            .unwrap();
+        let limits = ProcessLimits::try_new(
+            1_024,
+            1_024,
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let (supervisor, fault_gate, proof_continuation_started) =
+            ProcessSupervisor::new_faulted_paused_for_test(limits, task.clone(), fault);
+        let pid_file = temp.path().join(format!("{fault:?}-grandchild-pid"));
+        let leader_pid_file = temp.path().join(format!("{fault:?}-leader-pid"));
+        let release_file = temp.path().join(format!("{fault:?}-release"));
+        let running_supervisor = supervisor.clone();
+        let running = tokio::spawn({
+            let command = helper_command_with_tree_files(
+                "leader-release",
+                &temp,
+                &pid_file,
+                Some(&leader_pid_file),
+                Some(&release_file),
+                Duration::from_secs(10),
+            );
+            async move {
+                running_supervisor
+                    .run(command, CancellationToken::new())
+                    .await
+            }
+        });
+        let process_id = wait_for_helper_pid(&pid_file).await;
+        let leader_id = wait_for_helper_pid(&leader_pid_file).await;
+        wait_until_process_not_running(leader_id).await;
+
+        assert!(
+            process_is_running(process_id),
+            "{fault:?} requires a live held grandchild before injection"
+        );
+        assert_eq!(task.active_tree_count(), 1);
+        assert_eq!(task.cleanup_proof().unwrap(), ProcessCleanupProof::Held);
+
+        fault_gate.notify_one();
+        time::timeout(
+            Duration::from_secs(3),
+            proof_continuation_started.notified(),
+        )
+        .await
+        .expect("fault path must enter its proof continuation before release");
+        assert!(
+            process_is_running(process_id),
+            "{fault:?} must not kill the proof-gating grandchild"
+        );
+        assert_eq!(
+            task.active_tree_count(),
+            1,
+            "{fault:?} must retain its in-memory sentinel registration before tree proof"
+        );
+        assert_eq!(
+            task.cleanup_proof().unwrap(),
+            ProcessCleanupProof::Held,
+            "{fault:?} must retain the OS-held sentinel before tree proof"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("process-liveness"))
+                .unwrap()
+                .count(),
+            1,
+            "{fault:?} must retain exactly one sentinel before tree proof"
+        );
+
+        std::fs::write(&release_file, b"release").unwrap();
+        let error = time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("faulted supervision must return after tree proof")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.process_cleanup_is_unproven(),
+            "{fault:?} must remain a cleanup-unproven error"
+        );
+        wait_until_process_gone(process_id).await;
+
+        time::timeout(Duration::from_secs(3), async {
+            while task.active_tree_count() != 0 {
+                time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the spawned sentinel owner must finish through tracked retry");
+        time::timeout(Duration::from_secs(3), supervisor.shutdown())
+            .await
+            .expect("tracked sentinel retry must join during supervisor shutdown");
+        assert_eq!(
+            task.cleanup_proof().unwrap(),
+            ProcessCleanupProof::Confirmed
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("process-liveness"))
+                .unwrap()
+                .count(),
+            0,
+            "the completed tracked retry must remove exactly its stale sentinel"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1979,6 +2650,188 @@ mod tests {
         supervisor.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scoped_supervisor_keeps_cleanup_unproven_until_the_whole_tree_exits() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+        let instance = directory.instance_scope(test_uuid(31)).unwrap();
+        let task = instance.task_scope(test_uuid(32)).unwrap();
+        let limits =
+            ProcessLimits::try_new(1_024, 1_024, Duration::from_secs(5), Duration::from_secs(2))
+                .unwrap();
+        let (supervisor, supervision_gate) =
+            ProcessSupervisor::new_paused_for_test(limits, task.clone());
+        let pid_file = temp.path().join("scoped-grandchild-pid");
+        let leader_pid_file = temp.path().join("scoped-leader-pid");
+        let execution = supervisor
+            .start(
+                helper_command_with_tree_files(
+                    "leader",
+                    &temp,
+                    &pid_file,
+                    Some(&leader_pid_file),
+                    None,
+                    Duration::from_secs(5),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let process_id = wait_for_helper_pid(&pid_file).await;
+        let leader_id = wait_for_helper_pid(&leader_pid_file).await;
+        wait_until_process_not_running(leader_id).await;
+
+        assert_eq!(task.active_tree_count(), 1);
+        assert_eq!(
+            task.cleanup_proof().unwrap(),
+            ProcessCleanupProof::Held,
+            "a live descendant must keep the cross-crash sentinel held"
+        );
+        #[cfg(windows)]
+        {
+            assert!(
+                execution.tree.active_processes_for_test().unwrap() >= 1,
+                "the Job must retain at least the live grandchild"
+            );
+            assert!(
+                process_is_running(process_id),
+                "the grandchild must remain live while supervision is paused"
+            );
+            assert_eq!(
+                task.cleanup_proof().unwrap(),
+                ProcessCleanupProof::Held,
+                "the grandchild sentinel must remain held before Job cleanup"
+            );
+        }
+
+        #[cfg(windows)]
+        let tree_after_cleanup = execution.tree.clone();
+        supervision_gate.notify_one();
+        execution.wait().await.unwrap();
+        #[cfg(windows)]
+        assert_eq!(
+            tree_after_cleanup.active_processes_for_test().unwrap(),
+            0,
+            "supervision may complete only after Job active count reaches zero"
+        );
+        supervisor.shutdown().await;
+        wait_until_process_gone(process_id).await;
+
+        assert_eq!(task.active_tree_count(), 0);
+        assert_eq!(
+            task.cleanup_proof().unwrap(),
+            ProcessCleanupProof::Confirmed
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("process-liveness"))
+                .unwrap()
+                .count(),
+            0,
+            "successful cleanup must not leave a held or stale sentinel"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_primary_probes_the_crashed_primary_tree_before_cleanup_is_confirmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("crash-grandchild-pid");
+        let release_file = temp.path().join("release-crash-grandchild");
+        let mut primary = tokio::process::Command::new(std::env::current_exe().unwrap());
+        primary
+            .args(["--exact", HELPER_TEST, "--nocapture"])
+            .env(HELPER_ENV, "primary-crash")
+            .env(HELPER_RUNTIME_DIRECTORY, temp.path())
+            .env(HELPER_PID_FILE, &pid_file)
+            .env(HELPER_RELEASE_FILE, &release_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut primary = primary.spawn().unwrap();
+        let grandchild_id = wait_for_helper_pid(&pid_file).await;
+        assert!(primary.wait().await.unwrap().success());
+
+        let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            directory.probe_stale().unwrap(),
+            ProcessCleanupProof::Held,
+            "an orphaned Unix grandchild must retain the inherited file-description lock"
+        );
+        #[cfg(windows)]
+        assert!(
+            matches!(
+                directory.probe_stale().unwrap(),
+                ProcessCleanupProof::Held | ProcessCleanupProof::Confirmed
+            ),
+            "the Windows probe may race Job close, but must never claim unknown state"
+        );
+
+        std::fs::write(&release_file, b"release").unwrap();
+        wait_until_process_gone(grandchild_id).await;
+        let deadline = TokioInstant::now() + Duration::from_secs(3);
+        loop {
+            match directory.probe_stale().unwrap() {
+                ProcessCleanupProof::Confirmed => break,
+                ProcessCleanupProof::Held if TokioInstant::now() < deadline => {
+                    time::sleep(Duration::from_millis(5)).await;
+                }
+                proof => panic!("crashed-primary sentinel did not become stale: {proof:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eventual_cleanup_keeps_retry_ownership_across_unknown_probe_state() {
+        use std::os::fd::{FromRawFd as _, RawFd};
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+        let instance = directory.instance_scope(test_uuid(41)).unwrap();
+        let task = instance.task_scope(test_uuid(42)).unwrap();
+        let mut liveness = task.begin_tree().unwrap();
+        let duplicate: RawFd = unsafe { libc::dup(liveness.raw_descriptor()) };
+        assert!(
+            duplicate >= 0,
+            "duplicate the inherited sentinel descriptor"
+        );
+        let inherited = unsafe { std::fs::File::from_raw_fd(duplicate) };
+        liveness.mark_spawned();
+
+        let tracker = TaskTracker::new();
+        tracker.spawn(complete_liveness_eventually(liveness));
+        tracker.close();
+        time::sleep(Duration::from_millis(20)).await;
+
+        let sentinel_path = std::fs::read_dir(temp.path().join("process-liveness"))
+            .unwrap()
+            .next()
+            .expect("one registered sentinel")
+            .unwrap()
+            .path();
+        std::fs::write(&sentinel_path, b"temporarily-invalid").unwrap();
+        drop(inherited);
+
+        assert!(
+            time::timeout(Duration::from_millis(100), tracker.wait())
+                .await
+                .is_err(),
+            "Unknown must retain a background retry owner instead of detaching cleanup"
+        );
+
+        let name = sentinel_path.file_name().unwrap().to_string_lossy();
+        std::fs::write(
+            &sentinel_path,
+            format!("coding-agent-process-liveness-v1\n{name}\n"),
+        )
+        .unwrap();
+        time::timeout(Duration::from_secs(2), tracker.wait())
+            .await
+            .expect("cleanup owner completes after the probe becomes provable");
+        assert_eq!(task.active_tree_count(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn child_environment_is_allowlist_built_and_clears_sensitive_variables() {
         let temp = tempfile::tempdir().unwrap();
@@ -1998,6 +2851,8 @@ mod tests {
             "GOOGLE_APPLICATION_CREDENTIALS",
             "GIT_ASKPASS",
             "CARGO_REGISTRY_TOKEN",
+            "CARGO_BUILD_JOBS",
+            "RUST_TEST_THREADS",
             "RUSTC_WRAPPER",
             "RUSTFLAGS",
             "LD_PRELOAD",
@@ -2351,6 +3206,7 @@ mod tests {
                 Duration::from_secs(2),
             )
             .unwrap(),
+            crate::process_liveness::test_process_scope(),
         )
     }
 
@@ -2403,6 +3259,54 @@ mod tests {
         .unwrap()
     }
 
+    fn helper_command_with_tree_files(
+        mode: &str,
+        temp: &TempDir,
+        pid_file: &Path,
+        leader_pid_file: Option<&Path>,
+        release_file: Option<&Path>,
+        timeout: Duration,
+    ) -> ValidatedCommand {
+        helper_command_for_directory(
+            mode,
+            temp.path(),
+            pid_file,
+            leader_pid_file,
+            release_file,
+            timeout,
+        )
+    }
+
+    fn helper_command_for_directory(
+        mode: &str,
+        directory: &Path,
+        pid_file: &Path,
+        leader_pid_file: Option<&Path>,
+        release_file: Option<&Path>,
+        timeout: Duration,
+    ) -> ValidatedCommand {
+        let mut environment = ChildEnvironment::from_current_process().unwrap();
+        environment.insert_test_value(HELPER_ENV, mode);
+        environment.insert_test_value(HELPER_PID_FILE, pid_file.as_os_str());
+        if let Some(leader_pid_file) = leader_pid_file {
+            environment.insert_test_value(HELPER_LEADER_PID_FILE, leader_pid_file.as_os_str());
+        }
+        if let Some(release_file) = release_file {
+            environment.insert_test_value(HELPER_RELEASE_FILE, release_file.as_os_str());
+        }
+        ValidatedCommand::for_test(
+            std::env::current_exe().unwrap(),
+            ["--exact", HELPER_TEST, "--nocapture"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            directory.canonicalize().unwrap(),
+            environment,
+            timeout,
+        )
+        .unwrap()
+    }
+
     fn platform_environment(temp: &TempDir) -> PlatformEnvironment {
         #[cfg(windows)]
         let system_root = std::env::var_os("SYSTEMROOT")
@@ -2421,6 +3325,21 @@ mod tests {
     fn write_helper_pid() {
         let path = std::env::var_os(HELPER_PID_FILE).expect("helper pid file is configured");
         std::fs::write(path, std::process::id().to_string()).unwrap();
+    }
+
+    fn write_optional_helper_pid(environment_key: &str) {
+        if let Some(path) = std::env::var_os(environment_key) {
+            std::fs::write(path, std::process::id().to_string()).unwrap();
+        }
+    }
+
+    fn wait_for_release_file_sync() {
+        let path = PathBuf::from(
+            std::env::var_os(HELPER_RELEASE_FILE).expect("helper release file is configured"),
+        );
+        while !path.exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn wait_for_helper_pid_sync() {
@@ -2462,10 +3381,28 @@ mod tests {
         }
     }
 
+    async fn wait_until_process_not_running(process_id: u32) {
+        let deadline = TokioInstant::now() + Duration::from_secs(3);
+        while process_is_running(process_id) {
+            assert!(
+                TokioInstant::now() < deadline,
+                "process {process_id} remained running"
+            );
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
             .windows(needle.len())
             .any(|window| window == needle)
+    }
+
+    fn test_uuid(seed: u8) -> [u8; 16] {
+        let mut identity = [seed; 16];
+        identity[6] = (identity[6] & 0x0f) | 0x40;
+        identity[8] = (identity[8] & 0x3f) | 0x80;
+        identity
     }
 
     #[cfg(target_os = "linux")]

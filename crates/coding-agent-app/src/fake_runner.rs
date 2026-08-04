@@ -51,7 +51,8 @@ impl FakeTaskRunner {
 
 #[async_trait::async_trait]
 impl TaskRunner for FakeTaskRunner {
-    async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+    async fn run(&self, mut context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+        context.complete_preparation_for_test().await;
         run_success(self.config, context, sink).await
     }
 }
@@ -676,11 +677,13 @@ mod scripted {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&task_id);
         }
-    }
 
-    #[async_trait::async_trait]
-    impl TaskRunner for ScriptedFakeRunner {
-        async fn run(&self, context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+        #[doc(hidden)]
+        pub async fn run_after_preparation_for_test(
+            &self,
+            context: RunContext,
+            sink: RunnerEventSink,
+        ) -> RunnerOutcome {
             let task_id = context.task.id;
             let scenario = self.scenario_for(context.launch_ordinal()).await;
             let release = match scenario {
@@ -727,6 +730,14 @@ mod scripted {
                 FakeScenario::Failure => RunnerOutcome::Failed(fixed_failure()),
                 FakeScenario::Panic => panic!("injected scripted fake runner panic"),
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TaskRunner for ScriptedFakeRunner {
+        async fn run(&self, mut context: RunContext, sink: RunnerEventSink) -> RunnerOutcome {
+            context.complete_preparation_for_test().await;
+            self.run_after_preparation_for_test(context, sink).await
         }
     }
 

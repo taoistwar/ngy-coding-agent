@@ -569,6 +569,36 @@ describe("REST collection validation", () => {
       service_state: "ready",
       service_state_generation: 1,
       max_concurrent_tasks: 2,
+      scheduler: {
+        schema_version: 1,
+        server_instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        server_started_at: NOW,
+        generation: 1,
+        as_of_event_id: 12,
+        service_state_generation: 1,
+        admission_state: "running",
+        limits: {
+          global: 2,
+          per_repository: 2,
+          queued: 32,
+          cargo_jobs_per_task: 4,
+        },
+        active_task_count: 1,
+        queued_task_count: 0,
+        queued_tasks: [],
+        stopping_tasks: [],
+        storage: {
+          state: "normal",
+          data: { state: "normal" },
+          runtime: { state: "normal" },
+          repositories: [
+            {
+              repository_id: REPOSITORY_ID,
+              state: "normal",
+            },
+          ],
+        },
+      },
     };
   }
 

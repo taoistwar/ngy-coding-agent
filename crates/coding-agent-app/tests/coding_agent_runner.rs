@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use std::collections::VecDeque;
@@ -7,10 +9,13 @@ use std::time::Duration;
 
 use coding_agent_app::{
     AttemptArtifactObservation, AttemptReservation, CodingAgentAttempt, CodingAgentAttemptFactory,
-    CodingAgentRunner, CodingAgentRunnerConfig, CodingAttemptError, CodingAttemptProvisionError,
-    EventDispatcherHandle, QuiesceResult, ServiceState, ServiceStateController, StoreWriterHandle,
-    SystemWallClock, TaskAgentRuntime, TaskManagerHandle, TaskModelProviderFactory,
-    TaskModelSession, TestTaskRuntimeSession,
+    CodingAgentPreparationControl, CodingAgentRunner, CodingAgentRunnerConfig, CodingAttemptError,
+    CodingAttemptProvisionError, EventDispatcherHandle, QuiesceResult,
+    RepositoryControlCoordinator, RepositoryControlPoisonReason, RepositoryControlState,
+    SchedulerConcurrencyLimits, ServiceState, ServiceStateController, StoreWriterFaultPoint,
+    StoreWriterFaultSpec, StoreWriterHandle, StoreWriterOperationKind, StoreWriterTestController,
+    SystemWallClock, TaskAgentRuntime, TaskManagerHandle, TaskManagerLaunchResources,
+    TaskModelProviderFactory, TaskModelSession, TestTaskRuntimeSession,
 };
 use coding_agent_core::{
     ActionRequest, ContextRedactor, DiffEvent, FinalizationGuard, FinalizationGuardError,
@@ -23,11 +28,13 @@ use coding_agent_core::{
 };
 use coding_agent_domain::{
     ActivityActor, CanonicalPath, CheckEvidenceStatus, DeliveryReadiness, EventCursor,
-    RequiredCheckSelector, ReviewVerdict, Task, TaskEventKind, TaskEventPayload, TaskId,
-    TaskStatus, TestStatus,
+    RequiredCheckSelector, ReviewVerdict, Task, TaskEventKind, TaskEventPayload, TaskFailure,
+    TaskId, TaskStatus, TestStatus,
 };
-use coding_agent_runtime::WorktreeIdentity;
-use coding_agent_store::{AttemptArtifactState, Store};
+use coding_agent_runtime::{ProcessLivenessScope, WorktreeIdentity};
+use coding_agent_store::{
+    AttemptArtifactIdentity, AttemptArtifactState, ReserveAttemptArtifact, Store,
+};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -193,6 +200,46 @@ fn batch(calls: Vec<ToolCall>) -> ModelResponse {
     })
 }
 
+#[test]
+fn cargo_model_actions_cannot_supply_jobs_arguments_or_environment() {
+    for (name, arguments) in [
+        ("cargo_check", r#"{"package":"demo","jobs":9}"#),
+        (
+            "cargo_check",
+            r#"{"check_id":"check-01","package":"demo","args":["--jobs=9"]}"#,
+        ),
+        (
+            "cargo_test",
+            r#"{"package":"demo","integration_test":"smoke","environment":{"CARGO_BUILD_JOBS":"9"}}"#,
+        ),
+        (
+            "cargo_test",
+            r#"{"check_id":"check-02","package":"demo","integration_test":"smoke","jobs":9}"#,
+        ),
+    ] {
+        assert!(
+            ActionRequest::decode(Role::Executor, name, arguments).is_err(),
+            "{name} accepted untrusted parallelism controls: {arguments}"
+        );
+    }
+
+    for (name, arguments) in [
+        (
+            "cargo_check",
+            r#"{"package":"demo","timeout_ms":1000,"jobs":9}"#,
+        ),
+        (
+            "cargo_test",
+            r#"{"package":"demo","test":"smoke","timeout_ms":1000,"environment":{"RUST_TEST_THREADS":"9"}}"#,
+        ),
+    ] {
+        assert!(
+            ActionRequest::decode_legacy(name, arguments).is_err(),
+            "{name} accepted legacy untrusted parallelism controls: {arguments}"
+        );
+    }
+}
+
 fn plan_call() -> ToolCall {
     ToolCall {
         id: "plan".to_owned(),
@@ -339,9 +386,21 @@ fn scenario_responses() -> Vec<ModelResponse> {
 
 #[derive(Clone, Copy)]
 enum ProvisionMode {
+    PrepareFailure,
+    PrepareCleanupUnknown,
+    PreparePanicWithCleanup,
+    PrepareRepositoryMismatch,
     Ready,
+    ExistingReadyCleanupUnknown,
     ReadyFailureCaptureTimeout,
+    CancelAfterReservation,
+    AbsentFailure,
+    IdentityMismatch,
+    RepositoryMismatch,
+    InconsistentFailure,
+    CleanupUnknownAfterReservation,
     PartialFailure,
+    UnavailableFailure,
 }
 
 struct ScriptedAttemptFactory {
@@ -349,6 +408,55 @@ struct ScriptedAttemptFactory {
     runtime: Arc<ScriptedRuntime>,
     prepared: AtomicUsize,
     provisioned: Arc<AtomicUsize>,
+    cleanup_hold: Arc<ScriptedCleanupHold>,
+}
+
+#[derive(Default)]
+struct ScriptedCleanupHold {
+    held: Mutex<Option<coding_agent_runtime::HeldProcessLivenessTreeForTest>>,
+    published: AtomicBool,
+    published_notify: Notify,
+}
+
+impl ScriptedCleanupHold {
+    fn hold(&self, scope: &ProcessLivenessScope) {
+        let held = scope
+            .hold_tree_for_test()
+            .expect("hold the exact scripted attempt process tree");
+        assert!(
+            self.held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .replace(held)
+                .is_none(),
+            "one scripted cleanup failure owns exactly one process tree",
+        );
+        self.published.store(true, Ordering::Release);
+        self.published_notify.notify_waiters();
+    }
+
+    async fn wait_until_held(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = self.published_notify.notified();
+                if self.published.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("scripted cleanup failure holds its exact process tree");
+    }
+
+    fn release(&self) {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the scripted cleanup process tree remains held before proof");
+        self.published.store(false, Ordering::Release);
+    }
 }
 
 impl ScriptedAttemptFactory {
@@ -358,7 +466,16 @@ impl ScriptedAttemptFactory {
             runtime,
             prepared: AtomicUsize::new(0),
             provisioned: Arc::new(AtomicUsize::new(0)),
+            cleanup_hold: Arc::new(ScriptedCleanupHold::default()),
         }
+    }
+
+    async fn wait_until_cleanup_is_held(&self) {
+        self.cleanup_hold.wait_until_held().await;
+    }
+
+    fn release_cleanup(&self) {
+        self.cleanup_hold.release();
     }
 }
 
@@ -368,10 +485,26 @@ impl CodingAgentAttemptFactory for ScriptedAttemptFactory {
         &self,
         identity: WorktreeIdentity,
         repository: coding_agent_domain::Repository,
+        process_liveness_scope: ProcessLivenessScope,
         cancellation: CancellationToken,
     ) -> Result<Box<dyn CodingAgentAttempt>, CodingAttemptError> {
         if cancellation.is_cancelled() {
             return Err(CodingAttemptError::new("COMMAND_CANCELLED", false));
+        }
+        if matches!(self.mode, ProvisionMode::PrepareFailure) {
+            return Err(CodingAttemptError::new("WORKTREE_PREPARATION_FAILED", true));
+        }
+        if matches!(self.mode, ProvisionMode::PrepareCleanupUnknown) {
+            self.cleanup_hold.hold(&process_liveness_scope);
+            return Err(CodingAttemptError::new("PROCESS_TREE_CLEANUP_FAILED", true));
+        }
+        if matches!(self.mode, ProvisionMode::PreparePanicWithCleanup) {
+            self.cleanup_hold.hold(&process_liveness_scope);
+            panic!("scripted preparation panic after acquiring repository control");
+        }
+        if matches!(self.mode, ProvisionMode::PrepareRepositoryMismatch) {
+            return Err(CodingAttemptError::new("WORKTREE_CREATE_FAILED", false)
+                .with_repository_poison_required());
         }
         self.prepared.fetch_add(1, Ordering::SeqCst);
         let path = repository
@@ -389,6 +522,8 @@ impl CodingAgentAttemptFactory for ScriptedAttemptFactory {
             ),
             runtime: Arc::clone(&self.runtime),
             provisioned: Arc::clone(&self.provisioned),
+            process_liveness_scope,
+            cleanup_hold: Arc::clone(&self.cleanup_hold),
             ready: AtomicBool::new(false),
         }))
     }
@@ -399,6 +534,8 @@ struct ScriptedAttempt {
     reservation: AttemptReservation,
     runtime: Arc<ScriptedRuntime>,
     provisioned: Arc<AtomicUsize>,
+    process_liveness_scope: ProcessLivenessScope,
+    cleanup_hold: Arc<ScriptedCleanupHold>,
     ready: AtomicBool,
 }
 
@@ -408,15 +545,42 @@ impl CodingAgentAttempt for ScriptedAttempt {
         &self.reservation
     }
 
-    async fn provision(
+    async fn open_existing_ready(
         &mut self,
         _cancellation: CancellationToken,
+    ) -> Result<(), CodingAttemptError> {
+        if matches!(self.mode, ProvisionMode::ExistingReadyCleanupUnknown) {
+            self.cleanup_hold.hold(&self.process_liveness_scope);
+            return Err(CodingAttemptError::new("PROCESS_TREE_CLEANUP_FAILED", true));
+        }
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn provision(
+        &mut self,
+        cancellation: CancellationToken,
     ) -> Result<(), CodingAttemptProvisionError> {
         self.provisioned.fetch_add(1, Ordering::SeqCst);
+        if cancellation.is_cancelled() {
+            return Err(CodingAttemptProvisionError::new(
+                CodingAttemptError::new("COMMAND_CANCELLED", false),
+                AttemptArtifactObservation::Absent,
+            ));
+        }
         match self.mode {
+            ProvisionMode::PrepareFailure
+            | ProvisionMode::PrepareCleanupUnknown
+            | ProvisionMode::PreparePanicWithCleanup
+            | ProvisionMode::PrepareRepositoryMismatch => {
+                unreachable!("prepare failure never constructs an attempt")
+            }
             ProvisionMode::Ready => {
                 self.ready.store(true, Ordering::Release);
                 Ok(())
+            }
+            ProvisionMode::ExistingReadyCleanupUnknown => {
+                unreachable!("a durable Ready artifact uses open_existing_ready")
             }
             ProvisionMode::ReadyFailureCaptureTimeout => {
                 self.ready.store(true, Ordering::Release);
@@ -425,9 +589,45 @@ impl CodingAgentAttempt for ScriptedAttempt {
                     AttemptArtifactObservation::Ready,
                 ))
             }
+            ProvisionMode::CancelAfterReservation => {
+                cancellation.cancel();
+                Err(CodingAttemptProvisionError::new(
+                    CodingAttemptError::new("COMMAND_CANCELLED", false),
+                    AttemptArtifactObservation::Absent,
+                ))
+            }
             ProvisionMode::PartialFailure => Err(CodingAttemptProvisionError::new(
                 CodingAttemptError::new("WORKTREE_CREATE_FAILED", true),
                 AttemptArtifactObservation::Partial,
+            )),
+            ProvisionMode::AbsentFailure => Err(CodingAttemptProvisionError::new(
+                CodingAttemptError::new("WORKTREE_CREATE_FAILED", true),
+                AttemptArtifactObservation::Absent,
+            )),
+            ProvisionMode::IdentityMismatch => Err(CodingAttemptProvisionError::new(
+                CodingAttemptError::new("REPOSITORY_IDENTITY_MISMATCH", false),
+                AttemptArtifactObservation::Inconsistent,
+            )),
+            ProvisionMode::RepositoryMismatch => Err(CodingAttemptProvisionError::new(
+                CodingAttemptError::new("WORKTREE_STATE_INCONSISTENT", false),
+                AttemptArtifactObservation::Inconsistent,
+            )
+            .with_repository_poison_required()),
+            ProvisionMode::InconsistentFailure => Err(CodingAttemptProvisionError::new(
+                CodingAttemptError::new("WORKTREE_STATE_INCONSISTENT", false),
+                AttemptArtifactObservation::Inconsistent,
+            )),
+            ProvisionMode::CleanupUnknownAfterReservation => {
+                self.cleanup_hold.hold(&self.process_liveness_scope);
+                Err(CodingAttemptProvisionError::new(
+                    CodingAttemptError::new("WORKTREE_STATE_INCONSISTENT", false),
+                    AttemptArtifactObservation::Inconsistent,
+                )
+                .with_unproven_process_cleanup())
+            }
+            ProvisionMode::UnavailableFailure => Err(CodingAttemptProvisionError::new(
+                CodingAttemptError::new("WORKTREE_OBSERVATION_UNAVAILABLE", true),
+                AttemptArtifactObservation::Unavailable,
             )),
         }
     }
@@ -894,15 +1094,37 @@ struct Fixture {
     providers: Arc<ScriptedProviderFactory>,
     attempts: Arc<ScriptedAttemptFactory>,
     runtime: Arc<ScriptedRuntime>,
+    repository_control: Arc<RepositoryControlCoordinator>,
+    service_state: ServiceStateController,
+    writer_controller: Option<Arc<StoreWriterTestController>>,
 }
 
 impl Fixture {
     async fn new(provider_mode: ProviderMode, provision_mode: ProvisionMode) -> Self {
+        Self::new_with_faults(provider_mode, provision_mode, Vec::new()).await
+    }
+
+    async fn new_with_faults(
+        provider_mode: ProviderMode,
+        provision_mode: ProvisionMode,
+        faults: Vec<StoreWriterFaultSpec>,
+    ) -> Self {
         let base = support::store_fixture().await;
         let dispatcher = EventDispatcherHandle::spawn(base.store.clone(), 1_024)
             .await
             .unwrap();
-        let writer = StoreWriterHandle::spawn(base.store.clone(), Arc::new(dispatcher.clone()), 64);
+        let writer_controller = (!faults.is_empty()).then(|| {
+            Arc::new(StoreWriterTestController::try_new(faults).expect("valid writer faults"))
+        });
+        let writer = match &writer_controller {
+            Some(controller) => StoreWriterHandle::spawn_with_test_controller(
+                base.store.clone(),
+                Arc::new(dispatcher.clone()),
+                64,
+                Arc::clone(controller),
+            ),
+            None => StoreWriterHandle::spawn(base.store.clone(), Arc::new(dispatcher.clone()), 64),
+        };
         let providers = Arc::new(ScriptedProviderFactory::new(provider_mode));
         let terminal_capture_mode = match (provider_mode, provision_mode) {
             (_, ProvisionMode::ReadyFailureCaptureTimeout) => TerminalCaptureMode::AlwaysTimeout,
@@ -923,20 +1145,34 @@ impl Fixture {
         } else {
             Duration::from_secs(5)
         };
+        let (repository_control, repository_identity_resolver) =
+            support::repository_control_fixture(&base.store).await;
+        let launch_resources = TaskManagerLaunchResources::new_for_test(
+            SchedulerConcurrencyLimits::try_new(1, 1)
+                .expect("valid coding-agent runner test concurrency"),
+            Arc::clone(&repository_control),
+            base.instance_process_scope(),
+        );
         let runner = Arc::new(CodingAgentRunner::new(
-            writer.clone(),
+            CodingAgentPreparationControl::new(
+                base.store.clone(),
+                writer.clone(),
+                Arc::clone(&repository_control),
+                repository_identity_resolver,
+            ),
             providers.clone(),
             attempts.clone(),
             Arc::new(SystemWallClock),
             CodingAgentRunnerConfig::try_new(artifact_timeout, Duration::from_secs(10)).unwrap(),
         ));
+        let service_state = ServiceStateController::new(ServiceState::Ready);
         let manager = TaskManagerHandle::spawn(
             base.store.clone(),
             writer.clone(),
             dispatcher,
-            ServiceStateController::new(ServiceState::Ready),
+            service_state.clone(),
             runner,
-            1,
+            launch_resources,
             64,
         );
         Self {
@@ -946,12 +1182,62 @@ impl Fixture {
             providers,
             attempts,
             runtime,
+            repository_control,
+            service_state,
+            writer_controller,
         }
     }
 
     async fn enqueue(&self) -> Task {
-        let task = self
-            .writer
+        let task = self.create_task().await;
+        self.manager.notify_queued(task.id).await.unwrap();
+        task
+    }
+
+    async fn enqueue_with_existing_ready_artifact(&self) -> Task {
+        let task = self.create_task().await;
+        let worktree_identity = WorktreeIdentity::try_new(
+            task.repository_id.to_string(),
+            task.id.to_string(),
+            task.attempt,
+        )
+        .expect("construct exact existing-Ready worktree identity");
+        let identity = AttemptArtifactIdentity {
+            task_id: task.id,
+            repository_id: task.repository_id,
+            attempt: task.attempt,
+        };
+        self.writer
+            .reserve_attempt_artifact(
+                ReserveAttemptArtifact {
+                    identity,
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                    branch_name: worktree_identity.branch_name(),
+                    worktree_path: CanonicalPath::try_from_canonical(
+                        self.base
+                            .repository
+                            .git_root
+                            .as_path()
+                            .join("scripted-worktrees")
+                            .join(task.id.to_string())
+                            .join(task.attempt.to_string()),
+                    )
+                    .expect("construct exact existing-Ready worktree path"),
+                },
+                support::deadline(),
+            )
+            .await
+            .expect("reserve existing-Ready artifact");
+        self.writer
+            .mark_attempt_artifact_ready(identity, support::deadline())
+            .await
+            .expect("mark existing artifact Ready");
+        self.manager.notify_queued(task.id).await.unwrap();
+        task
+    }
+
+    async fn create_task(&self) -> Task {
+        self.writer
             .create_task(
                 support::new_task(self.base.repository.id, "change the demo"),
                 support::deadline(),
@@ -960,9 +1246,7 @@ impl Fixture {
             .unwrap()
             .value
             .task()
-            .clone();
-        self.manager.notify_queued(task.id).await.unwrap();
-        task
+            .clone()
     }
 
     async fn wait_for(&self, task_id: TaskId, status: TaskStatus) -> Task {
@@ -1288,7 +1572,12 @@ async fn normal_cancellation_forces_terminal_diff_and_retains_ready_artifact() {
     fixture.wait_for(task.id, TaskStatus::Cancelled).await;
 
     let detail = fixture.detail(task.id).await;
-    assert!(detail.diff.is_some());
+    let event_kinds = fixture.event_kinds(task.id).await;
+    assert!(
+        detail.diff.is_some(),
+        "terminal_calls={}, events={event_kinds:?}",
+        fixture.runtime.terminal_calls()
+    );
     assert!(fixture.runtime.terminal_calls() >= 1);
     assert_eq!(
         fixture
@@ -1412,18 +1701,28 @@ async fn terminal_capture_timeout_uses_fresh_projection_token_and_clears_stale_c
 }
 
 #[tokio::test]
-async fn ready_observation_capture_timeout_cancels_capture_without_starting_provider() {
+async fn exact_ready_observation_releases_control_and_starts_provider_roles() {
     let fixture = Fixture::new(
-        ProviderMode::SuccessfulChange,
+        ProviderMode::Blocking,
         ProvisionMode::ReadyFailureCaptureTimeout,
     )
     .await;
     let task = fixture.enqueue().await;
-    let failed = fixture.wait_for(task.id, TaskStatus::Failed).await;
+    tokio::time::timeout(Duration::from_secs(5), fixture.providers.entered.notified())
+        .await
+        .unwrap();
+    fixture.manager.cancel(task.id).await.unwrap();
+    fixture.wait_for(task.id, TaskStatus::Cancelled).await;
 
-    assert_eq!(failed.failure.unwrap().code, "WORKTREE_CREATE_FAILED");
-    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.runtime.terminal_calls(), 1);
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Available,
+        "normal roles must not retain the repository control lease"
+    );
     assert_eq!(
         fixture
             .store()
@@ -1466,4 +1765,530 @@ async fn partial_provision_failure_is_marked_inconsistent_and_never_starts_provi
         Some("WORKTREE_STATE_INCONSISTENT")
     );
     assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pre_reservation_failure_creates_no_artifact_and_cleanly_releases_control() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::PrepareFailure,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Failed).await;
+    assert!(
+        fixture
+            .store()
+            .load_attempt_artifact(task.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Available
+    );
+}
+
+#[tokio::test]
+async fn pre_reservation_unknown_child_cleanup_releases_owner_only_after_exact_process_proof() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::PrepareCleanupUnknown,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.attempts.wait_until_cleanup_is_held().await;
+    assert_eq!(fixture.service_state.current().state, ServiceState::Ready);
+    assert_eq!(
+        fixture.detail(task.id).await.task.status,
+        TaskStatus::Running
+    );
+    assert!(
+        fixture
+            .store()
+            .load_attempt_artifact(task.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Poisoned
+    );
+    let key = fixture
+        .repository_control
+        .coordination_key(fixture.base.repository.id)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .repository_control
+            .try_acquire_reconciliation(key)
+            .unwrap_err(),
+        coding_agent_app::RepositoryControlError::Busy,
+        "unknown child cleanup keeps the original logical owner",
+    );
+
+    fixture.attempts.release_cleanup();
+    let failed = fixture.wait_for(task.id, TaskStatus::Failed).await;
+    assert_eq!(
+        failed.failure,
+        Some(TaskFailure {
+            code: "PROCESS_TREE_CLEANUP_FAILED".to_owned(),
+            message: "the runner returned without proving process-tree cleanup".to_owned(),
+            retryable: true,
+        })
+    );
+    let reconciliation = fixture
+        .repository_control
+        .try_acquire_reconciliation(key)
+        .expect("exact process proof releases the cleanup handoff owner");
+    reconciliation
+        .poison(RepositoryControlPoisonReason::GitChildOutcomeUnknown)
+        .expect("reconciliation release retains sticky unknown-child poison");
+}
+
+#[tokio::test]
+async fn preparation_panic_releases_abnormal_owner_only_after_exact_process_proof() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::PreparePanicWithCleanup,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.attempts.wait_until_cleanup_is_held().await;
+    assert_eq!(fixture.service_state.current().state, ServiceState::Ready);
+    assert_eq!(
+        fixture.detail(task.id).await.task.status,
+        TaskStatus::Running
+    );
+    let key = fixture
+        .repository_control
+        .coordination_key(fixture.base.repository.id)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .repository_control
+            .try_acquire_reconciliation(key)
+            .unwrap_err(),
+        coding_agent_app::RepositoryControlError::Busy,
+        "panic keeps the abnormal exact owner until process cleanup is proven",
+    );
+
+    fixture.attempts.release_cleanup();
+    let failed = fixture.wait_for(task.id, TaskStatus::Failed).await;
+    assert_eq!(failed.failure.unwrap().code, "RUNNER_PANICKED");
+    let reconciliation = fixture
+        .repository_control
+        .try_acquire_reconciliation(key)
+        .expect("exact process proof releases the abnormal-drop owner");
+    reconciliation
+        .poison(RepositoryControlPoisonReason::AbnormalLeaseDrop)
+        .expect("reconciliation release retains abnormal-drop poison");
+}
+
+#[tokio::test]
+async fn existing_ready_cleanup_error_releases_owner_only_after_exact_process_proof() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::ExistingReadyCleanupUnknown,
+    )
+    .await;
+    let task = fixture.enqueue_with_existing_ready_artifact().await;
+    fixture.attempts.wait_until_cleanup_is_held().await;
+    assert_eq!(fixture.service_state.current().state, ServiceState::Ready);
+    assert_eq!(
+        fixture.detail(task.id).await.task.status,
+        TaskStatus::Running
+    );
+    assert_eq!(
+        fixture
+            .store()
+            .load_attempt_artifact(task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptArtifactState::Ready
+    );
+    let key = fixture
+        .repository_control
+        .coordination_key(fixture.base.repository.id)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .repository_control
+            .try_acquire_reconciliation(key)
+            .unwrap_err(),
+        coding_agent_app::RepositoryControlError::Busy,
+    );
+
+    fixture.attempts.release_cleanup();
+    let failed = fixture.wait_for(task.id, TaskStatus::Failed).await;
+    assert_eq!(failed.failure.unwrap().code, "PROCESS_TREE_CLEANUP_FAILED");
+    let reconciliation = fixture
+        .repository_control
+        .try_acquire_reconciliation(key)
+        .expect("exact process proof releases existing-Ready cleanup owner");
+    reconciliation
+        .poison(RepositoryControlPoisonReason::GitChildOutcomeUnknown)
+        .expect("reconciliation release retains unknown-child poison");
+}
+
+#[tokio::test]
+async fn pre_reservation_repository_mismatch_creates_no_artifact_and_sticky_poison() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::PrepareRepositoryMismatch,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Failed).await;
+
+    assert!(
+        fixture
+            .store()
+            .load_attempt_artifact(task.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Poisoned
+    );
+}
+
+#[tokio::test]
+async fn confirmed_absent_after_reservation_is_abandoned_without_starting_roles() {
+    let fixture = Fixture::new(ProviderMode::SuccessfulChange, ProvisionMode::AbsentFailure).await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Failed).await;
+
+    let artifact = fixture
+        .store()
+        .load_attempt_artifact(task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.state, AttemptArtifactState::Inconsistent);
+    assert_eq!(
+        artifact.failure_code.as_deref(),
+        Some("WORKTREE_RESERVATION_ABANDONED")
+    );
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Available
+    );
+}
+
+#[tokio::test]
+async fn cancellation_after_reservation_is_abandoned_with_no_role_start() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::CancelAfterReservation,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Cancelled).await;
+
+    let artifact = fixture
+        .store()
+        .load_attempt_artifact(task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.state, AttemptArtifactState::Inconsistent);
+    assert_eq!(
+        artifact.failure_code.as_deref(),
+        Some("WORKTREE_RESERVATION_ABANDONED")
+    );
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Available
+    );
+}
+
+#[tokio::test]
+async fn unavailable_observation_keeps_reserved_and_allows_exact_reconciliation() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::UnavailableFailure,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Failed).await;
+    let artifact = fixture
+        .store()
+        .load_attempt_artifact(task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.state, AttemptArtifactState::Reserved);
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Poisoned
+    );
+    let key = fixture
+        .repository_control
+        .coordination_key(fixture.base.repository.id)
+        .unwrap();
+    let reconciliation = fixture
+        .repository_control
+        .try_acquire_reconciliation(key)
+        .expect("a process-clean unavailable scene is eligible for exact reconciliation");
+    reconciliation
+        .poison(RepositoryControlPoisonReason::IdentityUnavailable)
+        .expect("release reconciliation owner while retaining sticky poison");
+}
+
+#[tokio::test]
+async fn common_git_identity_mismatch_is_durable_inconsistent_and_sticky_poisoned() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::IdentityMismatch,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Failed).await;
+
+    let artifact = fixture
+        .store()
+        .load_attempt_artifact(task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.state, AttemptArtifactState::Inconsistent);
+    assert_eq!(
+        artifact.failure_code.as_deref(),
+        Some("WORKTREE_STATE_INCONSISTENT")
+    );
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Poisoned
+    );
+}
+
+#[tokio::test]
+async fn repository_control_mismatch_provenance_is_durable_and_sticky() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::RepositoryMismatch,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Failed).await;
+
+    let artifact = fixture
+        .store()
+        .load_attempt_artifact(task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.state, AttemptArtifactState::Inconsistent);
+    assert_eq!(
+        artifact.failure_code.as_deref(),
+        Some("WORKTREE_STATE_INCONSISTENT")
+    );
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Poisoned
+    );
+}
+
+#[tokio::test]
+async fn ordinary_inconsistent_artifact_does_not_invent_repository_identity_poison() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::InconsistentFailure,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Failed).await;
+
+    let artifact = fixture
+        .store()
+        .load_attempt_artifact(task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.state, AttemptArtifactState::Inconsistent);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Available
+    );
+}
+
+#[tokio::test]
+async fn unknown_provision_process_cleanup_releases_reserved_owner_after_exact_process_proof() {
+    let fixture = Fixture::new(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::CleanupUnknownAfterReservation,
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.attempts.wait_until_cleanup_is_held().await;
+    assert_eq!(fixture.service_state.current().state, ServiceState::Ready);
+    assert_eq!(
+        fixture.detail(task.id).await.task.status,
+        TaskStatus::Running
+    );
+    let artifact = fixture
+        .store()
+        .load_attempt_artifact(task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.state, AttemptArtifactState::Reserved);
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    let key = fixture
+        .repository_control
+        .coordination_key(fixture.base.repository.id)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .repository_control
+            .try_acquire_reconciliation(key)
+            .unwrap_err(),
+        coding_agent_app::RepositoryControlError::Busy
+    );
+
+    fixture.attempts.release_cleanup();
+    let failed = fixture.wait_for(task.id, TaskStatus::Failed).await;
+    assert_eq!(
+        failed.failure,
+        Some(TaskFailure {
+            code: "PROCESS_TREE_CLEANUP_FAILED".to_owned(),
+            message: "the runner returned without proving process-tree cleanup".to_owned(),
+            retryable: true,
+        })
+    );
+    let reconciliation = fixture
+        .repository_control
+        .try_acquire_reconciliation(key)
+        .expect("exact process proof releases the reserved cleanup handoff owner");
+    reconciliation
+        .poison(RepositoryControlPoisonReason::GitChildOutcomeUnknown)
+        .expect("reconciliation release retains sticky unknown-child poison");
+}
+
+#[tokio::test]
+async fn reservation_and_ready_reply_loss_are_exactly_reconciled_before_roles_start() {
+    for operation in [
+        StoreWriterOperationKind::ReserveAttemptArtifact,
+        StoreWriterOperationKind::MarkAttemptArtifactReady,
+    ] {
+        let fixture = Fixture::new_with_faults(
+            ProviderMode::Blocking,
+            ProvisionMode::Ready,
+            vec![StoreWriterFaultSpec {
+                point: StoreWriterFaultPoint::FailAfterCommitBeforeReply,
+                operation: Some(operation),
+                count: 1,
+            }],
+        )
+        .await;
+        let task = fixture.enqueue().await;
+        tokio::time::timeout(Duration::from_secs(5), fixture.providers.entered.notified())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture
+                .store()
+                .load_attempt_artifact(task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            AttemptArtifactState::Ready
+        );
+        assert_eq!(
+            fixture
+                .repository_control
+                .control_state(fixture.base.repository.id)
+                .unwrap(),
+            RepositoryControlState::Available
+        );
+        assert_eq!(
+            fixture
+                .writer_controller
+                .as_ref()
+                .unwrap()
+                .hit_count(StoreWriterFaultPoint::FailAfterCommitBeforeReply, operation),
+            1
+        );
+
+        fixture.manager.cancel(task.id).await.unwrap();
+        fixture.wait_for(task.id, TaskStatus::Cancelled).await;
+    }
+}
+
+#[tokio::test]
+async fn inconsistent_reply_loss_is_reconciled_without_starting_roles() {
+    let fixture = Fixture::new_with_faults(
+        ProviderMode::SuccessfulChange,
+        ProvisionMode::PartialFailure,
+        vec![StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::FailAfterCommitBeforeReply,
+            operation: Some(StoreWriterOperationKind::MarkAttemptArtifactInconsistent),
+            count: 1,
+        }],
+    )
+    .await;
+    let task = fixture.enqueue().await;
+    fixture.wait_for(task.id, TaskStatus::Failed).await;
+
+    assert_eq!(
+        fixture
+            .store()
+            .load_attempt_artifact(task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptArtifactState::Inconsistent
+    );
+    assert_eq!(fixture.providers.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .repository_control
+            .control_state(fixture.base.repository.id)
+            .unwrap(),
+        RepositoryControlState::Available
+    );
 }

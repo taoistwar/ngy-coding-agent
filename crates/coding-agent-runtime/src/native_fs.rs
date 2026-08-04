@@ -33,6 +33,72 @@ pub(crate) fn open_child_directory(parent: &File, name: &OsStr) -> io::Result<Fi
     }
 }
 
+#[cfg(all(test, windows))]
+mod tests {
+    use std::ffi::OsStr;
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_FILE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
+        SYNCHRONIZE,
+    };
+
+    use super::{child_file_matches, create_child_file_exclusive, open_child_file};
+
+    #[test]
+    fn child_file_match_compares_the_namespace_entry_to_the_open_handle() {
+        let fixture = tempfile::tempdir().expect("create child-identity fixture");
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .access_mode(
+                FILE_ADD_FILE
+                    | FILE_DELETE_CHILD
+                    | FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | SYNCHRONIZE,
+            )
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let parent = options
+            .open(fixture.path())
+            .expect("open child-identity parent");
+        assert_eq!(
+            parent
+                .metadata()
+                .expect("read parent metadata")
+                .file_attributes()
+                & FILE_ATTRIBUTE_REPARSE_POINT,
+            0
+        );
+
+        let expected_name = OsStr::new("expected.sentinel");
+        let other_name = OsStr::new("other.sentinel");
+        drop(
+            create_child_file_exclusive(&parent, expected_name)
+                .expect("create expected namespace child"),
+        );
+        drop(
+            create_child_file_exclusive(&parent, other_name).expect("create other namespace child"),
+        );
+        let expected =
+            open_child_file(&parent, expected_name).expect("open expected namespace child");
+        let other = open_child_file(&parent, other_name).expect("open other namespace child");
+
+        assert!(
+            child_file_matches(&parent, expected_name, &expected)
+                .expect("compare matching child identity")
+        );
+        assert!(
+            !child_file_matches(&parent, expected_name, &other)
+                .expect("compare mismatched child identity"),
+            "a different open object must never authorize namespace cleanup"
+        );
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn open_child_file(parent: &File, name: &OsStr) -> io::Result<File> {
     use std::ffi::CString;
@@ -46,6 +112,29 @@ pub(crate) fn open_child_file(parent: &File, name: &OsStr) -> io::Result<File> {
             parent.as_raw_fd(),
             name.as_ptr(),
             libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: openat returned a new owned descriptor on success.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn open_child_file_for_exclusive_probe(parent: &File, name: &OsStr) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL"))?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
     if descriptor < 0 {
@@ -134,6 +223,80 @@ pub(crate) fn create_child_file_exclusive(parent: &File, name: &OsStr) -> io::Re
 pub(crate) fn remove_child_file(parent: &File, name: &OsStr, _: &File) -> io::Result<()> {
     let options = fs_at::OpenOptions::default();
     options.unlink_at(parent, name)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn quarantine_child_file_no_replace(
+    parent: &File,
+    source: &OsStr,
+    quarantine: &OsStr,
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source name contains NUL"))?;
+    let quarantine = CString::new(quarantine.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name contains NUL"))?;
+    let descriptor = parent.as_raw_fd();
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            descriptor,
+            source.as_ptr(),
+            descriptor,
+            quarantine.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn quarantine_child_file_no_replace(
+    parent: &File,
+    source: &OsStr,
+    quarantine: &OsStr,
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source name contains NUL"))?;
+    let quarantine = CString::new(quarantine.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name contains NUL"))?;
+    let descriptor = parent.as_raw_fd();
+    let result = unsafe {
+        libc::renameatx_np(
+            descriptor,
+            source.as_ptr(),
+            descriptor,
+            quarantine.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+pub(crate) fn quarantine_child_file_no_replace(_: &File, _: &OsStr, _: &OsStr) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no no-replace quarantine rename is available",
+    ))
 }
 
 #[cfg(unix)]
@@ -279,7 +442,8 @@ pub(crate) fn reopen_directory_path_lease(directory: &File) -> io::Result<File> 
 #[cfg(windows)]
 pub(crate) use windows::{
     child_entry_exists, child_file_matches, child_matches_protected_metadata,
-    create_child_directory, create_child_file_exclusive, open_child_directory, open_child_file,
+    create_child_directory, create_child_directory_with_created, create_child_file_exclusive,
+    open_child_directory, open_child_file, open_child_file_for_exclusive_probe,
     preserve_replace_metadata, publish_child_file, read_directory_names, remove_child_file,
     reopen_directory, reopen_directory_for_child_directory, reopen_directory_for_write,
     reopen_directory_path_lease, reopen_file_read_lease,
@@ -315,8 +479,8 @@ mod windows {
         FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
         FILE_WRITE_DATA, FileBasicInfo, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
-        GetFileInformationByHandle, GetFileInformationByHandleEx, SYNCHRONIZE,
-        SetFileInformationByHandle,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
+        SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -344,11 +508,27 @@ mod windows {
         )
     }
 
+    pub(crate) fn open_child_file_for_exclusive_probe(
+        parent: &File,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        open_child(
+            parent,
+            name,
+            DELETE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_NON_DIRECTORY_FILE,
+            false,
+            FILE_OPEN,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+    }
+
     pub(crate) fn create_child_directory(parent: &File, name: &OsStr) -> io::Result<File> {
         let access = FILE_ADD_SUBDIRECTORY
             | FILE_LIST_DIRECTORY
             | FILE_TRAVERSE
             | FILE_READ_ATTRIBUTES
+            | READ_CONTROL
             | SYNCHRONIZE;
         match open_child(
             parent,
@@ -369,6 +549,47 @@ mod windows {
                 FILE_OPEN,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn create_child_directory_with_created(
+        parent: &File,
+        name: &OsStr,
+    ) -> io::Result<(File, bool)> {
+        let access = FILE_ADD_SUBDIRECTORY
+            | FILE_LIST_DIRECTORY
+            | FILE_TRAVERSE
+            | FILE_READ_ATTRIBUTES
+            | READ_CONTROL
+            | WRITE_DAC
+            | WRITE_OWNER
+            | SYNCHRONIZE;
+        match open_child(
+            parent,
+            name,
+            access,
+            FILE_DIRECTORY_FILE,
+            false,
+            FILE_CREATE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ) {
+            Ok(directory) => Ok((directory, true)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => open_child(
+                parent,
+                name,
+                FILE_ADD_SUBDIRECTORY
+                    | FILE_LIST_DIRECTORY
+                    | FILE_TRAVERSE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE,
+                FILE_DIRECTORY_FILE,
+                false,
+                FILE_OPEN,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            )
+            .map(|directory| (directory, false)),
             Err(error) => Err(error),
         }
     }
@@ -554,10 +775,21 @@ mod windows {
         set_basic_attributes(temporary, attributes)
     }
 
-    pub(crate) fn child_file_matches(_: &File, _: &OsStr, _: &File) -> io::Result<bool> {
-        // Windows publication and cleanup act on the already-open source
-        // handle, so the temporary namespace name is never re-resolved.
-        Ok(true)
+    pub(crate) fn child_file_matches(parent: &File, name: &OsStr, file: &File) -> io::Result<bool> {
+        let named = match open_child(
+            parent,
+            name,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_NON_DIRECTORY_FILE,
+            false,
+            FILE_OPEN,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ) {
+            Ok(named) => named,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(file_identity(file)? == file_identity(&named)?)
     }
 
     pub(crate) fn child_matches_protected_metadata(
@@ -815,13 +1047,18 @@ mod windows {
             let name = unsafe {
                 slice::from_raw_parts(info.FileName.as_ptr(), name_bytes / size_of::<u16>())
             };
-            if names.len() == max_entries {
-                return Err(io::Error::new(
-                    io::ErrorKind::FileTooLarge,
-                    "directory exceeds its entry limit",
-                ));
+            // NtQueryDirectoryFile includes the two kernel navigation aliases,
+            // unlike Unix read_dir. They are not child namespace entries and
+            // must never consume protocol limits or reach callers.
+            if name != [u16::from(b'.')] && name != [u16::from(b'.'), u16::from(b'.')] {
+                if names.len() == max_entries {
+                    return Err(io::Error::new(
+                        io::ErrorKind::FileTooLarge,
+                        "directory exceeds its entry limit",
+                    ));
+                }
+                names.push(OsString::from_wide(name));
             }
-            names.push(OsString::from_wide(name));
 
             if info.NextEntryOffset == 0 {
                 break;

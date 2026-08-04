@@ -1,7 +1,13 @@
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 
-use coding_agent_runtime::{RelativePath, RelativePathError, RootCapability};
+use coding_agent_runtime::{
+    DirectoryIdentityError, RelativePath, RelativePathError, RootCapability,
+};
 
 #[test]
 fn relative_paths_are_utf8_slash_paths_with_an_explicit_root() {
@@ -76,6 +82,152 @@ fn root_capability_reads_regular_files_one_component_at_a_time() {
     file.read_to_string(&mut content).unwrap();
 
     assert_eq!(content, "pub fn answer() -> u8 { 42 }");
+}
+
+#[test]
+fn directory_identity_markers_compare_and_hash_only_by_authenticated_object() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let first_path = first.path().canonicalize().unwrap();
+    let first_capability = RootCapability::open(&first_path).unwrap();
+    let same_capability = RootCapability::open(&first_path).unwrap();
+    let second_capability = RootCapability::open(second.path().canonicalize().unwrap()).unwrap();
+
+    let first_marker = first_capability.identity_marker().unwrap();
+    let same_marker = same_capability.identity_marker().unwrap();
+    let second_marker = second_capability.identity_marker().unwrap();
+    let markers = HashSet::from([first_marker, same_marker, second_marker]);
+
+    assert_eq!(first_marker, same_marker);
+    assert_ne!(first_marker, second_marker);
+    assert_eq!(markers.len(), 2);
+    let mut recording_hasher = RecordingHasher::default();
+    first_marker.hash(&mut recording_hasher);
+    assert_eq!(
+        recording_hasher.bytes.len(),
+        std::mem::size_of::<u64>(),
+        "Hash must expose only one keyed opaque token, never raw platform identity fields"
+    );
+    assert_eq!(
+        format!("{first_marker:?}"),
+        "DirectoryIdentityMarker(<opaque>)"
+    );
+    assert!(!format!("{first_marker:?}").contains(&first_path.display().to_string()));
+    assert!(first_capability.require_identity(first_marker).is_ok());
+    assert_eq!(
+        first_capability.require_identity(second_marker),
+        Err(DirectoryIdentityError::Mismatch)
+    );
+    assert_eq!(
+        DirectoryIdentityError::Unavailable.to_string(),
+        "authenticated directory identity is unavailable"
+    );
+    assert_eq!(
+        DirectoryIdentityError::Mismatch.to_string(),
+        "authenticated directory identity does not match"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_case_and_subst_aliases_share_directory_identity() {
+    use std::process::Command;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().join("MarkerCaseRoot");
+    std::fs::create_dir(&directory).unwrap();
+    let canonical = directory.canonicalize().unwrap();
+    let expected = RootCapability::open(&canonical)
+        .unwrap()
+        .identity_marker()
+        .unwrap();
+
+    let case_alias = canonical.to_string_lossy().to_ascii_uppercase();
+    assert_eq!(
+        RootCapability::open(case_alias)
+            .unwrap()
+            .identity_marker()
+            .unwrap(),
+        expected
+    );
+
+    let Some(drive) = (b'D'..=b'Z')
+        .rev()
+        .map(|letter| format!("{}:", char::from(letter)))
+        .find(|drive| !Path::new(&format!("{drive}\\")).exists())
+    else {
+        return;
+    };
+    let status = Command::new("subst.exe")
+        .arg(&drive)
+        .arg(temporary.path().canonicalize().unwrap())
+        .status();
+    let Ok(status) = status else {
+        return;
+    };
+    if !status.success() {
+        return;
+    }
+    let _subst = SubstDrive(drive.clone());
+    let subst_root = PathBuf::from(format!("{drive}\\"));
+    let subst_alias = subst_root.join("MarkerCaseRoot");
+    assert_eq!(
+        RootCapability::open(subst_alias)
+            .unwrap()
+            .identity_marker()
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn retained_directory_identity_rejects_a_same_path_replacement() {
+    let parent = tempfile::tempdir().unwrap();
+    let path = parent.path().join("repository");
+    let retained_path = parent.path().join("retained-repository");
+    std::fs::create_dir(&path).unwrap();
+    let capability = RootCapability::open(path.canonicalize().unwrap()).unwrap();
+    let marker = capability.identity_marker().unwrap();
+
+    std::fs::rename(&path, &retained_path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let replacement = RootCapability::open(path.canonicalize().unwrap()).unwrap();
+    let replacement_marker = replacement.identity_marker().unwrap();
+
+    assert_eq!(capability.identity_marker().unwrap(), marker);
+    assert_ne!(replacement_marker, marker);
+    assert_eq!(
+        replacement.require_identity(marker),
+        Err(DirectoryIdentityError::Mismatch)
+    );
+}
+
+#[derive(Default)]
+struct RecordingHasher {
+    bytes: Vec<u8>,
+}
+
+impl Hasher for RecordingHasher {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+}
+
+#[cfg(windows)]
+struct SubstDrive(String);
+
+#[cfg(windows)]
+impl Drop for SubstDrive {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("subst.exe")
+            .arg(&self.0)
+            .arg("/D")
+            .status();
+    }
 }
 
 #[test]

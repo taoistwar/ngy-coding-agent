@@ -44,7 +44,9 @@ test("descriptor publication precedes browser dispatch with positive and negativ
         boundaryProbe = probeBrowserBoundary(roots, releasePath);
         void boundaryProbe.catch(() => undefined);
         return {
+          runtime_config: null,
           fake_scenarios: [],
+          storage_samples: [{ kind: "native" }],
           store_writer_faults: [],
           actor_pauses: ["descriptor_before_browser"],
           virtual_release_signals: [
@@ -89,7 +91,9 @@ test("restart recovery completes before a replacement descriptor is published", 
   await withLocalApp(
     testInfo,
     {
+      runtime_config: null,
       fake_scenarios: ["blocking"],
+      storage_samples: [{ kind: "native" }],
       store_writer_faults: [],
       actor_pauses: [],
       virtual_release_signals: [],
@@ -117,7 +121,9 @@ test("restart recovery completes before a replacement descriptor is published", 
         "recovery-before-descriptor.release",
       );
       const restart = app.restart({
+        runtime_config: null,
         fake_scenarios: [],
+        storage_samples: [{ kind: "native" }],
         store_writer_faults: [],
         actor_pauses: ["recovery_before_descriptor"],
         virtual_release_signals: [

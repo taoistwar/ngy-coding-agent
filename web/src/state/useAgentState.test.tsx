@@ -1,6 +1,10 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import {
+  schedulerStateDigest,
+  type SchedulerSnapshotCandidate,
+} from "../api/schedulerSnapshot";
 import type {
   BootstrapResponse,
   CancellationAcceptedResponse,
@@ -20,8 +24,9 @@ import {
 
 const NOW = "2026-07-15T00:00:00Z";
 const STREAM_REVIEW_TASK_ID = "00000000-0000-4000-8000-000000000001";
+const SCHEDULER_REPOSITORY_ID = "00000000-0000-4000-8000-000000000002";
 
-function repository(id = "repo-1"): Repository {
+function repository(id = SCHEDULER_REPOSITORY_ID): Repository {
   return {
     id,
     display_name: id,
@@ -36,7 +41,7 @@ function repository(id = "repo-1"): Repository {
 function task(id: string, status: Task["status"] = "running", cursor = 10): Task {
   return {
     id,
-    repository_id: "repo-1",
+    repository_id: SCHEDULER_REPOSITORY_ID,
     client_request_id: `request-${id}`,
     prompt: id,
     status,
@@ -61,6 +66,48 @@ function bootstrap(): BootstrapResponse {
     service_state: "ready",
     service_state_generation: 1,
     tasks: [task("task-1"), task("task-2")],
+    scheduler: {
+      schema_version: 1,
+      server_instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      server_started_at: NOW,
+      generation: 1,
+      as_of_event_id: 10,
+      service_state_generation: 1,
+      admission_state: "running",
+      limits: {
+        global: 4,
+        per_repository: 2,
+        queued: 32,
+        cargo_jobs_per_task: 2,
+      },
+      active_task_count: 2,
+      queued_task_count: 0,
+      queued_tasks: [],
+      stopping_tasks: [],
+      storage: {
+        state: "normal",
+        data: { state: "normal" },
+        runtime: { state: "normal" },
+        repositories: [
+          { repository_id: SCHEDULER_REPOSITORY_ID, state: "normal" },
+        ],
+      },
+    },
+  };
+}
+
+function schedulerCandidate(
+  overrides: Partial<BootstrapResponse["scheduler"]> = {},
+): SchedulerSnapshotCandidate {
+  const snapshot = {
+    ...structuredClone(bootstrap().scheduler),
+    generation: 2,
+    ...overrides,
+  };
+  return {
+    snapshot,
+    digest: "0".repeat(64),
+    canonicalJson: JSON.stringify(snapshot),
   };
 }
 
@@ -254,7 +301,7 @@ function fixture(detailImpl: (taskId: string) => Promise<TaskDetail>) {
   }));
   const pickRepository = vi.fn(async () => repository("repo-picked"));
   const createTaskExecute = vi.fn(async () => task("task-created", "queued", 11));
-  const newCreateTask = vi.fn(() => ({
+  const newCreateTask = vi.fn((repositoryId: string, prompt: string) => ({
     clientRequestId: "stable-create-id",
     execute: createTaskExecute,
   }));
@@ -325,6 +372,237 @@ describe("useAgentState", () => {
       expect(testFixture.dependencies.api.taskDetail).toHaveBeenCalledWith("task-1"),
     );
     expect(testFixture.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("installs a complete scheduler candidate forwarded by the stream", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+    const candidate = schedulerCandidate();
+
+    act(() => {
+      testFixture.callbacks.onSchedulerSnapshot(candidate);
+    });
+
+    expect(result.current.state.scheduler).toMatchObject({
+      snapshot: candidate.snapshot,
+      digest: candidate.digest,
+      freshness: "fresh",
+      recoveryReason: null,
+    });
+  });
+
+  it("rejects a new scheduler epoch synchronously for transport recovery", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    let thrown: unknown;
+    act(() => {
+      try {
+        testFixture.callbacks.onSchedulerSnapshot(
+          schedulerCandidate({
+            server_instance_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          }),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(thrown).toEqual(
+      expect.objectContaining({ name: "SchedulerProjectionProtocolError" }),
+    );
+    expect(result.current.state.scheduler).toMatchObject({
+      snapshot: null,
+      recoveryReason: "scheduler_instance_changed",
+    });
+    expect(result.current.state.connection).toBe("protocol_error");
+  });
+
+  it("atomically adopts lower service and scheduler generations from a recovered epoch", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const oldEpoch = {
+      ...bootstrap(),
+      service_state_generation: 100,
+      scheduler: {
+        ...bootstrap().scheduler,
+        generation: 100,
+        service_state_generation: 100,
+      },
+    };
+    testFixture.initialize.mockResolvedValueOnce(oldEpoch);
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    const nextInstanceId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let epochError: unknown;
+    act(() => {
+      try {
+        testFixture.callbacks.onSchedulerSnapshot(
+          schedulerCandidate({
+            server_instance_id: nextInstanceId,
+            generation: 1,
+            service_state_generation: 1,
+          }),
+        );
+      } catch (error) {
+        epochError = error;
+      }
+    });
+    expect(epochError).toEqual(
+      expect.objectContaining({ name: "SchedulerProjectionProtocolError" }),
+    );
+
+    const recoveredEpoch = {
+      ...bootstrap(),
+      service_state_generation: 1,
+      scheduler: {
+        ...bootstrap().scheduler,
+        server_instance_id: nextInstanceId,
+        generation: 1,
+        service_state_generation: 1,
+      },
+    };
+    let cursor: number | undefined;
+    act(() => {
+      cursor = testFixture.callbacks.onBootstrap(recoveredEpoch);
+    });
+
+    expect(cursor).toBe(10);
+    expect(result.current.state.serviceGeneration).toBe(1);
+    expect(result.current.state.serviceState).toBe("ready");
+    expect(result.current.state.scheduler).toMatchObject({
+      snapshot: recoveredEpoch.scheduler,
+      freshness: "fresh",
+      pending: null,
+      recoveryReason: null,
+    });
+    expect(result.current.state.connection).toBe("live");
+  });
+
+  it("rejects a pending scheduler tuple when a live service update crosses it", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+    const candidate = schedulerCandidate({
+      as_of_event_id: 11,
+      service_state_generation: 1,
+    });
+
+    act(() => {
+      testFixture.callbacks.onSchedulerSnapshot(candidate);
+    });
+    expect(result.current.state.scheduler.pending?.snapshot).toBe(
+      candidate.snapshot,
+    );
+
+    let thrown: unknown;
+    act(() => {
+      try {
+        testFixture.callbacks.onServiceState("ready", 2);
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(thrown).toEqual(
+      expect.objectContaining({ name: "SchedulerProjectionProtocolError" }),
+    );
+    expect(result.current.state.scheduler.recoveryReason).toBe(
+      "scheduler_causal_tuple_incomparable",
+    );
+  });
+
+  it("rejects a pending scheduler tuple when a live membership event crosses it", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    act(() => {
+      testFixture.callbacks.onSchedulerSnapshot(
+        schedulerCandidate({
+          as_of_event_id: 10,
+          service_state_generation: 2,
+        }),
+      );
+    });
+
+    let thrown: unknown;
+    act(() => {
+      try {
+        testFixture.callbacks.onTaskEvent(completedEvent(11, "task-1"));
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(thrown).toEqual(
+      expect.objectContaining({ name: "SchedulerProjectionProtocolError" }),
+    );
+    expect(result.current.state.scheduler.recoveryReason).toBe(
+      "scheduler_causal_tuple_incomparable",
+    );
+  });
+
+  it("rejects an unknown persisted event that passes a pending membership watermark", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    act(() => {
+      testFixture.callbacks.onSchedulerSnapshot(
+        schedulerCandidate({ as_of_event_id: 11 }),
+      );
+    });
+
+    let thrown: unknown;
+    act(() => {
+      try {
+        testFixture.callbacks.onUnknownEvent(11, "future.event", 1);
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(thrown).toEqual(
+      expect.objectContaining({ name: "SchedulerProjectionProtocolError" }),
+    );
+    expect(result.current.state.scheduler.recoveryReason).toBe(
+      "scheduler_event_watermark_impossible",
+    );
+  });
+
+  it("lets an authoritative new-epoch Bootstrap replace a buffered old-epoch candidate", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalledWith(10));
+
+    act(() => {
+      testFixture.callbacks.onSchedulerSnapshot(
+        schedulerCandidate({ as_of_event_id: 11 }),
+      );
+    });
+
+    const nextEpoch = {
+      ...bootstrap(),
+      scheduler: {
+        ...bootstrap().scheduler,
+        server_instance_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      },
+    };
+    let returnedCursor: number | undefined;
+    act(() => {
+      returnedCursor = testFixture.callbacks.onBootstrap(nextEpoch);
+    });
+
+    expect(returnedCursor).toBe(10);
+    expect(result.current.state.scheduler).toMatchObject({
+      snapshot: nextEpoch.scheduler,
+      freshness: "fresh",
+      pending: null,
+      recoveryReason: null,
+    });
   });
 
   it("buffers live events during detail fetch and replays only ids above its cursor", async () => {
@@ -699,7 +977,7 @@ describe("useAgentState", () => {
     expect(testFixture.newCreateTask).toHaveBeenCalledTimes(1);
     expect(testFixture.createTaskExecute).toHaveBeenCalledTimes(2);
     expect(result.current.state.repositoryOrder).toEqual([
-      "repo-1",
+      SCHEDULER_REPOSITORY_ID,
       "repo-added",
       "repo-picked",
     ]);
@@ -710,6 +988,42 @@ describe("useAgentState", () => {
       "task-created",
     ]);
     expect(testFixture.quit).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves queue-full create replay input and clears it after the same command succeeds", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    testFixture.createTaskExecute
+      .mockReset()
+      .mockRejectedValueOnce({
+        status: 429,
+        code: "TASK_QUEUE_FULL",
+        message: "the task queue is full",
+        retryable: true,
+        requestId: "queue-full-http-request",
+      })
+      .mockResolvedValueOnce(task("task-created", "queued", 11));
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalled());
+    const command = result.current.newCreateTask("repo-1", "original prompt");
+
+    await act(async () => {
+      await command.execute().catch(() => undefined);
+    });
+
+    expect(result.current.state.commands.queueFullReplay).toEqual({
+      repositoryId: "repo-1",
+      prompt: "original prompt",
+      clientRequestId: "stable-create-id",
+      requestId: "queue-full-http-request",
+    });
+    expect(command).toMatchObject({
+      clientRequestId: "stable-create-id",
+    });
+
+    await act(async () => {
+      await command.execute();
+    });
+    expect(result.current.state.commands.queueFullReplay).toBeNull();
   });
 
   it.each(["add", "pick", "create", "retry", "quit"] as const)(
@@ -1042,6 +1356,7 @@ describe("useAgentState", () => {
     });
     const stream = factory({
       onTaskEvent: vi.fn(),
+      onSchedulerSnapshot: vi.fn(),
       onUnknownEvent: vi.fn(),
       onServiceState: vi.fn(),
       onBootstrap,
@@ -1058,5 +1373,77 @@ describe("useAgentState", () => {
     expect(signal).toBeDefined();
     expect(signal?.aborted).toBe(true);
     expect(onBootstrap).not.toHaveBeenCalled();
+  });
+
+  it("forwards a complete scheduler snapshot through the default SSE bridge", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const snapshot = {
+      ...structuredClone(bootstrap().scheduler),
+      generation: 2,
+      active_task_count: 0,
+      queued_task_count: 0,
+      queued_tasks: [],
+      stopping_tasks: [],
+      storage: {
+        state: "normal" as const,
+        data: { state: "normal" as const },
+        runtime: { state: "normal" as const },
+        repositories: [],
+      },
+    };
+    const digest = await schedulerStateDigest(snapshot);
+    const control = {
+      schema_version: 1,
+      kind: "scheduler.state",
+      server_instance_id: snapshot.server_instance_id,
+      server_started_at: snapshot.server_started_at,
+      generation: snapshot.generation,
+      as_of_event_id: snapshot.as_of_event_id,
+      service_state_generation: snapshot.service_state_generation,
+      admission_state: snapshot.admission_state,
+      limits: snapshot.limits,
+      active_task_count: snapshot.active_task_count,
+      queued_task_count: snapshot.queued_task_count,
+      stopping_task_count: 0,
+      repository_storage_count: 0,
+      storage: {
+        state: snapshot.storage.state,
+        data: snapshot.storage.data,
+        runtime: snapshot.storage.runtime,
+      },
+      item_count: 0,
+      chunk_count: 0,
+      snapshot_digest: digest,
+    };
+    const received = deferred<SchedulerSnapshotCandidate>();
+    const factory = createSseAgentStreamFactory(testFixture.dependencies.api, {
+      fetch: async () =>
+        new Response(
+          `event: scheduler.state\ndata: ${JSON.stringify(control)}\n\n`,
+          {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream; charset=utf-8" },
+          },
+        ),
+      baseDelayMs: 1,
+      maxDelayMs: 1,
+      jitter: () => 0,
+    });
+    const stream = factory({
+      onTaskEvent: vi.fn(),
+      onSchedulerSnapshot: (candidate) => received.resolve(candidate),
+      onUnknownEvent: vi.fn(),
+      onServiceState: vi.fn(),
+      onBootstrap: (nextBootstrap) => nextBootstrap.latest_event_id,
+      onConnectionState: vi.fn(),
+      onSessionExpired: vi.fn(),
+    });
+
+    const running = stream.start(10);
+    const candidate = await received.promise;
+    stream.stop();
+    await running;
+
+    expect(candidate).toMatchObject({ snapshot, digest });
   });
 });

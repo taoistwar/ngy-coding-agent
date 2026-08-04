@@ -7,16 +7,25 @@ import type {
   PlanSnapshot,
   Repository,
   ReviewEvidence,
+  SchedulerState,
   Task,
   TaskDetail,
   TaskEvent,
   TestSnapshot,
 } from "../api/types";
+import {
+  canonicalizeSchedulerState,
+  schedulerStateDigest,
+  type SchedulerSnapshotCandidate,
+} from "../api/schedulerSnapshot";
 import { initialAgentState } from "./model";
 import { agentReducer, inspectEventProjection } from "./reducer";
 
 const NOW = "2026-07-15T00:00:00Z";
 const REVIEW_TASK_ID = "11111111-1111-4111-8111-111111111111";
+const SCHEDULER_QUEUED_TASK_ID = "22222222-2222-4222-8222-222222222222";
+const SCHEDULER_REPOSITORY_ONE = "33333333-3333-4333-8333-333333333333";
+const SCHEDULER_REPOSITORY_TWO = "44444444-4444-4444-8444-444444444444";
 
 function repository(id: string): Repository {
   return {
@@ -62,7 +71,60 @@ function bootstrap(overrides: Partial<BootstrapResponse> = {}): BootstrapRespons
     service_state: "ready",
     service_state_generation: 7,
     tasks: [task("task-1"), task("task-2", "queued")],
+    scheduler: {
+      schema_version: 1,
+      server_instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      server_started_at: NOW,
+      generation: 3,
+      as_of_event_id: 10,
+      service_state_generation: 7,
+      admission_state: "running",
+      limits: {
+        global: 4,
+        per_repository: 2,
+        queued: 32,
+        cargo_jobs_per_task: 2,
+      },
+      active_task_count: 1,
+      queued_task_count: 1,
+      queued_tasks: [
+        {
+          task_id: SCHEDULER_QUEUED_TASK_ID,
+          reason: "global_capacity",
+        },
+      ],
+      stopping_tasks: [],
+      storage: {
+        state: "normal",
+        data: { state: "normal" },
+        runtime: { state: "normal" },
+        repositories: [
+          { repository_id: SCHEDULER_REPOSITORY_ONE, state: "normal" },
+          { repository_id: SCHEDULER_REPOSITORY_TWO, state: "normal" },
+        ],
+      },
+    },
     ...overrides,
+  };
+}
+
+function schedulerAuthorityBootstrap(): BootstrapResponse {
+  const base = bootstrap();
+  const running = {
+    ...task(REVIEW_TASK_ID, "running", 10),
+    repository_id: SCHEDULER_REPOSITORY_ONE,
+  };
+  const queued = {
+    ...task(SCHEDULER_QUEUED_TASK_ID, "queued", 10),
+    repository_id: SCHEDULER_REPOSITORY_TWO,
+  };
+  return {
+    ...base,
+    repositories: [
+      repository(SCHEDULER_REPOSITORY_ONE),
+      repository(SCHEDULER_REPOSITORY_TWO),
+    ],
+    tasks: [running, queued],
   };
 }
 
@@ -216,11 +278,22 @@ function lifecycleEvent(
   } as TaskEvent;
 }
 
+async function schedulerCandidate(
+  snapshot: SchedulerState,
+): Promise<SchedulerSnapshotCandidate> {
+  return {
+    snapshot,
+    canonicalJson: canonicalizeSchedulerState(snapshot),
+    digest: await schedulerStateDigest(snapshot),
+  };
+}
+
 describe("agentReducer", () => {
   it("normalizes bootstrap collections by id while preserving order", () => {
+    const snapshot = bootstrap();
     const state = agentReducer(initialAgentState, {
       type: "bootstrap.received",
-      bootstrap: bootstrap(),
+      bootstrap: snapshot,
     });
 
     expect(state.repositoryOrder).toEqual(["repo-1", "repo-2"]);
@@ -228,6 +301,373 @@ describe("agentReducer", () => {
     expect(state.taskOrder).toEqual(["task-1", "task-2"]);
     expect(state.tasksById["task-1"]?.status).toBe("running");
     expect(state.appliedEventId).toBe(10);
+    expect(state.appliedMembershipEventId).toBe(10);
+    expect(state.scheduler).toMatchObject({
+      snapshot: snapshot.scheduler,
+      freshness: "fresh",
+      staleReason: null,
+      pending: null,
+      recoveryReason: null,
+    });
+  });
+
+  it("keeps the exact snapshot but marks it stale instead of deriving scheduler facts", () => {
+    const ready = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap(),
+    });
+    const snapshot = ready.scheduler.snapshot;
+    const afterTask = agentReducer(ready, {
+      type: "task.upserted",
+      task: task("task-3", "queued", 11),
+    });
+    const afterService = agentReducer(afterTask, {
+      type: "service.received",
+      state: "quiescing",
+      generation: 8,
+    });
+
+    expect(afterTask.scheduler.snapshot).toBe(snapshot);
+    expect(afterTask.scheduler.snapshot?.queued_tasks).toHaveLength(1);
+    expect(afterTask.scheduler).toMatchObject({
+      freshness: "stale",
+      staleReason: "task_membership_changed",
+    });
+    expect(afterService.scheduler.snapshot).toBe(snapshot);
+    expect(afterService.serviceGeneration).toBe(8);
+  });
+
+  it("advances the independent membership watermark only for lifecycle events", () => {
+    const ready = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap(),
+    });
+    const lifecycle = agentReducer(ready, {
+      type: "event.received",
+      event: lifecycleEvent(
+        11,
+        task("task-2", "running", 11),
+        "task.started",
+      ),
+    });
+
+    expect(lifecycle.appliedEventId).toBe(11);
+    expect(lifecycle.appliedMembershipEventId).toBe(11);
+    expect(lifecycle.scheduler).toMatchObject({
+      freshness: "stale",
+      staleReason: "membership_event_advanced",
+    });
+  });
+
+  it("advances membership for all six lifecycle kinds and never for projection or diagnostic events", () => {
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: bootstrap(),
+    });
+    const lifecycleKinds = [
+      ["task.queued", "queued"],
+      ["task.started", "running"],
+      ["task.completed", "completed"],
+      ["task.failed", "failed"],
+      ["task.cancelled", "cancelled"],
+      ["task.interrupted", "interrupted"],
+    ] as const;
+    for (const [index, [kind, status]] of lifecycleKinds.entries()) {
+      const id = 11 + index;
+      state = agentReducer(state, {
+        type: "event.received",
+        event: lifecycleEvent(
+          id,
+          task(`lifecycle-${id}`, status, id),
+          kind,
+        ),
+      });
+      expect(state.appliedMembershipEventId).toBe(id);
+    }
+
+    const nonMembershipKinds = [
+      "plan.updated",
+      "activity.appended",
+      "diff.updated",
+      "test.updated",
+      "review.updated",
+    ] as const;
+    for (const [index, kind] of nonMembershipKinds.entries()) {
+      state = agentReducer(state, {
+        type: "event.received",
+        event: {
+          id: 17 + index,
+          schema_version: 1,
+          task_id: "task-1",
+          kind,
+          created_at: NOW,
+          payload: {},
+        } as TaskEvent,
+      });
+      expect(state.appliedMembershipEventId).toBe(16);
+    }
+    state = agentReducer(state, {
+      type: "event.unknown",
+      id: 22,
+      kind: "future.event",
+      schemaVersion: 1,
+    });
+    expect(state.appliedMembershipEventId).toBe(16);
+    expect(state.appliedEventId).toBe(22);
+  });
+
+  it("applies a complete scheduler candidate only after both causal watermarks become exact", async () => {
+    const authoritativeBootstrap = schedulerAuthorityBootstrap();
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: authoritativeBootstrap,
+    });
+    const nextSnapshot: SchedulerState = {
+      ...authoritativeBootstrap.scheduler,
+      generation: 4,
+      as_of_event_id: 11,
+      service_state_generation: 8,
+      admission_state: "paused",
+      active_task_count: 2,
+      queued_task_count: 0,
+      queued_tasks: [],
+    };
+
+    state = agentReducer(state, {
+      type: "scheduler.received",
+      candidate: await schedulerCandidate(nextSnapshot),
+    });
+    expect(state.scheduler).toMatchObject({
+      snapshot: authoritativeBootstrap.scheduler,
+      pending: { snapshot: nextSnapshot },
+    });
+
+    state = agentReducer(state, {
+      type: "event.received",
+      event: lifecycleEvent(
+        11,
+        {
+          ...task(SCHEDULER_QUEUED_TASK_ID, "running", 11),
+          repository_id: SCHEDULER_REPOSITORY_TWO,
+        },
+        "task.started",
+      ),
+    });
+    expect(state.scheduler.pending?.snapshot).toBe(nextSnapshot);
+    expect(state.scheduler.snapshot?.generation).toBe(3);
+
+    state = agentReducer(state, {
+      type: "service.received",
+      state: "quiescing",
+      generation: 8,
+    });
+    expect(state.scheduler).toMatchObject({
+      snapshot: nextSnapshot,
+      freshness: "fresh",
+      pending: null,
+      recoveryReason: null,
+    });
+  });
+
+  it("fails closed when a fresh live candidate disagrees with authoritative task state", async () => {
+    const authoritativeBootstrap = schedulerAuthorityBootstrap();
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: authoritativeBootstrap,
+    });
+    const invalidSnapshot: SchedulerState = {
+      ...authoritativeBootstrap.scheduler,
+      generation: 4,
+      active_task_count: 0,
+    };
+
+    state = agentReducer(state, {
+      type: "scheduler.received",
+      candidate: await schedulerCandidate(invalidSnapshot),
+    });
+
+    expect(state.connection).toBe("protocol_error");
+    expect(state.scheduler).toMatchObject({
+      snapshot: null,
+      pending: null,
+      recoveryReason: "scheduler_authority_mismatch",
+    });
+  });
+
+  it("recovers when a non-membership persisted cursor passes a pending membership watermark", async () => {
+    const authoritativeBootstrap = schedulerAuthorityBootstrap();
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: authoritativeBootstrap,
+    });
+    const impossibleSnapshot: SchedulerState = {
+      ...authoritativeBootstrap.scheduler,
+      generation: 4,
+      as_of_event_id: 11,
+    };
+    state = agentReducer(state, {
+      type: "scheduler.received",
+      candidate: await schedulerCandidate(impossibleSnapshot),
+    });
+
+    state = agentReducer(state, {
+      type: "event.unknown",
+      id: 11,
+      kind: "future.non_membership",
+      schemaVersion: 1,
+    });
+
+    expect(state.appliedMembershipEventId).toBe(10);
+    expect(state.scheduler.recoveryReason).toBe(
+      "scheduler_event_watermark_impossible",
+    );
+  });
+
+  it("drops causally old controls and does not let an older Bootstrap overwrite live generation", async () => {
+    const originalBootstrap = schedulerAuthorityBootstrap();
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: originalBootstrap,
+    });
+    const liveSnapshot: SchedulerState = {
+      ...originalBootstrap.scheduler,
+      generation: 4,
+      admission_state: "paused",
+    };
+    state = agentReducer(state, {
+      type: "scheduler.received",
+      candidate: await schedulerCandidate(liveSnapshot),
+    });
+    state = agentReducer(state, {
+      type: "bootstrap.received",
+      bootstrap: originalBootstrap,
+    });
+    expect(state.scheduler.snapshot).toBe(liveSnapshot);
+
+    state = agentReducer(state, {
+      type: "service.received",
+      state: "quiescing",
+      generation: 8,
+    });
+    const oldButHigherGeneration: SchedulerState = {
+      ...originalBootstrap.scheduler,
+      generation: 5,
+    };
+    state = agentReducer(state, {
+      type: "scheduler.received",
+      candidate: await schedulerCandidate(oldButHigherGeneration),
+    });
+    expect(state.scheduler.pending).toBeNull();
+    expect(state.scheduler.snapshot).toBe(liveSnapshot);
+    expect(state.scheduler.freshness).toBe("stale");
+  });
+
+  it("resets service generation for an authoritative new epoch but keeps one epoch monotonic", () => {
+    const authority = schedulerAuthorityBootstrap();
+    const oldEpoch = {
+      ...authority,
+      service_state_generation: 100,
+      scheduler: {
+        ...authority.scheduler,
+        generation: 100,
+        service_state_generation: 100,
+      },
+    };
+    const newEpoch = {
+      ...authority,
+      service_state_generation: 1,
+      scheduler: {
+        ...authority.scheduler,
+        server_instance_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        generation: 1,
+        service_state_generation: 1,
+      },
+    };
+
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: oldEpoch,
+    });
+    state = agentReducer(state, {
+      type: "bootstrap.received",
+      bootstrap: newEpoch,
+    });
+
+    expect(state.serviceGeneration).toBe(1);
+    expect(state.serviceState).toBe("ready");
+    expect(state.scheduler).toMatchObject({
+      snapshot: newEpoch.scheduler,
+      freshness: "fresh",
+      pending: null,
+      recoveryReason: null,
+    });
+
+    state = agentReducer(state, {
+      type: "service.received",
+      state: "store_degraded",
+      generation: 2,
+    });
+    state = agentReducer(state, {
+      type: "bootstrap.received",
+      bootstrap: newEpoch,
+    });
+
+    expect(state.serviceGeneration).toBe(2);
+    expect(state.serviceState).toBe("store_degraded");
+    expect(state.scheduler.snapshot).toBe(newEpoch.scheduler);
+  });
+
+  it("clears scheduler state and flags recovery for a new epoch", async () => {
+    const authoritativeBootstrap = schedulerAuthorityBootstrap();
+    let state = agentReducer(initialAgentState, {
+      type: "bootstrap.received",
+      bootstrap: authoritativeBootstrap,
+    });
+    const nextEpoch: SchedulerState = {
+      ...authoritativeBootstrap.scheduler,
+      server_instance_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      generation: 1,
+    };
+
+    state = agentReducer(state, {
+      type: "scheduler.received",
+      candidate: await schedulerCandidate(nextEpoch),
+    });
+
+    expect(state.connection).toBe("protocol_error");
+    expect(state.scheduler).toMatchObject({
+      snapshot: null,
+      pending: null,
+      recoveryReason: "scheduler_instance_changed",
+    });
+  });
+
+  it("retains queue-full create replay input until the same request succeeds", () => {
+    const queued = agentReducer(initialAgentState, {
+      type: "create.queue_full",
+      replay: {
+        repositoryId: "repo-1",
+        prompt: "ship it",
+        clientRequestId: "request-1",
+        requestId: "http-request-1",
+      },
+    });
+    const unrelated = agentReducer(queued, {
+      type: "create.succeeded",
+      clientRequestId: "request-2",
+    });
+    const cleared = agentReducer(unrelated, {
+      type: "create.succeeded",
+      clientRequestId: "request-1",
+    });
+
+    expect(unrelated.commands.queueFullReplay).toEqual({
+      repositoryId: "repo-1",
+      prompt: "ship it",
+      clientRequestId: "request-1",
+      requestId: "http-request-1",
+    });
+    expect(cleared.commands.queueFullReplay).toBeNull();
   });
 
   it("ignores duplicate persisted ids and marks older ids as protocol recovery", () => {

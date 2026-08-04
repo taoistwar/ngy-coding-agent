@@ -47,9 +47,21 @@ test("keeps four tasks running, cancels the queued fifth, and starts only the si
     (roots): ProcessScenario => {
       runnerReleasePath = roots.releaseSignalPath("release-first-runner");
       return {
-        // Only five tasks can start: the first four and, after task five is
-        // cancelled, task six. Every possible launch has an explicit script.
+        runtime_config: {
+          schema_version: 1,
+          max_concurrent_tasks: 4,
+          max_concurrent_tasks_per_repository: 4,
+          max_queued_tasks: 32,
+          storage: {
+            data_control_reserve_bytes: 1,
+            data_task_reservation_bytes: 1,
+          },
+        },
+        // This scenario explicitly raises the P4-A limits to four so only five
+        // tasks can start: the first four and, after task five is cancelled,
+        // task six. Every possible launch has an explicit script.
         fake_scenarios: ["blocking", "blocking", "blocking", "blocking", "blocking"],
+        storage_samples: [{ kind: "native" }],
         store_writer_faults: [],
         actor_pauses: [],
         virtual_release_signals: [
@@ -146,7 +158,9 @@ test("isolates failure and panic across retries and keeps old attempts read-only
   page,
 }, testInfo) => {
   const scenario: ProcessScenario = {
+    runtime_config: null,
     fake_scenarios: ["failure", "panic", "success"],
+    storage_samples: [{ kind: "native" }],
     store_writer_faults: [],
     actor_pauses: [],
     virtual_release_signals: [],

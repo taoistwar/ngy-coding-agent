@@ -1,26 +1,40 @@
 //! Persistence responsibilities for coding-agent domain data.
 
 mod artifacts;
+mod claims;
 mod migrate;
 mod projection;
+mod recovery;
 mod repositories;
 mod reviews;
+mod stop_intents;
 mod tasks;
 
 use std::path::Path;
 use std::time::Duration;
 
 use coding_agent_domain::{DomainError, TaskStatus};
-use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Connection as _, SqlitePool};
 
-pub use projection::{BootstrapSnapshot, EventPage, TaskDetail};
-pub use repositories::RegisterRepositoryOutcome;
-pub use reviews::{FinalizeReviewedTaskOutcome, RecordReviewOutcome};
-pub use tasks::{
-    AppendEventOutcome, CreateTaskOutcome, RecoveryOutcome, RetryTaskOutcome, TaskTransition,
-    TransitionOutcome,
+pub use projection::{
+    BootstrapSnapshot, EventPage, QueueCapacity, SchedulerBootstrapSnapshot, TaskDetail,
 };
+pub use recovery::RecoveryReceipt;
+pub use repositories::{RegisterRepositoryOutcome, RepositoryIdentityLookup};
+pub use reviews::{FinalizeReviewedTaskOutcome, RecordReviewOutcome};
+pub use stop_intents::{
+    FinalizeStoppedTaskOutcome, FinalizeStoppedTaskReceipt, FinalizeStoppedTaskRequest,
+    MAX_STOP_INTENT_BATCH, PersistStopIntentOutcome, StopIntentBatchItem, StopIntentBatchReceipt,
+    StopIntentKind, StopIntentReceipt, StopIntentRequest,
+};
+pub use tasks::{
+    AppendEventOutcome, CreateTaskOutcome, FinalizeUnreviewedTaskOutcome,
+    FinalizeUnreviewedTaskRequest, QueueLimitedCreateTaskOutcome, QueueLimitedRetryTaskOutcome,
+    RecoveryOutcome, RetryTaskOutcome, TaskTransition, TransitionOutcome,
+};
+
+pub const DATABASE_SCHEMA_UNSUPPORTED: &str = "DATABASE_SCHEMA_UNSUPPORTED";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -44,6 +58,10 @@ pub enum StoreError {
     InvalidEventSchemaVersion(i64),
     #[error("stored attempt artifact state is invalid: {0}")]
     InvalidArtifactState(String),
+    #[error("DATABASE_SCHEMA_UNSUPPORTED")]
+    DatabaseSchemaUnsupported,
+    #[error("database migration failed")]
+    DatabaseMigration(#[source] sqlx::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("illegal task transition from {from:?} to {to:?}")]
@@ -107,23 +125,27 @@ impl Store {
         migrate::run(&self.pool).await
     }
 
-    /// Checkpoints the WAL and then closes every handle sharing this store's pool.
+    /// Seals and drains every handle sharing this store's pool, then checkpoints the WAL.
     ///
-    /// Pool closure is unconditional: callers receive the checkpoint error only after
-    /// SQLx has closed the shared pool, so a failed checkpoint cannot leave SQLite
-    /// handles live during process shutdown.
+    /// A dedicated connection is opened after pool closure so the strict truncating
+    /// checkpoint runs only after every pooled reader has stopped. The dedicated
+    /// connection is closed unconditionally, including when the checkpoint fails.
     pub async fn checkpoint_and_close(&self) -> Result<(), StoreError> {
-        let checkpoint = async {
-            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
-                sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
-                    .fetch_one(&self.pool)
-                    .await?;
-            validate_wal_checkpoint(busy, log_frames, checkpointed_frames)
-        }
-        .await;
-
+        let checkpoint_options = self
+            .pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .create_if_missing(false);
         self.pool.close().await;
-        checkpoint
+
+        let mut checkpoint_connection = SqliteConnection::connect_with(&checkpoint_options).await?;
+        let checkpoint = checkpoint_wal(&mut checkpoint_connection).await;
+        let close = checkpoint_connection
+            .close()
+            .await
+            .map_err(StoreError::from);
+        checkpoint.and(close)
     }
 
     /// Closes every handle sharing this store's pool without exposing raw SQL access.
@@ -140,6 +162,14 @@ impl Store {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+async fn checkpoint_wal(connection: &mut SqliteConnection) -> Result<(), StoreError> {
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(connection)
+            .await?;
+    validate_wal_checkpoint(busy, log_frames, checkpointed_frames)
 }
 
 fn validate_wal_checkpoint(
@@ -163,4 +193,7 @@ fn validate_wal_checkpoint(
 pub use artifacts::{
     AttemptArtifactIdentity, AttemptArtifactState, ReserveAttemptArtifact,
     ReserveAttemptArtifactOutcome, TaskAttemptArtifact, UpdateAttemptArtifactOutcome,
+};
+pub use claims::{
+    ClaimTaskOutcome, ClaimTaskReceipt, ClaimTaskReconciliationOutcome, ClaimTaskRequest,
 };

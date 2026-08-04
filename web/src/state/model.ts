@@ -5,6 +5,10 @@ import type {
   TaskDetail,
   TaskEvent,
 } from "../api/types";
+import {
+  initialSchedulerProjection,
+  type SchedulerProjectionState,
+} from "./schedulerProjection";
 
 export type AgentConnectionState =
   | "bootstrapping"
@@ -43,6 +47,14 @@ export type CancelCommandState =
 
 export interface EphemeralCommands {
   cancelByTaskId: Record<string, CancelCommandState>;
+  queueFullReplay: QueueFullReplayState | null;
+}
+
+export interface QueueFullReplayState {
+  repositoryId: string;
+  prompt: string;
+  clientRequestId: string;
+  requestId: string | null;
 }
 
 export interface SnapshotRecoveryState {
@@ -68,8 +80,11 @@ export interface AgentState {
   snapshotRecovery: SnapshotRecoveryState | null;
   recoveryBuffer: TaskEvent[];
   appliedEventId: number;
+  appliedMembershipEventId: number;
+  serverInstanceId: string | null;
   serviceState: BootstrapResponse["service_state"] | null;
   serviceGeneration: number;
+  scheduler: SchedulerProjectionState;
   diagnostics: IgnoredEventDiagnostic[];
   commands: EphemeralCommands;
   connection: AgentConnectionState;
@@ -91,10 +106,13 @@ export const initialAgentState: AgentState = {
   snapshotRecovery: null,
   recoveryBuffer: [],
   appliedEventId: 0,
+  appliedMembershipEventId: 0,
+  serverInstanceId: null,
   serviceState: null,
   serviceGeneration: 0,
+  scheduler: initialSchedulerProjection,
   diagnostics: [],
-  commands: { cancelByTaskId: {} },
+  commands: { cancelByTaskId: {}, queueFullReplay: null },
   connection: "bootstrapping",
   recoveryReason: null,
 };

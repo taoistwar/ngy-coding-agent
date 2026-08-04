@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::command_policy::{ExecutionDirectory, PinnedExecutable, ValidatedCommand};
+use crate::process_liveness::ProcessLivenessScope;
 use crate::process_supervisor::{ChildEnvironment, ProcessError, ProcessLimits, ProcessSupervisor};
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -146,6 +147,7 @@ impl ToolDiscoveryError {
 /// bootstrap child.
 pub async fn discover(
     runtime_safe_cwd: impl AsRef<Path>,
+    process_liveness_scope: ProcessLivenessScope,
     explicit_bootstrap_rustc: Option<&Path>,
     explicit_bootstrap_git: Option<&Path>,
 ) -> Result<ToolchainPaths, ToolDiscoveryError> {
@@ -188,6 +190,7 @@ pub async fn discover(
         &git,
         Arc::clone(&runtime_safe_cwd),
         bootstrap_environment.clone(),
+        process_liveness_scope.clone(),
     )
     .await?;
     require_supported_git_version(&git_version_output)?;
@@ -196,8 +199,13 @@ pub async fn discover(
     let sysroot = if let Some(known_sysroot) = known_sysroot {
         known_sysroot
     } else {
-        let sysroot_output =
-            query_sysroot(bootstrap_rustc, runtime_safe_cwd, bootstrap_environment).await?;
+        let sysroot_output = query_sysroot(
+            bootstrap_rustc,
+            runtime_safe_cwd,
+            bootstrap_environment,
+            process_liveness_scope,
+        )
+        .await?;
         parse_sysroot_line(&sysroot_output)?
     };
     let sysroot = canonical_existing_directory(&sysroot, ToolDiscoveryError::SysrootInvalid)?;
@@ -766,6 +774,7 @@ async fn query_sysroot(
     rustc: BootstrapExecutable,
     runtime_safe_cwd: Arc<ExecutionDirectory>,
     environment: BootstrapEnvironment,
+    process_liveness_scope: ProcessLivenessScope,
 ) -> Result<Vec<u8>, ToolDiscoveryError> {
     let command = ValidatedCommand::rustc_sysroot(
         Arc::new(rustc.pinned),
@@ -781,7 +790,7 @@ async fn query_sysroot(
         BOOTSTRAP_CLEANUP_TIMEOUT,
     )
     .map_err(|_| ToolDiscoveryError::BootstrapEnvironmentInvalid)?;
-    let result = ProcessSupervisor::new(limits)
+    let result = ProcessSupervisor::new(limits, process_liveness_scope)
         .run(command, CancellationToken::new())
         .await
         .map_err(map_bootstrap_process_error)?;
@@ -811,6 +820,7 @@ async fn query_git_version(
     git: &BootstrapExecutable,
     runtime_safe_cwd: Arc<ExecutionDirectory>,
     environment: BootstrapEnvironment,
+    process_liveness_scope: ProcessLivenessScope,
 ) -> Result<Vec<u8>, ToolDiscoveryError> {
     let command = ValidatedCommand::git_version(
         Arc::new(
@@ -830,7 +840,7 @@ async fn query_git_version(
         BOOTSTRAP_CLEANUP_TIMEOUT,
     )
     .map_err(|_| ToolDiscoveryError::BootstrapEnvironmentInvalid)?;
-    let result = ProcessSupervisor::new(limits)
+    let result = ProcessSupervisor::new(limits, process_liveness_scope)
         .run(command, CancellationToken::new())
         .await
         .map_err(map_git_process_error)?;
@@ -861,15 +871,18 @@ fn map_git_process_error(error: ProcessError) -> ToolDiscoveryError {
         ProcessError::InvalidCommand
         | ProcessError::CommandPolicy(_)
         | ProcessError::TimeoutOutsideLimit => ToolDiscoveryError::BootstrapGitInvalid,
-        ProcessError::SpawnFailed(_) | ProcessError::TreeSetupFailed(_) => {
-            ToolDiscoveryError::BootstrapGitSpawnFailed
-        }
+        ProcessError::SpawnFailed(_)
+        | ProcessError::TreeSetupFailed(_)
+        | ProcessError::LivenessSetupFailed(_) => ToolDiscoveryError::BootstrapGitSpawnFailed,
         ProcessError::MissingOutputPipe | ProcessError::OutputDrainFailed(_) => {
             ToolDiscoveryError::BootstrapGitOutputFailed
         }
         ProcessError::WaitFailed(_)
+        | ProcessError::TreeControlLost(_)
         | ProcessError::TreeCleanupFailed(_)
         | ProcessError::CleanupTimedOut
+        | ProcessError::LivenessCleanupUnproven
+        | ProcessError::LivenessCleanupFailed(_)
         | ProcessError::WorkerFailed => ToolDiscoveryError::BootstrapGitWaitFailed,
     }
 }
@@ -920,15 +933,18 @@ fn map_bootstrap_process_error(error: ProcessError) -> ToolDiscoveryError {
         ProcessError::InvalidCommand
         | ProcessError::CommandPolicy(_)
         | ProcessError::TimeoutOutsideLimit => ToolDiscoveryError::BootstrapRustcInvalid,
-        ProcessError::SpawnFailed(_) | ProcessError::TreeSetupFailed(_) => {
-            ToolDiscoveryError::BootstrapSpawnFailed
-        }
+        ProcessError::SpawnFailed(_)
+        | ProcessError::TreeSetupFailed(_)
+        | ProcessError::LivenessSetupFailed(_) => ToolDiscoveryError::BootstrapSpawnFailed,
         ProcessError::MissingOutputPipe | ProcessError::OutputDrainFailed(_) => {
             ToolDiscoveryError::BootstrapOutputFailed
         }
         ProcessError::WaitFailed(_)
+        | ProcessError::TreeControlLost(_)
         | ProcessError::TreeCleanupFailed(_)
         | ProcessError::CleanupTimedOut
+        | ProcessError::LivenessCleanupUnproven
+        | ProcessError::LivenessCleanupFailed(_)
         | ProcessError::WorkerFailed => ToolDiscoveryError::BootstrapWaitFailed,
     }
 }

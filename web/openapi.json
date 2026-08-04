@@ -732,6 +732,16 @@
               }
             }
           },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "",
             "content": {
@@ -1141,6 +1151,16 @@
               }
             }
           },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "",
             "content": {
@@ -1325,7 +1345,8 @@
           "server_started_at",
           "service_state",
           "service_state_generation",
-          "max_concurrent_tasks"
+          "max_concurrent_tasks",
+          "scheduler"
         ],
         "properties": {
           "csrf_token": {
@@ -1333,18 +1354,24 @@
           },
           "latest_event_id": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
           },
           "max_concurrent_tasks": {
             "type": "integer",
             "format": "int32",
-            "minimum": 0
+            "maximum": 4,
+            "minimum": 1
           },
           "repositories": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RepositoryDto"
             }
+          },
+          "scheduler": {
+            "$ref": "#/components/schemas/SchedulerStateDto"
           },
           "server_started_at": {
             "$ref": "#/components/schemas/UtcTimestampDto"
@@ -1355,6 +1382,7 @@
           "service_state_generation": {
             "type": "integer",
             "format": "int64",
+            "maximum": 9007199254740991,
             "minimum": 0
           },
           "tasks": {
@@ -2122,6 +2150,561 @@
           "changes_requested"
         ]
       },
+      "SchedulerAdmissionStateDto": {
+        "type": "string",
+        "enum": [
+          "running",
+          "paused"
+        ]
+      },
+      "SchedulerControlStorageDto": {
+        "type": "object",
+        "required": [
+          "state",
+          "data",
+          "runtime"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SchedulerStorageScopeDto"
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/SchedulerStorageScopeDto"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SchedulerStorageStateDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerLimitsDto": {
+        "type": "object",
+        "required": [
+          "global",
+          "per_repository",
+          "queued",
+          "cargo_jobs_per_task"
+        ],
+        "properties": {
+          "cargo_jobs_per_task": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 8,
+            "minimum": 1
+          },
+          "global": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4,
+            "minimum": 1
+          },
+          "per_repository": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4,
+            "minimum": 1
+          },
+          "queued": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 256,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerQueueReasonDto": {
+        "type": "string",
+        "enum": [
+          "service_paused",
+          "storage_pressure",
+          "global_capacity",
+          "repository_capacity",
+          "repository_control_busy"
+        ]
+      },
+      "SchedulerQueuedTaskDto": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/SchedulerQueueReasonDto"
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerQueuedTaskItemDto": {
+        "type": "object",
+        "required": [
+          "kind",
+          "task_id",
+          "reason"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/SchedulerQueuedTaskItemKind"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/SchedulerQueueReasonDto"
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerQueuedTaskItemKind": {
+        "type": "string",
+        "enum": [
+          "queued_task"
+        ]
+      },
+      "SchedulerRepositoryStorageDto": {
+        "type": "object",
+        "required": [
+          "repository_id",
+          "state"
+        ],
+        "properties": {
+          "repository_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SchedulerStorageStateDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerRepositoryStorageItemDto": {
+        "type": "object",
+        "required": [
+          "kind",
+          "repository_id",
+          "state"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/SchedulerRepositoryStorageItemKind"
+          },
+          "repository_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SchedulerStorageStateDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerRepositoryStorageItemKind": {
+        "type": "string",
+        "enum": [
+          "repository_storage"
+        ]
+      },
+      "SchedulerStateChunkControl": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "kind",
+          "server_instance_id",
+          "generation",
+          "snapshot_digest",
+          "chunk_index",
+          "chunk_count",
+          "items"
+        ],
+        "properties": {
+          "chunk_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4294967295,
+            "minimum": 1
+          },
+          "chunk_index": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchedulerStateItemDto"
+            },
+            "maxItems": 128,
+            "minItems": 1
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SchedulerStateChunkKind"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "server_instance_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "snapshot_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerStateChunkKind": {
+        "type": "string",
+        "enum": [
+          "scheduler.state.chunk"
+        ]
+      },
+      "SchedulerStateControl": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "kind",
+          "server_instance_id",
+          "server_started_at",
+          "generation",
+          "as_of_event_id",
+          "service_state_generation",
+          "admission_state",
+          "limits",
+          "active_task_count",
+          "queued_task_count",
+          "stopping_task_count",
+          "repository_storage_count",
+          "storage",
+          "item_count",
+          "chunk_count",
+          "snapshot_digest"
+        ],
+        "properties": {
+          "active_task_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4,
+            "minimum": 0
+          },
+          "admission_state": {
+            "$ref": "#/components/schemas/SchedulerAdmissionStateDto"
+          },
+          "as_of_event_id": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "chunk_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "item_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SchedulerStateKind"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/SchedulerLimitsDto"
+          },
+          "queued_task_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "repository_storage_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "server_instance_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "server_started_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "service_state_generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "snapshot_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "stopping_task_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4,
+            "minimum": 0
+          },
+          "storage": {
+            "$ref": "#/components/schemas/SchedulerControlStorageDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerStateDto": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "server_instance_id",
+          "server_started_at",
+          "generation",
+          "as_of_event_id",
+          "service_state_generation",
+          "admission_state",
+          "limits",
+          "active_task_count",
+          "queued_task_count",
+          "queued_tasks",
+          "stopping_tasks",
+          "storage"
+        ],
+        "properties": {
+          "active_task_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4,
+            "minimum": 0
+          },
+          "admission_state": {
+            "$ref": "#/components/schemas/SchedulerAdmissionStateDto"
+          },
+          "as_of_event_id": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "limits": {
+            "$ref": "#/components/schemas/SchedulerLimitsDto"
+          },
+          "queued_task_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 4294967295,
+            "minimum": 0
+          },
+          "queued_tasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchedulerQueuedTaskDto"
+            }
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 1,
+            "minimum": 1
+          },
+          "server_instance_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "server_started_at": {
+            "$ref": "#/components/schemas/UtcTimestampDto"
+          },
+          "service_state_generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "stopping_tasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchedulerStoppingTaskDto"
+            },
+            "maxItems": 4
+          },
+          "storage": {
+            "$ref": "#/components/schemas/SchedulerStorageDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerStateItemDto": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SchedulerQueuedTaskItemDto"
+          },
+          {
+            "$ref": "#/components/schemas/SchedulerStoppingTaskItemDto"
+          },
+          {
+            "$ref": "#/components/schemas/SchedulerRepositoryStorageItemDto"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "queued_task": "#/components/schemas/SchedulerQueuedTaskItemDto",
+            "repository_storage": "#/components/schemas/SchedulerRepositoryStorageItemDto",
+            "stopping_task": "#/components/schemas/SchedulerStoppingTaskItemDto"
+          }
+        }
+      },
+      "SchedulerStateKind": {
+        "type": "string",
+        "enum": [
+          "scheduler.state"
+        ]
+      },
+      "SchedulerStopIntentDto": {
+        "type": "string",
+        "enum": [
+          "user_cancelled",
+          "disk_pressure_critical"
+        ]
+      },
+      "SchedulerStoppingTaskDto": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "intent"
+        ],
+        "properties": {
+          "intent": {
+            "$ref": "#/components/schemas/SchedulerStopIntentDto"
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerStoppingTaskItemDto": {
+        "type": "object",
+        "required": [
+          "kind",
+          "task_id",
+          "intent"
+        ],
+        "properties": {
+          "intent": {
+            "$ref": "#/components/schemas/SchedulerStopIntentDto"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SchedulerStoppingTaskItemKind"
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerStoppingTaskItemKind": {
+        "type": "string",
+        "enum": [
+          "stopping_task"
+        ]
+      },
+      "SchedulerStorageDto": {
+        "type": "object",
+        "required": [
+          "state",
+          "data",
+          "runtime",
+          "repositories"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SchedulerStorageScopeDto"
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchedulerRepositoryStorageDto"
+            }
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/SchedulerStorageScopeDto"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SchedulerStorageStateDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerStorageScopeDto": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/SchedulerStorageStateDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchedulerStorageStateDto": {
+        "type": "string",
+        "enum": [
+          "normal",
+          "pressure",
+          "critical",
+          "unavailable"
+        ]
+      },
       "ServiceStateControl": {
         "type": "object",
         "required": [
@@ -2184,6 +2767,12 @@
           },
           {
             "$ref": "#/components/schemas/ServiceStateControl"
+          },
+          {
+            "$ref": "#/components/schemas/SchedulerStateControl"
+          },
+          {
+            "$ref": "#/components/schemas/SchedulerStateChunkControl"
           }
         ]
       },

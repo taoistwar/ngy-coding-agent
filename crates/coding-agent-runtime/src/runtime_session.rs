@@ -1,4 +1,5 @@
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +17,8 @@ use crate::{
     CargoRunStatus, CargoToolError, CargoToolLimits, CargoTools, CommandPolicyError, DiffCollector,
     DiffError, DiffLimits, ExecutionDirectory, FileEntryKind, FileToolError, FileToolLimits,
     FileTools, FingerprintError, FingerprintLimits, GitRunResult, GitRunStatus, GitToolError,
-    GitToolLimits, GitTools, ProcessLimits, ProvisionedWorktree, RelativePath, ToolchainPaths,
-    WorkspaceFingerprinter,
+    GitToolLimits, GitTools, ProcessLimits, ProcessLivenessScope, ProvisionedWorktree,
+    RelativePath, ToolchainPaths, WorkspaceFingerprinter,
 };
 
 pub const ATTEMPT_IDENTITY_MISMATCH: &str = "ATTEMPT_IDENTITY_MISMATCH";
@@ -136,6 +137,7 @@ pub struct RuntimeSession {
     cargo_catalog: CargoCatalog,
     pub(crate) output_redactor: KnownPathRedactor,
     pub(crate) validation_timeout: Duration,
+    pub(crate) cargo_jobs_per_task: NonZeroU32,
     pub(crate) review_diff_state: ReviewDiffState,
 }
 
@@ -144,6 +146,8 @@ impl RuntimeSession {
         worktree: &ProvisionedWorktree,
         toolchain: &ToolchainPaths,
         temporary_directory: impl AsRef<Path>,
+        process_liveness_scope: ProcessLivenessScope,
+        cargo_jobs_per_task: NonZeroU32,
         limits: RuntimeSessionLimits,
     ) -> Result<Self, RuntimeSessionError> {
         let work_tree = worktree.work_tree();
@@ -160,6 +164,7 @@ impl RuntimeSession {
             worktree.cargo_workspace(),
             worktree.target_directory(),
             temporary_directory,
+            process_liveness_scope.clone(),
             limits.process,
             limits.cargo,
         )
@@ -175,6 +180,7 @@ impl RuntimeSession {
             worktree.git_directory(),
             Arc::clone(&work_tree),
             temporary_directory,
+            process_liveness_scope.clone(),
             limits.process,
             limits.git,
         )
@@ -184,6 +190,7 @@ impl RuntimeSession {
             worktree.git_directory(),
             Arc::clone(&work_tree),
             temporary_directory,
+            process_liveness_scope.clone(),
             limits.process,
             limits.diff,
         )
@@ -193,6 +200,7 @@ impl RuntimeSession {
             worktree.git_directory(),
             work_tree,
             temporary_directory,
+            process_liveness_scope,
             limits.process,
             limits.fingerprint,
         )
@@ -208,6 +216,7 @@ impl RuntimeSession {
             cargo_catalog: worktree.cargo_catalog().clone(),
             output_redactor,
             validation_timeout: limits.validation_timeout,
+            cargo_jobs_per_task,
             review_diff_state: ReviewDiffState::default(),
         })
     }
@@ -434,6 +443,7 @@ impl ToolRuntime for RuntimeSession {
             } => match self
                 .cargo
                 .check(
+                    self.cargo_jobs_per_task,
                     package.as_deref(),
                     Duration::from_millis(timeout_ms),
                     cancellation,
@@ -450,6 +460,7 @@ impl ToolRuntime for RuntimeSession {
             } => match self
                 .cargo
                 .test(
+                    self.cargo_jobs_per_task,
                     package.as_deref(),
                     test.as_deref(),
                     Duration::from_millis(timeout_ms),

@@ -3,8 +3,8 @@ mod support;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use coding_agent_domain::{CanonicalPath, UtcTimestamp};
-use coding_agent_store::RegisterRepositoryOutcome;
+use coding_agent_domain::{CanonicalPath, RepositoryId, UtcTimestamp};
+use coding_agent_store::{RegisterRepositoryOutcome, StoreError};
 use time::OffsetDateTime;
 
 #[tokio::test]
@@ -247,6 +247,152 @@ async fn repository_rows_store_lowercase_uuids_rfc3339_times_and_identity_keys()
     }
 }
 
+#[tokio::test]
+async fn identity_lookups_are_sorted_by_repository_id_and_preserve_git_aliases() {
+    let fixture = support::store_fixture().await;
+    let first_input = fixture.canonical_repository_input("identity-first").await;
+    let mut second_input = first_input.clone();
+    second_input.selected_path = fixture.canonical_path("repositories/identity-second").await;
+    second_input.display_name = "identity-second".to_owned();
+    second_input.cargo_workspace_root = fixture
+        .canonical_path("repositories/identity-second/cargo")
+        .await;
+
+    let first = match fixture
+        .store
+        .register_repository(first_input.clone())
+        .await
+        .unwrap()
+    {
+        RegisterRepositoryOutcome::Created(repository) => repository,
+        RegisterRepositoryOutcome::Existing(_) => panic!("first identity pair must be new"),
+    };
+    let second = match fixture
+        .store
+        .register_repository(second_input)
+        .await
+        .unwrap()
+    {
+        RegisterRepositoryOutcome::Created(repository) => repository,
+        RegisterRepositoryOutcome::Existing(_) => panic!("second identity pair must be new"),
+    };
+
+    let lookups = fixture
+        .store
+        .list_repository_identity_lookups()
+        .await
+        .unwrap();
+    let mut expected_ids = vec![first.id, second.id];
+    expected_ids.sort_by_key(ToString::to_string);
+
+    assert_eq!(
+        lookups
+            .iter()
+            .map(|lookup| lookup.repository_id)
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    assert_eq!(lookups.len(), 2);
+    assert!(
+        lookups
+            .iter()
+            .all(|lookup| lookup.git_root == first_input.git_root),
+        "each alias must retain the exact validated Git root projection"
+    );
+    assert_eq!(lookups[0].git_identity_key, lookups[1].git_identity_key);
+    assert_eq!(
+        lookups[0].git_identity_key,
+        expected_identity_key(&first_input.git_root)
+    );
+
+    let rendered = format!("{:?}", lookups[0]);
+    assert!(rendered.contains(&lookups[0].repository_id.to_string()));
+    assert_eq!(
+        rendered.matches("<redacted>").count(),
+        2,
+        "both path-derived fields must be redacted"
+    );
+    assert!(!rendered.contains(&lookups[0].git_identity_key));
+    assert!(!rendered.contains(&lookups[0].git_root.to_string()));
+}
+
+#[tokio::test]
+async fn one_repository_identity_lookup_is_exact_and_missing_is_not_guessed() {
+    let fixture = support::store_fixture().await;
+    let input = fixture
+        .canonical_repository_input("single-identity-lookup")
+        .await;
+    let repository = match fixture
+        .store
+        .register_repository(input.clone())
+        .await
+        .unwrap()
+    {
+        RegisterRepositoryOutcome::Created(repository) => repository,
+        RegisterRepositoryOutcome::Existing(_) => panic!("fixture identity must be new"),
+    };
+
+    let lookup = fixture
+        .store
+        .repository_identity_lookup(repository.id)
+        .await
+        .unwrap()
+        .expect("durable repository has one identity lookup");
+    assert_eq!(lookup.repository_id, repository.id);
+    assert_eq!(lookup.git_root, input.git_root);
+    assert_eq!(
+        lookup.git_identity_key,
+        expected_identity_key(&input.git_root)
+    );
+    assert!(
+        fixture
+            .store
+            .repository_identity_lookup(RepositoryId::new())
+            .await
+            .unwrap()
+            .is_none(),
+        "runtime attachment must never infer a row for an unknown ID"
+    );
+}
+
+#[tokio::test]
+async fn identity_lookup_projection_fails_closed_without_echoing_corrupt_rows() {
+    for corruption in [
+        IdentityLookupCorruption::UppercaseId,
+        IdentityLookupCorruption::NoncanonicalGitRoot,
+        IdentityLookupCorruption::WrongGitIdentityKey,
+        IdentityLookupCorruption::IdBlob,
+        IdentityLookupCorruption::GitRootBlob,
+        IdentityLookupCorruption::GitIdentityKeyBlob,
+    ] {
+        let fixture = support::store_fixture().await;
+        let input = fixture
+            .canonical_repository_input("lookup-corruption")
+            .await;
+        fixture.store.register_repository(input).await.unwrap();
+        let secret = corrupt_identity_lookup_row(&fixture.store, corruption).await;
+
+        let error = fixture
+            .store
+            .list_repository_identity_lookups()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::InvariantViolation("repository identity lookup projection is inconsistent")
+        ));
+        let rendered = error.to_string();
+        assert_eq!(
+            rendered,
+            "store invariant failed: repository identity lookup projection is inconsistent"
+        );
+        assert!(
+            !rendered.contains(&secret),
+            "corrupt stored content must not be echoed"
+        );
+    }
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_identity_reuses_case_variant_paths() {
@@ -263,7 +409,8 @@ async fn windows_identity_reuses_case_variant_paths() {
     };
 
     let mut variant = input;
-    variant.git_root = lowercase_path(&variant.git_root);
+    let lowercase_git_root = lowercase_path(&variant.git_root);
+    variant.git_root = lowercase_git_root.clone();
     variant.cargo_workspace_root = lowercase_path(&variant.cargo_workspace_root);
     variant.selected_path = fixture
         .canonical_path("repositories/CaseRepo/reopened")
@@ -275,6 +422,24 @@ async fn windows_identity_reuses_case_variant_paths() {
 
     assert_eq!(existing.id, first.id);
     assert_eq!(fixture.store.list_repositories().await.unwrap().len(), 1);
+    let lookup = fixture
+        .store
+        .repository_identity_lookup(first.id)
+        .await
+        .unwrap()
+        .expect("reused repository retains its durable identity projection");
+    assert_eq!(
+        lookup.git_root, first.git_root,
+        "lookup must retain the original exact-case Git root"
+    );
+    assert_ne!(
+        lookup.git_root, lowercase_git_root,
+        "the normalized identity alias must not replace the actual Git root"
+    );
+    assert_eq!(
+        lookup.git_identity_key,
+        expected_identity_key(&first.git_root)
+    );
 }
 
 #[cfg(windows)]
@@ -341,5 +506,93 @@ async fn wait_for_timestamp_after(reference: UtcTimestamp) -> UtcTimestamp {
             "system clock did not advance while arranging the lock interleaving"
         );
         tokio::task::yield_now().await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IdentityLookupCorruption {
+    UppercaseId,
+    NoncanonicalGitRoot,
+    WrongGitIdentityKey,
+    IdBlob,
+    GitRootBlob,
+    GitIdentityKeyBlob,
+}
+
+async fn corrupt_identity_lookup_row(
+    store: &coding_agent_store::Store,
+    corruption: IdentityLookupCorruption,
+) -> String {
+    match corruption {
+        IdentityLookupCorruption::UppercaseId => {
+            let corrupt = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".to_owned();
+            sqlx::query("UPDATE repositories SET id = ?")
+                .bind(&corrupt)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            corrupt
+        }
+        IdentityLookupCorruption::NoncanonicalGitRoot => {
+            let raw: String = sqlx::query_scalar("SELECT git_root FROM repositories")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+            let corrupt = format!("{raw}{}..", std::path::MAIN_SEPARATOR);
+            sqlx::query("UPDATE repositories SET git_root = ?")
+                .bind(&corrupt)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            corrupt
+        }
+        IdentityLookupCorruption::WrongGitIdentityKey => {
+            let corrupt = "SECRET-WRONG-GIT-IDENTITY-KEY".to_owned();
+            sqlx::query("UPDATE repositories SET git_identity_key = ?")
+                .bind(&corrupt)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            corrupt
+        }
+        IdentityLookupCorruption::IdBlob => {
+            let corrupt = "SECRET-ID-BLOB".to_owned();
+            sqlx::query("UPDATE repositories SET id = ?")
+                .bind(corrupt.as_bytes())
+                .execute(store.pool())
+                .await
+                .unwrap();
+            corrupt
+        }
+        IdentityLookupCorruption::GitRootBlob => {
+            let corrupt = "SECRET-GIT-ROOT-BLOB".to_owned();
+            sqlx::query("UPDATE repositories SET git_root = ?")
+                .bind(corrupt.as_bytes())
+                .execute(store.pool())
+                .await
+                .unwrap();
+            corrupt
+        }
+        IdentityLookupCorruption::GitIdentityKeyBlob => {
+            let corrupt = "SECRET-GIT-IDENTITY-KEY-BLOB".to_owned();
+            sqlx::query("UPDATE repositories SET git_identity_key = ?")
+                .bind(corrupt.as_bytes())
+                .execute(store.pool())
+                .await
+                .unwrap();
+            corrupt
+        }
+    }
+}
+
+fn expected_identity_key(path: &CanonicalPath) -> String {
+    #[cfg(windows)]
+    {
+        path.to_string().replace('/', "\\").to_lowercase()
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.to_string()
     }
 }

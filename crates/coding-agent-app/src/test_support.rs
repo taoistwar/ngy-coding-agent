@@ -9,7 +9,6 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -19,7 +18,6 @@ use sqlx::Connection as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 use tokio::sync::OnceCell;
 
-#[cfg(windows)]
 use crate::PrivateFile;
 use crate::platform::{create_private_directory, harden_private_file};
 use crate::{
@@ -29,13 +27,17 @@ use crate::{
 };
 use coding_agent_store::{Store, StoreError};
 
+mod process_storage;
+
+pub use process_storage::ProcessStorageSample;
+use process_storage::ProcessVolumeSampler;
+
 pub const TEST_APP_DATA_ENV: &str = "CODING_AGENT_TEST_APP_DATA_DIR";
 pub const TEST_RUNTIME_ENV: &str = "CODING_AGENT_TEST_RUNTIME_DIR";
 pub const TEST_SCENARIO_ENV: &str = "CODING_AGENT_TEST_SCENARIO";
 
 const MAX_SCENARIO_BYTES: u64 = 1024 * 1024;
 const MAX_SIGNAL_NAME_BYTES: usize = 64;
-const PROCESS_TEST_CONCURRENCY: NonZeroU32 = NonZeroU32::new(4).unwrap();
 const SIGNAL_DIRECTORY_NAME: &str = "signals";
 pub const TEST_PICKER_PROBE_FILE: &str = "native-picker-invoked.probe";
 pub const TEST_BROWSER_PROBE_FILE: &str = "browser-invoked.probe";
@@ -52,6 +54,8 @@ pub enum ActorPausePoint {
     ClaimPermitAcquired,
     ClaimHandleRegistered,
     ClaimRunningCommitted,
+    AfterFinalGateBeforeSpawn,
+    TerminalAfterDispatchBeforeSchedulerPublish,
     CreateBeforeWrite,
     RetryBeforeWrite,
     ResultBeforeWrite,
@@ -75,12 +79,15 @@ pub struct VirtualReleaseSignal {
 #[serde(rename_all = "snake_case")]
 pub enum VirtualReleaseTarget {
     RunnerNext,
+    StorageNext,
     StoreWriterBeforeExecute,
     StoreWriterAfterCommitBeforeWake,
     ActorCancelEnqueued,
     ActorClaimPermitAcquired,
     ActorClaimHandleRegistered,
     ActorClaimRunningCommitted,
+    ActorAfterFinalGateBeforeSpawn,
+    ActorTerminalAfterDispatchBeforeSchedulerPublish,
     ActorCreateBeforeWrite,
     ActorRetryBeforeWrite,
     ActorResultBeforeWrite,
@@ -96,12 +103,19 @@ impl VirtualReleaseTarget {
     const fn actor_pause(self) -> Option<ActorPausePoint> {
         match self {
             Self::RunnerNext
+            | Self::StorageNext
             | Self::StoreWriterBeforeExecute
             | Self::StoreWriterAfterCommitBeforeWake => None,
             Self::ActorCancelEnqueued => Some(ActorPausePoint::CancelEnqueued),
             Self::ActorClaimPermitAcquired => Some(ActorPausePoint::ClaimPermitAcquired),
             Self::ActorClaimHandleRegistered => Some(ActorPausePoint::ClaimHandleRegistered),
             Self::ActorClaimRunningCommitted => Some(ActorPausePoint::ClaimRunningCommitted),
+            Self::ActorAfterFinalGateBeforeSpawn => {
+                Some(ActorPausePoint::AfterFinalGateBeforeSpawn)
+            }
+            Self::ActorTerminalAfterDispatchBeforeSchedulerPublish => {
+                Some(ActorPausePoint::TerminalAfterDispatchBeforeSchedulerPublish)
+            }
             Self::ActorCreateBeforeWrite => Some(ActorPausePoint::CreateBeforeWrite),
             Self::ActorRetryBeforeWrite => Some(ActorPausePoint::RetryBeforeWrite),
             Self::ActorResultBeforeWrite => Some(ActorPausePoint::ResultBeforeWrite),
@@ -145,8 +159,37 @@ pub enum LegacyV2Seed {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProcessRuntimeConfig {
+    pub schema_version: u32,
+    pub max_concurrent_tasks: u32,
+    pub max_concurrent_tasks_per_repository: u32,
+    pub max_queued_tasks: u32,
+    pub storage: ProcessRuntimeStorageConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRuntimeStorageConfig {
+    pub data_control_reserve_bytes: u64,
+    pub data_task_reservation_bytes: u64,
+}
+
+fn deserialize_required_runtime_config<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProcessRuntimeConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ProcessRuntimeConfig>::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessTestConfig {
+    #[serde(deserialize_with = "deserialize_required_runtime_config")]
+    pub runtime_config: Option<ProcessRuntimeConfig>,
     pub fake_scenarios: Vec<FakeScenario>,
+    pub storage_samples: Vec<ProcessStorageSample>,
     pub store_writer_faults: Vec<StoreWriterFaultSpec>,
     pub actor_pauses: Vec<ActorPausePoint>,
     pub virtual_release_signals: Vec<VirtualReleaseSignal>,
@@ -201,6 +244,22 @@ impl ProcessTestConfig {
     }
 
     fn validate(&self) -> Result<(), ProcessTestConfigError> {
+        if self.storage_samples.is_empty() {
+            return Err(ProcessTestConfigError::EmptyStorageSamples);
+        }
+        let expected_storage_releases = self.storage_samples.len() - 1;
+        let actual_storage_releases = self
+            .virtual_release_signals
+            .iter()
+            .filter(|signal| signal.target == VirtualReleaseTarget::StorageNext)
+            .count();
+        if actual_storage_releases != expected_storage_releases {
+            return Err(ProcessTestConfigError::StorageReleaseCount {
+                expected: expected_storage_releases,
+                actual: actual_storage_releases,
+            });
+        }
+
         if let LegacyV2Seed::CompletedTask {
             repository_path,
             task_prompt,
@@ -385,6 +444,7 @@ impl ProcessTestEnvironment {
             }
             Ok(())
         })?;
+        write_runtime_config_if_requested(&paths, config.runtime_config.as_ref())?;
 
         Ok(Self {
             paths,
@@ -433,6 +493,9 @@ impl ProcessTestEnvironment {
             self.signals.clone(),
             actor_pause_gates,
         ));
+        let storage_sampler = Arc::new(ProcessVolumeSampler::new(
+            self.config.storage_samples.clone(),
+        ));
         let picker_probe = self.paths.runtime_dir.join(TEST_PICKER_PROBE_FILE);
         dependencies.paths = Arc::new(ProcessStartupPaths(self.paths));
         dependencies.browser = Arc::new(ProcessBrowserOpener {
@@ -440,19 +503,49 @@ impl ProcessTestEnvironment {
         });
         dependencies.messages = Arc::new(ProcessNativeMessageSink);
         dependencies.dialog = Some(crate::NativeDialogService::process_test_probe(picker_probe));
-        dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new(
+        dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new_for_process_test(
             runner.clone(),
-            PROCESS_TEST_CONCURRENCY,
+            storage_sampler.clone(),
         ));
         dependencies.process_test_support = Some(Arc::new(ProcessTestRuntime {
             config: self.config,
             writer_controller,
             runner,
+            storage_sampler,
             actor_pauses,
             signals: self.signals,
         }));
         Ok(dependencies)
     }
+}
+
+fn write_runtime_config_if_requested(
+    paths: &PlatformPaths,
+    config: Option<&ProcessRuntimeConfig>,
+) -> Result<(), ProcessTestConfigError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let path = &paths.runtime_config;
+    let mut file = PrivateFile::create_new(path).map_err(|source| ProcessTestConfigError::Io {
+        action: "create private runtime configuration",
+        path: path.clone(),
+        source,
+    })?;
+    let write_result = (|| -> io::Result<()> {
+        serde_json::to_writer(&mut file, config).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.as_file().sync_all()
+    })();
+    drop(file);
+    if write_result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    write_result.map_err(|source| ProcessTestConfigError::Io {
+        action: "write private runtime configuration",
+        path: path.clone(),
+        source,
+    })
 }
 
 struct ProcessTestStoreFactory {
@@ -496,6 +589,10 @@ async fn seed_legacy_v2_database(path: &Path, seed: &LegacyV2Seed) -> Result<(),
         .ok_or(StoreError::InvariantViolation(
             "legacy v2 process seed repository path is not Unicode",
         ))?;
+    #[cfg(windows)]
+    let repository_identity_key = repository_path.replace('/', "\\").to_lowercase();
+    #[cfg(not(windows))]
+    let repository_identity_key = repository_path.to_owned();
     let mut connection = SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(path)
@@ -534,8 +631,8 @@ async fn seed_legacy_v2_database(path: &Path, seed: &LegacyV2Seed) -> Result<(),
     .bind("Legacy v2 repository")
     .bind(repository_path)
     .bind(repository_path)
-    .bind("legacy-v2-git-identity")
-    .bind("legacy-v2-cargo-identity")
+    .bind(&repository_identity_key)
+    .bind(&repository_identity_key)
     .bind("2026-07-23T00:00:00.000000000Z")
     .bind("2026-07-23T00:00:00.000000000Z")
     .execute(&mut connection)
@@ -618,6 +715,7 @@ pub(crate) struct ProcessTestRuntime {
     pub writer_controller: Arc<StoreWriterTestController>,
     pub actor_pauses: Arc<ActorPauseController>,
     runner: Arc<ScriptedFakeRunner>,
+    storage_sampler: Arc<ProcessVolumeSampler>,
     signals: Arc<ProcessSignalDirectory>,
 }
 
@@ -645,6 +743,7 @@ impl ProcessTestRuntime {
             .cloned()
             .map(|signal| {
                 let runner = self.runner.clone();
+                let storage_sampler = self.storage_sampler.clone();
                 let writer = self.writer_controller.clone();
                 let actor_pauses = self.actor_pauses.clone();
                 let signals = self.signals.clone();
@@ -687,6 +786,15 @@ impl ProcessTestRuntime {
                         VirtualReleaseTarget::RunnerNext => {
                             runner.wait_and_release_next().await;
                         }
+                        VirtualReleaseTarget::StorageNext => {
+                            if !storage_sampler.advance() {
+                                tracing::warn!(
+                                    error_code = "TEST_STORAGE_SCRIPT_EXHAUSTED",
+                                    signal = %signal.name,
+                                    "process-test storage script could not advance"
+                                );
+                            }
+                        }
                         VirtualReleaseTarget::StoreWriterBeforeExecute => {
                             writer.release(StoreWriterFaultPoint::PauseBeforeExecute);
                         }
@@ -697,6 +805,8 @@ impl ProcessTestRuntime {
                         | VirtualReleaseTarget::ActorClaimPermitAcquired
                         | VirtualReleaseTarget::ActorClaimHandleRegistered
                         | VirtualReleaseTarget::ActorClaimRunningCommitted
+                        | VirtualReleaseTarget::ActorAfterFinalGateBeforeSpawn
+                        | VirtualReleaseTarget::ActorTerminalAfterDispatchBeforeSchedulerPublish
                         | VirtualReleaseTarget::ActorCreateBeforeWrite
                         | VirtualReleaseTarget::ActorRetryBeforeWrite
                         | VirtualReleaseTarget::ActorResultBeforeWrite
@@ -817,6 +927,10 @@ impl StartupPaths for ProcessStartupPaths {
         Ok(self.0.clone())
     }
 
+    fn prepare_lock_parent(&self, paths: &PlatformPaths) -> std::io::Result<()> {
+        paths.prepare_runtime_directory()
+    }
+
     fn prepare(&self, paths: &PlatformPaths) -> std::io::Result<()> {
         paths.prepare()
     }
@@ -878,6 +992,12 @@ pub enum ProcessTestConfigError {
     InvalidLegacyV2Repository(PathBuf),
     #[error("legacy v2 completed task prompt is invalid")]
     InvalidLegacyV2Prompt,
+    #[error("process storage sample script must contain at least one sample")]
+    EmptyStorageSamples,
+    #[error(
+        "process storage sample script requires {expected} storage release targets, got {actual}"
+    )]
+    StorageReleaseCount { expected: usize, actual: usize },
     #[error("StoreWriter fault count must be positive")]
     InvalidFaultCount,
     #[error("StoreWriter process pause {point:?} must have count 1, got {count}")]
@@ -1629,8 +1749,8 @@ mod tests {
 
     use super::{
         ActorPauseController, ActorPausePoint, LegacyV2Seed, ProcessSignalDirectory,
-        ProcessTestConfig, ProcessTestConfigError, StoreWriterFaultPoint, StoreWriterFaultSpec,
-        VirtualReleaseSignal, VirtualReleaseTarget, wait_for_virtual_signal,
+        ProcessStorageSample, ProcessTestConfig, ProcessTestConfigError, StoreWriterFaultPoint,
+        StoreWriterFaultSpec, VirtualReleaseSignal, VirtualReleaseTarget, wait_for_virtual_signal,
     };
     use crate::StoreWriterOperationKind;
 
@@ -1775,11 +1895,13 @@ mod tests {
         let release_path = signals.path.join("store.release");
         let pause = StoreWriterFaultSpec {
             point: StoreWriterFaultPoint::PauseBeforeExecute,
-            operation: Some(StoreWriterOperationKind::RecoverIncomplete),
+            operation: Some(StoreWriterOperationKind::InterruptRemainingAfterStops),
             count: 1,
         };
         let base = ProcessTestConfig {
+            runtime_config: None,
             fake_scenarios: Vec::new(),
+            storage_samples: vec![ProcessStorageSample::Native],
             store_writer_faults: vec![pause.clone()],
             actor_pauses: Vec::new(),
             virtual_release_signals: Vec::new(),

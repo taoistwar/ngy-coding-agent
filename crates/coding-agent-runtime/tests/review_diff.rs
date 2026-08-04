@@ -1,5 +1,6 @@
 mod support;
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -386,6 +387,7 @@ impl Fixture {
 
         let toolchain = discover_toolchain(
             &runtime_directory,
+            support::instance_process_scope(&runtime_directory),
             Some(&concrete_rustc()),
             Some(&path_executable(if cfg!(windows) {
                 "git.exe"
@@ -415,10 +417,12 @@ impl Fixture {
         .unwrap();
         let provisioner = WorktreeProvisioner::from_trusted_paths(
             &self.toolchain,
+            "repository-1",
             &self.repository,
             &self.repository,
             &self.artifact_root,
             &self.runtime_directory,
+            support::task_process_scope(&self.runtime_directory),
             process_limits(),
             WorktreeLimits::try_new(Duration::from_secs(15)).unwrap(),
         )
@@ -438,6 +442,8 @@ impl Fixture {
             provisioned,
             &self.toolchain,
             &self.runtime_directory,
+            support::task_process_scope(&self.runtime_directory),
+            NonZeroU32::new(1).expect("test Cargo jobs are nonzero"),
             RuntimeSessionLimits::project_2_defaults(),
         )
         .unwrap()

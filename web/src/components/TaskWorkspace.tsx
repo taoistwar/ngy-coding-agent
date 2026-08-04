@@ -1,11 +1,21 @@
 import { useRef, useState, type ReactNode } from "react";
 
-import type { Repository, Task, TaskDetail } from "../api/types";
+import type {
+  Repository,
+  SchedulerQueuedTask,
+  SchedulerStoppingTask,
+  Task,
+  TaskDetail,
+} from "../api/types";
 import type { CancelCommandState } from "../state/model";
 import { ActivityPane } from "./ActivityPane";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { PlanPane } from "./PlanPane";
 import { ResultPane } from "./ResultPane";
+import {
+  schedulerQueueReasonLabel,
+  schedulerStopIntentLabel,
+} from "./SchedulerSummary";
 
 export interface TaskWorkspaceProps {
   task: Task | null;
@@ -13,6 +23,8 @@ export interface TaskWorkspaceProps {
   detailLoading: boolean;
   detailError: string | null;
   cancelState: CancelCommandState | undefined;
+  schedulerQueuedTask: SchedulerQueuedTask | null;
+  schedulerStoppingTask: SchedulerStoppingTask | null;
   tasksById: Record<string, Task>;
   taskOrder: string[];
   onCancel: (taskId: string) => void | Task | Promise<void | Task>;
@@ -141,6 +153,8 @@ export function TaskWorkspace({
   detailLoading,
   detailError,
   cancelState,
+  schedulerQueuedTask,
+  schedulerStoppingTask,
   tasksById,
   taskOrder,
   onCancel,
@@ -176,6 +190,15 @@ export function TaskWorkspace({
 
   const canCancel = task.status === "queued" || task.status === "running";
   const cancelPending = canCancel && cancelState?.phase === "pending";
+  const queuedProjection =
+    task.status === "queued" && schedulerQueuedTask?.task_id === task.id
+      ? schedulerQueuedTask
+      : null;
+  const stoppingProjection =
+    task.status === "running" && schedulerStoppingTask?.task_id === task.id
+      ? schedulerStoppingTask
+      : null;
+  const cancelDisabled = cancelPending || stoppingProjection !== null;
   const hasNewerAttempt = Object.values(tasksById).some(
     (candidate) => candidate.retry_of === task.id,
   );
@@ -244,13 +267,32 @@ export function TaskWorkspace({
             task.delivery_readiness === "unreviewed" ? (
               <p className="completion-disclaimer">Execution completed — not reviewed</p>
             ) : null}
+            {queuedProjection !== null ? (
+              <p className="scheduler-task-control">
+                {schedulerQueueReasonLabel(queuedProjection.reason)}
+              </p>
+            ) : null}
+            {stoppingProjection !== null ? (
+              <p
+                className="scheduler-task-control stopping"
+                role="status"
+                aria-label="Durable stop status"
+              >
+                {schedulerStopIntentLabel(stoppingProjection.intent)}
+              </p>
+            ) : null}
+            {task.status === "cancelled" ? (
+              <p className="task-final-outcome">Final outcome: Cancelled</p>
+            ) : task.status === "failed" && task.failure?.retryable ? (
+              <p className="task-final-outcome">Final outcome: Failed — retryable</p>
+            ) : null}
           </div>
           <div className="task-actions" aria-label="Task actions">
             {canCancel ? (
               <button
                 type="button"
                 onClick={handleCancel}
-                disabled={cancelPending}
+                disabled={cancelDisabled}
                 aria-label={cancelPending ? "Cancelling" : "Cancel task"}
               >
                 {cancelPending ? "Cancelling" : "Cancel task"}

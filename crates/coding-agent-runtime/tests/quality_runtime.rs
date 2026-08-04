@@ -1,5 +1,6 @@
 mod support;
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -26,6 +27,8 @@ async fn typed_quality_runtime_covers_catalog_status_bounds_and_stability() {
         &provisioned,
         &fixture.toolchain,
         &fixture.runtime_directory,
+        support::task_process_scope(&fixture.runtime_directory),
+        cargo_jobs_per_task(),
         RuntimeSessionLimits::project_2_defaults()
             .try_with_validation_timeout(Duration::from_secs(30))
             .unwrap(),
@@ -174,6 +177,8 @@ async fn typed_quality_runtime_covers_catalog_status_bounds_and_stability() {
         &provisioned,
         &fixture.toolchain,
         &fixture.runtime_directory,
+        support::task_process_scope(&fixture.runtime_directory),
+        cargo_jobs_per_task(),
         RuntimeSessionLimits::project_2_defaults()
             .try_with_validation_timeout(Duration::from_secs(2))
             .unwrap(),
@@ -253,6 +258,10 @@ fn contains_selector(
     })
 }
 
+fn cargo_jobs_per_task() -> NonZeroU32 {
+    NonZeroU32::new(3).expect("test Cargo jobs are nonzero")
+}
+
 fn write_integration(workspace: &Path, name: &str, source: &str) {
     std::fs::write(workspace.join("tests").join(format!("{name}.rs")), source).unwrap();
 }
@@ -328,6 +337,7 @@ impl Fixture {
 
         let toolchain = discover_toolchain(
             &runtime_directory,
+            support::instance_process_scope(&runtime_directory),
             Some(&concrete_rustc()),
             Some(&path_executable(if cfg!(windows) {
                 "git.exe"
@@ -357,10 +367,12 @@ impl Fixture {
         .unwrap();
         let provisioner = WorktreeProvisioner::from_trusted_paths(
             &self.toolchain,
+            "repository-1",
             &self.repository,
             &self.repository,
             &self.artifact_root,
             &self.runtime_directory,
+            support::task_process_scope(&self.runtime_directory),
             process_limits(),
             WorktreeLimits::try_new(Duration::from_secs(15)).unwrap(),
         )

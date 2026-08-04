@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -10,13 +11,16 @@ use axum::body::Body;
 use coding_agent_api::{
     AddRepositoryRequest, ApiBackend, ApiError, ApiResult, AuthContext, BootstrapResponse,
     CancelResult, CreateResult, CreateTaskRequest, LiveEventStream, QuitAcceptance, RepositoryDto,
-    RequestSecurity, ServiceStateControl, ServiceStateDto, ServiceStateStream, SessionExchange,
-    SseBackend, TaskDetailDto, TaskDto, TaskEventDto,
+    RequestSecurity, SchedulerAdmissionStateDto, SchedulerLimitsDto, SchedulerQueueReasonDto,
+    SchedulerQueuedTaskDto, SchedulerRepositoryStorageDto, SchedulerStateDto, SchedulerStorageDto,
+    SchedulerStorageScopeDto, SchedulerStorageStateDto, ServiceStateControl, ServiceStateDto,
+    ServiceStateStream, SessionExchange, SseBackend, TaskDetailDto, TaskDto, TaskEventDto,
 };
 use coding_agent_domain::{
     CanonicalPath, ClientRequestId, DeliveryReadiness, EventId, Repository, RepositoryId, Task,
     TaskId, TaskStatus, UtcTimestamp,
 };
+use futures_util::Stream;
 use futures_util::stream;
 use http::header::{COOKIE, HOST, ORIGIN};
 use http::request::Parts;
@@ -44,6 +48,7 @@ pub enum CancelMode {
     Finished = 0,
     Accepted = 1,
     Conflict = 2,
+    StopAlreadyRequested = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +56,7 @@ pub enum RetryMode {
     Created = 0,
     Existing = 1,
     Conflict = 2,
+    QueueFull = 3,
 }
 
 pub struct FakeBackend {
@@ -124,6 +130,7 @@ impl ApiBackend for FakeBackend {
             service_state: ServiceStateDto::Ready,
             service_state_generation: 0,
             max_concurrent_tasks: 4,
+            scheduler: scheduler(self.repository.id, self.task.id),
         })
     }
 
@@ -211,6 +218,7 @@ impl ApiBackend for FakeBackend {
                 "STORE_DEGRADED",
                 true,
             )),
+            "queue-full" => Err(ApiError::task_queue_full(32, 32)),
             "panic-known-prompt" => panic!("injected backend panic"),
             prompt if prompt.trim().is_empty() || prompt.chars().count() > 50_000 => Err(error(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -244,7 +252,10 @@ impl ApiBackend for FakeBackend {
             value if value == CancelMode::Accepted as u8 => Ok(CancelResult::Accepted {
                 task: self.task.clone(),
             }),
-            _ => Err(error(StatusCode::CONFLICT, "TASK_NOT_CANCELLABLE", false)),
+            value if value == CancelMode::Conflict as u8 => {
+                Err(error(StatusCode::CONFLICT, "TASK_NOT_CANCELLABLE", false))
+            }
+            _ => Err(ApiError::task_stop_already_requested()),
         }
     }
 
@@ -257,7 +268,10 @@ impl ApiBackend for FakeBackend {
             value if value == RetryMode::Existing as u8 => {
                 Ok(CreateResult::Existing(self.task.clone()))
             }
-            _ => Err(error(StatusCode::CONFLICT, "TASK_NOT_RETRYABLE", false)),
+            value if value == RetryMode::Conflict as u8 => {
+                Err(error(StatusCode::CONFLICT, "TASK_NOT_RETRYABLE", false))
+            }
+            _ => Err(ApiError::task_queue_full(32, 32)),
         }
     }
 
@@ -363,8 +377,22 @@ impl SseBackend for FakeSse {
         Box::pin(stream::empty())
     }
 
+    fn subscribe_scheduler_state(
+        &self,
+    ) -> Pin<Box<dyn Stream<Item = ApiResult<Arc<SchedulerStateDto>>> + Send + 'static>> {
+        Box::pin(stream::empty())
+    }
+
     async fn current_service_state(&self) -> ApiResult<ServiceStateControl> {
         Ok(ServiceStateControl::new(ServiceStateDto::Ready, 0))
+    }
+
+    async fn current_scheduler_state(&self) -> ApiResult<Arc<SchedulerStateDto>> {
+        Ok(Arc::new(scheduler(uuid::Uuid::nil(), uuid::Uuid::nil())))
+    }
+
+    async fn membership_watermark_through(&self, _: i64) -> ApiResult<i64> {
+        Ok(0)
     }
 
     async fn latest_event_id(&self) -> ApiResult<i64> {
@@ -543,6 +571,45 @@ fn task(repository_id: uuid::Uuid) -> TaskDto {
         last_event_id: EventId::new(1).expect("event ID"),
         failure: None,
     })
+}
+
+fn scheduler(repository_id: uuid::Uuid, queued_task_id: uuid::Uuid) -> SchedulerStateDto {
+    SchedulerStateDto {
+        schema_version: 1,
+        server_instance_id: uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000")
+            .expect("scheduler instance UUID"),
+        server_started_at: timestamp().into(),
+        generation: 1,
+        as_of_event_id: 1,
+        service_state_generation: 0,
+        admission_state: SchedulerAdmissionStateDto::Running,
+        limits: SchedulerLimitsDto {
+            global: 4,
+            per_repository: 2,
+            queued: 32,
+            cargo_jobs_per_task: 1,
+        },
+        active_task_count: 0,
+        queued_task_count: 1,
+        queued_tasks: vec![SchedulerQueuedTaskDto {
+            task_id: queued_task_id,
+            reason: SchedulerQueueReasonDto::RepositoryControlBusy,
+        }],
+        stopping_tasks: Vec::new(),
+        storage: SchedulerStorageDto {
+            state: SchedulerStorageStateDto::Normal,
+            data: SchedulerStorageScopeDto {
+                state: SchedulerStorageStateDto::Normal,
+            },
+            runtime: SchedulerStorageScopeDto {
+                state: SchedulerStorageStateDto::Normal,
+            },
+            repositories: vec![SchedulerRepositoryStorageDto {
+                repository_id,
+                state: SchedulerStorageStateDto::Normal,
+            }],
+        },
+    }
 }
 
 fn timestamp() -> UtcTimestamp {

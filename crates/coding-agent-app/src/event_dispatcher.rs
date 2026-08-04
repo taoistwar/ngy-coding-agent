@@ -17,6 +17,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub enum EventDispatcherError {
     #[error("event store read failed: {0}")]
     Store(#[source] Arc<StoreError>),
+    #[error("event dispatcher startup cursor does not match the durable high watermark")]
+    StartupCursorMismatch,
     #[error("event dispatcher is closed")]
     Closed,
 }
@@ -54,11 +56,30 @@ impl EventDispatcherHandle {
         store: Store,
         broadcast_capacity: usize,
     ) -> Result<Self, EventDispatcherError> {
+        let cursor = store.latest_event_id().await?;
+        Ok(Self::spawn_with_cursor(store, broadcast_capacity, cursor))
+    }
+
+    pub async fn spawn_at(
+        store: Store,
+        broadcast_capacity: usize,
+        startup_cursor: EventCursor,
+    ) -> Result<Self, EventDispatcherError> {
+        if store.latest_event_id().await? != startup_cursor {
+            return Err(EventDispatcherError::StartupCursorMismatch);
+        }
+        Ok(Self::spawn_with_cursor(
+            store,
+            broadcast_capacity,
+            startup_cursor,
+        ))
+    }
+
+    fn spawn_with_cursor(store: Store, broadcast_capacity: usize, cursor: EventCursor) -> Self {
         assert!(
             broadcast_capacity > 0,
             "event-dispatcher broadcast capacity must be positive"
         );
-        let cursor = store.latest_event_id().await?;
         let (commands, receiver) = mpsc::unbounded_channel();
         let wake = Arc::new(Notify::new());
         let (events, _) = broadcast::channel(broadcast_capacity);
@@ -70,12 +91,12 @@ impl EventDispatcherHandle {
             run_dispatcher(store, cursor, receiver, actor_wake, actor_events).await;
             actor_lifecycle.closed.cancel();
         });
-        Ok(Self {
+        Self {
             commands,
             wake,
             events,
             lifecycle,
-        })
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {

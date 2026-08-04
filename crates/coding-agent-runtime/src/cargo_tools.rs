@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(all(windows, target_env = "msvc"))]
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
+use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +28,7 @@ use crate::process_supervisor::{
 };
 use crate::root_capability::{ensure_plain_directory, ensure_plain_file};
 use crate::tool_discovery::ToolchainPaths;
-use crate::{CommandPolicyError, RelativePath};
+use crate::{CommandPolicyError, ProcessLivenessScope, RelativePath};
 
 /// Bounded Cargo metadata projected into the only package and integration-test
 /// selectors that typed Cargo commands may accept.
@@ -198,6 +199,7 @@ impl CargoTools {
         execution_directory: Arc<ExecutionDirectory>,
         target_directory: Arc<ExecutionDirectory>,
         temporary_directory: impl AsRef<std::path::Path>,
+        process_liveness_scope: ProcessLivenessScope,
         process_limits: ProcessLimits,
         limits: CargoToolLimits,
     ) -> Result<Self, CargoToolError> {
@@ -251,7 +253,7 @@ impl CargoTools {
         environment.set_cargo_target_directory(&child_visible_path(target_directory.path()));
 
         Ok(Self {
-            supervisor: ProcessSupervisor::new(process_limits),
+            supervisor: ProcessSupervisor::new(process_limits, process_liveness_scope),
             cargo: toolchain.cargo(),
             rustc,
             rustdoc,
@@ -332,6 +334,7 @@ impl CargoTools {
 
     pub async fn check(
         &self,
+        cargo_jobs_per_task: NonZeroU32,
         package: Option<&str>,
         timeout: Duration,
         cancellation: CancellationToken,
@@ -360,6 +363,7 @@ impl CargoTools {
             self.cargo.clone(),
             self.execution_directory.clone(),
             self.environment.clone(),
+            cargo_jobs_per_task,
             package,
             remaining,
         )
@@ -370,6 +374,7 @@ impl CargoTools {
 
     pub async fn test(
         &self,
+        cargo_jobs_per_task: NonZeroU32,
         package: Option<&str>,
         test: Option<&str>,
         timeout: Duration,
@@ -402,6 +407,7 @@ impl CargoTools {
             self.cargo.clone(),
             self.execution_directory.clone(),
             self.environment.clone(),
+            cargo_jobs_per_task,
             package,
             test,
             remaining,
@@ -986,6 +992,10 @@ pub enum CargoToolError {
 }
 
 impl CargoToolError {
+    pub const fn process_cleanup_is_unproven(&self) -> bool {
+        matches!(self, Self::Process(error) if error.process_cleanup_is_unproven())
+    }
+
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidLimits

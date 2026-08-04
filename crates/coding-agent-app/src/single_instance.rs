@@ -3,17 +3,23 @@ use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use coding_agent_domain::{TaskFailure, UtcTimestamp};
+use coding_agent_domain::UtcTimestamp;
+#[cfg(feature = "test-support")]
+use coding_agent_domain::{Repository, TaskId};
+use coding_agent_runtime::{
+    ProcessCleanupProof, ProcessLivenessDirectory, ProcessLivenessError, ProcessLivenessScope,
+    SealedProcessLivenessScope,
+};
 use coding_agent_store::{Store, StoreError};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -23,21 +29,29 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::SecuritySeed;
 use crate::platform::{
     PrivateFile, harden_private_file, validate_private_file, validate_private_file_snapshot,
 };
-use crate::security::{LauncherSecret, SecurityClock, SecurityError, SystemSecurityClock};
-use crate::shutdown::ShutdownCleanup;
 #[cfg(feature = "test-support")]
-use crate::test_support::{ActorPausePoint, ProcessTestWatchers};
+use crate::repository_service::RepositoryRuntimeRegistrar;
+use crate::runtime_config::RuntimeConfigLoadError;
+use crate::security::{LauncherSecret, SecurityClock, SecurityError, SystemSecurityClock};
+use crate::shutdown::{ShutdownCleanup, ShutdownLockDisposition, ShutdownRuntimeCleanupProof};
+#[cfg(feature = "test-support")]
+use crate::test_support::ProcessTestWatchers;
 use crate::{
-    ApplicationBackend, BrowserLaunchError, BrowserLauncher, EventDispatcherError,
-    EventDispatcherHandle, MutationGate, NativeDialogService, PlatformPaths,
-    ProductionStartupRunnerFactory, RepositoryDiscovery, SecurityManager, SecuritySeed,
-    ServiceState, ServiceStateController, ShutdownCoordinator, ShutdownOutcome,
-    StartupRunnerContext, StartupRunnerFactory, StoreWriterHandle, SystemWallClock,
-    TaskManagerHandle, WallClock, build_runtime_router,
+    BrowserLaunchError, BrowserLauncher, EventDispatcherError, NativeDialogService, PlatformPaths,
+    ProductionStartupRunnerFactory, ShutdownCoordinator, ShutdownOutcome, StartupRunnerFactory,
+    SystemWallClock, WallClock,
 };
+#[cfg(feature = "test-support")]
+use crate::{EventDispatcherHandle, MutationGate, StoreWriterHandle, TaskManagerHandle};
+
+mod start_primary;
+
+use start_primary::start_primary;
 
 const MAX_DESCRIPTOR_BYTES: u64 = 4 * 1024;
 const LAUNCHER_SECRET_BYTES: usize = 32;
@@ -47,7 +61,7 @@ const SECONDARY_MAX_DELAY: Duration = Duration::from_secs(1);
 const LISTENER_BIND_ATTEMPTS: usize = 3;
 const EVENT_BROADCAST_CAPACITY: usize = 1_024;
 const ACTOR_QUEUE_CAPACITY: usize = 64;
-const WRITE_BUDGET: Duration = Duration::from_secs(5);
+const PROCESS_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const DEGRADED_SHUTDOWN_WARNING_ARGUMENT: &str =
     "--coding-agent-internal-degraded-shutdown-warning";
 const DEGRADED_SHUTDOWN_TITLE: &str = "Coding Agent did not shut down cleanly";
@@ -530,6 +544,7 @@ impl Default for StartupPhaseController {
 
 pub trait StartupPaths: Send + Sync + 'static {
     fn discover(&self) -> io::Result<PlatformPaths>;
+    fn prepare_lock_parent(&self, paths: &PlatformPaths) -> io::Result<()>;
     fn prepare(&self, paths: &PlatformPaths) -> io::Result<()>;
 }
 
@@ -559,6 +574,19 @@ pub trait NativeMessageSink: Send + Sync + 'static {
     }
 }
 
+pub trait AvailableParallelismProbe: Send + Sync + 'static {
+    fn available_parallelism(&self) -> Option<NonZeroUsize>;
+}
+
+#[derive(Debug, Default)]
+struct SystemAvailableParallelismProbe;
+
+impl AvailableParallelismProbe for SystemAvailableParallelismProbe {
+    fn available_parallelism(&self) -> Option<NonZeroUsize> {
+        std::thread::available_parallelism().ok()
+    }
+}
+
 #[derive(Clone)]
 pub struct StartupDependencies {
     pub paths: Arc<dyn StartupPaths>,
@@ -568,6 +596,7 @@ pub struct StartupDependencies {
     pub messages: Arc<dyn NativeMessageSink>,
     pub wall_clock: Arc<dyn WallClock>,
     pub security_clock: Arc<dyn SecurityClock>,
+    pub available_parallelism: Arc<dyn AvailableParallelismProbe>,
     pub runner_factory: Arc<dyn StartupRunnerFactory>,
     pub dialog: Option<NativeDialogService>,
     #[cfg(feature = "test-support")]
@@ -601,6 +630,7 @@ impl StartupDependencies {
             messages: Arc::new(SystemNativeMessageSink),
             wall_clock: Arc::new(SystemWallClock),
             security_clock: Arc::new(SystemSecurityClock),
+            available_parallelism: Arc::new(SystemAvailableParallelismProbe),
             runner_factory: Arc::new(ProductionStartupRunnerFactory),
             dialog,
             #[cfg(feature = "test-support")]
@@ -612,7 +642,7 @@ impl StartupDependencies {
     /// Routes browser requests through one exact development origin while Axum
     /// continues to require the dynamically-bound listener authority as Host.
     ///
-    /// The value is validated by [`SecurityManager`] when a primary starts; no
+    /// The value is validated by [`crate::SecurityManager`] when a primary starts; no
     /// localhost alias, wildcard origin, or authentication bypass is introduced.
     pub fn with_development_public_origin(mut self, public_origin: impl Into<String>) -> Self {
         self.public_origin = StartupPublicOrigin::Development(public_origin.into());
@@ -636,10 +666,16 @@ pub enum StartupError {
     Paths(#[source] io::Error),
     #[error("the single-instance lock is unavailable: {0}")]
     Lock(#[source] io::Error),
+    #[error("process-liveness state is unavailable: {0}")]
+    ProcessLiveness(#[from] ProcessLivenessError),
+    #[error("cleanup of a previous process tree could not be proven")]
+    ProcessCleanupUnproven,
     #[error(transparent)]
     Descriptor(#[from] RuntimeDescriptorError),
     #[error("the local store could not be started: {0}")]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    RuntimeConfig(#[from] RuntimeConfigLoadError),
     #[error("startup security initialization failed: {0}")]
     Security(#[from] SecurityError),
     #[error("the event dispatcher could not be started: {0}")]
@@ -675,6 +711,10 @@ impl StartupError {
                 "The local database could not be opened, migrated, or recovered. No web server was published."
                     .to_owned()
             }
+            Self::RuntimeConfig(error) => format!(
+                "The runtime configuration is invalid.\n\nError code: {}",
+                error.code()
+            ),
             Self::Runner(error) => format!(
                 "The coding task runner could not be started.\n\nError code: {}",
                 error.code()
@@ -706,15 +746,22 @@ async fn launch_inner(dependencies: StartupDependencies) -> Result<StartupOutcom
     let paths = dependencies.paths.discover().map_err(StartupError::Paths)?;
     dependencies
         .paths
-        .prepare(&paths)
+        .prepare_lock_parent(&paths)
         .map_err(StartupError::Paths)?;
 
     let lock = InstanceLock::try_acquire(&paths.instance_lock).map_err(StartupError::Lock)?;
     match lock {
-        Some(lock) => start_primary(paths, lock, dependencies)
-            .await
-            .map(Box::new)
-            .map(StartupOutcome::Primary),
+        Some(lock) => {
+            dependencies
+                .paths
+                .prepare(&paths)
+                .map_err(StartupError::Paths)?;
+            let instance_id = Uuid::new_v4();
+            start_primary(paths, lock, instance_id, dependencies)
+                .await
+                .map(Box::new)
+                .map(StartupOutcome::Primary)
+        }
         None => start_secondary(paths, dependencies)
             .await
             .map(StartupOutcome::Secondary),
@@ -723,6 +770,7 @@ async fn launch_inner(dependencies: StartupDependencies) -> Result<StartupOutcom
 
 pub struct PrimaryRuntime {
     descriptor: RuntimeDescriptor,
+    _process_liveness_scope: ProcessLivenessScope,
     startup_phase: StartupPhaseController,
     shutdown: ShutdownCoordinator,
     quit_requested: Arc<Notify>,
@@ -741,6 +789,41 @@ pub struct PrimaryRuntimeTestHandles {
     pub dispatcher: EventDispatcherHandle,
     pub task_manager: TaskManagerHandle,
     pub mutation_gate: MutationGate,
+    repository_registrar: RepositoryRuntimeRegistrar,
+    process_liveness_scope: ProcessLivenessScope,
+}
+
+#[cfg(feature = "test-support")]
+impl PrimaryRuntimeTestHandles {
+    pub fn hold_instance_process_tree_for_test(
+        &self,
+    ) -> Result<coding_agent_runtime::HeldProcessLivenessTreeForTest, ProcessLivenessError> {
+        self.process_liveness_scope.hold_tree_for_test()
+    }
+
+    pub fn hold_task_process_tree_for_test(
+        &self,
+        task_id: TaskId,
+    ) -> Result<coding_agent_runtime::HeldProcessLivenessTreeForTest, ProcessLivenessError> {
+        self.process_liveness_scope
+            .task_scope(*task_id.as_uuid().as_bytes())?
+            .hold_tree_for_test()
+    }
+
+    pub async fn attach_repository_runtime_for_test(
+        &self,
+        repository: &Repository,
+        deadline: Instant,
+    ) -> Result<(), &'static str> {
+        self.repository_registrar
+            .attach(repository, deadline)
+            .await
+            .map_err(|_| "repository runtime attachment failed")?;
+        tokio::time::timeout_at(deadline, self.task_manager.notify_admission_changed())
+            .await
+            .map_err(|_| "repository admission notification deadline elapsed")?
+            .map_err(|_| "repository admission notification failed")
+    }
 }
 
 impl PrimaryRuntime {
@@ -784,6 +867,32 @@ impl Drop for PrimaryRuntime {
     }
 }
 
+struct StartupShutdownGuard {
+    shutdown: Option<ShutdownCoordinator>,
+}
+
+impl StartupShutdownGuard {
+    fn new(shutdown: ShutdownCoordinator) -> Self {
+        Self {
+            shutdown: Some(shutdown),
+        }
+    }
+
+    fn disarm(mut self) -> ShutdownCoordinator {
+        self.shutdown
+            .take()
+            .expect("startup shutdown guard is armed until primary construction")
+    }
+}
+
+impl Drop for StartupShutdownGuard {
+    fn drop(&mut self) {
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.force_cleanup();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecondaryRuntime {
     instance_id: Uuid,
@@ -800,280 +909,55 @@ impl SecondaryRuntime {
     }
 }
 
-async fn start_primary(
-    paths: PlatformPaths,
-    lock: InstanceLock,
-    dependencies: StartupDependencies,
-) -> Result<PrimaryRuntime, StartupError> {
-    #[cfg(feature = "test-support")]
-    let test_signal_watchers = dependencies
-        .process_test_support
-        .as_ref()
-        .map_or_else(ProcessTestWatchers::default, |support| {
-            support.spawn_virtual_release_watchers()
-        });
-    remove_stale_descriptors(&paths)?;
-
-    let store = dependencies.stores.open(&paths.database_path).await?;
-    store.migrate().await?;
-    let started_at = UtcTimestamp::new(dependencies.wall_clock.now_utc())
-        .map_err(|_| StartupError::Timestamp)?;
-    let recovery = store
-        .recover_incomplete(
-            started_at,
-            TaskFailure {
-                code: "APP_RESTARTED".to_owned(),
-                message: "task was interrupted because the application restarted".to_owned(),
-                retryable: true,
-            },
-        )
-        .await?;
-    #[cfg(feature = "test-support")]
-    if let Some(support) = &dependencies.process_test_support {
-        if support
-            .publish_startup_recovery_probe(recovery.interrupted_count)
-            .is_err()
-        {
-            tracing::warn!(
-                error_code = "TEST_RECOVERY_PROBE_FAILED",
-                "process-test recovery probe could not be published"
-            );
+async fn await_previous_process_cleanup(process_liveness: &ProcessLivenessDirectory) {
+    let mut last_observation = None;
+    loop {
+        let observation = process_liveness.probe_stale();
+        match observation {
+            Ok(ProcessCleanupProof::Confirmed) => return,
+            Ok(proof @ (ProcessCleanupProof::Held | ProcessCleanupProof::Unknown)) => {
+                if last_observation != Some(Ok(proof)) {
+                    tracing::warn!(
+                        error_code = "PROCESS_TREE_CLEANUP_PENDING",
+                        ?proof,
+                        "startup is retaining the primary lock while process cleanup remains unproven"
+                    );
+                    last_observation = Some(Ok(proof));
+                }
+            }
+            Err(error) => {
+                if last_observation != Some(Err(error)) {
+                    tracing::warn!(
+                        error_code = "PROCESS_TREE_CLEANUP_PROBE_UNAVAILABLE",
+                        %error,
+                        "startup is retaining the primary lock while the cleanup probe is unavailable"
+                    );
+                    last_observation = Some(Err(error));
+                }
+            }
         }
-        support
-            .actor_pauses
-            .pause(ActorPausePoint::RecoveryBeforeDescriptor)
-            .await;
+        tokio::time::sleep(PROCESS_CLEANUP_RETRY_INTERVAL).await;
     }
-    remove_recovered_shutdown_marker(&paths);
+}
 
-    let dispatcher = EventDispatcherHandle::spawn(store.clone(), EVENT_BROADCAST_CAPACITY).await?;
-    debug_assert_eq!(store.latest_event_id().await?, recovery.high_watermark);
-    #[cfg(not(feature = "test-support"))]
-    let writer = StoreWriterHandle::spawn(
-        store.clone(),
-        Arc::new(dispatcher.clone()),
-        ACTOR_QUEUE_CAPACITY,
-    );
-    #[cfg(feature = "test-support")]
-    let writer = match &dependencies.process_test_support {
-        Some(support) => StoreWriterHandle::spawn_with_test_controller(
-            store.clone(),
-            Arc::new(dispatcher.clone()),
-            ACTOR_QUEUE_CAPACITY,
-            support.writer_controller.clone(),
-        ),
-        None => StoreWriterHandle::spawn(
-            store.clone(),
-            Arc::new(dispatcher.clone()),
-            ACTOR_QUEUE_CAPACITY,
-        ),
-    };
-    let runner_selection = dependencies
-        .runner_factory
-        .create(StartupRunnerContext::new(
-            paths.clone(),
-            store.clone(),
-            writer.clone(),
-            dependencies.wall_clock.clone(),
-        ))
-        .await?;
-    let runner = runner_selection.runner();
-    let concurrency = usize::try_from(runner_selection.concurrency().get())
-        .expect("u32 task concurrency fits usize on supported platforms");
-
-    let seed = SecuritySeed::generate()?;
-    let initial_launch_token = seed.initial_launch_token().clone();
-    let launcher_secret = seed.launcher_secret().clone();
-    let listener = bind_loopback(&*dependencies.listeners).await?;
-    let local_address = listener.local_addr().map_err(StartupError::Listener)?;
-    let port = NonZeroU16::new(local_address.port()).ok_or(StartupError::InvalidListener)?;
-    let listener_host = format!("127.0.0.1:{port}");
-    let security = match &dependencies.public_origin {
-        StartupPublicOrigin::Listener => SecurityManager::from_seed(
-            seed,
-            format!("http://{listener_host}"),
-            dependencies.security_clock.clone(),
-        ),
-        StartupPublicOrigin::Development(public_origin) => {
-            SecurityManager::from_seed_for_development(
-                seed,
-                public_origin.clone(),
-                listener_host,
-                dependencies.security_clock.clone(),
-            )
+async fn await_process_liveness_directory(paths: &PlatformPaths) -> ProcessLivenessDirectory {
+    let mut last_error = None;
+    loop {
+        match ProcessLivenessDirectory::open(&paths.runtime_dir) {
+            Ok(directory) => return directory,
+            Err(error) => {
+                if last_error != Some(error) {
+                    tracing::warn!(
+                        error_code = "PROCESS_TREE_CLEANUP_PROBE_UNAVAILABLE",
+                        %error,
+                        "startup is retaining the primary lock while the process-liveness namespace is unavailable"
+                    );
+                    last_error = Some(error);
+                }
+            }
         }
-    }?;
-    let browser_port = canonical_loopback_origin_port(security.public_origin())
-        .expect("SecurityManager guarantees a canonical nonzero loopback public origin");
-
-    let service_state = ServiceStateController::new(ServiceState::Ready);
-    #[cfg(not(feature = "test-support"))]
-    let task_manager = TaskManagerHandle::spawn(
-        store.clone(),
-        writer.clone(),
-        dispatcher.clone(),
-        service_state.clone(),
-        runner.clone(),
-        concurrency,
-        ACTOR_QUEUE_CAPACITY,
-    );
-    #[cfg(feature = "test-support")]
-    let task_manager = match &dependencies.process_test_support {
-        Some(support) => TaskManagerHandle::spawn_with_process_test_pauses(
-            store.clone(),
-            writer.clone(),
-            dispatcher.clone(),
-            service_state.clone(),
-            runner.clone(),
-            concurrency,
-            ACTOR_QUEUE_CAPACITY,
-            support.actor_pauses.clone(),
-        ),
-        None => TaskManagerHandle::spawn(
-            store.clone(),
-            writer.clone(),
-            dispatcher.clone(),
-            service_state.clone(),
-            runner.clone(),
-            concurrency,
-            ACTOR_QUEUE_CAPACITY,
-        ),
-    };
-
-    let quit_requested = Arc::new(Notify::new());
-    let quit_signal = {
-        let quit_requested = quit_requested.clone();
-        Arc::new(move || quit_requested.notify_one()) as Arc<dyn Fn() + Send + Sync + 'static>
-    };
-    let mutation_gate = MutationGate::new(service_state.clone());
-    let backend = ApplicationBackend::new(
-        store.clone(),
-        writer.clone(),
-        dispatcher.clone(),
-        task_manager.clone(),
-        RepositoryDiscovery::new(paths.runtime_dir.clone()),
-        dependencies.dialog.clone(),
-        security.clone(),
-        service_state.clone(),
-        mutation_gate.clone(),
-        started_at,
-        runner_selection.concurrency().get(),
-        WRITE_BUDGET,
-        quit_signal,
-    );
-    #[cfg(feature = "test-support")]
-    let backend = match &dependencies.process_test_support {
-        Some(support) => backend.with_process_test_pauses(support.actor_pauses.clone()),
-        None => backend,
-    };
-    let backend = Arc::new(backend);
-    let api_router = coding_agent_api::build_api_router(
-        backend.clone(),
-        Arc::new(security.clone()),
-        backend.clone(),
-    );
-    let instance_id = Uuid::new_v4();
-    let startup_phase = StartupPhaseController::new();
-    let router = build_runtime_router(
-        api_router,
-        instance_id,
-        startup_phase.clone(),
-        security.clone(),
-        dependencies.wall_clock.clone(),
-    );
-    let server = ServerRuntime::spawn(listener, router, lock.keepalive());
-    let descriptor = RuntimeDescriptor::new(
-        instance_id,
-        NonZeroU32::new(std::process::id()).expect("the process ID is nonzero"),
-        port,
-        started_at,
-        launcher_secret,
-    )?;
-
-    let self_probe_deadline = Instant::now() + Duration::from_secs(2);
-    let (status, probe) = crate::local_client::probe_ready(&descriptor, self_probe_deadline)
-        .await
-        .map_err(|_| StartupError::SelfProbe)?;
-    let probe = probe.ok_or(StartupError::SelfProbe)?;
-    if status != http::StatusCode::OK
-        || probe.instance_id != instance_id
-        || probe.state != StartupPhase::Starting
-    {
-        return Err(StartupError::SelfProbe);
+        tokio::time::sleep(PROCESS_CLEANUP_RETRY_INTERVAL).await;
     }
-    if !startup_phase.mark_ready() {
-        return Err(StartupError::SelfProbe);
-    }
-    if let Err(error) = descriptor.publish(&paths.instance_descriptor) {
-        let _ = std::fs::remove_file(&paths.instance_descriptor);
-        return Err(error.into());
-    }
-    let cleanup = Arc::new(PrimaryRuntimeCleanup::new(
-        server,
-        lock,
-        paths.instance_descriptor.clone(),
-    ));
-    #[cfg(feature = "test-support")]
-    if let Some(support) = &dependencies.process_test_support {
-        support
-            .actor_pauses
-            .pause(ActorPausePoint::DescriptorBeforeBrowser)
-            .await;
-    }
-
-    let browser_opened = open_browser_or_report(
-        &*dependencies.browser,
-        &*dependencies.messages,
-        browser_port,
-        initial_launch_token.as_str(),
-    );
-    #[cfg(feature = "test-support")]
-    let test_handles = PrimaryRuntimeTestHandles {
-        store: store.clone(),
-        writer: writer.clone(),
-        dispatcher: dispatcher.clone(),
-        task_manager: task_manager.clone(),
-        mutation_gate: mutation_gate.clone(),
-    };
-    #[cfg(not(feature = "test-support"))]
-    let shutdown = ShutdownCoordinator::new(
-        mutation_gate,
-        task_manager,
-        dispatcher,
-        store,
-        cleanup,
-        &paths,
-        instance_id,
-        dependencies.wall_clock.clone(),
-        dependencies.messages.clone(),
-    );
-    #[cfg(feature = "test-support")]
-    let shutdown = ShutdownCoordinator::new_for_process_test(
-        mutation_gate,
-        task_manager,
-        dispatcher,
-        store,
-        cleanup,
-        &paths,
-        instance_id,
-        dependencies.wall_clock.clone(),
-        dependencies.messages.clone(),
-        dependencies
-            .process_test_support
-            .as_ref()
-            .is_some_and(|support| support.config.marker_write_failure),
-    );
-    Ok(PrimaryRuntime {
-        descriptor,
-        startup_phase,
-        shutdown,
-        quit_requested,
-        browser_opened,
-        #[cfg(feature = "test-support")]
-        test_handles,
-        #[cfg(feature = "test-support")]
-        _test_signal_watchers: test_signal_watchers,
-    })
 }
 
 fn remove_recovered_shutdown_marker(paths: &PlatformPaths) {
@@ -1348,6 +1232,8 @@ impl Drop for ServerRuntime {
 
 struct PrimaryRuntimeCleanup {
     descriptor_path: PathBuf,
+    instance_process_scope: ProcessLivenessScope,
+    runtime_actors_installed: AtomicBool,
     resources: Mutex<PrimaryRuntimeResources>,
 }
 
@@ -1357,14 +1243,46 @@ struct PrimaryRuntimeResources {
 }
 
 impl PrimaryRuntimeCleanup {
-    fn new(server: ServerRuntime, lock: InstanceLock, descriptor_path: PathBuf) -> Self {
+    fn new(
+        lock: InstanceLock,
+        descriptor_path: PathBuf,
+        instance_process_scope: ProcessLivenessScope,
+    ) -> Self {
         Self {
             descriptor_path,
+            instance_process_scope,
+            runtime_actors_installed: AtomicBool::new(false),
             resources: Mutex::new(PrimaryRuntimeResources {
-                server: Some(server),
+                server: None,
                 lock: Some(lock),
             }),
         }
+    }
+
+    fn mark_runtime_actors_installed(&self) {
+        self.runtime_actors_installed.store(true, Ordering::Release);
+    }
+
+    fn lock_keepalive(&self) -> Arc<LockLease> {
+        self.resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock
+            .as_ref()
+            .expect("a live primary cleanup owner retains the instance lock")
+            .keepalive()
+    }
+
+    fn install_server(&self, server: ServerRuntime) {
+        let mut resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            resources.lock.is_some() && resources.server.is_none(),
+            "primary runtime server can only be installed on a live owner"
+        );
+        resources.server = Some(server);
     }
 
     fn remove_descriptor(&self) {
@@ -1378,7 +1296,27 @@ impl PrimaryRuntimeCleanup {
         }
     }
 
-    fn force_cleanup(&self) {
+    fn stop_http_now(&self) {
+        let mut resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut server) = resources.server.take() {
+            server.stop();
+        }
+    }
+
+    fn release_lock(&self) {
+        let lock = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock
+            .take();
+        drop(lock);
+    }
+
+    fn retain_unreleased_runtime_until_process_exit(&self) {
         let mut resources = self
             .resources
             .lock()
@@ -1389,15 +1327,71 @@ impl PrimaryRuntimeCleanup {
         if let Some(mut server) = resources.server.take() {
             server.stop();
         }
-        self.remove_descriptor();
         drop(resources);
-        drop(lock);
+        self.remove_descriptor();
+        // If every asynchronous fail-safe has itself failed, leaking the
+        // OS-backed lease is safer than allowing a replacement primary to
+        // overlap process trees whose cleanup was never proven. The OS
+        // releases the lease when this process exits.
+        std::mem::forget(lock);
+    }
+
+    fn finish_abandoned_startup(&self) {
+        let owns_lock = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock
+            .is_some();
+        if !owns_lock {
+            return;
+        }
+        self.stop_http_now();
+        self.remove_descriptor();
+        if self.runtime_actors_installed.load(Ordering::Acquire) {
+            self.retain_unreleased_runtime_until_process_exit();
+            return;
+        }
+        let sealed_scope = match self.instance_process_scope.seal_instance_scope() {
+            Ok(scope) => scope,
+            Err(_) => {
+                self.retain_unreleased_runtime_until_process_exit();
+                return;
+            }
+        };
+        match sealed_scope.cleanup_proof() {
+            Ok(ProcessCleanupProof::Confirmed) => self.release_lock(),
+            Ok(ProcessCleanupProof::Held | ProcessCleanupProof::Unknown) | Err(_) => {
+                self.retain_until_instance_cleanup(sealed_scope);
+            }
+        }
+    }
+
+    fn retain_until_instance_cleanup(&self, sealed_scope: SealedProcessLivenessScope) {
+        let lock = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock
+            .take();
+        let Some(lock) = lock else {
+            return;
+        };
+        let retained_lock = FailClosedInstanceLock::new(lock);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            drop(retained_lock);
+            return;
+        };
+        handle.spawn(release_lock_after_instance_cleanup(
+            retained_lock,
+            sealed_scope,
+        ));
     }
 }
 
 impl Drop for PrimaryRuntimeCleanup {
     fn drop(&mut self) {
-        self.force_cleanup();
+        self.finish_abandoned_startup();
     }
 }
 
@@ -1415,8 +1409,63 @@ impl ShutdownCleanup for PrimaryRuntimeCleanup {
         }
     }
 
-    fn remove_descriptor_and_release_lock(&self) {
-        self.force_cleanup();
+    fn stop_http_now(&self) {
+        PrimaryRuntimeCleanup::stop_http_now(self);
+    }
+
+    fn unpublish_descriptor(&self) {
+        self.remove_descriptor();
+    }
+
+    fn finish_lock(
+        &self,
+        _proof: ShutdownRuntimeCleanupProof,
+        disposition: ShutdownLockDisposition,
+    ) {
+        match disposition {
+            ShutdownLockDisposition::ReleaseNow => PrimaryRuntimeCleanup::release_lock(self),
+            ShutdownLockDisposition::RetainUntilProcessExit => {
+                self.retain_unreleased_runtime_until_process_exit();
+            }
+        }
+    }
+}
+
+async fn release_lock_after_instance_cleanup(
+    mut lock: FailClosedInstanceLock,
+    sealed_scope: SealedProcessLivenessScope,
+) {
+    loop {
+        if matches!(
+            sealed_scope.cleanup_proof(),
+            Ok(ProcessCleanupProof::Confirmed)
+        ) {
+            lock.release_after_proof();
+            return;
+        }
+        tokio::time::sleep(PROCESS_CLEANUP_RETRY_INTERVAL).await;
+    }
+}
+
+struct FailClosedInstanceLock {
+    lock: Option<InstanceLock>,
+}
+
+impl FailClosedInstanceLock {
+    fn new(lock: InstanceLock) -> Self {
+        Self { lock: Some(lock) }
+    }
+
+    fn release_after_proof(&mut self) {
+        drop(self.lock.take());
+    }
+}
+
+impl Drop for FailClosedInstanceLock {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            std::mem::forget(lock);
+        }
     }
 }
 
@@ -1425,6 +1474,10 @@ struct SystemStartupPaths;
 impl StartupPaths for SystemStartupPaths {
     fn discover(&self) -> io::Result<PlatformPaths> {
         PlatformPaths::discover()
+    }
+
+    fn prepare_lock_parent(&self, paths: &PlatformPaths) -> io::Result<()> {
+        paths.prepare_runtime_directory()
     }
 
     fn prepare(&self, paths: &PlatformPaths) -> io::Result<()> {
@@ -1528,17 +1581,21 @@ mod tests {
         let lock = InstanceLock::try_acquire(&lock_path)
             .expect("acquire cleanup fixture lock")
             .expect("cleanup fixture lock is available");
+        let process_scope = ProcessLivenessDirectory::open(temp.path())
+            .expect("open cleanup fixture process-liveness directory")
+            .instance_scope(*Uuid::new_v4().as_bytes())
+            .expect("create cleanup fixture process-liveness scope");
         std::fs::write(&descriptor_path, b"old descriptor")
             .expect("write owned descriptor fixture");
 
-        let cleanup = Arc::new(PrimaryRuntimeCleanup {
-            descriptor_path: descriptor_path.clone(),
-            resources: Mutex::new(PrimaryRuntimeResources {
-                server: None,
-                lock: Some(lock),
-            }),
-        });
-        cleanup.force_cleanup();
+        let cleanup = Arc::new(PrimaryRuntimeCleanup::new(
+            lock,
+            descriptor_path.clone(),
+            process_scope,
+        ));
+        cleanup.stop_http_now();
+        cleanup.remove_descriptor();
+        cleanup.release_lock();
         assert!(
             !descriptor_path.exists(),
             "the first cleanup must remove the descriptor it owns"
@@ -1553,6 +1610,73 @@ mod tests {
             b"replacement descriptor",
             "dropping an already-cleaned owner must not remove a later primary's descriptor"
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn aborting_startup_cleanup_worker_keeps_the_lock_fail_closed() {
+        let temp = tempfile::tempdir().expect("create fail-closed cleanup fixture");
+        let lock_path = temp.path().join("instance.lock");
+        let lock = InstanceLock::try_acquire(&lock_path)
+            .expect("acquire fail-closed cleanup lock")
+            .expect("fail-closed cleanup lock is available");
+        let instance = ProcessLivenessDirectory::open(temp.path())
+            .expect("open fail-closed process-liveness directory")
+            .instance_scope(*Uuid::new_v4().as_bytes())
+            .expect("create fail-closed process-liveness scope");
+        let held_tree = instance
+            .hold_tree_for_test()
+            .expect("hold startup process tree");
+        let sealed = instance
+            .seal_instance_scope()
+            .expect("seal abandoned startup instance");
+        let worker = tokio::spawn(release_lock_after_instance_cleanup(
+            FailClosedInstanceLock::new(lock),
+            sealed,
+        ));
+        tokio::task::yield_now().await;
+
+        worker.abort();
+        let _ = worker.await;
+        assert!(
+            InstanceLock::try_acquire(&lock_path)
+                .expect("probe fail-closed startup lock")
+                .is_none(),
+            "aborting the proof worker must retain the OS lease until process exit"
+        );
+        drop(held_tree);
+        assert!(
+            InstanceLock::try_acquire(&lock_path)
+                .expect("probe leaked fail-closed startup lock")
+                .is_none(),
+            "a cancelled proof worker cannot later release the retained lease"
+        );
+        let _retained_fixture = temp.keep();
+    }
+
+    #[test]
+    fn abandoning_cleanup_after_runtime_actors_exist_retains_the_lock_fail_closed() {
+        let temp = tempfile::tempdir().expect("create actor-stage cleanup fixture");
+        let lock_path = temp.path().join("instance.lock");
+        let lock = InstanceLock::try_acquire(&lock_path)
+            .expect("acquire actor-stage cleanup lock")
+            .expect("actor-stage cleanup lock is available");
+        let instance = ProcessLivenessDirectory::open(temp.path())
+            .expect("open actor-stage process-liveness directory")
+            .instance_scope(*Uuid::new_v4().as_bytes())
+            .expect("create actor-stage process-liveness scope");
+        let cleanup = PrimaryRuntimeCleanup::new(lock, temp.path().join("runtime.json"), instance);
+        cleanup.mark_runtime_actors_installed();
+
+        drop(cleanup);
+
+        assert!(
+            InstanceLock::try_acquire(&lock_path)
+                .expect("probe actor-stage cleanup lock")
+                .is_none(),
+            "process cleanup alone cannot release the lease after in-process actors exist"
+        );
+        let _retained_fixture = temp.keep();
     }
 
     #[test]

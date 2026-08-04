@@ -494,14 +494,20 @@ async fn collector_for_with_process_limits(
 ) -> DiffCollector {
     let rustc = concrete_rustc();
     let git = path_executable(if cfg!(windows) { "git.exe" } else { "git" });
-    let toolchain = discover_toolchain(runtime_directory, Some(&rustc), Some(&git))
-        .await
-        .unwrap();
+    let toolchain = discover_toolchain(
+        runtime_directory,
+        support::instance_process_scope(runtime_directory),
+        Some(&rustc),
+        Some(&git),
+    )
+    .await
+    .unwrap();
     DiffCollector::from_trusted_capabilities(
         &toolchain,
         Arc::new(ExecutionDirectory::open(git_directory).unwrap()),
         Arc::new(ExecutionDirectory::open(work_tree).unwrap()),
         runtime_directory,
+        support::task_process_scope(runtime_directory),
         process_limits,
         limits,
     )

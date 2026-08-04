@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use coding_agent_domain::{
@@ -16,6 +17,15 @@ pub struct FileStoreFixture {
     pub store: Store,
     pub database_path: PathBuf,
     _temp_dir: TempDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableTaskEventSnapshot {
+    pub tasks: Vec<String>,
+    pub events: Vec<String>,
+    pub stop_intents: Vec<String>,
+    pub sequences: Vec<(String, i64)>,
+    pub high_watermark: i64,
 }
 
 pub async fn memory_store() -> Store {
@@ -58,6 +68,74 @@ pub async fn register_repository(store: &Store, name: &str) -> Repository {
 
 pub fn new_task(repository_id: RepositoryId, prompt: &str) -> NewTask {
     NewTask::try_new(ClientRequestId::new(), repository_id, prompt).expect("construct fixture task")
+}
+
+pub fn queue_limit(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).expect("queue limit must be nonzero")
+}
+
+pub async fn durable_task_event_snapshot(store: &Store) -> DurableTaskEventSnapshot {
+    let tasks = sqlx::query_scalar(
+        "SELECT json_array(\
+             typeof(id), quote(id),\
+             typeof(client_request_id), quote(client_request_id),\
+             typeof(repository_id), quote(repository_id),\
+             typeof(prompt), quote(prompt),\
+             typeof(status), quote(status),\
+             typeof(attempt), quote(attempt),\
+             typeof(retry_of), quote(retry_of),\
+             typeof(created_at), quote(created_at),\
+             typeof(started_at), quote(started_at),\
+             typeof(finished_at), quote(finished_at),\
+             typeof(last_event_id), quote(last_event_id),\
+             typeof(failure_json), quote(failure_json)\
+         ) FROM tasks ORDER BY id",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    let events = sqlx::query_scalar(
+        "SELECT json_array(\
+             typeof(id), quote(id),\
+             typeof(schema_version), quote(schema_version),\
+             typeof(task_id), quote(task_id),\
+             typeof(kind), quote(kind),\
+             typeof(payload_json), quote(payload_json),\
+             typeof(created_at), quote(created_at)\
+         ) \
+         FROM task_events ORDER BY id",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    let stop_intents = sqlx::query_scalar(
+        "SELECT json_array(\
+             typeof(task_id), quote(task_id),\
+             typeof(repository_id), quote(repository_id),\
+             typeof(attempt), quote(attempt),\
+             typeof(kind), quote(kind),\
+             typeof(requested_at), quote(requested_at)\
+         ) \
+         FROM task_stop_intents ORDER BY task_id",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    let sequences = sqlx::query_as("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+    let high_watermark = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM task_events")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    DurableTaskEventSnapshot {
+        tasks,
+        events,
+        stop_intents,
+        sequences,
+        high_watermark,
+    }
 }
 
 pub async fn queued_task(store: &Store) -> Task {

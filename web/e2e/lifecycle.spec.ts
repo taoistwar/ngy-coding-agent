@@ -9,6 +9,7 @@ import {
 import {
   publishUncoordinatedReleaseSignal,
   successScenario,
+  waitForReachedSignal,
   withLocalApp,
   type LocalApp,
   type ProcessScenario,
@@ -34,10 +35,11 @@ interface EventView {
 
 const emptyScenario = (): ProcessScenario => ({
   ...successScenario(),
+  runtime_config: null,
   fake_scenarios: [],
 });
 
-test("hard-kill restart interrupts every queued and running task without auto-resume", async (
+test("hard-kill restart interrupts Running tasks and preserves Queued work", async (
   { context, page },
   testInfo,
 ) => {
@@ -45,7 +47,8 @@ test("hard-kill restart interrupts every queued and running task without auto-re
     testInfo,
     {
       ...successScenario(),
-      fake_scenarios: ["blocking", "blocking", "blocking", "blocking"],
+      runtime_config: null,
+      fake_scenarios: ["blocking", "blocking"],
     },
     async (app) => {
       await openApp(page, app);
@@ -59,20 +62,30 @@ test("hard-kill restart interrupts every queued and running task without auto-re
         app.origin,
         (tasks) =>
           tasks.length === 5 &&
-          tasks.filter((task) => task.status === "running").length === 4 &&
-          tasks.filter((task) => task.status === "queued").length === 1,
-        "four Running tasks and one Queued task",
+          tasks.filter((task) => task.status === "running").length === 2 &&
+          tasks.filter((task) => task.status === "queued").length === 3,
+        "two Running tasks and three Queued tasks",
       );
       expect(new Set(beforeKill.map((task) => task.id))).toEqual(
         new Set(created.map((task) => task.id)),
       );
+      const runningBeforeKill = new Set(
+        beforeKill.filter((task) => task.status === "running").map((task) => task.id),
+      );
+      const queuedBeforeKill = new Set(
+        beforeKill.filter((task) => task.status === "queued").map((task) => task.id),
+      );
       const taskList = page.getByRole("list", { name: "Tasks" });
-      await expect(taskList.locator("li").filter({ hasText: "Running" })).toHaveCount(4);
-      await expect(taskList.locator("li").filter({ hasText: "Queued" })).toHaveCount(1);
+      await expect(taskList.locator("li").filter({ hasText: "Running" })).toHaveCount(2);
+      await expect(taskList.locator("li").filter({ hasText: "Queued" })).toHaveCount(3);
 
       const oldIdentity = await app.runtimeIdentity();
       await app.hardKillPrimaryPreservingRoot();
-      await app.restart(emptyScenario());
+      await app.restart({
+        ...successScenario(),
+        runtime_config: null,
+        fake_scenarios: ["blocking", "blocking"],
+      });
       const newIdentity = await app.runtimeIdentity();
       expect(newIdentity.instanceId).not.toBe(oldIdentity.instanceId);
       await openApp(page, app);
@@ -80,20 +93,148 @@ test("hard-kill restart interrupts every queued and running task without auto-re
       const recovered = await waitForTasks(
         context.request,
         app.origin,
-        (tasks) => tasks.length === 5 && tasks.every((task) => task.status === "interrupted"),
-        "five Interrupted tasks after restart recovery",
+        (tasks) =>
+          tasks.length === 5 &&
+          tasks
+            .filter((task) => runningBeforeKill.has(task.id))
+            .every((task) => task.status === "interrupted") &&
+          tasks.filter(
+            (task) => queuedBeforeKill.has(task.id) && task.status === "running",
+          ).length === 2 &&
+          tasks.filter(
+            (task) => queuedBeforeKill.has(task.id) && task.status === "queued",
+          ).length === 1,
+        "Running tasks interrupted and preserved Queued work readmitted",
       );
-      expect(recovered.every((task) => task.failure?.code === "APP_RESTARTED")).toBe(true);
-      expect(recovered.every((task) => task.status !== "queued" && task.status !== "running")).toBe(
-        true,
-      );
+      const recoveredRunning = recovered.filter((task) => runningBeforeKill.has(task.id));
+      const recoveredQueued = recovered.filter((task) => queuedBeforeKill.has(task.id));
+      expect(recoveredRunning).toHaveLength(2);
+      expect(recoveredRunning.every((task) => task.failure?.code === "APP_RESTARTED")).toBe(true);
+      expect(recoveredQueued).toHaveLength(3);
+      expect(recoveredQueued.every((task) => task.failure === null)).toBe(true);
+      expect(
+        recoveredQueued.every(
+          (task) => task.status === "queued" || task.status === "running",
+        ),
+      ).toBe(true);
       expect(recovered.every((task) => task.id.length > 0)).toBe(true);
       expect(repository.id).not.toBe("");
-      await expect(taskList.locator("li").filter({ hasText: "Interrupted" })).toHaveCount(5);
+      await expect(taskList.locator("li").filter({ hasText: "Interrupted" })).toHaveCount(2);
+      await expect(taskList.locator("li").filter({ hasText: "Running" })).toHaveCount(2);
+      await expect(taskList.locator("li").filter({ hasText: "Queued" })).toHaveCount(1);
+
+      for (const taskId of runningBeforeKill) {
+        const events = await taskEvents(context.request, app.origin, taskId);
+        expect(events.filter((event) => event.kind === "task.interrupted")).toHaveLength(1);
+      }
+      for (const taskId of queuedBeforeKill) {
+        const events = await taskEvents(context.request, app.origin, taskId);
+        expect(events.filter((event) => event.kind === "task.queued")).toHaveLength(1);
+        expect(events.filter((event) => event.kind === "task.interrupted")).toHaveLength(0);
+      }
 
       await page.waitForTimeout(1_200);
       const stable = await listTasks(context.request, app.origin);
-      expect(stable.every((task) => task.status === "interrupted")).toBe(true);
+      expect(
+        stable
+          .filter((task) => runningBeforeKill.has(task.id))
+          .every((task) => task.status === "interrupted"),
+      ).toBe(true);
+      expect(
+        stable
+          .filter((task) => queuedBeforeKill.has(task.id))
+          .every((task) => task.status === "queued" || task.status === "running"),
+      ).toBe(true);
+      await quitThroughUi(page, app);
+    },
+  );
+});
+
+test("a durable user stop intent survives a kill before its writer wake", async (
+  { context, page },
+  testInfo,
+) => {
+  let intentReleasePath = "";
+  await withLocalApp(
+    testInfo,
+    (roots) => {
+      intentReleasePath = roots.releaseSignalPath("user-stop-intent-committed");
+      return {
+        ...successScenario(),
+        runtime_config: null,
+        fake_scenarios: ["blocking"],
+        store_writer_faults: [
+          {
+            point: "pause_after_commit_before_wake",
+            operation: "persist_stop_intent_batch",
+            count: 1,
+          },
+        ],
+        virtual_release_signals: [
+          {
+            name: "user-stop-intent-committed",
+            path: intentReleasePath,
+            target: "store_writer_after_commit_before_wake",
+          },
+        ],
+      };
+    },
+    async (app) => {
+      await openApp(page, app);
+      await addRepository(page, app);
+      const prompt = "Recover the durable user cancellation winner";
+      const created = await createTask(page, app, prompt);
+      await waitForTask(
+        context.request,
+        app.origin,
+        created.id,
+        (task) => task.status === "running",
+        "blocking task to enter Running",
+      );
+
+      if (intentReleasePath.length === 0) {
+        throw new Error("user stop intent release path was not configured");
+      }
+      const cancelUrl = `${app.origin}/api/tasks/${created.id}/cancel`;
+      const cancelResponse = page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" && response.url() === cancelUrl,
+      );
+      void cancelResponse.catch(() => undefined);
+      await page.getByRole("button", { name: "Cancel task", exact: true }).click();
+      await waitForReachedSignal(app.runtimeDir, intentReleasePath);
+
+      const beforeKill = await readTask(context.request, app.origin, created.id);
+      expect(beforeKill.status).toBe("running");
+      expect(
+        (await taskEvents(context.request, app.origin, created.id)).filter(
+          (event) =>
+            event.kind === "task.cancelled" || event.kind === "task.interrupted",
+        ),
+      ).toHaveLength(0);
+
+      await app.hardKillPrimaryPreservingRoot();
+      await app.restart(emptyScenario());
+      await openApp(page, app);
+
+      const recovered = await waitForTask(
+        context.request,
+        app.origin,
+        created.id,
+        (task) => task.status === "cancelled",
+        "durable user stop intent to recover as Cancelled",
+      );
+      expect(recovered.failure).toBeNull();
+      const events = await taskEvents(context.request, app.origin, created.id);
+      expect(events.filter((event) => event.kind === "task.cancelled")).toHaveLength(1);
+      expect(events.filter((event) => event.kind === "task.interrupted")).toHaveLength(0);
+
+      await page
+        .getByRole("button", { name: `${prompt} Attempt 1`, exact: true })
+        .click();
+      await expect(page.locator(".task-status-label")).toHaveText(
+        "Execution status: cancelled",
+      );
       await quitThroughUi(page, app);
     },
   );
@@ -110,6 +251,7 @@ test("a terminal commit survives a kill before its writer wake", async (
       runnerReleasePath = roots.releaseSignalPath("complete-blocking-runner");
       return {
         ...successScenario(),
+        runtime_config: null,
         fake_scenarios: ["blocking"],
         store_writer_faults: [
           {

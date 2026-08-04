@@ -11,6 +11,7 @@ use std::time::Duration;
 use coding_agent_core::{DiffEvent, DiffFile, DiffFileStatus, ReviewDiffInputFile};
 use tokio_util::sync::CancellationToken;
 
+use crate::ProcessLivenessScope;
 use crate::command_policy::{
     CommandPolicyError, ExecutionDirectory, GitCommandBinding, ValidatedCommand,
 };
@@ -89,6 +90,7 @@ impl DiffCollector {
         git_directory: Arc<ExecutionDirectory>,
         work_tree: Arc<ExecutionDirectory>,
         temporary_directory: impl AsRef<Path>,
+        process_liveness_scope: ProcessLivenessScope,
         process_limits: ProcessLimits,
         limits: DiffLimits,
     ) -> Result<Self, DiffError> {
@@ -96,7 +98,7 @@ impl DiffCollector {
             .map_err(DiffError::CommandPolicy)?;
         let platform = platform_environment(temporary_directory.as_ref())?;
         Ok(Self {
-            supervisor: ProcessSupervisor::new(process_limits),
+            supervisor: ProcessSupervisor::new(process_limits, process_liveness_scope),
             git: toolchain.git(),
             binding,
             environment: ChildEnvironment::for_git(&platform),

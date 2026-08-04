@@ -2,7 +2,7 @@ import { act, cleanup, render, screen, waitFor, within } from "@testing-library/
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { Task, TaskDetail } from "../api/types";
+import type { SchedulerStoppingTask, Task, TaskDetail } from "../api/types";
 import type { CancelCommandState } from "../state/model";
 import { TaskWorkspace, type TaskWorkspaceProps } from "./TaskWorkspace";
 
@@ -130,6 +130,8 @@ function props(value: Task | null, overrides: Partial<TaskWorkspaceProps> = {}):
     detailLoading: false,
     detailError: null,
     cancelState: undefined,
+    schedulerQueuedTask: null,
+    schedulerStoppingTask: null,
     tasksById: value === null ? {} : { [value.id]: value },
     taskOrder: value === null ? [] : [value.id],
     onCancel: vi.fn(),
@@ -211,6 +213,88 @@ describe("TaskWorkspace", () => {
     expect(screen.getByText("Execution completed — not reviewed")).toBeVisible();
     expect(screen.queryByText("Cancelling")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry task" })).toBeEnabled();
+  });
+
+  it.each([
+    ["user_cancelled", "Stopping — user requested"],
+    ["disk_pressure_critical", "Stopping — critical storage pressure"],
+  ] as const)(
+    "disables repeated cancel for the durable %s stop winner",
+    (intent, label) => {
+      const running = task(`task-${intent}`, "running", { started_at: NOW });
+      const stopping: SchedulerStoppingTask = {
+        task_id: running.id,
+        intent,
+      };
+
+      render(
+        <TaskWorkspace
+          {...props(running, { schedulerStoppingTask: stopping })}
+        />,
+      );
+
+      expect(screen.getByRole("status", { name: "Durable stop status" })).toHaveTextContent(
+        label,
+      );
+      expect(screen.getByRole("button", { name: "Cancel task" })).toBeDisabled();
+    },
+  );
+
+  it("does not infer a durable stop winner from local cancel pending state", () => {
+    const running = task("task-local-cancel", "running", { started_at: NOW });
+    const pending: CancelCommandState = {
+      phase: "pending",
+      optimistic: true,
+      error: null,
+    };
+
+    render(<TaskWorkspace {...props(running, { cancelState: pending })} />);
+
+    expect(screen.getByRole("button", { name: "Cancelling" })).toBeDisabled();
+    expect(screen.queryByRole("status", { name: "Durable stop status" })).not.toBeInTheDocument();
+  });
+
+  it("ignores a stale stopping entry after terminal events and keeps final outcomes separate", () => {
+    const cancelled = task("task-cancelled", "cancelled", {
+      started_at: NOW,
+      finished_at: NOW,
+    });
+    const staleStopping: SchedulerStoppingTask = {
+      task_id: cancelled.id,
+      intent: "user_cancelled",
+    };
+    const { rerender } = render(
+      <TaskWorkspace
+        {...props(cancelled, { schedulerStoppingTask: staleStopping })}
+      />,
+    );
+
+    expect(screen.getByText("Final outcome: Cancelled")).toBeVisible();
+    expect(screen.queryByText(/Stopping —/u)).not.toBeInTheDocument();
+
+    const failed = task("task-disk-failed", "failed", {
+      started_at: NOW,
+      finished_at: NOW,
+      failure: {
+        code: "DISK_PRESSURE_CRITICAL",
+        message: "Execution stopped to protect storage",
+        retryable: true,
+      },
+    });
+    rerender(
+      <TaskWorkspace
+        {...props(failed, {
+          schedulerStoppingTask: {
+            task_id: failed.id,
+            intent: "disk_pressure_critical",
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Final outcome: Failed — retryable")).toBeVisible();
+    expect(screen.queryByText(/Stopping —/u)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Cancelled|Review rejected/u)).not.toBeInTheDocument();
   });
 
   it("shows cancel and retry request failures beside their actions", async () => {

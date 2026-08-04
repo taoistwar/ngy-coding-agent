@@ -1,10 +1,15 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+#[cfg(feature = "test-support")]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "test-support")]
+use coding_agent_runtime::WorktreeSideEffectTestOutcome;
 use coding_agent_runtime::{
     CargoToolLimits, CargoTools, GitRunStatus, GitToolLimits, ProcessLimits, RuntimeSession,
     RuntimeSessionLimits, ToolchainPaths, WorktreeArtifactState, WorktreeError, WorktreeIdentity,
@@ -83,7 +88,7 @@ async fn redirected_artifact_parent_is_rejected_without_creating_anything_outsid
         "{error:?}"
     );
     assert_eq!(error.code(), "WORKTREE_PATH_ESCAPE");
-    assert_eq!(error.artifact_state(), WorktreeArtifactState::Absent);
+    assert_eq!(error.artifact_state(), WorktreeArtifactState::Inconsistent);
     assert_eq!(
         std::fs::read_dir(&outside).unwrap().count(),
         0,
@@ -98,6 +103,470 @@ async fn redirected_artifact_parent_is_rejected_without_creating_anything_outsid
     );
     assert_eq!(worktree_admin_entries(&fixture.repository), admin_before);
     assert!(!branch_exists(&fixture.repository, &identity.branch_name()));
+}
+
+#[tokio::test]
+async fn reservation_debug_hides_paths_and_common_git_identity() {
+    let fixture = Fixture::new(true).await;
+    let provisioner = fixture.provisioner();
+    let reservation = provisioner
+        .prepare(
+            fixture.reserve("debug-redaction", 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let rendered = format!("{reservation:?}");
+    let marker = format!("{:?}", provisioner.common_git_identity_marker());
+    assert!(rendered.starts_with("WorktreeReservation"));
+    assert!(!rendered.contains(&fixture.root.to_string_lossy().to_string()));
+    assert!(!rendered.contains(&reservation.worktree_path().to_string_lossy().to_string()));
+    assert!(!rendered.contains(&marker));
+    assert!(!rendered.contains("common_git"));
+    assert!(!rendered.contains("cargo_workspace"));
+}
+
+#[tokio::test]
+async fn repository_and_cargo_workspace_aliases_share_common_git_identity() {
+    let fixture = Fixture::new(true).await;
+    let nested_workspace = fixture.provisioner();
+    let repository_workspace = WorktreeProvisioner::from_trusted_paths(
+        &fixture.toolchain,
+        "repository-cargo-workspace-alias",
+        &fixture.repository,
+        &fixture.repository,
+        &fixture.artifact_root,
+        &fixture.runtime_directory,
+        support::task_process_scope(&fixture.runtime_directory),
+        process_limits(),
+        WorktreeLimits::try_new(Duration::from_secs(15)).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        nested_workspace.common_git_identity_marker(),
+        repository_workspace.common_git_identity_marker()
+    );
+}
+
+#[tokio::test]
+async fn common_git_replacement_before_add_is_typed_and_has_no_new_side_effect() {
+    let fixture = Fixture::new(true).await;
+    let provisioner = fixture.provisioner();
+    let identity = fixture.reserve("identity-pre-gate", 1);
+    let target = fixture.target(&identity);
+    let reservation = provisioner
+        .prepare(identity.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    let refs_before = git_stdout(
+        &fixture.repository,
+        &["for-each-ref", "--format=%(refname)", "refs/heads"],
+    );
+    let admin_before = worktree_admin_entries(&fixture.repository);
+    let replacement = replace_common_git_directory(&fixture.repository);
+
+    let error = provisioner
+        .provision_reserved(reservation, CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    replacement.restore();
+    assert!(
+        matches!(error.cause(), WorktreeError::CommonGitIdentityMismatch),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "REPOSITORY_IDENTITY_MISMATCH");
+    let rendered = error.to_string();
+    assert!(!rendered.contains(&fixture.root.to_string_lossy().to_string()));
+    assert!(!rendered.contains(&format!("{:?}", provisioner.common_git_identity_marker())));
+    assert!(!target.exists());
+    assert_eq!(
+        git_stdout(
+            &fixture.repository,
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        ),
+        refs_before
+    );
+    assert_eq!(worktree_admin_entries(&fixture.repository), admin_before);
+    assert!(!branch_exists(&fixture.repository, &identity.branch_name()));
+}
+
+#[tokio::test]
+async fn cancelled_provision_uses_a_fresh_observation_and_preserves_the_absent_scene() {
+    let fixture = Fixture::new(true).await;
+    let provisioner = fixture.provisioner();
+    let identity = fixture.reserve("cancelled-before-add", 1);
+    let target = fixture.target(&identity);
+    let reservation = provisioner
+        .prepare(identity.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    let refs_before = git_stdout(
+        &fixture.repository,
+        &["for-each-ref", "--format=%(refname)", "refs/heads"],
+    );
+    let admin_before = worktree_admin_entries(&fixture.repository);
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    assert_eq!(
+        provisioner
+            .observe(&reservation, cancellation.clone())
+            .await,
+        WorktreeObservation::Unavailable,
+        "a cancelled observation cannot prove an artifact state"
+    );
+    let error = provisioner
+        .provision_reserved(reservation, cancellation)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error.cause(), WorktreeError::Cancelled),
+        "{error:?}"
+    );
+    assert_eq!(error.observation(), WorktreeObservation::Absent);
+    assert_eq!(error.artifact_state(), WorktreeArtifactState::Absent);
+    assert!(!target.exists());
+    assert_eq!(
+        git_stdout(
+            &fixture.repository,
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        ),
+        refs_before
+    );
+    assert_eq!(worktree_admin_entries(&fixture.repository), admin_before);
+    assert!(!branch_exists(&fixture.repository, &identity.branch_name()));
+}
+
+#[tokio::test]
+async fn unavailable_common_git_identity_keeps_the_reservation_and_preserves_the_scene() {
+    let fixture = Fixture::new(true).await;
+    let provisioner = fixture.provisioner();
+    let identity = fixture.reserve("identity-unavailable", 1);
+    let target = fixture.target(&identity);
+    let reservation = provisioner
+        .prepare(identity.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    let refs_before = git_stdout(
+        &fixture.repository,
+        &["for-each-ref", "--format=%(refname)", "refs/heads"],
+    );
+    let admin_before = worktree_admin_entries(&fixture.repository);
+    let git_scene_before = snapshot_tree_bytes(&fixture.repository.join(".git"));
+    let unavailable = make_common_git_unavailable(&fixture.repository);
+
+    assert_eq!(
+        provisioner
+            .observe(&reservation, CancellationToken::new())
+            .await,
+        WorktreeObservation::Unavailable
+    );
+    let error = provisioner
+        .provision_reserved(reservation, CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error.cause(), WorktreeError::CommonGitIdentityUnavailable),
+        "{error:?}"
+    );
+    assert_eq!(error.observation(), WorktreeObservation::Unavailable);
+    assert_eq!(error.artifact_state(), WorktreeArtifactState::Unavailable);
+    assert_eq!(
+        snapshot_tree_bytes(&unavailable.retained),
+        git_scene_before,
+        "unavailable observation modified the retained common Git scene"
+    );
+    assert!(!target.exists());
+    unavailable.restore();
+    assert_eq!(
+        git_stdout(
+            &fixture.repository,
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        ),
+        refs_before
+    );
+    assert_eq!(worktree_admin_entries(&fixture.repository), admin_before);
+    assert!(!branch_exists(&fixture.repository, &identity.branch_name()));
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn add_and_reset_share_the_same_side_effect_boundary() {
+    let fixture = Fixture::new(true).await;
+    let mut provisioner = fixture.provisioner();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let hook_events = Arc::clone(&events);
+    provisioner.set_side_effect_boundary_hook_for_tests(move |kind, boundary| {
+        hook_events.lock().unwrap().push((kind, boundary));
+    });
+    let reservation = provisioner
+        .prepare(
+            fixture.reserve("shared-side-effect-gate", 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    provisioner
+        .provision_reserved(reservation, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            ("worktree-add", "before-command"),
+            ("worktree-add", "after-command"),
+            ("reset", "before-command"),
+            ("reset", "after-command"),
+        ]
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn post_success_common_git_replacement_wins_over_add_success() {
+    let fixture = Fixture::new(true).await;
+    let mut provisioner = fixture.provisioner();
+    let replacement = Arc::new(Mutex::new(None));
+    let hook_replacement = Arc::clone(&replacement);
+    let repository = fixture.repository.clone();
+    provisioner.set_side_effect_boundary_hook_for_tests(move |kind, boundary| {
+        if kind == "worktree-add" && boundary == "after-command" {
+            *hook_replacement.lock().unwrap() = Some(replace_common_git_directory(&repository));
+        }
+    });
+    let reservation = provisioner
+        .prepare(
+            fixture.reserve("identity-post-success", 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let error = provisioner
+        .provision_reserved(reservation, CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    replacement
+        .lock()
+        .unwrap()
+        .take()
+        .expect("post-command hook replaced common Git directory")
+        .restore();
+    assert!(
+        matches!(error.cause(), WorktreeError::CommonGitIdentityMismatch),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "REPOSITORY_IDENTITY_MISMATCH");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn post_failure_common_git_replacement_wins_over_cancelled_add() {
+    let fixture = Fixture::new(true).await;
+    let mut provisioner = fixture.provisioner();
+    let cancellation = CancellationToken::new();
+    let hook_cancellation = cancellation.clone();
+    let replacement = Arc::new(Mutex::new(None));
+    let hook_replacement = Arc::clone(&replacement);
+    let repository = fixture.repository.clone();
+    provisioner.set_side_effect_boundary_hook_for_tests(move |kind, boundary| {
+        if kind != "worktree-add" {
+            return;
+        }
+        if boundary == "before-command" {
+            hook_cancellation.cancel();
+        } else if boundary == "after-command" {
+            *hook_replacement.lock().unwrap() = Some(replace_common_git_directory(&repository));
+        }
+    });
+    let reservation = provisioner
+        .prepare(
+            fixture.reserve("identity-post-failure", 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let error = provisioner
+        .provision_reserved(reservation, cancellation)
+        .await
+        .unwrap_err();
+
+    replacement
+        .lock()
+        .unwrap()
+        .take()
+        .expect("post-command hook replaced common Git directory")
+        .restore();
+    assert!(
+        matches!(error.cause(), WorktreeError::CommonGitIdentityMismatch),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), "REPOSITORY_IDENTITY_MISMATCH");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn post_identity_mismatch_wins_over_every_other_command_failure_class() {
+    for (attempt, outcome) in [
+        WorktreeSideEffectTestOutcome::NonZero,
+        WorktreeSideEffectTestOutcome::TimedOut,
+        WorktreeSideEffectTestOutcome::ProcessError,
+        WorktreeSideEffectTestOutcome::BuildError,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new(true).await;
+        let mut provisioner = fixture.provisioner();
+        let replacement = Arc::new(Mutex::new(None));
+        let hook_replacement = Arc::clone(&replacement);
+        let repository = fixture.repository.clone();
+        provisioner.set_side_effect_outcome_for_tests(outcome);
+        provisioner.set_side_effect_boundary_hook_for_tests(move |kind, boundary| {
+            if kind == "worktree-add" && boundary == "after-command" {
+                *hook_replacement.lock().unwrap() = Some(replace_common_git_directory(&repository));
+            }
+        });
+        let reservation = provisioner
+            .prepare(
+                fixture.reserve("identity-all-failures", attempt as u32 + 1),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let error = provisioner
+            .provision_reserved(reservation, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        replacement
+            .lock()
+            .unwrap()
+            .take()
+            .expect("post-command hook replaced common Git directory")
+            .restore();
+        assert!(
+            matches!(error.cause(), WorktreeError::CommonGitIdentityMismatch),
+            "{outcome:?}: {error:?}"
+        );
+        assert_eq!(error.code(), "REPOSITORY_IDENTITY_MISMATCH");
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn stable_identity_failure_outcomes_keep_the_original_error_and_absent_scene() {
+    for (attempt, outcome) in [
+        WorktreeSideEffectTestOutcome::NonZero,
+        WorktreeSideEffectTestOutcome::TimedOut,
+        WorktreeSideEffectTestOutcome::ProcessError,
+        WorktreeSideEffectTestOutcome::BuildError,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new(true).await;
+        let mut provisioner = fixture.provisioner();
+        provisioner.set_side_effect_outcome_for_tests(outcome);
+        let identity = fixture.reserve("stable-failure-outcomes", attempt as u32 + 1);
+        let target = fixture.target(&identity);
+        let reservation = provisioner
+            .prepare(identity.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let refs_before = git_stdout(
+            &fixture.repository,
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        );
+        let admin_before = worktree_admin_entries(&fixture.repository);
+
+        let error = provisioner
+            .provision_reserved(reservation, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        match outcome {
+            WorktreeSideEffectTestOutcome::NonZero => {
+                assert!(matches!(error.cause(), WorktreeError::GitCommandFailed));
+            }
+            WorktreeSideEffectTestOutcome::TimedOut => {
+                assert!(matches!(error.cause(), WorktreeError::TimedOut));
+            }
+            WorktreeSideEffectTestOutcome::ProcessError => {
+                assert!(matches!(error.cause(), WorktreeError::Process(_)));
+            }
+            WorktreeSideEffectTestOutcome::CleanupUnproven => {
+                unreachable!("cleanup-unproven has a dedicated fail-closed test")
+            }
+            WorktreeSideEffectTestOutcome::BuildError => {
+                assert!(matches!(error.cause(), WorktreeError::CommandPolicy(_)));
+            }
+        }
+        assert_eq!(
+            error.observation(),
+            WorktreeObservation::Absent,
+            "{outcome:?}: {error:?}"
+        );
+        assert_eq!(error.artifact_state(), WorktreeArtifactState::Absent);
+        assert!(!target.exists());
+        assert_eq!(
+            git_stdout(
+                &fixture.repository,
+                &["for-each-ref", "--format=%(refname)", "refs/heads"],
+            ),
+            refs_before
+        );
+        assert_eq!(worktree_admin_entries(&fixture.repository), admin_before);
+        assert!(!branch_exists(&fixture.repository, &identity.branch_name()));
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cleanup_unproven_precedes_post_identity_evidence_and_starts_no_observation() {
+    let fixture = Fixture::new(true).await;
+    let mut provisioner = fixture.provisioner();
+    let replacement = Arc::new(Mutex::new(None));
+    let hook_replacement = Arc::clone(&replacement);
+    let repository = fixture.repository.clone();
+    provisioner.set_side_effect_outcome_for_tests(WorktreeSideEffectTestOutcome::CleanupUnproven);
+    provisioner.set_side_effect_boundary_hook_for_tests(move |kind, boundary| {
+        if kind == "worktree-add" && boundary == "after-command" {
+            *hook_replacement.lock().unwrap() = Some(replace_common_git_directory(&repository));
+        }
+    });
+    let reservation = provisioner
+        .prepare(
+            fixture.reserve("cleanup-unproven-precedence", 1),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let error = provisioner
+        .provision_reserved(reservation, CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    replacement
+        .lock()
+        .unwrap()
+        .take()
+        .expect("test hook replaced common Git directory")
+        .restore();
+    assert_eq!(error.code(), "PROCESS_TREE_CLEANUP_FAILED");
+    assert!(error.process_cleanup_is_unproven());
+    assert_eq!(error.observation(), WorktreeObservation::Unavailable);
 }
 
 #[tokio::test]
@@ -172,6 +641,7 @@ async fn prepare_is_deterministic_and_has_no_artifact_or_git_side_effect() {
         provisioned.cargo_workspace(),
         provisioned.target_directory(),
         &fixture.runtime_directory,
+        support::task_process_scope(&fixture.runtime_directory),
         process_limits(),
         CargoToolLimits::try_new(Duration::from_secs(10), 8, 32, 128).unwrap(),
     )
@@ -193,6 +663,8 @@ async fn prepare_is_deterministic_and_has_no_artifact_or_git_side_effect() {
         &provisioned,
         &fixture.toolchain,
         &fixture.runtime_directory,
+        support::task_process_scope(&fixture.runtime_directory),
+        NonZeroU32::new(1).expect("test Cargo jobs are nonzero"),
         RuntimeSessionLimits::project_2_defaults(),
     )
     .unwrap();
@@ -348,16 +820,29 @@ async fn reservation_cannot_be_replayed_against_another_source_repository() {
     );
     let other = WorktreeProvisioner::from_trusted_paths(
         &fixture.toolchain,
+        "other-repository-id",
         &other_repository,
         &other_workspace,
         &fixture.artifact_root,
         &fixture.runtime_directory,
+        support::task_process_scope(&fixture.runtime_directory),
         process_limits(),
         WorktreeLimits::try_new(Duration::from_secs(15)).unwrap(),
     )
     .unwrap();
     let source_admin_before = worktree_admin_entries(&fixture.repository);
     let other_admin_before = worktree_admin_entries(&other_repository);
+
+    let restore_error = other
+        .restore_reservation(
+            identity.clone(),
+            reservation.base_commit().to_owned(),
+            reservation.branch_name().to_owned(),
+            reservation.worktree_path().to_owned(),
+        )
+        .unwrap_err();
+    assert!(matches!(restore_error, WorktreeError::InvalidReservation));
+    assert_eq!(restore_error.code(), "WORKTREE_STATE_INCONSISTENT");
 
     let error = other
         .provision_reserved(reservation, CancellationToken::new())
@@ -366,7 +851,8 @@ async fn reservation_cannot_be_replayed_against_another_source_repository() {
 
     assert!(matches!(error.cause(), WorktreeError::InvalidReservation));
     assert_eq!(error.code(), "WORKTREE_STATE_INCONSISTENT");
-    assert_eq!(error.artifact_state(), WorktreeArtifactState::Absent);
+    assert_eq!(error.observation(), WorktreeObservation::Inconsistent);
+    assert_eq!(error.artifact_state(), WorktreeArtifactState::Inconsistent);
     assert!(!target.exists());
     assert!(!branch_exists(&fixture.repository, &identity.branch_name()));
     assert!(!branch_exists(&other_repository, &identity.branch_name()));
@@ -463,11 +949,16 @@ async fn observation_classifies_every_creation_crash_point_without_deleting_the_
     let partial_git_dir = raw_worktree_add(&fixture.repository, &partial);
     let partial_sentinel = partial.worktree_path().join("partial-checkout-sentinel");
     std::fs::write(&partial_sentinel, b"preserve partial checkout\n").unwrap();
+    let partial_observation = provisioner
+        .observe_with_safety(&partial, CancellationToken::new())
+        .await;
     assert_eq!(
-        provisioner
-            .observe(&partial, CancellationToken::new())
-            .await,
+        partial_observation.observation(),
         WorktreeObservation::CheckoutPartial
+    );
+    assert!(
+        !partial_observation.repository_poison_required(),
+        "ordinary dirty content is inconsistent without inventing control identity drift"
     );
     assert_eq!(
         std::fs::read(&partial_sentinel).unwrap(),
@@ -498,11 +989,16 @@ async fn observation_classifies_every_creation_crash_point_without_deleting_the_
     let mismatch_git_dir = raw_worktree_add(&fixture.repository, &mismatch);
     std::fs::write(mismatch_git_dir.join("locked"), b"foreign-owner\n").unwrap();
     let mismatch_pointer = std::fs::read(mismatch.worktree_path().join(".git")).unwrap();
+    let mismatch_observation = provisioner
+        .observe_with_safety(&mismatch, CancellationToken::new())
+        .await;
     assert_eq!(
-        provisioner
-            .observe(&mismatch, CancellationToken::new())
-            .await,
+        mismatch_observation.observation(),
         WorktreeObservation::Inconsistent
+    );
+    assert!(
+        mismatch_observation.repository_poison_required(),
+        "admin/control-plane mismatch must poison every repository alias"
     );
     assert_eq!(
         std::fs::read(mismatch_git_dir.join("locked")).unwrap(),
@@ -940,6 +1436,7 @@ async fn hooks_fsmonitor_external_diff_and_textconv_never_run_and_linked_git_poi
         .bind_git_tools(
             &fixture.toolchain,
             &fixture.runtime_directory,
+            support::task_process_scope(&fixture.runtime_directory),
             process_limits(),
             GitToolLimits::try_new(Duration::from_secs(10), Duration::from_secs(10)).unwrap(),
         )
@@ -1098,6 +1595,7 @@ impl Fixture {
 
         let toolchain = discover_toolchain(
             &runtime_directory,
+            support::instance_process_scope(&runtime_directory),
             Some(&concrete_rustc()),
             Some(&path_executable(if cfg!(windows) {
                 "git.exe"
@@ -1137,10 +1635,12 @@ impl Fixture {
     fn provisioner(&self) -> WorktreeProvisioner {
         WorktreeProvisioner::from_trusted_paths(
             &self.toolchain,
+            REPOSITORY_ID,
             &self.repository,
             &self.cargo_workspace,
             &self.artifact_root,
             &self.runtime_directory,
+            support::task_process_scope(&self.runtime_directory),
             process_limits(),
             WorktreeLimits::try_new(Duration::from_secs(15)).unwrap(),
         )
@@ -1296,6 +1796,50 @@ fn raw_worktree_reset(reservation: &WorktreeReservation) {
             reservation.base_commit(),
         ],
     );
+}
+
+struct ReplacedCommonGit {
+    live: PathBuf,
+    retained: PathBuf,
+}
+
+impl ReplacedCommonGit {
+    fn restore(self) {
+        std::fs::remove_dir(&self.live)
+            .expect("replacement common Git directory must remain empty");
+        std::fs::rename(&self.retained, &self.live)
+            .expect("restore authenticated common Git directory");
+    }
+}
+
+fn replace_common_git_directory(repository: &Path) -> ReplacedCommonGit {
+    let live = repository.join(".git");
+    let retained = repository.join(".git-authenticated-object");
+    assert!(!retained.exists());
+    std::fs::rename(&live, &retained).expect("move authenticated common Git directory");
+    std::fs::create_dir(&live).expect("install replacement common Git directory");
+    ReplacedCommonGit { live, retained }
+}
+
+struct UnavailableCommonGit {
+    live: PathBuf,
+    retained: PathBuf,
+}
+
+impl UnavailableCommonGit {
+    fn restore(self) {
+        assert!(!self.live.exists());
+        std::fs::rename(&self.retained, &self.live)
+            .expect("restore temporarily unavailable common Git directory");
+    }
+}
+
+fn make_common_git_unavailable(repository: &Path) -> UnavailableCommonGit {
+    let live = repository.join(".git");
+    let retained = repository.join(".git-temporarily-unavailable");
+    assert!(!retained.exists());
+    std::fs::rename(&live, &retained).expect("make authenticated common Git directory unavailable");
+    UnavailableCommonGit { live, retained }
 }
 
 fn linked_admin_directory(worktree: &Path) -> PathBuf {

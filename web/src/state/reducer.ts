@@ -7,16 +7,31 @@ import type {
   TaskEvent,
   TimelineEntry,
 } from "../api/types";
+import type { SchedulerSnapshotCandidate } from "../api/schedulerSnapshot";
+import {
+  ValidationError,
+  validateSchedulerStateAgainstAuthority,
+} from "../api/schedulerValidation";
 import type {
   AgentConnectionState,
   AgentState,
   CommandError,
   IgnoredEventDiagnostic,
+  QueueFullReplayState,
 } from "./model";
 import {
   projectReviewEvent,
   type ReviewProjectionResult,
 } from "./reviewProjection";
+import {
+  acceptSchedulerCandidate,
+  advanceSchedulerCausalPosition,
+  adoptSchedulerBootstrap,
+  clearSchedulerForRecovery,
+  initialSchedulerProjection,
+  markSchedulerStale,
+  type SchedulerProjectionState,
+} from "./schedulerProjection";
 
 export type AgentAction =
   | { type: "bootstrap.started" }
@@ -35,6 +50,7 @@ export type AgentAction =
     }
   | { type: "detail.failed"; taskId: string; generation: number; message: string }
   | { type: "event.received"; event: TaskEvent }
+  | { type: "scheduler.received"; candidate: SchedulerSnapshotCandidate }
   | {
       type: "event.conflicted";
       event: Extract<TaskEvent, { kind: "review.updated" }>;
@@ -56,7 +72,9 @@ export type AgentAction =
     }
   | { type: "cancel.started"; taskId: string }
   | { type: "cancel.succeeded"; response: CancellationAcceptedResponse }
-  | { type: "cancel.failed"; taskId: string; error: CommandError };
+  | { type: "cancel.failed"; taskId: string; error: CommandError }
+  | { type: "create.queue_full"; replay: QueueFullReplayState }
+  | { type: "create.succeeded"; clientRequestId: string };
 
 interface Normalized<T> {
   byId: Record<string, T>;
@@ -92,7 +110,59 @@ function protocolError(state: AgentState, reason: string): AgentState {
     ...state,
     connection: "protocol_error",
     recoveryReason: reason,
+    scheduler: markSchedulerStale(state.scheduler, "protocol_error"),
   };
+}
+
+function installSchedulerProjection(
+  state: AgentState,
+  scheduler: SchedulerProjectionState,
+): AgentState {
+  scheduler = validateFreshSchedulerAuthority(state, scheduler);
+  if (scheduler.recoveryReason === null) {
+    return { ...state, scheduler };
+  }
+  return {
+    ...state,
+    scheduler,
+    connection: "protocol_error",
+    recoveryReason: scheduler.recoveryReason,
+  };
+}
+
+function validateFreshSchedulerAuthority(
+  state: AgentState,
+  scheduler: SchedulerProjectionState,
+): SchedulerProjectionState {
+  if (
+    scheduler.snapshot === null ||
+    scheduler.freshness !== "fresh" ||
+    scheduler.digest === null
+  ) {
+    return scheduler;
+  }
+  if (state.serviceState === null) {
+    return clearSchedulerForRecovery("scheduler_authority_mismatch");
+  }
+  const repositories = state.repositoryOrder
+    .map((id) => state.repositoriesById[id])
+    .filter((repository) => repository !== undefined);
+  const tasks = state.taskOrder
+    .map((id) => state.tasksById[id])
+    .filter((task) => task !== undefined);
+  try {
+    validateSchedulerStateAgainstAuthority(scheduler.snapshot, {
+      repositories,
+      tasks,
+      serviceState: state.serviceState,
+    });
+    return scheduler;
+  } catch (error) {
+    if (!(error instanceof ValidationError)) {
+      throw error;
+    }
+    return clearSchedulerForRecovery("scheduler_authority_mismatch");
+  }
 }
 
 function withTask(state: AgentState, value: Task): Pick<AgentState, "tasksById" | "taskOrder"> {
@@ -159,7 +229,11 @@ function upsertRestTask(state: AgentState, task: Task): AgentState {
   ) {
     return state;
   }
-  return { ...state, ...withTask(state, task) };
+  return {
+    ...state,
+    ...withTask(state, task),
+    scheduler: markSchedulerStale(state.scheduler, "task_membership_changed"),
+  };
 }
 
 function lifecycleLabel(event: LifecycleEvent): string {
@@ -308,6 +382,10 @@ function beginSnapshotRecovery(
     ...state,
     connection: "recovering",
     recoveryReason: reason,
+    scheduler: markSchedulerStale(
+      state.scheduler,
+      "snapshot_recovery_started",
+    ),
     snapshotRecovery:
       state.snapshotRecovery ?? {
         conflictEventId: event.id,
@@ -430,7 +508,16 @@ function reducePersistedEvent(state: AgentState, event: TaskEvent): AgentState {
     commands = removeCancelCommand(state, event.task_id);
   }
 
-  return {
+  const appliedMembershipEventId = isLifecycleEvent(event)
+    ? event.id
+    : state.appliedMembershipEventId;
+  const scheduler = advanceSchedulerCausalPosition(
+    state.scheduler,
+    event.id,
+    appliedMembershipEventId,
+    state.serviceGeneration,
+  );
+  const next: AgentState = {
     ...state,
     ...summary,
     selectedDetail,
@@ -439,8 +526,11 @@ function reducePersistedEvent(state: AgentState, event: TaskEvent): AgentState {
     detailLoading,
     detailError,
     appliedEventId: event.id,
+    appliedMembershipEventId,
+    scheduler,
     commands,
   };
+  return installSchedulerProjection(next, scheduler);
 }
 
 function installDetail(
@@ -525,9 +615,34 @@ function installBootstrapSnapshot(
     state.selectedTaskId !== null && state.selectedTaskId in tasks.byId
       ? state.selectedTaskId
       : null;
+  const serverInstanceId = bootstrap.scheduler.server_instance_id;
+  const epochChanged =
+    state.serverInstanceId !== null &&
+    state.serverInstanceId !== serverInstanceId;
   const acceptServiceGeneration =
+    epochChanged ||
     bootstrap.service_state_generation >= state.serviceGeneration;
-  return {
+  if (
+    !epochChanged &&
+    !acceptServiceGeneration &&
+    state.scheduler.recoveryReason !== null
+  ) {
+    return state;
+  }
+  const serviceGeneration = acceptServiceGeneration
+    ? bootstrap.service_state_generation
+    : state.serviceGeneration;
+  const scheduler = adoptSchedulerBootstrap(
+    epochChanged ? initialSchedulerProjection : state.scheduler,
+    bootstrap.scheduler,
+    bootstrap.latest_event_id,
+    bootstrap.scheduler.as_of_event_id,
+    serviceGeneration,
+  );
+  if (scheduler.recoveryReason !== null) {
+    return installSchedulerProjection(state, scheduler);
+  }
+  const next: AgentState = {
     ...state,
     repositoriesById: repositories.byId,
     repositoryOrder: repositories.order,
@@ -547,16 +662,18 @@ function installBootstrapSnapshot(
     snapshotRecovery: null,
     recoveryBuffer: [],
     appliedEventId: bootstrap.latest_event_id,
+    appliedMembershipEventId: bootstrap.scheduler.as_of_event_id,
+    serverInstanceId,
     serviceState: acceptServiceGeneration
       ? bootstrap.service_state
       : state.serviceState,
-    serviceGeneration: acceptServiceGeneration
-      ? bootstrap.service_state_generation
-      : state.serviceGeneration,
+    serviceGeneration,
+    scheduler,
     commands: reconcileCommands(state, tasks.byId),
     connection: "live",
     recoveryReason: null,
   };
+  return installSchedulerProjection(next, scheduler);
 }
 
 function recoverFromBootstrap(
@@ -572,10 +689,16 @@ function recoverFromBootstrap(
   }
 
   let recovered = installBootstrapSnapshot(state, bootstrap);
+  if (recovered.scheduler.recoveryReason !== null) {
+    return recovered;
+  }
   for (const event of combined
     .filter((candidate) => candidate.id > bootstrap.latest_event_id)
     .sort((left, right) => left.id - right.id)) {
     recovered = reducePersistedEvent(recovered, event);
+    if (recovered.scheduler.recoveryReason !== null) {
+      return recovered;
+    }
     if (
       recovered.connection === "protocol_error" ||
       recovered.snapshotRecovery !== null
@@ -585,6 +708,10 @@ function recoverFromBootstrap(
         connection: "recovering",
         recoveryReason:
           state.snapshotRecovery?.reason ?? "snapshot_recovery_failed",
+        scheduler: markSchedulerStale(
+          state.scheduler,
+          "snapshot_recovery_failed",
+        ),
       };
     }
   }
@@ -598,6 +725,7 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
         ...state,
         connection: "bootstrapping",
         recoveryReason: null,
+        scheduler: markSchedulerStale(state.scheduler, "bootstrap_started"),
       };
     case "bootstrap.received": {
       return installBootstrapSnapshot(state, action.bootstrap);
@@ -607,12 +735,20 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
         ...state,
         connection: action.protocol ? "protocol_error" : "unavailable",
         recoveryReason: action.reason,
+        scheduler: markSchedulerStale(state.scheduler, "bootstrap_failed"),
       };
     case "connection.changed":
       return {
         ...state,
         connection: action.connection,
         recoveryReason: action.reason,
+        scheduler:
+          action.connection === "live"
+            ? state.scheduler
+            : markSchedulerStale(
+                state.scheduler,
+                `connection_${action.connection}`,
+              ),
       };
     case "session.expired":
       return {
@@ -621,10 +757,18 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
         recoveryReason: "session_expired",
         snapshotRecovery: null,
         recoveryBuffer: [],
-        commands: { ...state.commands, cancelByTaskId: {} },
+        scheduler: markSchedulerStale(state.scheduler, "session_expired"),
+        commands: { cancelByTaskId: {}, queueFullReplay: null },
       };
     case "repository.upserted":
-      return { ...state, ...withRepository(state, action.repository) };
+      return {
+        ...state,
+        ...withRepository(state, action.repository),
+        scheduler: markSchedulerStale(
+          state.scheduler,
+          "repository_membership_changed",
+        ),
+      };
     case "task.upserted":
       return upsertRestTask(state, action.task);
     case "task.selected":
@@ -659,6 +803,16 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
       };
     case "event.received":
       return reducePersistedEvent(state, action.event);
+    case "scheduler.received": {
+      const scheduler = acceptSchedulerCandidate(
+        state.scheduler,
+        action.candidate,
+        state.appliedEventId,
+        state.appliedMembershipEventId,
+        state.serviceGeneration,
+      );
+      return installSchedulerProjection(state, scheduler);
+    }
     case "event.conflicted":
       if (
         action.event.schema_version !== SUPPORTED_SCHEMA_VERSION ||
@@ -686,26 +840,48 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
       if (action.id < state.appliedEventId) {
         return protocolError(state, "non_monotonic_event_id");
       }
-      return {
-        ...state,
-        appliedEventId: action.id,
-        diagnostics: appendDiagnostic(state, {
-          id: action.id,
-          kind: action.kind,
-          schemaVersion: action.schemaVersion,
-          message: "Ignored an event kind that this client does not yet understand.",
-        }),
-      };
+      const scheduler = advanceSchedulerCausalPosition(
+        state.scheduler,
+        action.id,
+        state.appliedMembershipEventId,
+        state.serviceGeneration,
+      );
+      return installSchedulerProjection(
+        {
+          ...state,
+          appliedEventId: action.id,
+          scheduler,
+          diagnostics: appendDiagnostic(state, {
+            id: action.id,
+            kind: action.kind,
+            schemaVersion: action.schemaVersion,
+            message:
+              "Ignored an event kind that this client does not yet understand.",
+          }),
+        },
+        scheduler,
+      );
     }
-    case "service.received":
+    case "service.received": {
       if (action.generation <= state.serviceGeneration) {
         return state;
       }
-      return {
-        ...state,
-        serviceState: action.state,
-        serviceGeneration: action.generation,
-      };
+      const scheduler = advanceSchedulerCausalPosition(
+        state.scheduler,
+        state.appliedEventId,
+        state.appliedMembershipEventId,
+        action.generation,
+      );
+      return installSchedulerProjection(
+        {
+          ...state,
+          serviceState: action.state,
+          serviceGeneration: action.generation,
+          scheduler,
+        },
+        scheduler,
+      );
+    }
     case "cancel.started":
       return {
         ...state,
@@ -734,7 +910,15 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
       const commands = resultingTask !== undefined && isTerminalTask(resultingTask)
         ? removeCancelCommand(state, action.response.task.id)
         : state.commands;
-      return { ...state, ...taskUpdate, commands };
+      return {
+        ...state,
+        ...taskUpdate,
+        commands,
+        scheduler: markSchedulerStale(
+          state.scheduler,
+          "stop_projection_changed",
+        ),
+      };
     }
     case "cancel.failed": {
       const current = state.tasksById[action.taskId];
@@ -759,5 +943,27 @@ export function agentReducer(state: AgentState, action: AgentAction): AgentState
         },
       };
     }
+    case "create.queue_full":
+      return {
+        ...state,
+        commands: {
+          ...state.commands,
+          queueFullReplay: action.replay,
+        },
+      };
+    case "create.succeeded":
+      if (
+        state.commands.queueFullReplay?.clientRequestId !==
+        action.clientRequestId
+      ) {
+        return state;
+      }
+      return {
+        ...state,
+        commands: {
+          ...state.commands,
+          queueFullReplay: null,
+        },
+      };
   }
 }

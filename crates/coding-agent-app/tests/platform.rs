@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 mod support;
 
 use std::io::Write;
@@ -22,6 +24,7 @@ fn project_directories_use_the_approved_identity_and_runtime_fallback() {
         paths.database_path,
         paths.data_dir.join("coding-agent.sqlite3")
     );
+    assert_eq!(paths.runtime_config, paths.data_dir.join("runtime.json"));
     assert_eq!(paths.instance_lock, paths.runtime_dir.join("instance.lock"));
     assert_eq!(
         paths.instance_descriptor,

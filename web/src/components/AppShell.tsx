@@ -4,6 +4,7 @@ import type { Repository, Task } from "../api/types";
 import type { UseAgentStateResult } from "../state/useAgentState";
 import { ConnectionBanner } from "./ConnectionBanner";
 import { ResizableWorkbench } from "./ResizableWorkbench";
+import { SchedulerSummary } from "./SchedulerSummary";
 import { Sidebar } from "./Sidebar";
 import { TaskComposer } from "./TaskComposer";
 import { TaskWorkspace } from "./TaskWorkspace";
@@ -116,6 +117,18 @@ export function AppShell({ agent }: AppShellProps) {
     task !== null && agent.state.selectedDetail?.task.id === task.id
       ? agent.state.selectedDetail
       : null;
+  const schedulerQueuedTask =
+    task === null
+      ? null
+      : (agent.state.scheduler.snapshot?.queued_tasks.find(
+          (queued) => queued.task_id === task.id,
+        ) ?? null);
+  const schedulerStoppingTask =
+    task === null
+      ? null
+      : (agent.state.scheduler.snapshot?.stopping_tasks.find(
+          (stopping) => stopping.task_id === task.id,
+        ) ?? null);
 
   const selectTask = (taskId: string) => {
     const next = agent.state.tasksById[taskId];
@@ -172,10 +185,13 @@ export function AppShell({ agent }: AppShellProps) {
         </button>
       </header>
 
+      <SchedulerSummary scheduler={agent.state.scheduler} />
+
       <ResizableWorkbench inert={quitDialogOpen}>
         <Sidebar
           repositories={repositories}
           tasks={tasks}
+          scheduler={agent.state.scheduler}
           selectedRepositoryId={selectedRepositoryId}
           selectedTaskId={task?.id ?? null}
           onSelectRepository={setSelectedRepositoryId}
@@ -192,6 +208,8 @@ export function AppShell({ agent }: AppShellProps) {
           cancelState={
             task === null ? undefined : agent.state.commands.cancelByTaskId[task.id]
           }
+          schedulerQueuedTask={schedulerQueuedTask}
+          schedulerStoppingTask={schedulerStoppingTask}
           tasksById={agent.state.tasksById}
           taskOrder={agent.state.taskOrder}
           onCancel={agent.cancelTask}
@@ -201,6 +219,8 @@ export function AppShell({ agent }: AppShellProps) {
           composer={
             <TaskComposer
               repositoryId={selectedRepositoryId}
+              scheduler={agent.state.scheduler}
+              queueFullReplay={agent.state.commands.queueFullReplay}
               onCreateTask={agent.newCreateTask}
               onCreated={(created) => {
                 setSelectedRepositoryId(created.repository_id);

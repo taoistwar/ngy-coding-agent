@@ -274,6 +274,7 @@ async fn tasks(
         (status = 409, body = crate::ApiErrorResponse),
         (status = 415, body = crate::ApiErrorResponse),
         (status = 422, body = crate::ApiErrorResponse),
+        (status = 429, body = crate::ApiErrorResponse),
         (status = 500, body = crate::ApiErrorResponse),
         (status = 503, body = crate::ApiErrorResponse)
     )
@@ -375,6 +376,7 @@ async fn cancel_task(
         (status = 403, body = crate::ApiErrorResponse),
         (status = 404, body = crate::ApiErrorResponse),
         (status = 409, body = crate::ApiErrorResponse),
+        (status = 429, body = crate::ApiErrorResponse),
         (status = 500, body = crate::ApiErrorResponse),
         (status = 503, body = crate::ApiErrorResponse)
     )

@@ -189,7 +189,9 @@ test("migrates a real v2 Completed task as unreviewed in REST, SSE, and React", 
   await withLocalApp(
     testInfo,
     (roots): ProcessScenario => ({
+      runtime_config: null,
       fake_scenarios: [],
+      storage_samples: [{ kind: "native" }],
       store_writer_faults: [],
       actor_pauses: [],
       virtual_release_signals: [],
@@ -248,7 +250,9 @@ test("migrates a real v2 Completed task as unreviewed in REST, SSE, and React", 
 
 function processScenario(fakeScenario: FakeScenario): ProcessScenario {
   return {
+    runtime_config: null,
     fake_scenarios: [fakeScenario],
+    storage_samples: [{ kind: "native" }],
     store_writer_faults: [],
     actor_pauses: [],
     virtual_release_signals: [],
