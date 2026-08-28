@@ -2,6 +2,10 @@ use std::fmt;
 
 use coding_agent_domain::TaskId;
 
+use crate::delivery::mutation::{
+    DeliveryMutationEntity, DeliveryMutationEntityKind, DeliveryMutationKey, DeliveryMutationKind,
+    impl_delivery_mutation_request,
+};
 use crate::delivery::{
     DeliveryError, DeliveryOperationId, DeliveryVersion, GitCommitOid, GitTreeOid,
     MergeOperationState, PreflightStaleReason,
@@ -144,3 +148,16 @@ impl RecordMergePreflightResultRequest {
         })
     }
 }
+
+impl_delivery_mutation_request!(RecordMergePreflightResultRequest, |request| {
+    DeliveryMutationKey::new(
+        DeliveryMutationKind::RecordMergePreflightResult,
+        request.task_id,
+        vec![DeliveryMutationEntity::operation(
+            DeliveryMutationEntityKind::MergeOperation,
+            request.operation_id,
+            request.expected_version,
+        )],
+        None,
+    )
+});

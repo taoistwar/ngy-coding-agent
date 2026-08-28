@@ -1,5 +1,43 @@
 use super::*;
 
+/// Exact process-local TaskManager ownership for one task.
+///
+/// This is intentionally not a process-cleanup proof. `Inactive` says only
+/// that the task is absent from the actor's current `active` map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskActiveOwnership {
+    Inactive,
+    Active {
+        repository_id: RepositoryId,
+        attempt: u32,
+    },
+}
+
+impl TaskManagerHandle {
+    pub async fn active_ownership(
+        &self,
+        task_id: TaskId,
+    ) -> Result<TaskActiveOwnership, TaskManagerError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(TaskManagerMessage::ActiveOwnership { task_id, response })
+            .await?;
+        receiver.await.map_err(|_| TaskManagerError::Closed)
+    }
+}
+
+impl TaskManager {
+    pub(super) fn active_ownership(&self, task_id: TaskId) -> TaskActiveOwnership {
+        self.active
+            .get(&task_id)
+            .map_or(TaskActiveOwnership::Inactive, |active| {
+                TaskActiveOwnership::Active {
+                    repository_id: active.repository_id,
+                    attempt: active.attempt,
+                }
+            })
+    }
+}
+
 impl TaskManager {
     pub(super) fn finalize_terminal_release_commit(
         &mut self,

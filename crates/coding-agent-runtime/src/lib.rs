@@ -11,6 +11,7 @@
 mod atomic_replace;
 mod cargo_tools;
 mod command_policy;
+mod delivery;
 mod diff;
 mod file_tools;
 mod fingerprint;
@@ -30,6 +31,7 @@ mod role_runtime;
 mod root_capability;
 mod runtime_session;
 mod storage;
+mod target_checkout;
 mod tool_discovery;
 mod worktree;
 
@@ -42,6 +44,55 @@ pub use cargo_tools::{
     CargoTools,
 };
 pub use command_policy::{CommandPolicyError, ExecutionDirectory, PinnedExecutable};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use delivery::probe_delivery_git_with_after_initialize_hook_for_test;
+pub use delivery::{
+    DeliveryAbortAppliedPersistenceBinding, DeliveryAbortAppliedProof, DeliveryAbortCapability,
+    DeliveryAbortError, DeliveryAbortOutcome, DeliveryAbortPendingAuthorizer,
+    DeliveryAbortPendingDisposition, DeliveryAbortPersistenceBinding, DeliveryAbortProof,
+    DeliveryAbortProofCapture, DeliveryBranchCleanupIntent,
+    DeliveryBranchCleanupRecoveryBindingOutcome, DeliveryBranchCleanupRefreshProof,
+    DeliveryCandidateTree, DeliveryCommitPersistenceMetadata, DeliveryConflictPath,
+    DeliveryConflictPathEncoding, DeliveryDeletePendingAuthorizer, DeliveryDeletePendingCapability,
+    DeliveryDeletePendingDisposition, DeliveryExpectedMerge,
+    DeliveryExpectedMergePersistenceBinding, DeliveryGitObjectFormat, DeliveryGitProbeError,
+    DeliveryGitVersion, DeliveryKnownMergeConflict, DeliveryMergeAppliedPersistenceBinding,
+    DeliveryMergeAppliedProof, DeliveryMergeError, DeliveryMergeInput, DeliveryMergeOutcome,
+    DeliveryMergePendingDisposition, DeliveryMergeRecoveryBindingOutcome,
+    DeliveryMergeRecoveryCapability, DeliveryPersistedAbortRecoveryObservation,
+    DeliveryPersistedMergeRecovery, DeliveryPersistedSourceRecovery, DeliveryPersistedSourceState,
+    DeliveryPersistedTargetRecovery, DeliveryPersistenceBinding, DeliveryPersistenceInputError,
+    DeliveryPreflightError, DeliveryPreflightResult, DeliveryPreflightSource,
+    DeliveryRemovePendingAuthorizer, DeliveryRemovePendingCapability,
+    DeliveryRemovePendingDisposition, DeliverySourceAppliedPersistenceBinding,
+    DeliverySourceCapability, DeliverySourceCommit, DeliverySourceCommitInput, DeliverySourceError,
+    DeliverySourceLimits, DeliverySourceObjectPersistenceBinding, DeliverySourcePendingState,
+    DeliverySourceProvisioner, DeliverySourceRecoveryBindingOutcome,
+    DeliverySourceRecoveryCapability, DeliverySourceRecoveryDisposition,
+    DeliverySourceRecoveryIntent, DeliveryTargetCapability, DeliveryTargetError,
+    DeliveryTargetProvisioner, DeliveryTargetRecoveryBindingOutcome,
+    DeliveryTargetRecoveryCapability, DeliveryTargetRecoveryIntent, DeliveryTargetRequest,
+    DeliveryUnlockPendingAuthorizer, DeliveryUnlockPendingCapability,
+    DeliveryUnlockPendingDisposition, DeliveryUnlockedPendingRemoveAuthorizer,
+    DeliveryUnlockedPendingRemoveCapability, DeliveryUnlockedPendingRemoveDisposition,
+    DeliveryWorktreeCleanupError, DeliveryWorktreeCleanupIntent,
+    DeliveryWorktreeCleanupProvisioner, DeliveryWorktreeCleanupRecoveryBindingOutcome,
+    DeliveryWorktreeCleanupRecoveryPhase, PreparedDeliveryPreflightSource, ProbedDeliveryGit,
+    RegisteredDeliveryTargetObservation, abort_expected_delivery_merge,
+    apply_expected_delivery_merge, authorize_persisted_delivery_abort,
+    authorize_persisted_delivery_branch_delete, authorize_persisted_delivery_remove,
+    authorize_persisted_delivery_unlock, authorize_persisted_delivery_unlocked_pending_remove,
+    bind_persisted_delivery_merge_recovery, build_expected_delivery_merge,
+    build_expected_persisted_delivery_merge, capture_delivery_abort_proof,
+    capture_delivery_abort_proof_from_recovery, capture_persisted_delivery_abort_proof,
+    capture_persisted_delivery_abort_recovery, classify_delivery_abort_pending,
+    classify_delivery_merge_pending, classify_persisted_delivery_merge_pending,
+    preflight_delivery_merge, preflight_prepared_delivery_merge, probe_delivery_git,
+    project_persisted_delivery_source_applied, project_persisted_delivery_source_object,
+    retry_delivery_abort_pending, retry_delivery_merge_pending,
+    retry_persisted_delivery_abort_pending, retry_persisted_delivery_merge_pending,
+};
 pub use diff::{DiffCollector, DiffError, DiffLimits};
 pub use file_tools::{
     FileEntry, FileEntryKind, FileToolError, FileToolLimits, FileToolLimitsError, FileTools,
@@ -59,6 +110,17 @@ pub use process_liveness::{
 pub use process_supervisor::{
     CapturedStream, CommandResult, ProcessError, ProcessLimits, ProcessLimitsError,
     ProcessSpawnGuard, acquire_process_spawn_lock,
+};
+#[doc(hidden)]
+pub use process_supervisor::{
+    MAX_EXACT_CHILD_INPUT_BYTES_FOR_TEST, ProcessStdinTestObservation, ProcessStdinTestOutcome,
+    ProcessStdinTestScenario, exercise_process_stdin_for_test,
+};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use process_supervisor::{
+    ProcessFault, ProcessFaultController, ProcessFaultControllerError, ProcessFaultEvent,
+    ProcessFaultEventKind, ProcessFaultZeroLiveProof,
 };
 pub use relative_path::{RelativePath, RelativePathError};
 pub use repository_discovery::{RepositoryDiscoveryCommandError, RepositoryDiscoveryCommands};
@@ -78,4 +140,12 @@ pub use worktree::{
     ProvisionedWorktree, WorktreeArtifactState, WorktreeError, WorktreeIdentity, WorktreeLimits,
     WorktreeObservation, WorktreeObservationOutcome, WorktreeProvisionError, WorktreeProvisioner,
     WorktreeReservation,
+};
+
+// Internal-only retained primary-checkout authority used by Task 13. Keeping
+// this crate-private prevents callers from obtaining a target Git/worktree
+// binding or raw checkout paths.
+pub(crate) use target_checkout::{
+    RegisteredCheckoutAuthentication, RegisteredCheckoutAuthenticator,
+    RegisteredCheckoutCommandContext,
 };

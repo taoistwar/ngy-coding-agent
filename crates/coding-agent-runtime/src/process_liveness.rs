@@ -11,7 +11,7 @@ use crate::native_fs::create_child_directory_with_created;
 use crate::native_fs::{
     child_entry_exists, child_file_matches, create_child_file_exclusive,
     open_child_file_for_exclusive_probe, read_directory_names, remove_child_file,
-    reopen_directory_for_write,
+    reopen_directory_for_child_directory,
 };
 #[cfg(unix)]
 use crate::native_fs::{create_child_directory, quarantine_child_file_no_replace};
@@ -70,7 +70,7 @@ impl ProcessLivenessDirectory {
             .map_err(|_| ProcessLivenessError::Unavailable)?;
         let parent = root
             .try_clone_root()
-            .and_then(|root| reopen_directory_for_write(&root))
+            .and_then(|root| reopen_directory_for_child_directory(&root))
             .map_err(|_| ProcessLivenessError::Unavailable)?;
         let directory = create_process_liveness_directory(&parent)
             .and_then(|directory| {
@@ -186,6 +186,22 @@ impl fmt::Debug for ProcessLivenessScope {
 }
 
 impl ProcessLivenessScope {
+    /// Returns true only for the same liveness instance and the same exact
+    /// task/instance selector. Lifecycle code uses this to keep a sealed
+    /// worker scope distinct from the supervisor scope that runs cleanup
+    /// children.
+    pub(crate) fn is_same_scope(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.instance, &other.instance) && self.task_id == other.task_id
+    }
+
+    pub(crate) fn is_same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.instance, &other.instance)
+    }
+
+    pub(crate) const fn is_task_scope(&self) -> bool {
+        self.task_id.is_some()
+    }
+
     pub fn task_scope(
         &self,
         task_id: [u8; 16],
@@ -196,6 +212,25 @@ impl ProcessLivenessScope {
         }
         Ok(Self {
             instance: self.instance.clone(),
+            task_id: Some(task_id),
+        })
+    }
+
+    /// Creates a distinct task-scoped sibling in the same authenticated
+    /// liveness instance. Cleanup children use this to remain visible to the
+    /// same startup/recovery namespace without reusing the sealed worker
+    /// scope that they are proving inactive.
+    pub fn sibling_task_scope(
+        &self,
+        task_id: [u8; 16],
+    ) -> Result<ProcessLivenessScope, ProcessLivenessError> {
+        validate_identity(task_id)?;
+        let current_task = self.task_id.ok_or(ProcessLivenessError::InvalidIdentity)?;
+        if current_task == task_id {
+            return Err(ProcessLivenessError::InvalidIdentity);
+        }
+        Ok(Self {
+            instance: Arc::clone(&self.instance),
             task_id: Some(task_id),
         })
     }
@@ -370,6 +405,18 @@ impl SealedProcessLivenessScope {
             SealedScopeSelector::Instance => self.scope.cleanup_proof(),
             SealedScopeSelector::Task(task_id) => self.scope.cleanup_proof_for_task(task_id),
         }
+    }
+
+    /// Proves that this sealed cleanup authority was minted from the exact
+    /// process-liveness scope retained by a mutation runtime. A confirmed
+    /// proof from another task or another liveness instance must never
+    /// authorize cleanup of this task's worktree.
+    pub(crate) fn is_bound_to(&self, expected: &ProcessLivenessScope) -> bool {
+        self.scope.is_same_scope(expected)
+            && match self.selector {
+                SealedScopeSelector::Instance => expected.task_id.is_none(),
+                SealedScopeSelector::Task(task_id) => expected.task_id == Some(task_id),
+            }
     }
 }
 
@@ -618,7 +665,7 @@ fn probe_quarantined(
     if !validate_sentinel_file(&mut file, original_name) {
         return Ok(ProcessCleanupProof::Unknown);
     }
-    let removed = (|| {
+    let removed = (|| -> io::Result<bool> {
         if !child_file_matches(directory, OsStr::new(quarantine_name), &file)? {
             return Ok(false);
         }
@@ -1129,6 +1176,47 @@ mod tests {
         BeginTreeAfterCheckHook, ProcessCleanupProof, ProcessLivenessDirectory,
         ProcessLivenessError,
     };
+
+    #[test]
+    fn sealed_cleanup_scope_binds_only_the_exact_worker_scope() {
+        let runtime = tempfile::tempdir().expect("create process-liveness runtime");
+        let directory =
+            ProcessLivenessDirectory::open(runtime.path()).expect("open process-liveness runtime");
+        let mut instance_id = [0x21; 16];
+        instance_id[6] = 0x41;
+        instance_id[8] = 0x81;
+        let instance = directory
+            .instance_scope(instance_id)
+            .expect("derive process-liveness instance");
+        let mut worker_id = [0x32; 16];
+        worker_id[6] = 0x42;
+        worker_id[8] = 0x82;
+        let mut cleanup_id = [0x43; 16];
+        cleanup_id[6] = 0x43;
+        cleanup_id[8] = 0x83;
+        let worker = instance.task_scope(worker_id).expect("derive worker scope");
+        let same_worker = instance
+            .task_scope(worker_id)
+            .expect("rederive worker scope");
+        let cleanup = instance
+            .task_scope(cleanup_id)
+            .expect("derive cleanup command scope");
+        let cleanup_from_worker = worker
+            .sibling_task_scope(cleanup_id)
+            .expect("derive cleanup sibling from worker scope");
+        let sealed = worker
+            .seal_task_scope(worker_id)
+            .expect("seal exact worker scope");
+
+        assert!(worker.is_same_scope(&same_worker));
+        assert!(sealed.is_bound_to(&same_worker));
+        assert!(!worker.is_same_scope(&cleanup));
+        assert!(worker.is_same_instance(&cleanup_from_worker));
+        assert!(cleanup.is_same_scope(&cleanup_from_worker));
+        assert!(worker.sibling_task_scope(worker_id).is_err());
+        assert!(!sealed.is_bound_to(&cleanup));
+        assert!(!sealed.is_bound_to(&instance));
+    }
 
     #[test]
     fn task_scope_seal_linearizes_after_in_flight_registration_and_rejects_late_begins() {

@@ -11,7 +11,7 @@ use crate::delivery::{
 use super::merge_invariant;
 use super::model::MergeTransitionReceipt;
 
-pub(super) enum TransitionLookup {
+pub(in crate::delivery) enum TransitionLookup {
     Exact(MergeTransitionReceipt),
     Missing,
     Conflict,
@@ -73,7 +73,7 @@ async fn audit_no_orphan_evidence(
     }
 }
 
-pub(super) async fn lookup_transition(
+pub(in crate::delivery) async fn lookup_transition(
     connection: &mut sqlx::SqliteConnection,
     operation_id: DeliveryOperationId,
     version: DeliveryVersion,

@@ -14,7 +14,7 @@ async fn delivery_source_origin_is_exact_required_and_immutable() {
     .unwrap();
     assert_eq!(origin.0, support::delivery::MERGE_OPERATION_ID);
     assert_eq!(origin.1, support::delivery::ACCEPT_RECEIPT_ID);
-    assert_eq!(origin.2, 3);
+    assert_eq!(origin.2, 4);
 
     for update in [
         "UPDATE task_delivery_sources \
@@ -26,7 +26,7 @@ async fn delivery_source_origin_is_exact_required_and_immutable() {
              failure_code = 'COMMAND_TIMED_OUT', version = 2 \
          WHERE task_id = ?",
         "UPDATE task_delivery_sources \
-         SET origin_accepted_version = 4, failure_code = 'COMMAND_TIMED_OUT', version = 2 \
+         SET origin_accepted_version = 5, failure_code = 'COMMAND_TIMED_OUT', version = 2 \
          WHERE task_id = ?",
     ] {
         let error = sqlx::query(update)

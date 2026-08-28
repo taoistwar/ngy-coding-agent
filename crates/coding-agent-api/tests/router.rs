@@ -30,6 +30,7 @@ fn openapi_paths_and_cancel_responses_are_exact() {
         [
             "/api/app/quit",
             "/api/bootstrap",
+            "/api/delivery-operations/{operation_id}",
             "/api/events",
             "/api/repositories",
             "/api/repositories/pick",
@@ -39,6 +40,11 @@ fn openapi_paths_and_cancel_responses_are_exact() {
             "/api/tasks/{id}/cancel",
             "/api/tasks/{id}/events",
             "/api/tasks/{id}/retry",
+            "/api/tasks/{task_id}/cleanup/branch",
+            "/api/tasks/{task_id}/cleanup/worktree",
+            "/api/tasks/{task_id}/delivery",
+            "/api/tasks/{task_id}/merge",
+            "/api/tasks/{task_id}/merge/preflight",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -116,6 +122,44 @@ fn openapi_paths_and_cancel_responses_are_exact() {
             "/api/app/quit",
             "post",
             &["202", "400", "401", "403", "500", "503"],
+        ),
+        (
+            "/api/tasks/{task_id}/delivery",
+            "get",
+            &["200", "400", "401", "403", "404", "500", "503"],
+        ),
+        (
+            "/api/delivery-operations/{operation_id}",
+            "get",
+            &["200", "400", "401", "403", "404", "500", "503"],
+        ),
+        (
+            "/api/tasks/{task_id}/merge/preflight",
+            "post",
+            &[
+                "200", "201", "400", "401", "403", "404", "409", "415", "422", "500", "503", "504",
+            ],
+        ),
+        (
+            "/api/tasks/{task_id}/merge",
+            "post",
+            &[
+                "200", "202", "400", "401", "403", "404", "409", "415", "422", "500", "503", "504",
+            ],
+        ),
+        (
+            "/api/tasks/{task_id}/cleanup/worktree",
+            "post",
+            &[
+                "200", "202", "400", "401", "403", "404", "409", "415", "422", "500", "503", "504",
+            ],
+        ),
+        (
+            "/api/tasks/{task_id}/cleanup/branch",
+            "post",
+            &[
+                "200", "202", "400", "401", "403", "404", "409", "415", "422", "500", "503", "504",
+            ],
         ),
     ];
     for (path, method, expected) in response_cases {

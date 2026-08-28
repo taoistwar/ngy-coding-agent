@@ -3,8 +3,57 @@
 use std::io;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::Mutex;
 
-use coding_agent_runtime::{ProcessLivenessDirectory, ProcessLivenessScope};
+use coding_agent_runtime::{ProcessCleanupProof, ProcessLivenessDirectory, ProcessLivenessScope};
+
+/// Retains the exact liveness scopes handed to runtime components and proves
+/// at fixture teardown that none of those scopes still owns a live child.
+///
+/// This is deliberately only an observer. It cannot construct a process,
+/// bypass command policy, or force-clean a failed process tree.
+#[derive(Default)]
+pub struct ProcessScopeTracker {
+    scopes: Mutex<Vec<ProcessLivenessScope>>,
+}
+
+impl ProcessScopeTracker {
+    pub fn track(&self, scope: ProcessLivenessScope) -> ProcessLivenessScope {
+        self.scopes
+            .lock()
+            .expect("lock process-scope tracker")
+            .push(scope.clone());
+        scope
+    }
+
+    pub fn assert_zero_live(&self) {
+        let scopes = self.scopes.lock().expect("lock process-scope tracker");
+        for scope in scopes.iter() {
+            assert_eq!(
+                scope.active_tree_count(),
+                0,
+                "delivery fixture retained a live process tree"
+            );
+            assert_eq!(
+                scope
+                    .cleanup_proof()
+                    .expect("observe delivery fixture process cleanup"),
+                ProcessCleanupProof::Confirmed,
+                "delivery fixture could not prove process-tree cleanup"
+            );
+        }
+    }
+}
+
+impl Drop for ProcessScopeTracker {
+    fn drop(&mut self) {
+        // Avoid turning an existing test assertion into a double-panic abort.
+        // Passing tests always execute the proof below.
+        if !std::thread::panicking() {
+            self.assert_zero_live();
+        }
+    }
+}
 
 pub fn instance_process_scope(runtime_directory: &Path) -> ProcessLivenessScope {
     let liveness_runtime = private_liveness_runtime(runtime_directory);

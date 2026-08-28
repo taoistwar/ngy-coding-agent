@@ -155,7 +155,7 @@ async fn contradictory_source_merge_reconciliation_pair_fails_closed() {
     sqlx::query(
         "UPDATE task_delivery_operation_transitions \
          SET failure_code = 'PROCESS_TREE_CLEANUP_FAILED' \
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 4",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 5",
     )
     .bind(operation_id.to_string())
     .execute(store.pool())

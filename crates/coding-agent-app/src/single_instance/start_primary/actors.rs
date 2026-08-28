@@ -5,8 +5,9 @@ use coding_agent_store::Store;
 
 use crate::bootstrap_join::{BootstrapJoin, BootstrapJoinError};
 use crate::{
-    EventDispatcherHandle, MutationGate, ServiceState, ServiceStateController, ShutdownCoordinator,
-    StoreWriterHandle, TaskManagerHandle, TaskManagerLaunchResources,
+    DeliveryManagerHandle, EventDispatcherHandle, MutationGate, ServiceState,
+    ServiceStateController, ShutdownCoordinator, StoreWriterHandle, TaskManagerHandle,
+    TaskManagerLaunchResources,
 };
 
 use super::{ActorsReady, RecoveredStore, StartupContext};
@@ -46,9 +47,20 @@ pub(super) async fn start(recovered: RecoveredStore) -> Result<ActorsReady, Star
     let repository_discovery = runner_selection
         .repository_discovery()
         .ok_or_else(runner_startup_failed)?;
-    let service_state = ServiceStateController::new(ServiceState::Ready);
+    // Actors and delivery recovery need to exist before HTTP, but task claims
+    // must remain closed until the Ready descriptor has been published.
+    let service_state = ServiceStateController::new(ServiceState::StoreDegraded);
     let mutation_gate = MutationGate::new(service_state.clone());
     let lock_keepalive = recovered.cleanup.lock_keepalive();
+    let delivery = super::delivery::start(
+        &recovered.store,
+        &writer,
+        &runner_selection,
+        &launch_resources,
+        &service_state,
+        &recovered.instance_process_scope,
+    )
+    .await?;
     let task_manager = spawn_task_manager_with_resources(
         &recovered.context.dependencies,
         &recovered.store,
@@ -58,12 +70,16 @@ pub(super) async fn start(recovered: RecoveredStore) -> Result<ActorsReady, Star
         runner,
         launch_resources,
     );
+    delivery
+        .install_task_manager(task_manager.clone())
+        .map_err(|_| runner_startup_failed())?;
     let shutdown_guard = build_shutdown_guard(
         &recovered.context,
         &recovered.cleanup,
         &recovered.instance_process_scope,
         &recovered.store,
         &dispatcher,
+        &delivery.manager,
         &task_manager,
         &mutation_gate,
     );
@@ -79,6 +95,7 @@ pub(super) async fn start(recovered: RecoveredStore) -> Result<ActorsReady, Star
         writer,
         dispatcher,
         task_manager,
+        delivery_manager: delivery.manager,
         runner_selection,
         repository_registrar: Some(repository_registrar),
         repository_discovery: Some(repository_discovery),
@@ -185,6 +202,7 @@ fn build_shutdown_guard(
     instance_process_scope: &ProcessLivenessScope,
     store: &Store,
     dispatcher: &EventDispatcherHandle,
+    delivery_manager: &DeliveryManagerHandle,
     task_manager: &TaskManagerHandle,
     mutation_gate: &MutationGate,
 ) -> StartupShutdownGuard {
@@ -192,6 +210,7 @@ fn build_shutdown_guard(
     let shutdown = ShutdownCoordinator::new(
         mutation_gate.clone(),
         instance_process_scope.clone(),
+        delivery_manager.clone(),
         task_manager.clone(),
         dispatcher.clone(),
         store.clone(),
@@ -205,6 +224,7 @@ fn build_shutdown_guard(
     let shutdown = ShutdownCoordinator::new_for_process_test(
         mutation_gate.clone(),
         instance_process_scope.clone(),
+        delivery_manager.clone(),
         task_manager.clone(),
         dispatcher.clone(),
         store.clone(),
@@ -228,7 +248,7 @@ async fn verify_initial_scheduler_snapshot(
     task_manager: &TaskManagerHandle,
 ) -> Result<(), StartupError> {
     task_manager
-        .notify_admission_changed()
+        .refresh_startup_snapshot()
         .await
         .map_err(|_| runner_startup_failed())?;
     let bootstrap_join = BootstrapJoin::new(

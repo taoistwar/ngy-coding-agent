@@ -6,8 +6,8 @@ use coding_agent_store::{
     CreateDeliverySourceOutcome, CreateDeliverySourceRequest, CreatePreflightOutcome,
     CreatePreflightRequest, DeliverySourceAppliedProof, DeliverySourceReconciliationReason,
     DeliverySourceRetryReason, DeliverySourceState, DeliverySourceTransitionOutcome,
-    DeliveryVersion, DirectoryIdentity, GitBranchRef, GitCommitOid, GitTreeOid,
-    PreflightCommandRequest, ReconcileDeliverySourceOutcome, ReconcileDeliverySourceRequest,
+    DeliveryVersion, DirectoryIdentity, GitBranchRef, GitCommitOid, PreflightCommandRequest,
+    ReconcileDeliverySourceOutcome, ReconcileDeliverySourceRequest,
     RecordDeliverySourceRetryRequest, Sha256Digest, SourceWorktreeProof,
 };
 
@@ -17,7 +17,7 @@ use super::fixtures::{
 };
 use crate::support::delivery::eligibility::{
     ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, DELIVERY_TIMESTAMP,
-    SOURCE_COMMIT, TARGET_HEAD,
+    SOURCE_COMMIT, TARGET_CONFIG_DIGEST, TARGET_HEAD, TARGET_SECURITY_DIGEST,
 };
 use crate::support::delivery::merge::{
     accept_merge_operation_with_request_hash, mark_preflight_ready,
@@ -79,7 +79,7 @@ async fn old_operation_replays_survive_a_later_accepted_owner_reconciliation() {
 
     sqlx::query(
         "UPDATE task_merge_operations SET delivery_source_task_id = ?, source_commit_oid = ?, \
-             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 4, updated_at = ? \
+             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 5, updated_at = ? \
          WHERE operation_id = ?",
     )
     .bind(first_command.task_id().to_string())
@@ -106,7 +106,7 @@ async fn old_operation_replays_survive_a_later_accepted_owner_reconciliation() {
         second_anchor,
         DeliverySourceState::Committed,
         DeliveryVersion::try_new(4).unwrap(),
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -177,17 +177,25 @@ async fn accept_another_operation(
     .unwrap();
     let preflight = CreatePreflightRequest::try_new(
         preflight_command,
-        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
-        GitCommitOid::from_str(SOURCE_COMMIT).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", COMMON_IDENTITY).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY).unwrap(),
         Sha256Digest::from_str(CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_SECURITY_DIGEST).unwrap(),
     )
     .unwrap();
     let operation_id = match store.create_merge_preflight(preflight).await.unwrap() {
         CreatePreflightOutcome::Created(receipt) => receipt.operation_id,
         other => panic!("expected second preflight, got {other:?}"),
     };
+    crate::support::delivery::merge::bind_preflight_inputs(
+        store,
+        first.task_id(),
+        operation_id,
+        CANDIDATE_TREE,
+        SOURCE_COMMIT,
+    )
+    .await;
     mark_preflight_ready(store.pool(), &operation_id.to_string())
         .await
         .unwrap();
@@ -195,7 +203,7 @@ async fn accept_another_operation(
         ClientRequestId::new(),
         first.task_id(),
         operation_id,
-        DeliveryVersion::try_new(2).unwrap(),
+        DeliveryVersion::try_new(3).unwrap(),
         evidence.workspace_generation(),
         evidence.workspace_fingerprint().clone(),
         GitBranchRef::from_str(TARGET_BRANCH).unwrap(),

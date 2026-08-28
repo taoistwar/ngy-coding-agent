@@ -4,7 +4,7 @@ use coding_agent_domain::{ClientRequestId, Task};
 use coding_agent_store::{
     AcceptMergeOutcome, BeginMergeAbortRequest, DeliveryOperationId, DeliveryVersion,
     DirectoryIdentity, GitBranchRef, GitCommitOid, MergeAbortProof, MergeAutostashObservation,
-    MergeKnownNotAppliedReason, MergeOperationRecord, MergeOperationState,
+    MergeConflictPaths, MergeKnownNotAppliedReason, MergeOperationRecord, MergeOperationState,
     MergeReconciliationReason, MergeTransitionOutcome, OtherGitOperationObservation,
     ReconcileMergeRequest, RecordMergeKnownFailureRequest, Sha256Digest, Store,
 };
@@ -154,7 +154,7 @@ async fn reconcile_merge_accepts_every_documented_nonterminal_origin() {
         task,
         operation_id,
         MergeOperationState::PreflightPending,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         ReconciliationShape::default(),
     )
     .await;
@@ -166,7 +166,7 @@ async fn reconcile_merge_accepts_every_documented_nonterminal_origin() {
         task,
         operation_id,
         MergeOperationState::PreflightReady,
-        DeliveryVersion::try_new(2).unwrap(),
+        DeliveryVersion::try_new(3).unwrap(),
         ReconciliationShape {
             has_preflight_result: true,
             ..ReconciliationShape::default()
@@ -227,6 +227,18 @@ fn terminal_request_constructors_reject_illegal_origin_states() {
     let task_id = coding_agent_domain::TaskId::new();
     let operation_id = DeliveryOperationId::new();
     let version = DeliveryVersion::initial();
+
+    assert!(
+        ReconcileMergeRequest::try_new(
+            task_id,
+            operation_id,
+            MergeOperationState::PreflightPending,
+            version,
+            MergeReconciliationReason::DeliveryStateInconsistent,
+        )
+        .is_err(),
+        "unbound preflight reconciliation must use the dedicated failure mutation"
+    );
 
     for state in [
         MergeOperationState::PreflightPending,
@@ -496,8 +508,11 @@ fn assert_reconciliation_shape(
         has_abort_proof
     );
     assert!(operation.merged_disposition_task_id.is_none());
-    assert_eq!(operation.conflict_path_count, None);
-    assert!(operation.conflicts.is_empty());
+    assert_eq!(operation.conflict_path_count, has_abort_proof.then_some(1));
+    assert_eq!(
+        operation.conflicts.len(),
+        if has_abort_proof { 1 } else { 0 }
+    );
 }
 
 async fn accepted_without_source() -> (Store, Task, DeliveryOperationId, DeliveryVersion) {
@@ -528,6 +543,7 @@ async fn abort_pending() -> (Store, Task, DeliveryOperationId, DeliveryVersion) 
         Sha256Digest::from_str(WORKTREE).unwrap(),
         MergeAutostashObservation::Absent,
         OtherGitOperationObservation::Clear,
+        MergeConflictPaths::try_from_raw(vec![b"src/conflicted.rs".to_vec()]).unwrap(),
     )
     .unwrap();
     let request =

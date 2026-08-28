@@ -10,6 +10,11 @@ use crate::{
     SchedulerStateDto, ServiceStateControl, TaskDetailDto, TaskDto, TaskEventDto,
 };
 
+mod delivery;
+
+pub use delivery::DeliveryBackend;
+pub(crate) use delivery::UnavailableDeliveryBackend;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthContext {
     pub session_id: String,

@@ -398,7 +398,7 @@ async fn old_failed_merge_is_validated_before_later_source_and_merge_reconciliat
     let mut transaction = store.pool().begin().await.unwrap();
     sqlx::query(
         "UPDATE task_merge_operations SET state = 'reconciliation_required', \
-             failure_code = 'DELIVERY_SOURCE_INCONSISTENT', version = 4, updated_at = ? WHERE operation_id = ?",
+             failure_code = 'DELIVERY_SOURCE_INCONSISTENT', version = 5, updated_at = ? WHERE operation_id = ?",
     )
     .bind(DELIVERY_TIMESTAMP)
     .bind(reconciliation.to_string())

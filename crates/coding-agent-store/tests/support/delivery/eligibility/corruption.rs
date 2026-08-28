@@ -263,11 +263,11 @@ pub async fn corrupt_transition_ids(
     .fetch_all(store.pool())
     .await
     .unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     if make_current_negative {
         sqlx::query(
             "UPDATE task_delivery_operation_transitions SET transition_id = -1 \
-             WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 2",
+             WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 3",
         )
         .bind(operation_id)
         .execute(store.pool())

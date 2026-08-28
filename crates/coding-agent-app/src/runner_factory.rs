@@ -8,12 +8,16 @@ use std::time::Duration;
 use coding_agent_domain::{CanonicalPath, Repository, RepositoryId};
 use coding_agent_provider::{ChatCompletionsClient, ClientLimits};
 use coding_agent_runtime::{
-    DirectoryIdentityMarker, NativeVolumeSampler, ProcessLimits, ProcessLivenessScope,
-    RepositoryDiscoveryCommands, RootCapability, ToolchainPaths, VolumeSampler, WorktreeLimits,
-    WorktreeProvisioner, discover_toolchain,
+    DirectoryIdentityMarker, ExecutionDirectory, NativeVolumeSampler, ProbedDeliveryGit,
+    ProcessLimits, ProcessLivenessScope, RepositoryDiscoveryCommands, RootCapability,
+    ToolchainPaths, VolumeSampler, WorktreeLimits, WorktreeProvisioner, discover_toolchain,
+    probe_delivery_git as probe_delivery_git_capabilities,
 };
+#[cfg(feature = "test-support")]
+use coding_agent_runtime::{ProcessFault, ProcessFaultController};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
+use tokio_util::sync::CancellationToken;
 
 use crate::repository_service::{
     AuthenticatedRepositoryRuntime, DEFAULT_APPLICATION_WRITE_BUDGET_MILLIS,
@@ -29,15 +33,120 @@ use crate::{
     StartupDirectStoreArtifactAdapter, StorageMonitorConfig, StorageMonitorHandle, StoragePolicy,
     StorageProbeTarget, TaskManagerLaunchResources, TaskRunner, TokioStorageMonitorClock,
     WorktreeArtifactObserver, WorktreeCodingAgentAttemptFactory, load_provider_config,
-    reconcile_startup_artifacts_grouped,
 };
 
 mod context;
+mod delivery;
+
+#[cfg(feature = "test-support")]
+type TestDeliveryTargetBoundaryHook = Arc<dyn Fn(&'static str) + Send + Sync + 'static>;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub(crate) struct TestDeliveryTargetBoundary {
+    repository_path: std::path::PathBuf,
+    hook: TestDeliveryTargetBoundaryHook,
+}
+
+#[cfg(feature = "test-support")]
+impl TestDeliveryTargetBoundary {
+    pub(crate) fn new(
+        repository_path: std::path::PathBuf,
+        hook: TestDeliveryTargetBoundaryHook,
+    ) -> Self {
+        Self {
+            repository_path,
+            hook,
+        }
+    }
+
+    pub(crate) fn matches(&self, repository: &Repository) -> bool {
+        repository.git_root.as_path() == self.repository_path
+    }
+
+    pub(crate) fn hook(&self) -> TestDeliveryTargetBoundaryHook {
+        Arc::clone(&self.hook)
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub(crate) struct TestDeliveryProcessFaultBoundary {
+    repository_path: std::path::PathBuf,
+    controller: Arc<Mutex<Option<ProcessFaultController>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl TestDeliveryProcessFaultBoundary {
+    pub(crate) fn authenticate_preflight_first_child_cleanup_failure(
+        repository_path: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            repository_path,
+            controller: Arc::new(Mutex::new(Some(
+                ProcessFaultController::for_child(1, ProcessFault::CleanupFailure)
+                    .expect("the fixed delivery process-fault schedule is valid"),
+            ))),
+        }
+    }
+
+    pub(crate) fn matches(&self, repository: &Repository) -> bool {
+        repository.git_root.as_path() == self.repository_path
+    }
+
+    pub(crate) fn take_controller(&self) -> Option<ProcessFaultController> {
+        self.controller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use delivery::production_delivery_registries_for_test;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn production_delivery_dynamic_registries_for_test(
+    store: coding_agent_store::Store,
+    probe: Arc<ProbedDeliveryGit>,
+    toolchain: ToolchainPaths,
+    artifact_root: std::path::PathBuf,
+    temporary_directory: std::path::PathBuf,
+    repository_control: Arc<RepositoryControlCoordinator>,
+    instance_process_scope: ProcessLivenessScope,
+) -> (
+    Arc<dyn crate::DeliveryRuntimeRegistry>,
+    Arc<dyn crate::DeliveryLiveRuntimeRegistry>,
+    Arc<dyn crate::DeliveryCleanupRuntimeRegistry>,
+) {
+    let provisioners = Arc::new(ProductionWorktreeProvisioners {
+        toolchain: Arc::new(toolchain),
+        artifact_root,
+        temporary_directory,
+        process_limits: production_process_limits(),
+        worktree_limits: WorktreeLimits::try_new(Duration::from_secs(60))
+            .expect("constant production worktree limits are valid"),
+        instance_process_scope,
+        sampler: Arc::new(NativeVolumeSampler::new()),
+        prepare_slots: Arc::new(Semaphore::new(RUNTIME_ATTACHMENT_PREPARE_CONCURRENCY)),
+        bound: Mutex::new(HashMap::new()),
+    });
+    let prepared =
+        delivery::production_delivery_runtime(store, probe, provisioners, repository_control);
+    (
+        prepared.runtime(),
+        prepared.live_runtime(),
+        prepared.cleanup_runtime(),
+    )
+}
 
 pub(crate) use context::ValidatedStartupInputs;
 pub use context::{PreActorStartupRunnerContext, StartupRunnerContext};
+use delivery::PreparedDeliveryStartup;
 
 const ARTIFACT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
+const DELIVERY_GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_ATTACHMENT_PREPARE_CONCURRENCY: usize = 4;
 const REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS: u64 = 1_000;
 const REPOSITORY_DISCOVERY_CLEANUP_TIMEOUT_MILLIS: u64 = 500;
@@ -92,6 +201,7 @@ pub struct StartupRunnerSelection {
     launch_resources: TaskManagerLaunchResources,
     repository_registrar: Option<RepositoryRuntimeRegistrar>,
     repository_discovery: Option<RepositoryDiscovery>,
+    delivery_startup: Option<PreparedDeliveryStartup>,
 }
 
 impl StartupRunnerSelection {
@@ -102,6 +212,7 @@ impl StartupRunnerSelection {
             launch_resources,
             repository_registrar: None,
             repository_discovery: None,
+            delivery_startup: None,
         }
     }
 
@@ -110,12 +221,14 @@ impl StartupRunnerSelection {
         launch_resources: TaskManagerLaunchResources,
         repository_registrar: RepositoryRuntimeRegistrar,
         repository_discovery: RepositoryDiscovery,
+        delivery_startup: PreparedDeliveryStartup,
     ) -> Self {
         Self {
             runner,
             launch_resources,
             repository_registrar: Some(repository_registrar),
             repository_discovery: Some(repository_discovery),
+            delivery_startup: Some(delivery_startup),
         }
     }
 
@@ -138,6 +251,10 @@ impl StartupRunnerSelection {
     pub(crate) fn repository_discovery(&self) -> Option<RepositoryDiscovery> {
         self.repository_discovery.clone()
     }
+
+    pub(crate) fn delivery_startup(&self) -> Option<PreparedDeliveryStartup> {
+        self.delivery_startup.clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -145,6 +262,16 @@ pub trait StartupRunnerFactory: Send + Sync + 'static {
     async fn validate_pre_database(
         &self,
         _paths: &PlatformPaths,
+    ) -> Result<Arc<dyn Any + Send + Sync>, StartupRunnerFactoryError> {
+        Ok(Arc::new(()))
+    }
+
+    /// Proves the delivery Git capabilities after prior process ownership is
+    /// exclusive and before SQLite is opened or migrated.
+    async fn probe_delivery_git_pre_database(
+        &self,
+        _paths: &PlatformPaths,
+        _process_liveness_scope: ProcessLivenessScope,
     ) -> Result<Arc<dyn Any + Send + Sync>, StartupRunnerFactoryError> {
         Ok(Arc::new(()))
     }
@@ -250,6 +377,7 @@ pub struct ProductionStartupRunnerFactory;
 
 struct PreparedProductionRunner {
     toolchain: Arc<ToolchainPaths>,
+    delivery_git: Arc<ProbedDeliveryGit>,
     repository_discovery: RepositoryDiscovery,
     provisioners: Arc<ProductionWorktreeProvisioners>,
     repositories: Vec<Repository>,
@@ -258,6 +386,12 @@ struct PreparedProductionRunner {
     repository_identity_resolver: Arc<FilesystemRepositoryIdentityResolver>,
     scheduler_limits: SchedulerConcurrencyLimits,
     sampler: Arc<dyn VolumeSampler>,
+    delivery_startup: PreparedDeliveryStartup,
+}
+
+struct ProbedProductionRuntime {
+    toolchain: Arc<ToolchainPaths>,
+    delivery_git: Arc<ProbedDeliveryGit>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -269,6 +403,7 @@ struct PreparedFixedRunner {
     repository_control: Arc<RepositoryControlCoordinator>,
     sampler: Arc<dyn VolumeSampler>,
     scheduler_limits: SchedulerConcurrencyLimits,
+    delivery_startup: PreparedDeliveryStartup,
 }
 
 async fn prepare_repository_runtime<R>(
@@ -633,20 +768,54 @@ impl StartupRunnerFactory for ProductionStartupRunnerFactory {
         Ok(Arc::new(provider))
     }
 
-    async fn prepare_before_actors(
+    async fn probe_delivery_git_pre_database(
         &self,
-        context: &PreActorStartupRunnerContext,
+        paths: &PlatformPaths,
+        process_liveness_scope: ProcessLivenessScope,
     ) -> Result<Arc<dyn Any + Send + Sync>, StartupRunnerFactoryError> {
         let toolchain = Arc::new(
             discover_toolchain(
-                context.paths().runtime_dir.as_path(),
-                context.process_liveness_scope().clone(),
+                paths.runtime_dir.as_path(),
+                process_liveness_scope.clone(),
                 None,
                 None,
             )
             .await
             .map_err(|error| StartupRunnerFactoryError::new(error.code()))?,
         );
+        let retained_runtime = paths
+            .retain_private_runtime_directory()
+            .map_err(|_| StartupRunnerFactoryError::new("DELIVERY_GIT_PROBE_FAILED"))?;
+        let private_runtime = Arc::new(
+            ExecutionDirectory::from_retained_directory(
+                paths.runtime_dir.as_path(),
+                retained_runtime,
+            )
+            .map_err(|_| StartupRunnerFactoryError::new("DELIVERY_GIT_PROBE_FAILED"))?,
+        );
+        let delivery_git = probe_delivery_git_capabilities(
+            toolchain.git(),
+            private_runtime,
+            process_liveness_scope,
+            delivery_probe_process_limits(),
+            DELIVERY_GIT_PROBE_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| StartupRunnerFactoryError::new(error.code()))?;
+
+        Ok(Arc::new(ProbedProductionRuntime {
+            toolchain,
+            delivery_git: Arc::new(delivery_git),
+        }))
+    }
+
+    async fn prepare_before_actors(
+        &self,
+        context: &PreActorStartupRunnerContext,
+    ) -> Result<Arc<dyn Any + Send + Sync>, StartupRunnerFactoryError> {
+        let probed = context.probed::<ProbedProductionRuntime>()?;
+        let toolchain = Arc::clone(&probed.toolchain);
         let repository_discovery = supervised_repository_discovery(&toolchain, context)?;
         let worktree_limits = WorktreeLimits::try_new(Duration::from_secs(60))
             .map_err(|error| StartupRunnerFactoryError::new(error.code()))?;
@@ -687,13 +856,17 @@ impl StartupRunnerFactory for ProductionStartupRunnerFactory {
             .map_err(|_| StartupRunnerFactoryError::new("REPOSITORY_IDENTITY_UNAVAILABLE"))?;
         let observer = WorktreeArtifactObserver::new(observed_provisioners);
         let adapter = StartupDirectStoreArtifactAdapter::new(context.store().clone());
-        reconcile_startup_artifacts_grouped(
+        let delivery_startup = PreparedDeliveryStartup::load(context.store())
+            .await
+            .map_err(|_| StartupRunnerFactoryError::new("DELIVERY_OWNERSHIP_INCONSISTENT"))?;
+        crate::artifact_reconciliation::reconcile_startup_artifacts_grouped_with_ownership(
             &adapter,
             repository_control.as_ref(),
             repository_identity_resolver.as_ref(),
             &observer,
             NonZeroUsize::new(RUNTIME_ATTACHMENT_PREPARE_CONCURRENCY)
                 .expect("startup reconciliation concurrency is nonzero"),
+            delivery_startup.ownership_router(),
         )
         .await
         .map_err(|_| StartupRunnerFactoryError::new("ARTIFACT_RECONCILIATION_FAILED"))?;
@@ -707,6 +880,7 @@ impl StartupRunnerFactory for ProductionStartupRunnerFactory {
         .map_err(|_| StartupRunnerFactoryError::new("SCHEDULER_LIMITS_INVALID"))?;
         Ok(Arc::new(PreparedProductionRunner {
             toolchain,
+            delivery_git: Arc::clone(&probed.delivery_git),
             repository_discovery,
             provisioners,
             repositories,
@@ -715,6 +889,7 @@ impl StartupRunnerFactory for ProductionStartupRunnerFactory {
             repository_identity_resolver,
             scheduler_limits,
             sampler,
+            delivery_startup,
         }))
     }
 
@@ -777,11 +952,45 @@ impl StartupRunnerFactory for ProductionStartupRunnerFactory {
             context.wall_clock(),
             CodingAgentRunnerConfig::default(),
         ));
+        #[cfg(feature = "test-support")]
+        let delivery_runtime = {
+            let target_boundary = context.test_delivery_target_boundary();
+            let process_fault = context.test_delivery_process_fault();
+            if target_boundary.is_some() || process_fault.is_some() {
+                delivery::production_delivery_runtime_with_test_support(
+                    context.store().clone(),
+                    Arc::clone(&prepared.delivery_git),
+                    Arc::clone(&prepared.provisioners),
+                    Arc::clone(&prepared.repository_control),
+                    target_boundary,
+                    process_fault,
+                )
+            } else {
+                delivery::production_delivery_runtime(
+                    context.store().clone(),
+                    Arc::clone(&prepared.delivery_git),
+                    Arc::clone(&prepared.provisioners),
+                    Arc::clone(&prepared.repository_control),
+                )
+            }
+        };
+        #[cfg(not(feature = "test-support"))]
+        let delivery_runtime = delivery::production_delivery_runtime(
+            context.store().clone(),
+            Arc::clone(&prepared.delivery_git),
+            Arc::clone(&prepared.provisioners),
+            Arc::clone(&prepared.repository_control),
+        );
+        let delivery_startup = prepared
+            .delivery_startup
+            .clone()
+            .with_runtime(delivery_runtime);
         Ok(StartupRunnerSelection::with_repository_runtime(
             runner,
             launch_resources,
             repository_registrar,
             prepared.repository_discovery.clone(),
+            delivery_startup,
         ))
     }
 }
@@ -794,6 +1003,16 @@ fn production_process_limits() -> ProcessLimits {
         Duration::from_secs(5),
     )
     .expect("constant production process limits are valid")
+}
+
+fn delivery_probe_process_limits() -> ProcessLimits {
+    ProcessLimits::try_new(
+        64 * 1024,
+        64 * 1024,
+        DELIVERY_GIT_PROBE_TIMEOUT,
+        Duration::from_secs(5),
+    )
+    .expect("constant delivery Git probe process limits are valid")
 }
 
 fn repository_discovery_process_limits() -> ProcessLimits {
@@ -864,6 +1083,9 @@ impl StartupRunnerFactory for FixedStartupRunnerFactory {
             .list_repositories()
             .await
             .map_err(|_| StartupRunnerFactoryError::new("REPOSITORY_IDENTITY_UNAVAILABLE"))?;
+        let delivery_startup = PreparedDeliveryStartup::load(context.store())
+            .await
+            .map_err(|_| StartupRunnerFactoryError::new("DELIVERY_OWNERSHIP_INCONSISTENT"))?;
         let repository_control = Arc::new(RepositoryControlCoordinator::new());
         let sampler = Arc::clone(&self.sampler);
         let attachments = Arc::new(FixedRepositoryRuntimeAttachments {
@@ -917,6 +1139,7 @@ impl StartupRunnerFactory for FixedStartupRunnerFactory {
             repository_control,
             sampler,
             scheduler_limits,
+            delivery_startup,
         }))
     }
 
@@ -960,6 +1183,7 @@ impl StartupRunnerFactory for FixedStartupRunnerFactory {
             ),
             repository_registrar,
             prepared.repository_discovery.clone(),
+            prepared.delivery_startup.clone(),
         ))
     }
 }
@@ -1036,14 +1260,15 @@ mod tests {
         (temporary, prepared, process_liveness_scope)
     }
 
+    fn create_discovery_workspace(root: &Path) -> PathBuf {
+        let workspace = root.join("discovery-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), b"[workspace]\nmembers = []\n").unwrap();
+        workspace.canonicalize().unwrap()
+    }
+
     fn create_discovery_repository(root: &Path) -> PathBuf {
-        let repository = root.join("discovery-repository");
-        std::fs::create_dir_all(&repository).unwrap();
-        std::fs::write(
-            repository.join("Cargo.toml"),
-            b"[workspace]\nmembers = []\n",
-        )
-        .unwrap();
+        let repository = create_discovery_workspace(root);
         assert!(
             Command::new("git")
                 .args(["init", "--quiet"])
@@ -1052,7 +1277,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        repository.canonicalize().unwrap()
+        repository
     }
 
     #[tokio::test]
@@ -1062,7 +1287,7 @@ mod tests {
             NonZeroU32::new(2).unwrap(),
         );
         let (temporary, prepared, process_liveness_scope) = prepare_fixed_factory(&factory).await;
-        let repository = create_discovery_repository(temporary.path());
+        let repository = create_discovery_workspace(temporary.path());
 
         let error = prepared
             .repository_discovery
@@ -1464,7 +1689,12 @@ mod tests {
             .unwrap();
         let factory = ProductionStartupRunnerFactory;
         let runner_inputs = factory.validate_pre_database(&paths).await.unwrap();
-        let validated_inputs = ValidatedStartupInputs::new(runtime_config, runner_inputs);
+        let probed_runner_inputs = factory
+            .probe_delivery_git_pre_database(&paths, process_liveness_scope.clone())
+            .await
+            .unwrap();
+        let validated_inputs = ValidatedStartupInputs::new(runtime_config, runner_inputs)
+            .with_probed_runner_inputs(probed_runner_inputs);
         let context = PreActorStartupRunnerContext::new(
             paths,
             store.clone(),

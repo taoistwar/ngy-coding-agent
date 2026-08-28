@@ -28,7 +28,7 @@ async fn reconcile_preflight_pending() {
         &baseline,
         operation_id,
         MergeOperationState::PreflightPending,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         "preflight pending to reconciliation required",
     )
     .await;

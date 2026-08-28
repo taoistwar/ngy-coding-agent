@@ -39,6 +39,9 @@ test("rejects unauthorized local requests before protected capabilities run", as
     const csrfToken = csrfFromBootstrap(await bootstrapResponse.json());
 
     const mutationUrl = `${app.origin}/api/tasks/${randomUUID()}/cancel`;
+    const deliveryTaskId = randomUUID();
+    const deliveryReadUrl = `${app.origin}/api/tasks/${deliveryTaskId}/delivery`;
+    const deliveryMutationUrl = `${app.origin}/api/tasks/${deliveryTaskId}/merge/preflight`;
 
     await test.step("rejects a wrong Host before session authorization", async () => {
       await expectSecurityError(
@@ -63,11 +66,24 @@ test("rejects unauthorized local requests before protected capabilities run", as
         401,
         "SECURITY_INVALID_SESSION",
       );
+      await expectSecurityError(
+        request.get(deliveryReadUrl),
+        401,
+        "SECURITY_INVALID_SESSION",
+      );
     });
 
     await test.step("rejects missing and wrong mutation origins", async () => {
       await expectSecurityError(
         context.request.post(mutationUrl, {
+          headers: { "x-csrf-token": csrfToken },
+        }),
+        403,
+        "SECURITY_INVALID_ORIGIN",
+      );
+      await expectSecurityError(
+        context.request.post(deliveryMutationUrl, {
+          data: validPreflightBody(),
           headers: { "x-csrf-token": csrfToken },
         }),
         403,
@@ -102,6 +118,29 @@ test("rejects unauthorized local requests before protected capabilities run", as
         }),
         403,
         "SECURITY_INVALID_CSRF",
+      );
+      await expectSecurityError(
+        context.request.post(deliveryMutationUrl, {
+          data: validPreflightBody(),
+          headers: { origin: app.origin },
+        }),
+        403,
+        "SECURITY_INVALID_CSRF",
+      );
+    });
+
+    await test.step("rejects unknown delivery fields before backend dispatch", async () => {
+      await expectSecurityError(
+        context.request.post(deliveryMutationUrl, {
+          data: { ...validPreflightBody(), unknown: app.repositoryDir },
+          headers: {
+            origin: app.origin,
+            "x-csrf-token": csrfToken,
+          },
+        }),
+        400,
+        "INVALID_JSON",
+        [app.repositoryDir],
       );
     });
 
@@ -179,6 +218,7 @@ async function expectSecurityError(
   responsePromise: Promise<APIResponse>,
   expectedStatus: number,
   expectedCode: string,
+  forbiddenValues: readonly string[] = [],
 ): Promise<void> {
   const response = await responsePromise;
   expect(response.status()).toBe(expectedStatus);
@@ -194,6 +234,10 @@ async function expectSecurityError(
     throw new Error("security rejection did not include a string request ID");
   }
   expect(candidate.request_id.trim()).not.toBe("");
+  const serialized = JSON.stringify(candidate);
+  for (const forbidden of forbiddenValues) {
+    expect(serialized).not.toContain(forbidden);
+  }
 }
 
 function csrfFromBootstrap(candidate: unknown): string {
@@ -205,6 +249,18 @@ function csrfFromBootstrap(candidate: unknown): string {
     throw new Error("authorized bootstrap did not include a non-empty CSRF token");
   }
   return candidate.csrf_token;
+}
+
+function validPreflightBody(): {
+  client_request_id: string;
+  target_branch: string;
+  expected_target_head: string;
+} {
+  return {
+    client_request_id: randomUUID(),
+    target_branch: "refs/heads/main",
+    expected_target_head: "1".repeat(40),
+  };
 }
 
 function corsHeader(headers: Record<string, string>): string | undefined {

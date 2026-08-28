@@ -11,7 +11,10 @@ use crate::repository_service::DEFAULT_APPLICATION_WRITE_BUDGET;
 use crate::security::{LaunchToken, LauncherSecret};
 #[cfg(feature = "test-support")]
 use crate::test_support::ActorPausePoint;
-use crate::{ApplicationBackend, SecurityManager, SecuritySeed, build_runtime_router};
+use crate::{
+    ApplicationBackend, SecurityManager, SecuritySeed, build_application_api_router_with_delivery,
+    build_runtime_router,
+};
 
 use super::ActorsReady;
 #[cfg(feature = "test-support")]
@@ -163,10 +166,10 @@ fn build_server_router(
     security: &SecurityManager,
     backend: Arc<ApplicationBackend>,
 ) -> (Router, StartupPhaseController) {
-    let api_router = coding_agent_api::build_api_router(
+    let api_router = build_application_api_router_with_delivery(
         backend.clone(),
         Arc::new(security.clone()),
-        backend.clone(),
+        actors.delivery_manager.clone(),
     );
     let startup_phase = StartupPhaseController::new();
     let router = build_runtime_router(
@@ -203,6 +206,17 @@ impl ServingPrimary {
             let _ = std::fs::remove_file(&self.actors.context.paths.instance_descriptor);
             return Err(error.into());
         }
+        if self
+            .actors
+            .service_state
+            .set(crate::ServiceState::Ready)
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&self.actors.context.paths.instance_descriptor);
+            return Err(StartupError::Runner(crate::StartupRunnerFactoryError::new(
+                "STARTUP_ADMISSION_OPEN_FAILED",
+            )));
+        }
         #[cfg(feature = "test-support")]
         pause_after_descriptor(&self.actors.context.dependencies).await;
 
@@ -218,6 +232,7 @@ impl ServingPrimary {
             writer: self.actors.writer.clone(),
             dispatcher: self.actors.dispatcher.clone(),
             task_manager: self.actors.task_manager.clone(),
+            delivery_manager: self.actors.delivery_manager.clone(),
             mutation_gate: self.actors.mutation_gate.clone(),
             repository_registrar: self.test_repository_registrar,
             process_liveness_scope: self.actors.instance_process_scope.clone(),
@@ -235,6 +250,13 @@ impl ServingPrimary {
             test_handles,
             #[cfg(feature = "test-support")]
             _test_signal_watchers: self.actors.test_signal_watchers,
+            #[cfg(feature = "test-support")]
+            _process_test_support: self
+                .actors
+                .context
+                .dependencies
+                .process_test_support
+                .clone(),
         })
     }
 

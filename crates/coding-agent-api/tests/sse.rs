@@ -1601,6 +1601,20 @@ async fn heartbeat_arrives_at_fifteen_seconds_and_has_no_id() {
 #[tokio::test]
 async fn all_persisted_variants_use_the_exact_named_event_and_matching_json_id() {
     let events = all_wire_events();
+    assert_eq!(
+        events.len(),
+        11,
+        "delivery polling must not add a task lifecycle event"
+    );
+    for event in &events {
+        let kind = serde_json::to_value(event).unwrap()["kind"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!kind.contains("delivery"));
+        assert!(!kind.contains("merge"));
+        assert!(!kind.contains("cleanup"));
+    }
     let sse = ScriptedSse::finite([11], events, Vec::new(), Vec::new());
     let (_, body) = finite_body(connect(sse, 0).await).await;
     let expected = [

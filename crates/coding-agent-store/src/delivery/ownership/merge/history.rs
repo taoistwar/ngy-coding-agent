@@ -14,9 +14,35 @@ pub(super) async fn validate_merge_historical_shape(
     if audit_preflight_receipt(connection, operation).await? != PreflightReceiptAudit::Exact {
         return Err(ownership_invariant());
     }
+    validate_target_provenance_history(connection, operation).await?;
     validate_abort_child_receipt_uniqueness(connection, operation).await?;
     validate_phase_history(connection, operation).await?;
     validate_accepted_metadata_history(connection, operation).await
+}
+
+async fn validate_target_provenance_history(
+    connection: &mut SqliteConnection,
+    operation: &MergeOperationRecord,
+) -> Result<(), StoreError> {
+    let mismatch: i64 = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM task_delivery_operation_transitions \
+             WHERE entity_kind = 'merge_operation' AND entity_id = ? \
+               AND (target_config_attributes_digest IS NOT ? \
+                    OR target_security_digest IS NOT ?) \
+             LIMIT 1 \
+         )",
+    )
+    .bind(operation.operation_id.to_string())
+    .bind(operation.target_config_attributes_digest.as_str())
+    .bind(operation.target_security_digest.as_str())
+    .fetch_one(connection)
+    .await?;
+    if mismatch == 0 {
+        Ok(())
+    } else {
+        Err(ownership_invariant())
+    }
 }
 
 async fn validate_abort_child_receipt_uniqueness(
@@ -55,11 +81,23 @@ async fn validate_phase_history(
     .fetch_optional(connection)
     .await?;
     let phase = match (operation.state, from_state.as_deref()) {
-        (MergeOperationState::PreflightPending, Some("absent"))
-        | (MergeOperationState::Rejected, Some("preflight_pending"))
+        (MergeOperationState::PreflightPending, Some("absent")) => MergeFactPhase::PendingIntent,
+        (MergeOperationState::PreflightPending, Some("preflight_pending")) => {
+            MergeFactPhase::PendingPrepared
+        }
+        (MergeOperationState::Rejected, Some("preflight_pending"))
         | (MergeOperationState::Stale, Some("preflight_pending"))
-        | (MergeOperationState::ReconciliationRequired, Some("preflight_pending")) => {
-            MergeFactPhase::Pending
+        | (MergeOperationState::ReconciliationRequired, Some("preflight_pending"))
+            if operation.preflight_inputs.is_none() && operation.version.get() == 2 =>
+        {
+            MergeFactPhase::UnboundTerminal
+        }
+        (MergeOperationState::Rejected, Some("preflight_pending"))
+        | (MergeOperationState::Stale, Some("preflight_pending"))
+        | (MergeOperationState::ReconciliationRequired, Some("preflight_pending"))
+            if operation.preflight_inputs.is_some() && operation.version.get() == 3 =>
+        {
+            MergeFactPhase::PreparedTerminal
         }
         (MergeOperationState::PreflightReady, Some("preflight_pending"))
         | (MergeOperationState::Conflict, Some("preflight_pending"))
@@ -95,7 +133,10 @@ async fn validate_phase_history(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MergeFactPhase {
-    Pending,
+    PendingIntent,
+    PendingPrepared,
+    UnboundTerminal,
+    PreparedTerminal,
     PreflightResult,
     Accepted,
     SourceBound,
@@ -124,6 +165,7 @@ fn fact_phase_matches(operation: &MergeOperationRecord, phase: MergeFactPhase) -
         return false;
     }
     let preflight_result = preflight_field_count == 2;
+    let prepared_inputs = operation.preflight_inputs.is_some();
     let accepted = accepted_field_count == 2;
     let source_bound = source_field_count == 2;
     let expected_merge = operation.expected_merge_commit.is_some();
@@ -136,6 +178,7 @@ fn fact_phase_matches(operation: &MergeOperationRecord, phase: MergeFactPhase) -
     }
     let disposition = operation.merged_disposition_task_id.is_some();
     let actual = (
+        prepared_inputs,
         preflight_result,
         accepted,
         source_bound,
@@ -144,13 +187,16 @@ fn fact_phase_matches(operation: &MergeOperationRecord, phase: MergeFactPhase) -
         disposition,
     );
     let expected = match phase {
-        MergeFactPhase::Pending => (false, false, false, false, false, false),
-        MergeFactPhase::PreflightResult => (true, false, false, false, false, false),
-        MergeFactPhase::Accepted => (true, true, false, false, false, false),
-        MergeFactPhase::SourceBound => (true, true, true, false, false, false),
-        MergeFactPhase::MergePending => (true, true, true, true, false, false),
-        MergeFactPhase::AbortPending => (true, true, true, true, true, false),
-        MergeFactPhase::Merged => (true, true, true, true, false, true),
+        MergeFactPhase::PendingIntent => (false, false, false, false, false, false, false),
+        MergeFactPhase::PendingPrepared => (true, false, false, false, false, false, false),
+        MergeFactPhase::UnboundTerminal => (false, false, false, false, false, false, false),
+        MergeFactPhase::PreparedTerminal => (true, false, false, false, false, false, false),
+        MergeFactPhase::PreflightResult => (true, true, false, false, false, false, false),
+        MergeFactPhase::Accepted => (true, true, true, false, false, false, false),
+        MergeFactPhase::SourceBound => (true, true, true, true, false, false, false),
+        MergeFactPhase::MergePending => (true, true, true, true, true, false, false),
+        MergeFactPhase::AbortPending => (true, true, true, true, true, true, false),
+        MergeFactPhase::Merged => (true, true, true, true, true, false, true),
     };
     actual == expected
 }

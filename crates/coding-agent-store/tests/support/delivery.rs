@@ -34,6 +34,10 @@ pub const COMMON_IDENTITY_DIGEST: &str =
 pub const ADMIN_IDENTITY_DIGEST: &str =
     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 pub const CONFIG_DIGEST: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+pub const TARGET_CONFIG_DIGEST: &str =
+    "abababababababababababababababababababababababababababababababab";
+pub const TARGET_SECURITY_DIGEST: &str =
+    "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 pub const REQUEST_HASH: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 pub const TIMESTAMP: &str = "2026-08-04T00:00:00.000000000Z";
 pub const SOURCE_BRANCH: &str = "refs/heads/codex/task";
@@ -65,6 +69,8 @@ pub struct PreflightFixture<'a> {
     pub candidate_tree_oid: &'a str,
     pub target_branch: SqlTextFixture<'a>,
     pub config_attributes_digest: &'a str,
+    pub target_config_attributes_digest: &'a str,
+    pub target_security_digest: &'a str,
     pub request_hash: &'a str,
     pub receipt_created_at: &'a str,
 }
@@ -83,6 +89,8 @@ impl<'a> PreflightFixture<'a> {
             candidate_tree_oid: CANDIDATE_TREE_OID,
             target_branch: TARGET_BRANCH.into(),
             config_attributes_digest: CONFIG_DIGEST,
+            target_config_attributes_digest: TARGET_CONFIG_DIGEST,
+            target_security_digest: TARGET_SECURITY_DIGEST,
             request_hash: REQUEST_HASH,
             receipt_created_at: TIMESTAMP,
         }

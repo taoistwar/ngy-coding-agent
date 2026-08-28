@@ -135,8 +135,8 @@ fn release_binary_starts_without_node_or_dist() {
         "a fresh release must bootstrap in the ready state"
     );
     assert_eq!(
-        bootstrap.max_concurrent_tasks, 1,
-        "the production bootstrap must advertise the isolated single-runner limit"
+        bootstrap.max_concurrent_tasks, 2,
+        "the production bootstrap must advertise the default concurrent-task limit"
     );
     assert_secret_shape(&bootstrap.csrf_token, "bootstrap CSRF token");
     assert!(bootstrap.repositories.is_empty());
@@ -144,8 +144,15 @@ fn release_binary_starts_without_node_or_dist() {
     assert_eq!(bootstrap.latest_event_id, 0);
     assert!(!bootstrap.server_started_at.is_empty());
     assert_eq!(
-        bootstrap.service_state_generation, 0,
-        "a fresh ready service starts at generation zero"
+        bootstrap.service_state_generation, 1,
+        "startup advances the service generation when it becomes ready"
+    );
+    assert_fresh_scheduler(
+        &bootstrap.scheduler,
+        &descriptor,
+        &bootstrap.server_started_at,
+        bootstrap.service_state_generation,
+        bootstrap.max_concurrent_tasks,
     );
 
     let root = client
@@ -218,6 +225,37 @@ fn release_binary_starts_without_node_or_dist() {
         !temporary_root.exists(),
         "release-smoke data must be removed after the child exits"
     );
+}
+
+fn assert_fresh_scheduler(
+    scheduler: &SchedulerBody,
+    descriptor: &RuntimeDescriptor,
+    server_started_at: &str,
+    service_state_generation: u64,
+    max_concurrent_tasks: u32,
+) {
+    assert_eq!(scheduler.schema_version, 1);
+    assert_eq!(
+        scheduler.server_instance_id,
+        descriptor.instance_id().hyphenated().to_string()
+    );
+    assert_eq!(scheduler.server_started_at, server_started_at);
+    assert_eq!(scheduler.generation, 2);
+    assert_eq!(scheduler.as_of_event_id, 0);
+    assert_eq!(scheduler.service_state_generation, service_state_generation);
+    assert_eq!(scheduler.admission_state, "running");
+    assert_eq!(scheduler.limits.global, max_concurrent_tasks);
+    assert_eq!(scheduler.limits.per_repository, max_concurrent_tasks);
+    assert_eq!(scheduler.limits.queued, 32);
+    assert!((1..=8).contains(&scheduler.limits.cargo_jobs_per_task));
+    assert_eq!(scheduler.active_task_count, 0);
+    assert_eq!(scheduler.queued_task_count, 0);
+    assert!(scheduler.queued_tasks.is_empty());
+    assert!(scheduler.stopping_tasks.is_empty());
+    assert_eq!(scheduler.storage.state, "unavailable");
+    assert_eq!(scheduler.storage.data.state, "unavailable");
+    assert_eq!(scheduler.storage.runtime.state, "unavailable");
+    assert!(scheduler.storage.repositories.is_empty());
 }
 
 fn release_binary_from_environment() -> PathBuf {
@@ -994,6 +1032,49 @@ struct BootstrapBody {
     service_state: String,
     service_state_generation: u64,
     max_concurrent_tasks: u32,
+    scheduler: SchedulerBody,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerBody {
+    schema_version: u16,
+    server_instance_id: String,
+    server_started_at: String,
+    generation: u64,
+    as_of_event_id: u64,
+    service_state_generation: u64,
+    admission_state: String,
+    limits: SchedulerLimitsBody,
+    active_task_count: u32,
+    queued_task_count: u32,
+    queued_tasks: Vec<serde_json::Value>,
+    stopping_tasks: Vec<serde_json::Value>,
+    storage: SchedulerStorageBody,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerLimitsBody {
+    global: u32,
+    per_repository: u32,
+    queued: u32,
+    cargo_jobs_per_task: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerStorageBody {
+    state: String,
+    data: SchedulerStorageScopeBody,
+    runtime: SchedulerStorageScopeBody,
+    repositories: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerStorageScopeBody {
+    state: String,
 }
 
 #[derive(Deserialize)]

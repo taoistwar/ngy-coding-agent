@@ -122,6 +122,23 @@ fn deterministic_store_failures_keep_their_exact_clone_safe_variant() {
     );
 }
 
+#[test]
+fn delivery_store_failures_fail_closed_until_typed_writer_commands_exist() {
+    for error in [
+        StoreError::Delivery(coding_agent_store::DeliveryError::InvalidIdentity),
+        StoreError::TaskNotMergeEligible,
+        StoreError::DeliveryOperationInProgress,
+        StoreError::DeliveryReconciliationRequired,
+    ] {
+        assert_eq!(
+            classify_store_failure(error),
+            StoreFailureClassification::Invariant(
+                "delivery store outcome reached the writer before delivery command integration"
+            )
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum InjectedAttempt {
     KnownUncommittedBusy,

@@ -1,10 +1,18 @@
 use super::*;
 
+pub(super) mod delivery;
 pub(super) mod execution;
 
 use execution::*;
 
 pub(super) enum WriteCommand {
+    Delivery {
+        identity: delivery::DeliverySubmissionIdentity,
+        command: delivery::DeliveryWriteCommand,
+        deadline: Instant,
+        reconciliation_lane: bool,
+        response: oneshot::Sender<delivery::DeliveryCompletion>,
+    },
     RegisterRepository {
         input: NewRepository,
         deadline: Instant,
@@ -179,6 +187,7 @@ impl WriteCommand {
                 task_mutation_identities(identity)
             }
             Self::RegisterRepository { .. }
+            | Self::Delivery { .. }
             | Self::CreateTask { .. }
             | Self::RetryTask { .. }
             | Self::QueueLimitedCreate { .. }
@@ -310,6 +319,7 @@ pub(super) async fn run_writer(
 
 #[derive(Clone, Copy)]
 enum WriteCommandClass {
+    Delivery,
     DirectLifecycle,
     Maintenance,
     QueueAdmission,
@@ -320,6 +330,7 @@ enum WriteCommandClass {
 
 fn command_class(command: &WriteCommand) -> WriteCommandClass {
     match command {
+        WriteCommand::Delivery { .. } => WriteCommandClass::Delivery,
         WriteCommand::CreateTask { .. }
         | WriteCommand::RetryTask { .. }
         | WriteCommand::TransitionWithEvent { .. }
@@ -355,6 +366,7 @@ async fn process_write_command(
     wake: &dyn EventWake,
 ) -> bool {
     match command_class(&command) {
+        WriteCommandClass::Delivery => delivery::process_write_command(command, backend).await,
         WriteCommandClass::DirectLifecycle => {
             process_direct_lifecycle_command(command, backend, wake).await
         }

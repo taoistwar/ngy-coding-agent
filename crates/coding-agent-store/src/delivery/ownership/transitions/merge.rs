@@ -10,21 +10,27 @@ pub(super) async fn transition_pair_is_invalid(
         "SELECT EXISTS(SELECT 1 FROM task_delivery_operation_transitions \
          WHERE entity_kind = 'merge_operation' AND entity_id = ? AND NOT ( \
              (from_state = 'absent' AND to_state = 'preflight_pending' \
+                 AND entity_version = 1 \
                  AND failure_code IS NULL) \
              OR (from_state = 'preflight_pending' AND ( \
-                 (to_state = 'preflight_ready' AND failure_code IS NULL) \
-                 OR (to_state = 'conflict' AND failure_code IS 'MERGE_CONFLICT') \
-                 OR (to_state = 'rejected' AND failure_code IN ( \
+                 (to_state = 'preflight_pending' AND entity_version = 2 \
+                    AND failure_code IS NULL) \
+                 OR (to_state = 'preflight_ready' AND entity_version = 3 \
+                     AND failure_code IS NULL) \
+                 OR (to_state = 'conflict' AND entity_version = 3 \
+                    AND failure_code IS 'MERGE_CONFLICT') \
+                 OR (to_state = 'rejected' AND entity_version IN (2, 3) AND failure_code IN ( \
                      'TASK_NOT_MERGE_ELIGIBLE', 'TARGET_BRANCH_DETACHED', \
                      'TARGET_BRANCH_MISMATCH', 'TARGET_WORKTREE_DIRTY', \
                      'TARGET_IGNORED_PATH_COLLISION', \
                      'TARGET_GIT_OPERATION_IN_PROGRESS', \
                      'UNSAFE_GIT_CONFIGURATION', 'UNSUPPORTED_GIT_ATTRIBUTES', \
                      'SOURCE_ALREADY_IN_TARGET')) \
-                 OR (to_state = 'stale' AND failure_code IN ( \
+                 OR (to_state = 'stale' AND entity_version IN (2, 3) AND failure_code IN ( \
                      'DELIVERY_EVIDENCE_STALE', 'TARGET_BRANCH_MISMATCH', \
                      'TARGET_HEAD_CHANGED', 'DELIVERY_SOURCE_CHANGED')) \
-                 OR (to_state = 'reconciliation_required' AND failure_code IN ( \
+                 OR (to_state = 'reconciliation_required' AND entity_version IN (2, 3) \
+                    AND failure_code IN ( \
                      'DELIVERY_RECONCILIATION_REQUIRED', 'DELIVERY_SOURCE_INCONSISTENT', \
                      'PROCESS_TREE_CLEANUP_FAILED', 'WORKTREE_IDENTITY_MISMATCH', \
                      'UNSAFE_GIT_CONFIGURATION', 'UNSUPPORTED_GIT_ATTRIBUTES')))) \

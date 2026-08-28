@@ -1,5 +1,6 @@
 include!("support.rs");
 
+mod active_ownership;
 mod actor_lifecycle;
 mod admission;
 mod claim_ingress;

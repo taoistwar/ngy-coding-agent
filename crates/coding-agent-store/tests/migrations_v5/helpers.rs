@@ -27,7 +27,7 @@ pub(super) async fn transition_pending_merge(
         "UPDATE task_merge_operations
          SET state = ?, failure_code = ?, merge_base_oid = ?, candidate_merge_tree_oid = ?,
              conflict_path_count = CASE WHEN ? = 'conflict' THEN 0 ELSE NULL END,
-             version = 2, updated_at = ? WHERE operation_id = ?",
+             version = 3, updated_at = ? WHERE operation_id = ?",
     )
     .bind(state)
     .bind(failure_code)
@@ -103,7 +103,7 @@ pub(super) async fn transition_accepted_merge_to_failed(
     sqlx::query(
         "UPDATE task_merge_operations
          SET delivery_source_task_id = task_id, source_commit_oid = ?,
-             state = 'failed', failure_code = ?, version = 4, updated_at = ?
+             state = 'failed', failure_code = ?, version = 5, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind(support::delivery::SOURCE_COMMIT_OID)
@@ -122,7 +122,7 @@ pub(super) async fn mark_merge_pending(
         "UPDATE task_merge_operations
          SET delivery_source_task_id = task_id, source_commit_oid = ?,
              expected_merge_commit_oid = ?, state = 'merge_pending', failure_code = NULL,
-             version = 4, updated_at = ? WHERE operation_id = ?",
+             version = 5, updated_at = ? WHERE operation_id = ?",
     )
     .bind(support::delivery::SOURCE_COMMIT_OID)
     .bind(support::delivery::MERGE_COMMIT_OID)
@@ -137,20 +137,32 @@ pub(super) async fn begin_merge_abort(
     operation_id: &str,
     child_receipt_id: &str,
 ) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
-    sqlx::query(
+    let mut transaction = pool.begin().await?;
+    let updated = sqlx::query(
         "UPDATE task_merge_operations
          SET abort_child_receipt_id = ?, abort_merge_head_oid = source_commit_oid,
              abort_index_stages_digest = ?, abort_worktree_digest = ?,
-             abort_merge_autostash_proof = 'absent', state = 'abort_pending',
-             failure_code = NULL, version = 5, updated_at = ? WHERE operation_id = ?",
+             abort_merge_autostash_proof = 'absent', conflict_path_count = 1,
+             state = 'abort_pending',
+             failure_code = NULL, version = 6, updated_at = ? WHERE operation_id = ?",
     )
     .bind(child_receipt_id)
     .bind(support::delivery::CHECKS_DIGEST)
     .bind(support::delivery::COVERAGE_DIGEST)
     .bind(support::delivery::TIMESTAMP)
     .bind(operation_id)
-    .execute(pool)
-    .await
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO task_merge_conflicts
+             (operation_id, ordinal, path_encoding, path_value)
+         VALUES (?, 0, 'utf8', 'src/conflicted.rs')",
+    )
+    .bind(operation_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(updated)
 }
 
 pub(super) async fn transition_delivery_source(

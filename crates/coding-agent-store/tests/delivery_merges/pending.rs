@@ -248,5 +248,5 @@ async fn future_expected_version_is_a_zero_write_pending_conflict() {
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("accepted".to_owned(), 3, 3));
+    assert_eq!(row, ("accepted".to_owned(), 4, 4));
 }

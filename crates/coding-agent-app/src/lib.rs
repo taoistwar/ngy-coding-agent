@@ -12,6 +12,9 @@
 mod artifact_reconciliation;
 mod bootstrap_join;
 mod coding_agent_runner;
+mod delivery_api_projection;
+mod delivery_manager;
+mod delivery_reconciliation;
 mod event_dispatcher;
 #[cfg(any(test, feature = "test-support"))]
 mod fake_runner;
@@ -64,6 +67,55 @@ pub use coding_agent_runner::{
     RepositoryWorktreeProvisionerFactory, TaskAgentRuntime, TaskModelProviderFactory,
     TaskModelSession, WorktreeCodingAgentAttemptFactory,
 };
+pub use delivery_api_projection::{
+    DeliveryAllowedAction, DeliveryArtifactDispositionProjection, DeliveryBranchDispositionState,
+    DeliveryCleanupAcceptance, DeliveryCleanupAcceptanceOutcome, DeliveryCleanupOperationKind,
+    DeliveryCleanupOperationProjection, DeliveryCleanupOperationState,
+    DeliveryCleanupReceiptDisposition, DeliveryCommandConflict, DeliveryConflictPathEncoding,
+    DeliveryConflictPathProjection, DeliveryConflictSummaryProjection, DeliveryEligibility,
+    DeliveryEligibilityReason, DeliveryEvidenceProjection, DeliveryMergeAcceptance,
+    DeliveryMergeAcceptanceOutcome, DeliveryMergeOperationProjection,
+    DeliveryMergeReceiptDisposition, DeliveryOperationProjection, DeliveryOperationQueryOutcome,
+    DeliveryPreflightBusyReason, DeliveryPreflightDurability, DeliveryPreflightOperation,
+    DeliveryPreflightOutcome, DeliveryPreflightRetry, DeliveryPreflightState,
+    DeliveryPreflightUnavailableReason, DeliveryQueryUnavailableReason, DeliverySourceProjection,
+    DeliverySourceProjectionState, DeliveryTargetObservation, DeliveryTargetUnavailableReason,
+    DeliveryTaskProjection, DeliveryTaskQueryOutcome, DeliveryWorktreeDispositionState,
+};
+pub use delivery_manager::{
+    DeliveryAcceptAuthenticationError, DeliveryAcceptRequest, DeliveryBranchCleanupBinding,
+    DeliveryCleanupRuntimeRegistry, DeliveryCleanupRuntimeSession, DeliveryDeleteBranchRequest,
+    DeliveryLiveAbortAppliedProof, DeliveryLiveAbortDisposition, DeliveryLiveAbortProof,
+    DeliveryLiveBranchCleanupIntent, DeliveryLiveBranchCleanupRefreshProof,
+    DeliveryLiveCleanupRuntimeError, DeliveryLiveDeletePendingCapability,
+    DeliveryLiveDeletePendingDisposition, DeliveryLiveExpectedMergeProof,
+    DeliveryLiveMergeAppliedProof, DeliveryLiveMergeDisposition,
+    DeliveryLiveRemovePendingCapability, DeliveryLiveRuntimeError, DeliveryLiveRuntimeRegistry,
+    DeliveryLiveRuntimeSession, DeliveryLiveSourceAppliedProof, DeliveryLiveSourceDisposition,
+    DeliveryLiveSourceObjectProof, DeliveryLiveSourceResult, DeliveryLiveUnlockPendingCapability,
+    DeliveryLiveUnlockedPendingRemoveCapability, DeliveryLiveWorktreeCleanupIntent,
+    DeliveryManagerError, DeliveryManagerHandle, DeliveryManagerLiveDependencies,
+    DeliveryManagerQuiesceSnapshot, DeliveryManagerShutdownProof, DeliveryOperationQuery,
+    DeliveryOperationRecoveryOutcome, DeliveryPreflightRequest, DeliveryPreparedPreflight,
+    DeliveryProcessProof, DeliveryProcessProofError, DeliveryProcessProofProvider,
+    DeliveryRemoveWorktreeRequest, DeliveryRuntimeAuthentication,
+    DeliveryRuntimeAuthenticationOutcome, DeliveryRuntimeFailure, DeliveryRuntimeObservation,
+    DeliveryRuntimeObservationUnavailableReason, DeliveryRuntimeRegistry, DeliveryRuntimeSession,
+    DeliveryWorktreeCleanupBinding,
+};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use delivery_manager::{
+    DeliveryCleanupRuntimeRegistryTestSeam, DeliveryCleanupRuntimeSessionTestSeam,
+    DeliveryLiveRuntimeRegistryTestSeam, DeliveryLiveRuntimeSessionTestSeam,
+    DeliveryOperationQueryTestSeam, DeliveryProcessProofProviderTestSeam,
+    DeliveryRuntimeRegistryTestSeam, DeliveryRuntimeSessionTestSeam,
+};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use delivery_reconciliation::{
+    recover_delivery_startup_for_test, startup_artifact_is_delivery_owned_for_test,
+};
 pub use event_dispatcher::{EventDispatcherError, EventDispatcherHandle};
 #[cfg(any(test, feature = "test-support"))]
 pub use fake_runner::{FakeRunnerConfig, FakeTaskRunner};
@@ -98,6 +150,12 @@ pub use repository_service::{DiscoveredRepository, RepositoryDiscoveryError};
 pub use run_context::RunContext;
 #[cfg(any(test, feature = "test-support"))]
 pub use runner_factory::FixedStartupRunnerFactory;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use runner_factory::production_delivery_dynamic_registries_for_test;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use runner_factory::production_delivery_registries_for_test;
 pub use runner_factory::{
     PreActorStartupRunnerContext, ProductionStartupRunnerFactory, StartupRunnerContext,
     StartupRunnerFactory, StartupRunnerFactoryError, StartupRunnerSelection,
@@ -125,7 +183,17 @@ pub use security::{
     SessionRecord, SystemSecurityClock,
 };
 pub(crate) use server::MutationDrainOutcome;
-pub use server::{ApplicationBackend, MutationGate, MutationGuard, build_runtime_router};
+pub use server::{
+    ApplicationBackend, ApplicationDeliveryBackend, MutationGate, MutationGuard,
+    build_application_api_router_with_delivery, build_runtime_router,
+};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use server::{
+    map_delivery_busy_for_test, map_delivery_cleanup_eligibility_for_test,
+    map_delivery_command_conflict_for_test, map_delivery_eligibility_for_test,
+    map_delivery_unavailable_for_test,
+};
 pub use service_state::{
     InvalidServiceTransition, ServiceState, ServiceStateController, ServiceStateSnapshot,
 };
@@ -158,9 +226,13 @@ pub use storage_policy::{
     aggregate_storage_state, critical_affected_tasks,
 };
 pub use store_writer::{
-    EventWake, FinalizeReviewedTaskRequest, FinalizeUnreviewedTaskRequest,
-    PendingDurableSubmission, RecordReviewRequest, StoreWriterError, StoreWriterHandle,
-    StoreWriterSubmission, StoreWriterSubmitError, WriteReceipt,
+    DeliveryCleanupWriteCommand, DeliveryCleanupWriteOutcome, DeliveryCompletion,
+    DeliveryDisposition, DeliveryMergeWriteCommand, DeliveryMergeWriteOutcome,
+    DeliverySourceWriteCommand, DeliverySourceWriteOutcome, DeliverySubmission,
+    DeliverySubmissionIdentity, DeliveryWriteCommand, DeliveryWriteOutcome, EventWake,
+    FinalizeReviewedTaskRequest, FinalizeUnreviewedTaskRequest, PendingDurableSubmission,
+    RecordReviewRequest, StoreWriterError, StoreWriterHandle, StoreWriterSubmission,
+    StoreWriterSubmitError, WriteReceipt,
 };
 #[cfg(feature = "test-support")]
 pub use store_writer::{
@@ -170,16 +242,16 @@ pub use store_writer::{
 };
 pub use task_manager::{
     CancelOutcome, QuiesceResult, RunnerEvent, RunnerEventError, RunnerEventSink, RunnerOutcome,
-    RunnerShutdownHandle, TaskManagerError, TaskManagerHandle, TaskManagerLaunchResources,
-    TaskRunner,
+    RunnerShutdownHandle, TaskActiveOwnership, TaskManagerError, TaskManagerHandle,
+    TaskManagerLaunchResources, TaskRunner,
 };
 #[cfg(feature = "test-support")]
 pub use task_manager::{SchedulerProjectionTestSnapshot, TaskManagerSafetySnapshot};
 #[cfg(feature = "test-support")]
 pub use test_support::{
-    ActorPausePoint, LegacyV2Seed, ProcessRuntimeConfig, ProcessRuntimeStorageConfig,
-    ProcessStorageSample, ProcessTestConfig, ProcessTestConfigError, ProcessTestEnvironment,
-    TEST_APP_DATA_ENV, TEST_BROWSER_PROBE_FILE, TEST_PICKER_PROBE_FILE, TEST_RUNTIME_ENV,
-    TEST_SCENARIO_ENV, TEST_STARTUP_RECOVERY_PROBE_FILE, VirtualReleaseSignal,
-    VirtualReleaseTarget,
+    ActorPausePoint, LegacyV2Seed, ProcessDeliveryProcessFault, ProcessDeliveryProviderScenario,
+    ProcessRunnerMode, ProcessRuntimeConfig, ProcessRuntimeStorageConfig, ProcessStorageSample,
+    ProcessTestConfig, ProcessTestConfigError, ProcessTestEnvironment, TEST_APP_DATA_ENV,
+    TEST_BROWSER_PROBE_FILE, TEST_PICKER_PROBE_FILE, TEST_RUNTIME_ENV, TEST_SCENARIO_ENV,
+    TEST_STARTUP_RECOVERY_PROBE_FILE, VirtualReleaseSignal, VirtualReleaseTarget,
 };

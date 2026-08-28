@@ -15,8 +15,10 @@ use utoipa::openapi::Ref;
 use utoipa::openapi::schema::{Discriminator, ObjectBuilder, OneOfBuilder, Schema, Type};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
+mod delivery_contract;
 mod scheduler_contract;
 
+pub use delivery_contract::*;
 pub use scheduler_contract::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -1454,5 +1456,41 @@ impl QuitResponse {
     CancellationAcceptedResponse,
     QuitStatus,
     QuitResponse,
+    DeliveryPreflightRequest,
+    DeliveryMergeRequest,
+    DeliveryRemoveWorktreeRequest,
+    DeliveryDeleteBranchRequest,
+    DeliveryReceiptDispositionDto,
+    DeliveryCommandResponse,
+    DeliveryEligibilityDto,
+    DeliveryEligibilityReasonDto,
+    DeliveryAllowedActionDto,
+    DeliveryEvidenceSummaryDto,
+    DeliveryTargetUnavailableReasonDto,
+    DeliveryTargetObservationDto,
+    DeliveryAvailableTargetDto,
+    DeliveryUnavailableTargetDto,
+    DeliverySourceStateDto,
+    DeliverySourceDto,
+    DeliveryMergeStateDto,
+    DeliveryConflictPathEncodingDto,
+    DeliveryConflictPathDto,
+    DeliveryConflictSummaryDto,
+    DeliveryOperationFailureDto,
+    DeliveryMergeOperationDto,
+    DeliveryCleanupKindDto,
+    DeliveryCleanupStateDto,
+    DeliveryCleanupOperationDto,
+    DeliveryOperationDto,
+    DeliveryMergeOperationKindDto,
+    DeliveryCleanupOperationKindDto,
+    DeliveryMergeOperationEnvelopeDto,
+    DeliveryCleanupOperationEnvelopeDto,
+    DeliveryWorktreeDispositionStateDto,
+    DeliveryBranchDispositionStateDto,
+    DeliveryWorktreeDispositionDto,
+    DeliveryBranchDispositionDto,
+    DeliveryArtifactDispositionDto,
+    DeliveryTaskDto,
 )))]
 pub struct ApiDoc;

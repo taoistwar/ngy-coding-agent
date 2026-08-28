@@ -103,6 +103,22 @@ pub struct MergeConflictRecord {
     pub path_value: Vec<u8>,
 }
 
+/// Repository object inputs sealed after a durable preflight intent is created.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedMergePreflightInputs {
+    pub candidate_tree: GitTreeOid,
+    pub preflight_source_commit: GitCommitOid,
+}
+
+impl fmt::Debug for PreparedMergePreflightInputs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedMergePreflightInputs")
+            .field("repository_object_ids", &"<redacted>")
+            .finish()
+    }
+}
+
 impl fmt::Debug for MergeConflictRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -118,14 +134,18 @@ impl fmt::Debug for MergeConflictRecord {
 pub struct MergeOperationRecord {
     pub operation_id: DeliveryOperationId,
     pub provenance: DeliveryArtifactProvenance,
-    pub candidate_tree: GitTreeOid,
-    pub preflight_source_commit: GitCommitOid,
+    /// `None` is the durable intent-only phase. Once present, the pair is immutable.
+    pub preflight_inputs: Option<PreparedMergePreflightInputs>,
     pub delivery_source_task_id: Option<TaskId>,
     pub source_commit: Option<GitCommitOid>,
     pub preflight_receipt_id: DeliveryCommandId,
     pub accept_receipt_id: Option<DeliveryCommandId>,
     pub target_branch: GitBranchRef,
     pub expected_target_head: GitCommitOid,
+    /// Target-side attributes baseline captured before any merge mutation.
+    pub target_config_attributes_digest: Sha256Digest,
+    /// Target-side Git security baseline captured before any merge mutation.
+    pub target_security_digest: Sha256Digest,
     pub merge_base: Option<GitCommitOid>,
     pub candidate_merge_tree: Option<GitTreeOid>,
     pub merge_metadata: Option<DeliveryCommitMetadata>,
@@ -207,6 +227,7 @@ pub struct CleanupOperationRecord {
     pub identity: DeliveryIdentity,
     pub kind: CleanupKind,
     pub origin_receipt_id: DeliveryCommandId,
+    pub expected_merge_operation_id: DeliveryOperationId,
     pub disposition_task_id: TaskId,
     pub expected_worktree_path: CanonicalPath,
     pub expected_admin_identity: DirectoryIdentity,

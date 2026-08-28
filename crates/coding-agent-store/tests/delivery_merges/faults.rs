@@ -1,7 +1,6 @@
 use coding_agent_domain::ClientRequestId;
 use coding_agent_store::{
-    AcceptMergeOutcome, BeginMergeAbortRequest, CompleteMergeAbortRequest, MergeConflictPaths,
-    MergeTransitionOutcome, Store, StoreError,
+    AcceptMergeOutcome, BeginMergeAbortRequest, MergeTransitionOutcome, Store, StoreError,
 };
 use uuid::Uuid;
 
@@ -12,7 +11,7 @@ async fn accept_rolls_back_when_the_transition_journal_insert_faults() {
     assert_accept_fault_rolls_back(
         "CREATE TRIGGER task6_accept_journal_fault \
          BEFORE INSERT ON task_delivery_operation_transitions \
-         WHEN NEW.entity_kind = 'merge_operation' AND NEW.entity_version = 3 \
+         WHEN NEW.entity_kind = 'merge_operation' AND NEW.entity_version = 4 \
          BEGIN SELECT RAISE(ABORT, 'task6 accept journal fault'); END;",
         "DROP TRIGGER task6_accept_journal_fault;",
     )
@@ -68,7 +67,7 @@ async fn merged_rolls_back_when_the_merge_operation_journal_insert_faults() {
     assert_merged_fault_rolls_back(
         "CREATE TRIGGER task6_merged_operation_journal_fault \
          BEFORE INSERT ON task_delivery_operation_transitions \
-         WHEN NEW.entity_kind = 'merge_operation' AND NEW.entity_version = 5 \
+         WHEN NEW.entity_kind = 'merge_operation' AND NEW.entity_version = 6 \
          BEGIN SELECT RAISE(ABORT, 'task6 merged operation journal fault'); END;",
         "DROP TRIGGER task6_merged_operation_journal_fault;",
     )
@@ -130,18 +129,19 @@ async fn merged_rolls_back_when_deferred_commit_validation_fails() {
 }
 
 #[tokio::test]
-async fn abort_completion_rolls_back_when_a_conflict_child_insert_faults() {
-    let (store, task, operation_id, abort_version) = super::abort::abort_pending_fixture().await;
-    let request = CompleteMergeAbortRequest::try_new(
+async fn begin_abort_rolls_back_when_a_durable_conflict_path_insert_faults() {
+    let (store, task, operation_id, pending_version) = merge_pending().await;
+    let request = BeginMergeAbortRequest::try_new(
         task.id,
         operation_id,
-        abort_version,
-        super::abort::exact_abort_applied_proof(),
-        MergeConflictPaths::try_from_raw(vec![
-            b"src/first-conflict.rs".to_vec(),
-            b"src/second-conflict.rs".to_vec(),
-        ])
-        .unwrap(),
+        pending_version,
+        super::abort::exact_abort_begin_proof_with_paths(
+            Uuid::new_v4(),
+            vec![
+                b"src/first-conflict.rs".to_vec(),
+                b"src/second-conflict.rs".to_vec(),
+            ],
+        ),
     )
     .unwrap();
     sqlx::raw_sql(
@@ -155,19 +155,43 @@ async fn abort_completion_rolls_back_when_a_conflict_child_insert_faults() {
     .unwrap();
 
     assert!(matches!(
-        store.complete_merge_abort(request.clone()).await,
+        store.begin_merge_abort(request.clone()).await,
         Err(StoreError::Database(_))
     ));
-    assert_abort_pending_without_conflict_children(&store, operation_id).await;
+    assert_merge_pending_without_abort_facts(&store, operation_id).await;
 
     sqlx::raw_sql("DROP TRIGGER task6_abort_conflict_child_fault;")
         .execute(store.pool())
         .await
         .unwrap();
     assert!(matches!(
-        store.complete_merge_abort(request).await.unwrap(),
+        store.begin_merge_abort(request).await.unwrap(),
         MergeTransitionOutcome::Applied(_)
     ));
+    let durable: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, version, conflict_path_count
+         FROM task_merge_operations WHERE operation_id = ?",
+    )
+    .bind(operation_id.to_string())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(durable, ("abort_pending".to_owned(), 6, 2));
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT path_value FROM task_merge_conflicts
+         WHERE operation_id = ? ORDER BY ordinal",
+    )
+    .bind(operation_id.to_string())
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        paths,
+        vec![
+            "src/first-conflict.rs".to_owned(),
+            "src/second-conflict.rs".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -183,7 +207,7 @@ async fn begin_abort_rolls_back_when_the_transition_journal_insert_faults() {
     sqlx::raw_sql(
         "CREATE TRIGGER task6_begin_abort_journal_fault \
          BEFORE INSERT ON task_delivery_operation_transitions \
-         WHEN NEW.entity_kind = 'merge_operation' AND NEW.entity_version = 5 \
+         WHEN NEW.entity_kind = 'merge_operation' AND NEW.entity_version = 6 \
          BEGIN SELECT RAISE(ABORT, 'task6 begin abort journal fault'); END;",
     )
     .execute(store.pool())
@@ -243,7 +267,7 @@ async fn assert_ready_without_accept_writes(
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("preflight_ready".to_owned(), 2, None));
+    assert_eq!(row, ("preflight_ready".to_owned(), 3, None));
     let journal_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_delivery_operation_transitions \
          WHERE entity_kind = 'merge_operation' AND entity_id = ?",
@@ -252,7 +276,7 @@ async fn assert_ready_without_accept_writes(
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(journal_count, 2);
+    assert_eq!(journal_count, 3);
     let receipt_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_delivery_command_receipts \
          WHERE operation_id = ? AND command_kind = 'accept_merge'",
@@ -301,7 +325,7 @@ async fn assert_merge_pending_without_disposition(
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("merge_pending".to_owned(), 4, None));
+    assert_eq!(row, ("merge_pending".to_owned(), 5, None));
     let journal_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_delivery_operation_transitions \
          WHERE entity_kind = 'merge_operation' AND entity_id = ?",
@@ -310,7 +334,7 @@ async fn assert_merge_pending_without_disposition(
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(journal_count, 4);
+    assert_eq!(journal_count, 5);
     let disposition_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM task_artifact_dispositions WHERE task_id = ?")
             .bind(task_id.to_string())
@@ -320,19 +344,32 @@ async fn assert_merge_pending_without_disposition(
     assert_eq!(disposition_count, 0);
 }
 
-async fn assert_abort_pending_without_conflict_children(
+async fn assert_merge_pending_without_abort_facts(
     store: &Store,
     operation_id: coding_agent_store::DeliveryOperationId,
 ) {
-    let row: (String, i64, Option<i64>, Option<String>) = sqlx::query_as(
-        "SELECT state, version, conflict_path_count, failure_code \
+    type OptionalAbortFactsRow = (
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    );
+    let row: OptionalAbortFactsRow = sqlx::query_as(
+        "SELECT state, version, abort_child_receipt_id, abort_merge_head_oid, \
+                abort_index_stages_digest, abort_worktree_digest, conflict_path_count \
          FROM task_merge_operations WHERE operation_id = ?",
     )
     .bind(operation_id.to_string())
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("abort_pending".to_owned(), 5, None, None));
+    assert_eq!(
+        row,
+        ("merge_pending".to_owned(), 5, None, None, None, None, None)
+    );
     let journal_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_delivery_operation_transitions \
          WHERE entity_kind = 'merge_operation' AND entity_id = ?",
@@ -349,36 +386,4 @@ async fn assert_abort_pending_without_conflict_children(
             .await
             .unwrap();
     assert_eq!(conflict_count, 0);
-}
-
-async fn assert_merge_pending_without_abort_facts(
-    store: &Store,
-    operation_id: coding_agent_store::DeliveryOperationId,
-) {
-    let row: (
-        String,
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = sqlx::query_as(
-        "SELECT state, version, abort_child_receipt_id, abort_merge_head_oid, \
-                abort_index_stages_digest, abort_worktree_digest \
-         FROM task_merge_operations WHERE operation_id = ?",
-    )
-    .bind(operation_id.to_string())
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
-    assert_eq!(row, ("merge_pending".to_owned(), 4, None, None, None, None));
-    let journal_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM task_delivery_operation_transitions \
-         WHERE entity_kind = 'merge_operation' AND entity_id = ?",
-    )
-    .bind(operation_id.to_string())
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
-    assert_eq!(journal_count, 4);
 }

@@ -97,7 +97,7 @@ async fn closed_pool_returns_a_typed_database_error() {
         source_anchor(&command),
         DeliverySourceState::ObjectPending,
         source.version,
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -253,7 +253,7 @@ async fn assert_reconcile_fault_rolls_back(fault_sql: &'static str) {
         source_anchor(&command),
         DeliverySourceState::ObjectPending,
         source.version,
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -285,7 +285,7 @@ async fn assert_pristine_pair(
         .find(|operation| operation.operation_id == operation_id)
         .unwrap();
     assert_eq!(operation.state, MergeOperationState::Accepted);
-    assert_eq!(operation.version, DeliveryVersion::try_new(3).unwrap());
+    assert_eq!(operation.version, DeliveryVersion::try_new(4).unwrap());
     assert_eq!(operation.failure_code, None);
 }
 

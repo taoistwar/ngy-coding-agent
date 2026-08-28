@@ -9,7 +9,8 @@ use coding_agent_store::{
 
 use super::{
     ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, DELIVERY_TIMESTAMP, MERGE_BASE,
-    MERGE_TREE, PREFLIGHT_SOURCE, SOURCE_COMMIT, TARGET_HEAD,
+    MERGE_TREE, PREFLIGHT_SOURCE, SOURCE_COMMIT, TARGET_CONFIG_DIGEST, TARGET_HEAD,
+    TARGET_SECURITY_DIGEST,
 };
 
 pub async fn insert_preflight(
@@ -39,7 +40,8 @@ pub async fn insert_preflight(
              worktree_admin_identity_digest, fixed_lock_reason, candidate_tree_oid, \
              preflight_source_commit_oid, delivery_source_task_id, source_commit_oid, \
              preflight_receipt_id, accept_receipt_id, target_branch, expected_target_head, \
-             config_attributes_digest, merge_base_oid, candidate_merge_tree_oid, \
+             config_attributes_digest, target_config_attributes_digest, \
+             target_security_digest, merge_base_oid, candidate_merge_tree_oid, \
              merge_author_name, merge_author_email, merge_committer_name, merge_committer_email, \
              merge_author_date_bytes, merge_committer_date_bytes, merge_message_template_version, \
              merge_message_bytes, expected_merge_commit_oid, abort_child_receipt_id, \
@@ -48,8 +50,8 @@ pub async fn insert_preflight(
              version, created_at, updated_at \
          ) VALUES ( \
              ?, ?, ?, ?, 'evidence_identity_v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-             'directory_identity_v1', ?, 'directory_identity_v1', ?, 'codex-reserved', ?, ?, \
-             NULL, NULL, ?, NULL, 'refs/heads/main', ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, \
+             'directory_identity_v1', ?, 'directory_identity_v1', ?, 'codex-reserved', NULL, NULL, \
+             NULL, NULL, ?, NULL, 'refs/heads/main', ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, \
              NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
              'preflight_pending', NULL, 1, ?, ? \
          )",
@@ -69,11 +71,11 @@ pub async fn insert_preflight(
     .bind(artifact.worktree_path.to_string())
     .bind(COMMON_IDENTITY)
     .bind(ADMIN_IDENTITY)
-    .bind(CANDIDATE_TREE)
-    .bind(PREFLIGHT_SOURCE)
     .bind(receipt_id.to_string())
     .bind(TARGET_HEAD)
     .bind(CONFIG_DIGEST)
+    .bind(TARGET_CONFIG_DIGEST)
+    .bind(TARGET_SECURITY_DIGEST)
     .bind(DELIVERY_TIMESTAMP)
     .bind(DELIVERY_TIMESTAMP)
     .execute(&mut *transaction)
@@ -101,14 +103,28 @@ pub async fn insert_preflight(
     .execute(&mut *transaction)
     .await
     .unwrap();
+    sqlx::query(
+        "UPDATE task_merge_operations \
+         SET candidate_tree_oid = ?, preflight_source_commit_oid = ?, \
+             version = 2, updated_at = ? \
+         WHERE operation_id = ? AND state = 'preflight_pending' AND version = 1",
+    )
+    .bind(CANDIDATE_TREE)
+    .bind(PREFLIGHT_SOURCE)
+    .bind(DELIVERY_TIMESTAMP)
+    .bind(operation_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     transaction.commit().await.unwrap();
 }
 
 pub async fn mark_preflight_ready(store: &Store, operation_id: DeliveryOperationId) {
+    bind_preflight_inputs_if_needed(store, operation_id).await;
     sqlx::query(
-        "UPDATE task_merge_operations SET state = 'preflight_ready', version = 2, \
+        "UPDATE task_merge_operations SET state = 'preflight_ready', version = 3, \
              merge_base_oid = ?, candidate_merge_tree_oid = ?, updated_at = ? \
-         WHERE operation_id = ?",
+         WHERE operation_id = ? AND state = 'preflight_pending' AND version = 2",
     )
     .bind(MERGE_BASE)
     .bind(MERGE_TREE)
@@ -149,15 +165,16 @@ async fn finish_preflight_terminal_with_conflict_count(
 ) {
     let version = if state == MergeOperationState::Superseded {
         mark_preflight_ready(store, operation_id).await;
-        3
+        4
     } else {
+        bind_preflight_inputs_if_needed(store, operation_id).await;
         assert!(matches!(
             state,
             MergeOperationState::Conflict
                 | MergeOperationState::Rejected
                 | MergeOperationState::Stale
         ));
-        2
+        3
     };
     let (failure_code, merge_base, merge_tree) = match state {
         MergeOperationState::Conflict => {
@@ -191,11 +208,28 @@ async fn finish_preflight_terminal_with_conflict_count(
     .unwrap();
 }
 
+async fn bind_preflight_inputs_if_needed(store: &Store, operation_id: DeliveryOperationId) {
+    sqlx::query(
+        "UPDATE task_merge_operations \
+         SET candidate_tree_oid = ?, preflight_source_commit_oid = ?, \
+             version = 2, updated_at = ? \
+         WHERE operation_id = ? AND state = 'preflight_pending' AND version = 1 \
+           AND candidate_tree_oid IS NULL AND preflight_source_commit_oid IS NULL",
+    )
+    .bind(CANDIDATE_TREE)
+    .bind(PREFLIGHT_SOURCE)
+    .bind(DELIVERY_TIMESTAMP)
+    .bind(operation_id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+}
+
 pub async fn accept_merge(store: &Store, task: &Task, operation_id: DeliveryOperationId) {
     let command = exact_accept_command(store, task, operation_id).await;
     let mut transaction = store.pool().begin().await.unwrap();
     sqlx::query(
-        "UPDATE task_merge_operations SET state = 'accepted', version = 3, \
+        "UPDATE task_merge_operations SET state = 'accepted', version = 4, \
              accept_receipt_id = ?, merge_author_name = 'Coding Agent', \
              merge_author_email = 'coding-agent@localhost', \
              merge_committer_name = 'Coding Agent', \
@@ -221,7 +255,7 @@ pub async fn accept_merge(store: &Store, task: &Task, operation_id: DeliveryOper
              cleanup_operation_id, accepted_operation_version, accepted_operation_state, \
              response_discriminator, created_at \
          ) VALUES (?, 'accept_merge', ?, ?, ?, 'coding-agent-delivery-command-request', 1, \
-             'sha256', ?, 'merge_operation', ?, ?, NULL, 3, 'accepted', 'merge_accepted', ?)",
+             'sha256', ?, 'merge_operation', ?, ?, NULL, 4, 'accepted', 'merge_accepted', ?)",
     )
     .bind(command.client_request_id().to_string())
     .bind(task.id.to_string())
@@ -245,7 +279,7 @@ pub async fn try_accept_merge_ready(
     let command = exact_accept_command(store, task, operation_id).await;
     let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     let updated = sqlx::query(
-        "UPDATE task_merge_operations SET state = 'accepted', version = 3, \
+        "UPDATE task_merge_operations SET state = 'accepted', version = 4, \
              accept_receipt_id = ?, merge_author_name = 'Coding Agent', \
              merge_author_email = 'coding-agent@localhost', \
              merge_committer_name = 'Coding Agent', \
@@ -256,7 +290,7 @@ pub async fn try_accept_merge_ready(
              merge_message_bytes = CAST('coding-agent: merge task ' || task_id || \
                  ' attempt ' || attempt || char(10) AS BLOB), updated_at = ? \
          WHERE operation_id = ? AND task_id = ? \
-           AND state = 'preflight_ready' AND version = 2",
+           AND state = 'preflight_ready' AND version = 3",
     )
     .bind(command.client_request_id().to_string())
     .bind(DELIVERY_TIMESTAMP)
@@ -278,7 +312,7 @@ pub async fn try_accept_merge_ready(
              cleanup_operation_id, accepted_operation_version, accepted_operation_state, \
              response_discriminator, created_at \
          ) VALUES (?, 'accept_merge', ?, ?, ?, 'coding-agent-delivery-command-request', 1, \
-             'sha256', ?, 'merge_operation', ?, ?, NULL, 3, 'accepted', 'merge_accepted', ?)",
+             'sha256', ?, 'merge_operation', ?, ?, NULL, 4, 'accepted', 'merge_accepted', ?)",
     )
     .bind(command.client_request_id().to_string())
     .bind(task.id.to_string())
@@ -311,7 +345,7 @@ async fn exact_accept_command(
         ClientRequestId::new(),
         task.id,
         operation_id,
-        DeliveryVersion::try_new(2).unwrap(),
+        DeliveryVersion::try_new(3).unwrap(),
         evidence.workspace_generation(),
         evidence.workspace_fingerprint().clone(),
         GitBranchRef::from_str("refs/heads/main").unwrap(),
@@ -397,7 +431,7 @@ pub async fn create_committed_source(
 pub async fn fail_accepted_merge(store: &Store, task: &Task, operation_id: DeliveryOperationId) {
     sqlx::query(
         "UPDATE task_merge_operations SET delivery_source_task_id = ?, source_commit_oid = ?, \
-             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 4, updated_at = ? \
+             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 5, updated_at = ? \
          WHERE operation_id = ?",
     )
     .bind(task.id.to_string())

@@ -29,10 +29,11 @@ use crate::task_manager::{
     ShutdownProcessCleanupProof, TaskManagerMessage, terminal_task_is_structurally_valid,
 };
 use crate::{
-    EventDispatcherHandle, FinalizeReviewedTaskRequest, FinalizeUnreviewedTaskRequest,
-    MutationDrainOutcome, MutationGate, NativeMessageSink, PlatformPaths, PrivateFile,
-    QuiesceResult, RecordReviewRequest, ServiceState, ServiceStateController, StoreWriterHandle,
-    StoreWriterSubmitError, TaskManagerHandle, WallClock,
+    DeliveryManagerHandle, DeliveryManagerShutdownProof, EventDispatcherHandle,
+    FinalizeReviewedTaskRequest, FinalizeUnreviewedTaskRequest, MutationDrainOutcome, MutationGate,
+    NativeMessageSink, PlatformPaths, PrivateFile, QuiesceResult, RecordReviewRequest,
+    ServiceState, ServiceStateController, StoreWriterHandle, StoreWriterSubmitError,
+    TaskManagerHandle, WallClock,
 };
 
 const RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -68,6 +69,7 @@ pub(crate) trait ShutdownCleanup: Send + Sync + 'static {
 }
 
 pub(crate) struct ShutdownRuntimeCleanupProof {
+    _delivery: DeliveryManagerShutdownProof,
     task_processes: ShutdownProcessCleanupProof,
     _instance_processes: ConfirmedInstanceProcessCleanup,
 }
@@ -102,6 +104,7 @@ struct ShutdownCoordinatorInner {
 struct RuntimeShutdown {
     mutation_gate: MutationGate,
     instance_process_scope: ProcessLivenessScope,
+    delivery: DeliveryShutdown,
     task_manager: TaskManagerHandle,
     dispatcher: EventDispatcherHandle,
     store: Store,
@@ -119,6 +122,7 @@ impl ShutdownCoordinator {
     pub(crate) fn new(
         mutation_gate: MutationGate,
         instance_process_scope: ProcessLivenessScope,
+        delivery_manager: DeliveryManagerHandle,
         task_manager: TaskManagerHandle,
         dispatcher: EventDispatcherHandle,
         store: Store,
@@ -131,6 +135,7 @@ impl ShutdownCoordinator {
         Self::new_with_marker_writer(
             mutation_gate,
             instance_process_scope,
+            delivery_manager,
             task_manager,
             dispatcher,
             store,
@@ -148,6 +153,7 @@ impl ShutdownCoordinator {
     pub(crate) fn new_for_process_test(
         mutation_gate: MutationGate,
         instance_process_scope: ProcessLivenessScope,
+        delivery_manager: DeliveryManagerHandle,
         task_manager: TaskManagerHandle,
         dispatcher: EventDispatcherHandle,
         store: Store,
@@ -166,6 +172,7 @@ impl ShutdownCoordinator {
         Self::new_with_marker_writer(
             mutation_gate,
             instance_process_scope,
+            delivery_manager,
             task_manager,
             dispatcher,
             store,
@@ -182,6 +189,7 @@ impl ShutdownCoordinator {
     fn new_with_marker_writer(
         mutation_gate: MutationGate,
         instance_process_scope: ProcessLivenessScope,
+        delivery_manager: DeliveryManagerHandle,
         task_manager: TaskManagerHandle,
         dispatcher: EventDispatcherHandle,
         store: Store,
@@ -200,6 +208,7 @@ impl ShutdownCoordinator {
                 runtime: RuntimeShutdown {
                     mutation_gate,
                     instance_process_scope,
+                    delivery: DeliveryShutdown::new(delivery_manager),
                     task_manager,
                     dispatcher,
                     store,
@@ -260,7 +269,10 @@ impl ShutdownCoordinator {
     }
 }
 
+mod delivery;
 mod runtime;
+
+use delivery::DeliveryShutdown;
 
 #[derive(Serialize)]
 struct ShutdownMarker {
@@ -1498,6 +1510,11 @@ mod tests {
             .expect("spawn panic-supervision dispatcher");
         let writer = StoreWriterHandle::spawn(store.clone(), Arc::new(dispatcher.clone()), 8);
         let state = ServiceStateController::new(ServiceState::Ready);
+        let delivery_manager = DeliveryManagerHandle::spawn_unavailable(
+            Arc::new(crate::RepositoryControlCoordinator::new()),
+            state.clone(),
+            8,
+        );
         let manager = TaskManagerHandle::spawn(
             store.clone(),
             writer,
@@ -1524,6 +1541,7 @@ mod tests {
         let coordinator = ShutdownCoordinator::new(
             mutation_gate,
             instance_process_scope,
+            delivery_manager,
             manager,
             dispatcher,
             store,

@@ -15,7 +15,10 @@ pub(super) async fn validate_source_origin(
         .find(|operation| operation.operation_id == source.origin_accepted_operation_id)
         .ok_or_else(ownership_invariant)?;
     let origin_values_match = operation.provenance == source.provenance
-        && operation.candidate_tree == source.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.candidate_tree == source.candidate_tree)
         && operation.accept_receipt_id == Some(source.origin_accept_receipt_id);
     if !origin_values_match {
         return Err(ownership_invariant());

@@ -31,6 +31,10 @@ impl Store {
                 return Ok(MergeTransitionOutcome::Conflict);
             }
         };
+        if operation.preflight_inputs.is_none() {
+            transaction.commit().await?;
+            return Ok(MergeTransitionOutcome::Conflict);
+        }
         validate_result_algorithm(&operation, &request.result)?;
 
         match lookup_transition(
@@ -58,6 +62,7 @@ impl Store {
         if operation.state != crate::delivery::MergeOperationState::PreflightPending
             || operation.version != request.expected_version
             || operation.failure_code.is_some()
+            || operation.preflight_inputs.is_none()
         {
             transaction.commit().await?;
             return Ok(MergeTransitionOutcome::Conflict);
@@ -159,6 +164,7 @@ async fn apply_result(
              state = ?, failure_code = ?, \
              version = ?, updated_at = ? \
          WHERE operation_id = ? AND task_id = ? AND state = 'preflight_pending' AND version = ? \
+           AND candidate_tree_oid IS NOT NULL AND preflight_source_commit_oid IS NOT NULL \
            AND merge_base_oid IS NULL AND candidate_merge_tree_oid IS NULL",
     )
     .bind(merge_base)
@@ -186,35 +192,36 @@ fn validate_persisted_result(
     operation: &MergeOperationRecord,
     result: &MergePreflightResult,
 ) -> Result<(), StoreError> {
-    let exact = match result {
-        MergePreflightResult::Ready {
-            merge_base,
-            candidate_merge_tree,
-        } => {
-            operation.conflict_path_count.is_none()
-                && operation.merge_base.as_ref() == Some(merge_base)
-                && operation.candidate_merge_tree.as_ref() == Some(candidate_merge_tree)
-                && operation.conflicts.is_empty()
-        }
-        MergePreflightResult::Conflict {
-            merge_base,
-            candidate_merge_tree,
-            paths,
-        } => {
-            operation.conflict_path_count == u8::try_from(paths.len()).ok()
-                && operation.merge_base.as_ref() == Some(merge_base)
-                && operation.candidate_merge_tree.as_ref() == Some(candidate_merge_tree)
-                && operation.conflicts == paths.encoded
-        }
-        MergePreflightResult::Rejected(_)
-        | MergePreflightResult::Stale(_)
-        | MergePreflightResult::ReconciliationRequired(_) => {
-            operation.conflict_path_count.is_none()
-                && operation.merge_base.is_none()
-                && operation.candidate_merge_tree.is_none()
-                && operation.conflicts.is_empty()
-        }
-    };
+    let exact = operation.preflight_inputs.is_some()
+        && match result {
+            MergePreflightResult::Ready {
+                merge_base,
+                candidate_merge_tree,
+            } => {
+                operation.conflict_path_count.is_none()
+                    && operation.merge_base.as_ref() == Some(merge_base)
+                    && operation.candidate_merge_tree.as_ref() == Some(candidate_merge_tree)
+                    && operation.conflicts.is_empty()
+            }
+            MergePreflightResult::Conflict {
+                merge_base,
+                candidate_merge_tree,
+                paths,
+            } => {
+                operation.conflict_path_count == u8::try_from(paths.len()).ok()
+                    && operation.merge_base.as_ref() == Some(merge_base)
+                    && operation.candidate_merge_tree.as_ref() == Some(candidate_merge_tree)
+                    && operation.conflicts == paths.encoded
+            }
+            MergePreflightResult::Rejected(_)
+            | MergePreflightResult::Stale(_)
+            | MergePreflightResult::ReconciliationRequired(_) => {
+                operation.conflict_path_count.is_none()
+                    && operation.merge_base.is_none()
+                    && operation.candidate_merge_tree.is_none()
+                    && operation.conflicts.is_empty()
+            }
+        };
     if exact {
         Ok(())
     } else {

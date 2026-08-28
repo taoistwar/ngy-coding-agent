@@ -2,16 +2,17 @@ use std::str::FromStr;
 
 use coding_agent_domain::{ClientRequestId, Task};
 use coding_agent_store::{
-    AcceptMergeCommandRequest, CompleteMergeRequest, CreatePreflightOutcome,
-    CreatePreflightRequest, DeliveryOperationId, DeliveryVersion, DirectoryIdentity, GitBranchRef,
-    GitCommitOid, GitTreeOid, MergeAppliedProof, MergeAutostashObservation, MergeCommitObjectProof,
+    AcceptMergeCommandRequest, BindMergePreflightInputsRequest, CompleteMergeRequest,
+    CreatePreflightOutcome, CreatePreflightRequest, DeliveryOperationId, DeliveryVersion,
+    DirectoryIdentity, GitBranchRef, GitCommitOid, GitTreeOid, MergeAppliedProof,
+    MergeAutostashObservation, MergeCommitObjectProof, MergeTransitionOutcome,
     OtherGitOperationObservation, PreflightCommandRequest, Sha256Digest, Store,
 };
 
 use crate::support::delivery::eligibility::{
     ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, MERGE_COMMIT, MERGE_TREE,
-    PREFLIGHT_SOURCE, SOURCE_COMMIT, TARGET_HEAD, approved_task_on_store,
-    approved_task_with_ready_artifact,
+    PREFLIGHT_SOURCE, SOURCE_COMMIT, TARGET_CONFIG_DIGEST, TARGET_HEAD, TARGET_SECURITY_DIGEST,
+    approved_task_on_store, approved_task_with_ready_artifact,
 };
 
 pub const TARGET_BRANCH: &str = "refs/heads/main";
@@ -51,17 +52,30 @@ pub async fn create_pending_preflight_with_source(
     .unwrap();
     let request = CreatePreflightRequest::try_new(
         command,
-        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
-        GitCommitOid::from_str(preflight_source).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", COMMON_IDENTITY).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY).unwrap(),
         Sha256Digest::from_str(CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_SECURITY_DIGEST).unwrap(),
     )
     .unwrap();
-    match store.create_merge_preflight(request).await.unwrap() {
+    let operation_id = match store.create_merge_preflight(request).await.unwrap() {
         CreatePreflightOutcome::Created(receipt) => receipt.operation_id,
         other => panic!("expected created preflight, got {other:?}"),
-    }
+    };
+    let bind = BindMergePreflightInputsRequest::try_new(
+        task.id,
+        operation_id,
+        DeliveryVersion::initial(),
+        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
+        GitCommitOid::from_str(preflight_source).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.bind_merge_preflight_inputs(bind).await.unwrap(),
+        MergeTransitionOutcome::Applied(_)
+    ));
+    operation_id
 }
 
 pub async fn accept_command(
@@ -81,7 +95,7 @@ pub async fn accept_command(
         client_request_id,
         task.id,
         operation_id,
-        DeliveryVersion::try_new(2).unwrap(),
+        DeliveryVersion::try_new(3).unwrap(),
         evidence.workspace_generation(),
         evidence.workspace_fingerprint().clone(),
         GitBranchRef::from_str(TARGET_BRANCH).unwrap(),

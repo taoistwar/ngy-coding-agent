@@ -5,16 +5,17 @@ use coding_agent_store::{
     AcceptMergeCommandRequest, AdvanceDeliverySourceObjectRequest, CreateDeliverySourceOutcome,
     CreateDeliverySourceRequest, CreatePreflightOutcome, CreatePreflightRequest,
     DeliverySourceAnchor, DeliverySourceAppliedProof, DeliverySourceObjectProof, DeliveryVersion,
-    DirectoryIdentity, GitBranchRef, GitCommitOid, GitTreeOid, PreflightCommandRequest,
-    Sha256Digest, SourceWorktreeProof, Store,
+    DirectoryIdentity, GitBranchRef, GitCommitOid, PreflightCommandRequest, Sha256Digest,
+    SourceWorktreeProof, Store,
 };
 
 use crate::support::delivery::eligibility::{
     ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, PREFLIGHT_SOURCE,
-    SOURCE_COMMIT, TARGET_HEAD, approved_task_on_store, approved_task_with_ready_artifact,
+    SOURCE_COMMIT, TARGET_CONFIG_DIGEST, TARGET_HEAD, TARGET_SECURITY_DIGEST,
+    approved_task_on_store, approved_task_with_ready_artifact,
 };
 use crate::support::delivery::merge::{
-    accept_merge_operation_with_request_hash, mark_preflight_ready,
+    accept_merge_operation_with_request_hash, bind_preflight_inputs, mark_preflight_ready,
 };
 
 pub const ACCEPT_RECEIPT_ID: &str = "66666666-6666-4666-8666-666666666666";
@@ -53,17 +54,25 @@ async fn accepted_fixture_for_task(store: Store, task: Task) -> (Store, AcceptMe
     .unwrap();
     let preflight = CreatePreflightRequest::try_new(
         preflight_command,
-        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
-        GitCommitOid::from_str(PREFLIGHT_SOURCE).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", COMMON_IDENTITY).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY).unwrap(),
         Sha256Digest::from_str(CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_SECURITY_DIGEST).unwrap(),
     )
     .unwrap();
     let operation_id = match store.create_merge_preflight(preflight).await.unwrap() {
         CreatePreflightOutcome::Created(receipt) => receipt.operation_id,
         other => panic!("expected created preflight, got {other:?}"),
     };
+    bind_preflight_inputs(
+        &store,
+        task.id,
+        operation_id,
+        CANDIDATE_TREE,
+        PREFLIGHT_SOURCE,
+    )
+    .await;
     mark_preflight_ready(store.pool(), &operation_id.to_string())
         .await
         .unwrap();
@@ -71,7 +80,7 @@ async fn accepted_fixture_for_task(store: Store, task: Task) -> (Store, AcceptMe
         ClientRequestId::from_str(ACCEPT_RECEIPT_ID).unwrap(),
         task.id,
         operation_id,
-        DeliveryVersion::try_new(2).unwrap(),
+        DeliveryVersion::try_new(3).unwrap(),
         evidence.workspace_generation(),
         evidence.workspace_fingerprint().clone(),
         GitBranchRef::from_str(TARGET_BRANCH).unwrap(),
@@ -107,7 +116,7 @@ pub fn source_anchor(command: &AcceptMergeCommandRequest) -> DeliverySourceAncho
     DeliverySourceAnchor::try_new(
         command.task_id(),
         command.preflight_operation_id(),
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
     )
     .unwrap()
 }

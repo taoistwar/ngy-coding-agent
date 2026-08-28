@@ -75,14 +75,8 @@ async fn complete_abort(
     applied_merge(
         store
             .complete_merge_abort(
-                CompleteMergeAbortRequest::try_new(
-                    task.id,
-                    operation_id,
-                    abort_version,
-                    proof,
-                    MergeConflictPaths::try_from_raw(vec![b"src/conflicted.rs".to_vec()]).unwrap(),
-                )
-                .unwrap(),
+                CompleteMergeAbortRequest::try_new(task.id, operation_id, abort_version, proof)
+                    .unwrap(),
             )
             .await
             .unwrap(),
@@ -109,6 +103,7 @@ async fn abort_begin_proof(store: &Store, task_id: TaskId) -> MergeAbortProof {
         Sha256Digest::from_str(WORKTREE).unwrap(),
         MergeAutostashObservation::Absent,
         OtherGitOperationObservation::Clear,
+        MergeConflictPaths::try_from_raw(vec![b"src/conflicted.rs".to_vec()]).unwrap(),
     )
     .unwrap()
 }

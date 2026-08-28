@@ -2,7 +2,9 @@ use coding_agent_domain::TaskId;
 use sqlx::{Row, SqliteConnection};
 
 use crate::StoreError;
-use crate::delivery::{DeliveryCommitMetadata, DeliveryOperationId, MergeOperationRecord};
+use crate::delivery::{
+    DeliveryCommitMetadata, DeliveryOperationId, MergeOperationRecord, PreparedMergePreflightInputs,
+};
 
 use super::super::decode::{
     integer, optional_integer, optional_text, parse_merge_state, parse_optional,
@@ -108,7 +110,8 @@ pub(super) async fn load_merge_operation_local(
                 worktree_admin_identity_digest, fixed_lock_reason, candidate_tree_oid, \
                 preflight_source_commit_oid, delivery_source_task_id, source_commit_oid, \
                 preflight_receipt_id, accept_receipt_id, target_branch, expected_target_head, \
-                config_attributes_digest, merge_base_oid, candidate_merge_tree_oid, \
+                config_attributes_digest, target_config_attributes_digest, \
+                target_security_digest, merge_base_oid, candidate_merge_tree_oid, \
                 merge_author_name, merge_author_email, merge_committer_name, \
                 merge_committer_email, merge_author_date_bytes, merge_committer_date_bytes, \
                 merge_message_template_version, merge_message_bytes, expected_merge_commit_oid, \
@@ -146,11 +149,23 @@ pub(super) async fn load_merge_operation_local(
         conflict_path_count.map(usize::from),
     )
     .await?;
+    let preflight_inputs = match (
+        parse_optional(optional_text(&row, "candidate_tree_oid")?)?,
+        parse_optional(optional_text(&row, "preflight_source_commit_oid")?)?,
+    ) {
+        (None, None) => None,
+        (Some(candidate_tree), Some(preflight_source_commit)) => {
+            Some(PreparedMergePreflightInputs {
+                candidate_tree,
+                preflight_source_commit,
+            })
+        }
+        _ => return Err(ownership_invariant()),
+    };
     let operation = MergeOperationRecord {
         operation_id,
         provenance,
-        candidate_tree: parse_value(text(&row, "candidate_tree_oid")?)?,
-        preflight_source_commit: parse_value(text(&row, "preflight_source_commit_oid")?)?,
+        preflight_inputs,
         delivery_source_task_id: parse_optional_task_id(optional_text(
             &row,
             "delivery_source_task_id",
@@ -160,6 +175,11 @@ pub(super) async fn load_merge_operation_local(
         accept_receipt_id: parse_optional(optional_text(&row, "accept_receipt_id")?)?,
         target_branch: parse_value(text(&row, "target_branch")?)?,
         expected_target_head: parse_value(text(&row, "expected_target_head")?)?,
+        target_config_attributes_digest: parse_value(text(
+            &row,
+            "target_config_attributes_digest",
+        )?)?,
+        target_security_digest: parse_value(text(&row, "target_security_digest")?)?,
         merge_base: parse_optional(optional_text(&row, "merge_base_oid")?)?,
         candidate_merge_tree: parse_optional(optional_text(&row, "candidate_merge_tree_oid")?)?,
         merge_metadata: optional_merge_metadata(&row)?,

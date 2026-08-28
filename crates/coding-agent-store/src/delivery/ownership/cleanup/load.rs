@@ -91,13 +91,35 @@ pub(in crate::delivery::ownership) async fn load_cleanup_operation(
     operation_id: DeliveryOperationId,
 ) -> Result<CleanupOperationRecord, StoreError> {
     let row = sqlx::query(
-        "SELECT operation_id, task_id, repository_id, attempt, kind, origin_receipt_id, \
-                disposition_task_id, expected_worktree_path, expected_admin_identity_algorithm, \
-                expected_admin_identity_digest, expected_common_git_identity_algorithm, \
-                expected_common_git_identity_digest, expected_source_ref, expected_source_oid, \
-                expected_disposition_version, expected_target_ref, expected_target_head, \
-                origin_target_head, state, failure_code, version, created_at, updated_at \
-         FROM task_cleanup_operations WHERE operation_id = ?",
+        "SELECT cleanup.operation_id, cleanup.task_id, cleanup.repository_id, cleanup.attempt, \
+                cleanup.kind, cleanup.origin_receipt_id, \
+                receipt.cleanup_merged_operation_id AS expected_merge_operation_id, \
+                cleanup.disposition_task_id, cleanup.expected_worktree_path, \
+                cleanup.expected_admin_identity_algorithm, cleanup.expected_admin_identity_digest, \
+                cleanup.expected_common_git_identity_algorithm, \
+                cleanup.expected_common_git_identity_digest, cleanup.expected_source_ref, \
+                cleanup.expected_source_oid, cleanup.expected_disposition_version, \
+                cleanup.expected_target_ref, cleanup.expected_target_head, \
+                cleanup.origin_target_head, cleanup.state, cleanup.failure_code, cleanup.version, \
+                cleanup.created_at, cleanup.updated_at \
+         FROM task_cleanup_operations cleanup \
+         JOIN task_delivery_command_receipts receipt \
+           ON receipt.client_request_id = cleanup.origin_receipt_id \
+          AND receipt.command_kind = cleanup.kind \
+          AND receipt.task_id = cleanup.task_id \
+          AND receipt.repository_id = cleanup.repository_id \
+          AND receipt.attempt = cleanup.attempt \
+          AND receipt.operation_kind = 'cleanup_operation' \
+          AND receipt.operation_id = cleanup.operation_id \
+          AND receipt.merge_operation_id IS NULL \
+          AND receipt.cleanup_operation_id = cleanup.operation_id \
+         JOIN task_artifact_dispositions disposition \
+           ON disposition.task_id = cleanup.disposition_task_id \
+          AND disposition.task_id = cleanup.task_id \
+          AND disposition.repository_id = cleanup.repository_id \
+          AND disposition.attempt = cleanup.attempt \
+          AND disposition.merged_operation_id = receipt.cleanup_merged_operation_id \
+         WHERE cleanup.operation_id = ?",
     )
     .bind(operation_id.to_string())
     .fetch_optional(&mut *connection)
@@ -128,6 +150,7 @@ pub(in crate::delivery::ownership) async fn load_cleanup_operation(
         identity: identity_from_row(&row)?,
         kind,
         origin_receipt_id: parse_value(text(&row, "origin_receipt_id")?)?,
+        expected_merge_operation_id: parse_value(text(&row, "expected_merge_operation_id")?)?,
         disposition_task_id: text(&row, "disposition_task_id")?
             .parse()
             .map_err(|_| ownership_invariant())?,
@@ -200,13 +223,18 @@ async fn audit_orphan_cleanup_receipts(
               AND cleanup.repository_id = receipt.repository_id \
               AND cleanup.attempt = receipt.attempt \
               AND cleanup.kind = receipt.command_kind \
+             LEFT JOIN task_artifact_dispositions disposition \
+               ON disposition.task_id = cleanup.disposition_task_id \
+              AND disposition.merged_operation_id = receipt.cleanup_merged_operation_id \
              WHERE receipt.task_id = ? \
                AND (receipt.command_kind IN ('remove_worktree', 'delete_branch') \
                     OR receipt.operation_kind = 'cleanup_operation') \
                AND (receipt.operation_kind != 'cleanup_operation' \
                     OR receipt.merge_operation_id IS NOT NULL \
                     OR receipt.cleanup_operation_id IS NULL \
-                    OR cleanup.operation_id IS NULL) \
+                    OR receipt.cleanup_merged_operation_id IS NULL \
+                    OR cleanup.operation_id IS NULL \
+                    OR disposition.task_id IS NULL) \
          )",
     )
     .bind(task_id.to_string())

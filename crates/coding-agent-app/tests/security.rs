@@ -271,6 +271,54 @@ async fn read_and_mutation_authorization_require_the_full_matrix() {
 }
 
 #[tokio::test]
+async fn delivery_get_and_post_paths_share_the_existing_security_boundary() {
+    let fixture = support::SecurityFixture::production();
+    let session = establish_initial_session(&fixture).await;
+    let task_id = "216e4964-481b-475f-91f7-260d6b158edd";
+
+    let read = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/tasks/{task_id}/delivery"))
+        .header(HOST, &fixture.expected_host)
+        .header(COOKIE, &session.cookie)
+        .body(())
+        .expect("construct delivery read")
+        .into_parts()
+        .0;
+    RequestSecurity::authorize_read(&fixture.manager, &read)
+        .expect("delivery GET accepts an established session");
+
+    let mutation = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/tasks/{task_id}/merge/preflight"))
+        .header(HOST, &fixture.expected_host)
+        .header(COOKIE, &session.cookie)
+        .header(ORIGIN, &fixture.public_origin)
+        .header(CSRF_HEADER, &session.csrf)
+        .body(())
+        .expect("construct delivery mutation")
+        .into_parts()
+        .0;
+    RequestSecurity::authorize_mutation(&fixture.manager, &mutation)
+        .expect("delivery POST requires the existing exact Origin and CSRF tuple");
+
+    let missing_origin = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/tasks/{task_id}/cleanup/worktree"))
+        .header(HOST, &fixture.expected_host)
+        .header(COOKIE, &session.cookie)
+        .header(CSRF_HEADER, &session.csrf)
+        .body(())
+        .expect("construct rejected delivery mutation")
+        .into_parts()
+        .0;
+    assert_error_code(
+        RequestSecurity::authorize_mutation(&fixture.manager, &missing_origin),
+        "SECURITY_INVALID_ORIGIN",
+    );
+}
+
+#[tokio::test]
 async fn a_fresh_manager_invalidates_every_previous_process_secret() {
     let old = support::SecurityFixture::production();
     let old_session = establish_initial_session(&old).await;

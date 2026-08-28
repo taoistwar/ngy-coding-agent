@@ -192,11 +192,186 @@ fn openapi_contains_every_approved_top_level_component_and_no_task_12_paths() {
         "ApiErrorResponse",
         "CancellationAcceptedResponse",
         "QuitResponse",
+        "DeliveryPreflightRequest",
+        "DeliveryMergeRequest",
+        "DeliveryRemoveWorktreeRequest",
+        "DeliveryDeleteBranchRequest",
+        "DeliveryTaskDto",
+        "DeliveryOperationDto",
+        "DeliveryCommandResponse",
     ] {
         assert!(schemas.contains_key(schema), "missing {schema}");
     }
 
     assert_eq!(value["paths"], json!({}));
+}
+
+#[test]
+fn delivery_openapi_locks_request_bounds_operation_union_and_rest_only_paths() {
+    let value = serde_json::to_value(api_openapi()).expect("router OpenAPI must serialize");
+    let schemas = &value["components"]["schemas"];
+
+    assert_exact_required_object(
+        &schemas["DeliveryPreflightRequest"],
+        &["client_request_id", "target_branch", "expected_target_head"],
+    );
+    assert_exact_required_object(
+        &schemas["DeliveryMergeRequest"],
+        &[
+            "client_request_id",
+            "preflight_operation_id",
+            "expected_operation_version",
+            "expected_review_generation",
+            "expected_workspace_fingerprint",
+            "target_branch",
+            "expected_target_head",
+        ],
+    );
+    assert_exact_required_object(
+        &schemas["DeliveryRemoveWorktreeRequest"],
+        &[
+            "client_request_id",
+            "expected_disposition_version",
+            "expected_merge_operation_id",
+            "expected_source_ref",
+            "expected_source_oid",
+        ],
+    );
+    assert_exact_required_object(
+        &schemas["DeliveryDeleteBranchRequest"],
+        &[
+            "client_request_id",
+            "expected_disposition_version",
+            "expected_merge_operation_id",
+            "expected_source_ref",
+            "expected_source_oid",
+            "target_branch",
+            "target_head",
+        ],
+    );
+
+    let merge = &schemas["DeliveryMergeRequest"]["properties"];
+    assert_eq!(merge["expected_operation_version"]["minimum"], 1);
+    assert_eq!(
+        merge["expected_operation_version"]["maximum"],
+        9_007_199_254_740_991_u64
+    );
+    assert_eq!(merge["expected_review_generation"]["minimum"], 0);
+    assert_eq!(merge["expected_workspace_fingerprint"]["minLength"], 64);
+    assert_eq!(merge["expected_workspace_fingerprint"]["maxLength"], 64);
+    assert_eq!(merge["target_branch"]["maxLength"], 4096);
+    assert_eq!(merge["expected_target_head"]["minLength"], 40);
+    assert_eq!(merge["expected_target_head"]["maxLength"], 64);
+
+    assert_eq!(
+        schemas["DeliveryConflictSummaryDto"]["properties"]["paths"]["maxItems"],
+        128
+    );
+    assert_eq!(
+        schemas["DeliveryConflictSummaryDto"]["properties"]["payload_bytes"]["maximum"],
+        65_536
+    );
+    assert_eq!(
+        schemas["DeliveryConflictPathDto"]["properties"]["path"]["maxLength"],
+        4_096
+    );
+    assert_eq!(
+        schemas["DeliveryOperationDto"]["discriminator"]["propertyName"],
+        "kind"
+    );
+    assert_eq!(
+        schemas["DeliveryOperationDto"]["discriminator"]["mapping"],
+        json!({
+            "merge": "#/components/schemas/DeliveryMergeOperationEnvelopeDto",
+            "cleanup": "#/components/schemas/DeliveryCleanupOperationEnvelopeDto",
+        })
+    );
+    assert_eq!(
+        schemas["DeliveryOperationDto"]["oneOf"]
+            .as_array()
+            .expect("operation oneOf")
+            .len(),
+        2
+    );
+    assert_exact_required_object(
+        &schemas["DeliveryCleanupOperationDto"],
+        &[
+            "operation_id",
+            "cleanup_kind",
+            "version",
+            "state",
+            "expected_disposition_version",
+            "expected_merge_operation_id",
+            "expected_source_ref",
+            "expected_source_oid",
+            "target_branch",
+            "target_head",
+            "failure",
+        ],
+    );
+    assert!(
+        schemas["DeliveryCleanupOperationDto"]["properties"]
+            .get("kind")
+            .is_none(),
+        "task delivery embeds the bare cleanup DTO"
+    );
+    assert_eq!(
+        schemas["DeliveryTargetObservationDto"]["oneOf"]
+            .as_array()
+            .expect("target observation oneOf")
+            .len(),
+        2
+    );
+    assert_exact_required_object(
+        &schemas["DeliveryAvailableTargetDto"],
+        &["available", "branch", "head"],
+    );
+    assert_exact_required_object(
+        &schemas["DeliveryUnavailableTargetDto"],
+        &["available", "reason"],
+    );
+    assert_exact_required_object(
+        &schemas["DeliveryTaskDto"],
+        &[
+            "task_id",
+            "eligibility",
+            "reasons",
+            "evidence",
+            "target",
+            "source",
+            "latest_merge",
+            "latest_cleanup",
+            "disposition",
+            "allowed_actions",
+        ],
+    );
+    assert!(schema_accepts_null(
+        &schemas["DeliveryTaskDto"]["properties"]["latest_cleanup"]
+    ));
+    assert_eq!(
+        schemas["DeliveryTaskDto"]["properties"]["latest_cleanup"]["oneOf"][1]["$ref"],
+        "#/components/schemas/DeliveryCleanupOperationDto"
+    );
+
+    let paths = value["paths"].as_object().expect("router paths");
+    for path in [
+        "/api/tasks/{task_id}/delivery",
+        "/api/delivery-operations/{operation_id}",
+        "/api/tasks/{task_id}/merge/preflight",
+        "/api/tasks/{task_id}/merge",
+        "/api/tasks/{task_id}/cleanup/worktree",
+        "/api/tasks/{task_id}/cleanup/branch",
+    ] {
+        assert!(paths.contains_key(path), "missing delivery path {path}");
+    }
+    assert_eq!(
+        schemas["TaskEventDto"]["oneOf"]
+            .as_array()
+            .expect("task event oneOf")
+            .len(),
+        11,
+        "delivery polling must not add a task lifecycle/SSE event"
+    );
 }
 
 #[test]

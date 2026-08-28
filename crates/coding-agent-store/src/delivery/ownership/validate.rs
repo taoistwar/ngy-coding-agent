@@ -76,7 +76,10 @@ pub(super) async fn validate_ownership_graph(
         )?;
         if let Some(source) = source
             && (operation.provenance != source.provenance
-                || operation.candidate_tree != source.candidate_tree)
+                || operation
+                    .preflight_inputs
+                    .as_ref()
+                    .is_some_and(|inputs| inputs.candidate_tree != source.candidate_tree))
         {
             return Err(ownership_invariant());
         }

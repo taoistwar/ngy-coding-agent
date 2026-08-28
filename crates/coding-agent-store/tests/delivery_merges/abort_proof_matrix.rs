@@ -39,6 +39,7 @@ enum BeginMutation {
     ConfigDigest,
     IndexStages,
     Worktree,
+    ConflictPaths,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,6 +109,7 @@ async fn begin_abort_changed_proof_replay_is_conflict_and_preserves_the_sealed_f
         BeginMutation::ConfigDigest,
         BeginMutation::IndexStages,
         BeginMutation::Worktree,
+        BeginMutation::ConflictPaths,
     ] {
         let request = BeginMergeAbortRequest::try_new(
             task.id,
@@ -143,7 +145,6 @@ async fn complete_abort_rejects_every_fresh_binding_mismatch_without_writes() {
             operation_id,
             abort_version,
             complete_proof(mutation),
-            MergeConflictPaths::try_from_raw(vec![b"src/conflicted.rs".to_vec()]).unwrap(),
         )
         .unwrap();
         let outcome = store.complete_merge_abort(request).await.unwrap();
@@ -151,36 +152,35 @@ async fn complete_abort_rejects_every_fresh_binding_mismatch_without_writes() {
             matches!(outcome, MergeTransitionOutcome::Conflict),
             "{mutation:?} produced {outcome:?}"
         );
-        assert_abort_pending_without_conflict_facts(&store, operation_id).await;
+        assert_abort_pending_with_conflict_facts(&store, operation_id, "src/conflicted.rs").await;
     }
 }
 
 #[tokio::test]
-async fn complete_abort_changed_paths_replay_is_conflict_and_preserves_the_sealed_set() {
-    let (store, task, operation_id, abort_version) = super::abort::abort_pending_fixture().await;
+async fn complete_abort_reuses_durable_paths_across_reply_lost_replay() {
+    let (store, task, operation_id, abort_version) =
+        super::abort::abort_pending_fixture_with_paths(vec![b"src/first.rs".to_vec()]).await;
     let first = CompleteMergeAbortRequest::try_new(
         task.id,
         operation_id,
         abort_version,
         complete_proof(CompleteMutation::Exact),
-        MergeConflictPaths::try_from_raw(vec![b"src/first.rs".to_vec()]).unwrap(),
     )
     .unwrap();
     assert!(matches!(
         store.complete_merge_abort(first).await.unwrap(),
         MergeTransitionOutcome::Applied(_)
     ));
-    let changed = CompleteMergeAbortRequest::try_new(
+    let replay = CompleteMergeAbortRequest::try_new(
         task.id,
         operation_id,
         abort_version,
         complete_proof(CompleteMutation::Exact),
-        MergeConflictPaths::try_from_raw(vec![b"src/second.rs".to_vec()]).unwrap(),
     )
     .unwrap();
     assert!(matches!(
-        store.complete_merge_abort(changed).await.unwrap(),
-        MergeTransitionOutcome::Conflict
+        store.complete_merge_abort(replay).await.unwrap(),
+        MergeTransitionOutcome::Existing(_)
     ));
 
     let row: (String, i64, i64) = sqlx::query_as(
@@ -190,7 +190,7 @@ async fn complete_abort_changed_paths_replay_is_conflict_and_preserves_the_seale
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("conflict".to_owned(), 6, 1));
+    assert_eq!(row, ("conflict".to_owned(), 7, 1));
     let path: (String, String) = sqlx::query_as(
         "SELECT path_encoding, path_value FROM task_merge_conflicts WHERE operation_id = ?",
     )
@@ -199,19 +199,18 @@ async fn complete_abort_changed_paths_replay_is_conflict_and_preserves_the_seale
     .await
     .unwrap();
     assert_eq!(path, ("utf8".to_owned(), "src/first.rs".to_owned()));
-    assert_eq!(merge_journal_count(&store, operation_id).await, 6);
+    assert_eq!(merge_journal_count(&store, operation_id).await, 7);
 }
 
 #[tokio::test]
 async fn complete_abort_changed_binding_replay_is_conflict_and_preserves_the_sealed_set() {
-    let (store, task, operation_id, abort_version) = super::abort::abort_pending_fixture().await;
-    let paths = vec![b"src/sealed.rs".to_vec()];
+    let (store, task, operation_id, abort_version) =
+        super::abort::abort_pending_fixture_with_paths(vec![b"src/sealed.rs".to_vec()]).await;
     let exact = CompleteMergeAbortRequest::try_new(
         task.id,
         operation_id,
         abort_version,
         complete_proof(CompleteMutation::Exact),
-        MergeConflictPaths::try_from_raw(paths.clone()).unwrap(),
     )
     .unwrap();
     assert!(matches!(
@@ -233,7 +232,6 @@ async fn complete_abort_changed_binding_replay_is_conflict_and_preserves_the_sea
             operation_id,
             abort_version,
             complete_proof(mutation),
-            MergeConflictPaths::try_from_raw(paths.clone()).unwrap(),
         )
         .unwrap();
         let outcome = store.complete_merge_abort(changed).await.unwrap();
@@ -250,7 +248,7 @@ async fn complete_abort_changed_binding_replay_is_conflict_and_preserves_the_sea
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("conflict".to_owned(), 6, 1));
+    assert_eq!(row, ("conflict".to_owned(), 7, 1));
     let path: String =
         sqlx::query_scalar("SELECT path_value FROM task_merge_conflicts WHERE operation_id = ?")
             .bind(operation_id.to_string())
@@ -258,7 +256,7 @@ async fn complete_abort_changed_binding_replay_is_conflict_and_preserves_the_sea
             .await
             .unwrap();
     assert_eq!(path, "src/sealed.rs");
-    assert_eq!(merge_journal_count(&store, operation_id).await, 6);
+    assert_eq!(merge_journal_count(&store, operation_id).await, 7);
 }
 
 #[test]
@@ -466,6 +464,11 @@ fn begin_proof(child: Uuid, mutation: BeginMutation) -> MergeAbortProof {
     } else {
         WORKTREE
     };
+    let conflict_paths = if matches!(mutation, BeginMutation::ConflictPaths) {
+        vec![b"src/changed.rs".to_vec()]
+    } else {
+        vec![b"src/conflicted.rs".to_vec()]
+    };
     MergeAbortProof::try_new(
         child,
         GitBranchRef::from_str(target_branch).unwrap(),
@@ -481,6 +484,7 @@ fn begin_proof(child: Uuid, mutation: BeginMutation) -> MergeAbortProof {
         Sha256Digest::from_str(worktree).unwrap(),
         MergeAutostashObservation::Absent,
         OtherGitOperationObservation::Clear,
+        MergeConflictPaths::try_from_raw(conflict_paths).unwrap(),
     )
     .unwrap()
 }
@@ -564,6 +568,7 @@ fn begin_proof_result(
         Sha256Digest::from_str(WORKTREE).unwrap(),
         autostash,
         other,
+        MergeConflictPaths::try_from_raw(vec![b"src/conflicted.rs".to_vec()]).unwrap(),
     )
 }
 
@@ -597,24 +602,36 @@ async fn assert_merge_pending_without_abort_facts(
     store: &Store,
     operation_id: coding_agent_store::DeliveryOperationId,
 ) {
-    let row: (
+    type OptionalAbortFactsRow = (
         String,
         i64,
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
-    ) = sqlx::query_as(
+        Option<i64>,
+    );
+    let row: OptionalAbortFactsRow = sqlx::query_as(
         "SELECT state, version, abort_child_receipt_id, abort_merge_head_oid, \
-                    abort_index_stages_digest, abort_worktree_digest \
+                    abort_index_stages_digest, abort_worktree_digest, conflict_path_count \
              FROM task_merge_operations WHERE operation_id = ?",
     )
     .bind(operation_id.to_string())
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("merge_pending".to_owned(), 4, None, None, None, None));
-    assert_eq!(merge_journal_count(store, operation_id).await, 4);
+    assert_eq!(
+        row,
+        ("merge_pending".to_owned(), 5, None, None, None, None, None)
+    );
+    let conflict_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_merge_conflicts WHERE operation_id = ?")
+            .bind(operation_id.to_string())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(conflict_count, 0);
+    assert_eq!(merge_journal_count(store, operation_id).await, 5);
 }
 
 async fn assert_abort_pending_facts(
@@ -622,9 +639,9 @@ async fn assert_abort_pending_facts(
     operation_id: coding_agent_store::DeliveryOperationId,
     child: Uuid,
 ) {
-    let row: (String, i64, String, String, String, String) = sqlx::query_as(
+    let row: (String, i64, String, String, String, String, i64) = sqlx::query_as(
         "SELECT state, version, abort_child_receipt_id, abort_merge_head_oid, \
-                abort_index_stages_digest, abort_worktree_digest \
+                abort_index_stages_digest, abort_worktree_digest, conflict_path_count \
          FROM task_merge_operations WHERE operation_id = ?",
     )
     .bind(operation_id.to_string())
@@ -635,21 +652,30 @@ async fn assert_abort_pending_facts(
         row,
         (
             "abort_pending".to_owned(),
-            5,
+            6,
             child.to_string(),
             SOURCE_COMMIT.to_owned(),
             INDEX_STAGES.to_owned(),
             WORKTREE.to_owned(),
+            1,
         )
     );
-    assert_eq!(merge_journal_count(store, operation_id).await, 5);
+    let path: String =
+        sqlx::query_scalar("SELECT path_value FROM task_merge_conflicts WHERE operation_id = ?")
+            .bind(operation_id.to_string())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(path, "src/conflicted.rs");
+    assert_eq!(merge_journal_count(store, operation_id).await, 6);
 }
 
-async fn assert_abort_pending_without_conflict_facts(
+async fn assert_abort_pending_with_conflict_facts(
     store: &Store,
     operation_id: coding_agent_store::DeliveryOperationId,
+    expected_path: &str,
 ) {
-    let row: (String, i64, Option<i64>, Option<String>) = sqlx::query_as(
+    let row: (String, i64, i64, Option<String>) = sqlx::query_as(
         "SELECT state, version, conflict_path_count, failure_code \
          FROM task_merge_operations WHERE operation_id = ?",
     )
@@ -657,15 +683,15 @@ async fn assert_abort_pending_without_conflict_facts(
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("abort_pending".to_owned(), 5, None, None));
-    let conflicts: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM task_merge_conflicts WHERE operation_id = ?")
+    assert_eq!(row, ("abort_pending".to_owned(), 6, 1, None));
+    let path: String =
+        sqlx::query_scalar("SELECT path_value FROM task_merge_conflicts WHERE operation_id = ?")
             .bind(operation_id.to_string())
             .fetch_one(store.pool())
             .await
             .unwrap();
-    assert_eq!(conflicts, 0);
-    assert_eq!(merge_journal_count(store, operation_id).await, 5);
+    assert_eq!(path, expected_path);
+    assert_eq!(merge_journal_count(store, operation_id).await, 6);
 }
 
 async fn merge_journal_count(

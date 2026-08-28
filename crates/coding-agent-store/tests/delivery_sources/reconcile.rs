@@ -45,13 +45,13 @@ async fn retry_and_reconcile_require_exact_pending_source_and_accepted_owner() {
         retried_owner.state,
         coding_agent_store::MergeOperationState::Accepted
     );
-    assert_eq!(retried_owner.version, DeliveryVersion::try_new(3).unwrap());
+    assert_eq!(retried_owner.version, DeliveryVersion::try_new(4).unwrap());
     assert_eq!(retried_owner.failure_code, None);
     let reconcile = ReconcileDeliverySourceRequest::try_new(
         anchor,
         DeliverySourceState::ObjectPending,
         DeliveryVersion::try_new(2).unwrap(),
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -88,7 +88,7 @@ async fn retry_and_reconcile_require_exact_pending_source_and_accepted_owner() {
     assert_eq!(source_journal_count(&store, command.task_id()).await, 3);
     assert_eq!(
         merge_journal_count(&store, command.preflight_operation_id()).await,
-        4
+        5
     );
 }
 
@@ -101,7 +101,7 @@ async fn paired_reconcile_replay_and_wrong_expected_values_are_typed_conflicts()
         anchor,
         DeliverySourceState::ObjectPending,
         source.version,
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -121,14 +121,6 @@ async fn paired_reconcile_replay_and_wrong_expected_values_are_typed_conflicts()
             anchor,
             DeliverySourceState::ObjectPending,
             DeliveryVersion::try_new(2).unwrap(),
-            DeliveryVersion::try_new(3).unwrap(),
-            DeliverySourceReconciliationReason::SourceInconsistent,
-        )
-        .unwrap(),
-        ReconcileDeliverySourceRequest::try_new(
-            anchor,
-            DeliverySourceState::ObjectPending,
-            DeliveryVersion::initial(),
             DeliveryVersion::try_new(4).unwrap(),
             DeliverySourceReconciliationReason::SourceInconsistent,
         )
@@ -137,7 +129,15 @@ async fn paired_reconcile_replay_and_wrong_expected_values_are_typed_conflicts()
             anchor,
             DeliverySourceState::ObjectPending,
             DeliveryVersion::initial(),
-            DeliveryVersion::try_new(3).unwrap(),
+            DeliveryVersion::try_new(5).unwrap(),
+            DeliverySourceReconciliationReason::SourceInconsistent,
+        )
+        .unwrap(),
+        ReconcileDeliverySourceRequest::try_new(
+            anchor,
+            DeliverySourceState::ObjectPending,
+            DeliveryVersion::initial(),
+            DeliveryVersion::try_new(4).unwrap(),
             DeliverySourceReconciliationReason::ProcessTreeCleanupFailed,
         )
         .unwrap(),
@@ -164,7 +164,7 @@ async fn committed_source_can_reconcile_with_its_exact_still_accepted_owner() {
         anchor,
         DeliverySourceState::Committed,
         DeliveryVersion::try_new(3).unwrap(),
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -207,7 +207,7 @@ async fn committed_reconciliation_with_reversed_transition_order_fails_closed() 
         anchor,
         DeliverySourceState::Committed,
         DeliveryVersion::try_new(3).unwrap(),
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();

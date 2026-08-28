@@ -258,13 +258,13 @@ async fn insert_cleanup_receipt(
              client_request_id, command_kind, task_id, repository_id, attempt,
              request_hash_domain, request_hash_version, request_hash_algorithm,
              canonical_request_hash, operation_kind, operation_id,
-             merge_operation_id, cleanup_operation_id,
+             merge_operation_id, cleanup_operation_id, cleanup_merged_operation_id,
              accepted_operation_version, accepted_operation_state,
              response_discriminator, created_at
          ) VALUES (
              ?, ?, ?, ?, 1,
              'coding-agent-delivery-command-request', 1, 'sha256', ?,
-             'cleanup_operation', ?, NULL, ?, 1, ?, ?, ?
+             'cleanup_operation', ?, NULL, ?, ?, 1, ?, ?, ?
          )",
     )
     .bind(fixture.receipt_id)
@@ -274,6 +274,7 @@ async fn insert_cleanup_receipt(
     .bind(request_hash)
     .bind(fixture.operation_id)
     .bind(fixture.operation_id)
+    .bind(MERGE_OPERATION_ID)
     .bind(fixture.state)
     .bind(fixture.response_discriminator)
     .bind(TIMESTAMP)

@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use coding_agent_app::{
     ActorPausePoint, FakeScenario, FakeTaskRunner, FixedStartupRunnerFactory, LegacyV2Seed,
-    PreActorStartupRunnerContext, ProcessRuntimeConfig, ProcessRuntimeStorageConfig,
-    ProcessStorageSample, ProcessTestConfig, ProcessTestEnvironment, RunContext,
-    StartupDependencies, StartupOutcome, StartupRunnerContext, StartupRunnerFactory,
-    StartupRunnerFactoryError, StartupRunnerSelection, StoreWriterFaultPoint,
+    PreActorStartupRunnerContext, ProcessRunnerMode, ProcessRuntimeConfig,
+    ProcessRuntimeStorageConfig, ProcessStorageSample, ProcessTestConfig, ProcessTestEnvironment,
+    RunContext, ShutdownOutcome, StartupDependencies, StartupOutcome, StartupRunnerContext,
+    StartupRunnerFactory, StartupRunnerFactoryError, StartupRunnerSelection, StoreWriterFaultPoint,
     StoreWriterOperationKind, TEST_PICKER_PROBE_FILE, VirtualReleaseTarget, launch,
     load_runtime_config_for_test,
 };
@@ -93,6 +93,7 @@ fn complete_process_scenario_is_closed_validated_and_consumed_once() {
     assert!(config.marker_write_failure);
     assert_eq!(config.legacy_v2_seed, LegacyV2Seed::None);
     assert_eq!(config.runtime_config, None);
+    assert_eq!(config.runner_mode, ProcessRunnerMode::ScriptedFake {});
 
     assert!(
         !scenario_path.exists()
@@ -134,6 +135,211 @@ fn runtime_config_is_required_and_cannot_silently_default() {
 
     assert!(error.to_string().contains("runtime_config"));
     assert!(scenario_path.exists(), "invalid input is not consumed");
+}
+
+#[test]
+fn runner_mode_is_required_and_nested_unknown_fields_are_denied() {
+    for mutation in [
+        Box::new(|scenario: String| {
+            scenario.replace("  \"runner_mode\": { \"kind\": \"scripted_fake\" },\n", "")
+        }) as Box<dyn FnOnce(String) -> String>,
+        Box::new(|scenario: String| {
+            scenario.replace(
+                "{ \"kind\": \"scripted_fake\" }",
+                "{ \"kind\": \"scripted_fake\", \"unexpected\": true }",
+            )
+        }),
+    ] {
+        let fixture = tempfile::tempdir().expect("create strict runner-mode fixture");
+        let scenario_path = fixture.path().join("scenario.json");
+        write_scenario(
+            &scenario_path,
+            &fixture.path().join("claim-permit.release"),
+            "",
+        );
+        let scenario = mutation(fs::read_to_string(&scenario_path).expect("read scenario"));
+        fs::write(&scenario_path, scenario).expect("write malformed runner mode");
+
+        let error = ProcessTestConfig::load(&scenario_path)
+            .expect_err("missing or unknown runner-mode fields must be rejected");
+
+        assert!(
+            error.to_string().contains("runner_mode")
+                || error.to_string().contains("unknown field")
+        );
+        assert!(scenario_path.exists(), "invalid input is not consumed");
+    }
+}
+
+#[test]
+fn production_offline_runner_rejects_fake_runner_controls() {
+    let fixture = tempfile::tempdir().expect("create production runner validation fixture");
+    let repository = fixture.path().join("repository");
+    fs::create_dir_all(repository.join(".git")).expect("create git metadata directory");
+    fs::create_dir_all(repository.join("src")).expect("create source directory");
+    fs::write(
+        repository.join("Cargo.toml"),
+        "[package]\nname = \"e2e-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write fixture manifest");
+    fs::write(
+        repository.join("src").join("lib.rs"),
+        "pub fn fixture_value() -> u32 { 42 }\n",
+    )
+    .expect("write fixture source");
+    let repository = repository.canonicalize().expect("canonical repository");
+    let scenario_path = fixture.path().join("scenario.json");
+    write_scenario(
+        &scenario_path,
+        &fixture.path().join("claim-permit.release"),
+        "",
+    );
+    let mut scenario: serde_json::Value =
+        serde_json::from_slice(&fs::read(&scenario_path).expect("read production runner scenario"))
+            .expect("parse production runner scenario");
+    scenario["runner_mode"] = serde_json::json!({
+        "kind": "production_offline_delivery",
+        "repository_path": repository,
+        "provider_scenario": "approve",
+        "process_fault": "none"
+    });
+    fs::write(
+        &scenario_path,
+        serde_json::to_vec(&scenario).expect("encode production runner scenario"),
+    )
+    .expect("write production runner scenario");
+
+    let error = ProcessTestConfig::load(&scenario_path)
+        .expect_err("production runner cannot silently consume fake scenarios");
+
+    assert!(error.to_string().contains("fake_scenarios"));
+    assert!(scenario_path.exists(), "invalid input is not consumed");
+}
+
+#[test]
+fn production_offline_process_fault_is_required_and_closed() {
+    let fixture = tempfile::tempdir().expect("create production fault config fixture");
+    let repository = fixture.path().join("repository");
+    fs::create_dir_all(repository.join(".git")).expect("create git metadata directory");
+    fs::create_dir_all(repository.join("src")).expect("create source directory");
+    fs::write(
+        repository.join("Cargo.toml"),
+        "[package]\nname = \"e2e-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write fixture manifest");
+    fs::write(
+        repository.join("src").join("lib.rs"),
+        "pub fn fixture_value() -> u32 { 42 }\n",
+    )
+    .expect("write fixture source");
+    let repository = repository.canonicalize().expect("canonical repository");
+
+    let scenario = |process_fault: Option<&str>| {
+        let scenario_path = fixture.path().join(format!(
+            "scenario-{}.json",
+            process_fault.unwrap_or("missing")
+        ));
+        write_scenario(&scenario_path, &fixture.path().join("unused.release"), "");
+        let mut scenario: serde_json::Value = serde_json::from_slice(
+            &fs::read(&scenario_path).expect("read production fault scenario"),
+        )
+        .expect("parse production fault scenario");
+        scenario["runner_mode"] = serde_json::json!({
+            "kind": "production_offline_delivery",
+            "repository_path": repository,
+            "provider_scenario": "approve",
+        });
+        if let Some(process_fault) = process_fault {
+            scenario["runner_mode"]["process_fault"] = serde_json::json!(process_fault);
+        }
+        scenario["fake_scenarios"] = serde_json::json!([]);
+        scenario["actor_pauses"] = serde_json::json!([]);
+        scenario["virtual_release_signals"] = serde_json::json!([]);
+        fs::write(
+            &scenario_path,
+            serde_json::to_vec(&scenario).expect("encode production fault scenario"),
+        )
+        .expect("write production fault scenario");
+        scenario_path
+    };
+
+    let missing = scenario(None);
+    ProcessTestConfig::load(&missing)
+        .expect_err("production process fault must be stated explicitly");
+    assert!(missing.exists(), "invalid missing fault is not consumed");
+
+    let unknown = scenario(Some("arbitrary_process_fault"));
+    ProcessTestConfig::load(&unknown).expect_err("process fault enum is closed");
+    assert!(unknown.exists(), "invalid unknown fault is not consumed");
+
+    let none = scenario(Some("none"));
+    ProcessTestConfig::load(&none).expect("explicit no-fault production scenario is valid");
+    assert!(!none.exists(), "valid strict scenario is consumed");
+}
+
+#[tokio::test]
+async fn production_offline_runner_starts_loopback_and_seeds_the_real_repository() {
+    let fixture = tempfile::tempdir().expect("create production runner fixture");
+    let data_dir = fixture.path().join("data");
+    let runtime_dir = fixture.path().join("runtime");
+    let repository = fixture.path().join("repository");
+    fs::create_dir(&data_dir).expect("create isolated data root");
+    fs::create_dir(&runtime_dir).expect("create isolated runtime root");
+    fs::create_dir_all(repository.join(".git")).expect("create git metadata directory");
+    fs::create_dir_all(repository.join("src")).expect("create source directory");
+    fs::write(
+        repository.join("Cargo.toml"),
+        "[package]\nname = \"e2e-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write fixture manifest");
+    fs::write(
+        repository.join("src").join("lib.rs"),
+        "pub fn fixture_value() -> u32 { 42 }\n",
+    )
+    .expect("write fixture source");
+    let repository = repository.canonicalize().expect("canonical repository");
+    let scenario_path = data_dir.join("scenario.json");
+    let signal_path = runtime_dir.join("signals").join("unused.release");
+    write_scenario(&scenario_path, &signal_path, "");
+    let mut scenario: serde_json::Value =
+        serde_json::from_slice(&fs::read(&scenario_path).expect("read production runner scenario"))
+            .expect("parse production runner scenario");
+    scenario["runner_mode"] = serde_json::json!({
+        "kind": "production_offline_delivery",
+        "repository_path": repository,
+        "provider_scenario": "approve",
+        "process_fault": "none"
+    });
+    scenario["fake_scenarios"] = serde_json::json!([]);
+    scenario["actor_pauses"] = serde_json::json!([]);
+    scenario["virtual_release_signals"] = serde_json::json!([]);
+    fs::write(
+        &scenario_path,
+        serde_json::to_vec(&scenario).expect("encode production runner scenario"),
+    )
+    .expect("write production runner scenario");
+
+    let environment = ProcessTestEnvironment::load(&data_dir, &runtime_dir, &scenario_path)
+        .expect("load strict production runner environment");
+    let database_path = environment.paths().database_path.clone();
+    let dependencies = environment
+        .apply(StartupDependencies::production(None))
+        .expect("start loopback provider and install production factory");
+    let store = dependencies
+        .stores
+        .open(&database_path)
+        .await
+        .expect("open seeded process store");
+    store.migrate().await.expect("migrate seeded process store");
+    let repositories = store
+        .list_repositories()
+        .await
+        .expect("load production repository seed");
+
+    assert_eq!(repositories.len(), 1);
+    assert_eq!(repositories[0].git_root.as_path(), repository);
+    store.close().await;
+    drop(dependencies);
 }
 
 #[test]
@@ -486,7 +692,18 @@ async fn primary_uuid_and_instance_process_scope_are_created_once_after_lock_acq
         "the primary must prepare its fixed private sentinel directory before runner startup"
     );
 
-    let _ = primary.shutdown().await;
+    assert_eq!(primary.shutdown().await, ShutdownOutcome::Clean);
+    drop(primary);
+    drop(startup_scope);
+    drop(capture);
+    let fixture_root = fixture.path().to_path_buf();
+    fixture
+        .close()
+        .expect("remove process-liveness startup fixture after clean shutdown");
+    assert!(
+        !fixture_root.exists(),
+        "process-liveness startup fixture leaked after clean shutdown"
+    );
 }
 
 #[test]
@@ -559,6 +776,7 @@ fn write_scenario(path: &Path, signal_path: &Path, extra_field: &str) {
     let signal_path = serde_json::to_string(signal_path).expect("serialize signal path");
     let bytes = format!(
         r#"{{
+  "runner_mode": {{ "kind": "scripted_fake" }},
   "runtime_config": null,
   "fake_scenarios": ["success", "blocking"],
   "storage_samples": [{{ "kind": "native" }}],

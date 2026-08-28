@@ -20,6 +20,8 @@ mod merged;
 mod merged_proof_matrix;
 #[path = "delivery_merges/pending.rs"]
 mod pending;
+#[path = "delivery_merges/preflight_inputs.rs"]
+mod preflight_inputs;
 #[path = "delivery_merges/preflight_results.rs"]
 mod preflight_results;
 #[path = "delivery_merges/terminal.rs"]

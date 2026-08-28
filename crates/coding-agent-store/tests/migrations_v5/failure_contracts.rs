@@ -34,7 +34,7 @@ async fn failed_merge_cannot_bind_an_object_pending_source() {
         "UPDATE task_merge_operations
          SET delivery_source_task_id = ?, source_commit_oid = ?,
              state = 'failed', failure_code = 'TARGET_HEAD_CHANGED',
-             version = 4, updated_at = ?
+             version = 5, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind(support::delivery::TASK_ID)
@@ -73,7 +73,7 @@ async fn failure_codes_are_coupled_to_failed_reconciliation_and_success_states()
     .unwrap();
     let missing_merge_failure = sqlx::query(
         "UPDATE task_merge_operations
-         SET state = 'reconciliation_required', version = 2, updated_at = ?
+         SET state = 'reconciliation_required', version = 3, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind(support::delivery::TIMESTAMP)
@@ -241,7 +241,7 @@ async fn accepted_to_failed_rejects_a_cross_state_code_and_journals_a_legal_code
     let transition: (String, String, Option<String>) = sqlx::query_as(
         "SELECT from_state, to_state, failure_code
          FROM task_delivery_operation_transitions
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 4",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 5",
     )
     .bind(support::delivery::MERGE_OPERATION_ID)
     .fetch_one(fixture.store.pool())
@@ -429,7 +429,7 @@ async fn accepted_merge_and_pending_source_reconcile_only_as_one_transaction() {
     let merge_only = sqlx::query(
         "UPDATE task_merge_operations
          SET state = 'reconciliation_required', failure_code = 'DELIVERY_SOURCE_INCONSISTENT',
-             version = 4, updated_at = ? WHERE operation_id = ?",
+             version = 5, updated_at = ? WHERE operation_id = ?",
     )
     .bind(support::delivery::TIMESTAMP)
     .bind(support::delivery::MERGE_OPERATION_ID)
@@ -451,7 +451,7 @@ async fn accepted_merge_and_pending_source_reconcile_only_as_one_transaction() {
     sqlx::query(
         "UPDATE task_merge_operations
          SET state = 'reconciliation_required', failure_code = 'DELIVERY_SOURCE_INCONSISTENT',
-             version = 4, updated_at = ? WHERE operation_id = ?",
+             version = 5, updated_at = ? WHERE operation_id = ?",
     )
     .bind(support::delivery::TIMESTAMP)
     .bind(support::delivery::MERGE_OPERATION_ID)
@@ -513,7 +513,7 @@ async fn historical_failed_merge_does_not_block_a_new_paired_reconciliation() {
         "UPDATE task_merge_operations
          SET delivery_source_task_id = ?, source_commit_oid = ?,
              state = 'failed', failure_code = 'TARGET_HEAD_CHANGED',
-             version = 4, updated_at = ? WHERE operation_id = ?",
+             version = 5, updated_at = ? WHERE operation_id = ?",
     )
     .bind(support::delivery::TASK_ID)
     .bind(support::delivery::SOURCE_COMMIT_OID)
@@ -559,7 +559,7 @@ async fn historical_failed_merge_does_not_block_a_new_paired_reconciliation() {
     sqlx::query(
         "UPDATE task_merge_operations
          SET state = 'reconciliation_required', failure_code = 'DELIVERY_SOURCE_INCONSISTENT',
-             version = 4, updated_at = ? WHERE operation_id = ?",
+             version = 5, updated_at = ? WHERE operation_id = ?",
     )
     .bind(support::delivery::TIMESTAMP)
     .bind(support::delivery::SECOND_MERGE_OPERATION_ID)

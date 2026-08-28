@@ -20,7 +20,10 @@ pub(super) fn validate_anchor_compatibility(
     anchor: DeliverySourceAnchor,
 ) -> Result<(), StoreError> {
     let immutable_match = source.provenance == operation.provenance
-        && source.candidate_tree == operation.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| source.candidate_tree == inputs.candidate_tree)
         && source.expected_parent == operation.provenance.base_commit
         && operation.operation_id == anchor.accepted_operation_id
         && operation.provenance.identity.task_id() == anchor.task_id;
@@ -115,7 +118,10 @@ pub(super) async fn validate_current_source_reconciliation(
     let operation_id = DeliveryOperationId::from_str(&ids[0]).map_err(|_| source_invariant())?;
     let operation = load_merge_operation_exact(connection, operation_id).await?;
     let immutable_match = source.provenance == operation.provenance
-        && source.candidate_tree == operation.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| source.candidate_tree == inputs.candidate_tree)
         && source.expected_parent == operation.provenance.base_commit;
     let owner_is_unlinked =
         operation.delivery_source_task_id.is_none() && operation.source_commit.is_none();

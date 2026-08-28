@@ -43,11 +43,11 @@ async fn startup_ownership_and_recovery_return_a_pending_preflight() {
     assert!(batch.next_cursor.is_none());
     assert_eq!(batch.entries[0].identity.task_id(), task.id);
     assert!(matches!(
-        batch.entries[0].disposition,
+        &batch.entries[0].disposition,
         DeliveryRecoveryDisposition::Recover(DeliveryRecoveryAction::PreflightPending {
             operation_id: recovered,
             ..
-        }) if recovered == operation_id
+        }) if *recovered == operation_id
     ));
 }
 

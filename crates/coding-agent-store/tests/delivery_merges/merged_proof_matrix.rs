@@ -115,7 +115,7 @@ async fn complete_merge_changed_proof_replay_is_conflict_and_preserves_the_dispo
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("merged".to_owned(), 5, Some(task.id.to_string())));
+    assert_eq!(row, ("merged".to_owned(), 6, Some(task.id.to_string())));
     let dispositions: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM task_artifact_dispositions WHERE task_id = ?")
             .bind(task.id.to_string())
@@ -123,7 +123,7 @@ async fn complete_merge_changed_proof_replay_is_conflict_and_preserves_the_dispo
             .await
             .unwrap();
     assert_eq!(dispositions, 1);
-    assert_eq!(merge_journal_count(&store, operation_id).await, 5);
+    assert_eq!(merge_journal_count(&store, operation_id).await, 6);
 }
 
 #[test]
@@ -419,7 +419,7 @@ async fn assert_merge_pending_without_disposition(
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("merge_pending".to_owned(), 4, None));
+    assert_eq!(row, ("merge_pending".to_owned(), 5, None));
     let dispositions: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM task_artifact_dispositions WHERE task_id = ?")
             .bind(task_id.to_string())
@@ -427,7 +427,7 @@ async fn assert_merge_pending_without_disposition(
             .await
             .unwrap();
     assert_eq!(dispositions, 0);
-    assert_eq!(merge_journal_count(store, operation_id).await, 4);
+    assert_eq!(merge_journal_count(store, operation_id).await, 5);
 }
 
 async fn merge_journal_count(

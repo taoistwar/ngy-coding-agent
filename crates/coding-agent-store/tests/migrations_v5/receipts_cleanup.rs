@@ -247,8 +247,9 @@ async fn each_cleanup_kind_has_one_atomic_origin_receipt() {
     .await;
     assert!(competing.is_err());
 
-    let cleanup: (String, String, i64, String) = sqlx::query_as(
-        "SELECT c.kind, c.state, c.version, r.response_discriminator
+    let cleanup: (String, String, i64, String, String) = sqlx::query_as(
+        "SELECT c.kind, c.state, c.version, r.response_discriminator,
+                r.cleanup_merged_operation_id
          FROM task_cleanup_operations c
          JOIN task_delivery_command_receipts r
            ON r.cleanup_operation_id = c.operation_id
@@ -265,7 +266,8 @@ async fn each_cleanup_kind_has_one_atomic_origin_receipt() {
             "remove_worktree".to_owned(),
             "unlock_pending".to_owned(),
             1,
-            "worktree_cleanup_accepted".to_owned()
+            "worktree_cleanup_accepted".to_owned(),
+            support::delivery::MERGE_OPERATION_ID.to_owned()
         )
     );
     let second_count: i64 =
@@ -287,8 +289,9 @@ async fn each_cleanup_kind_has_one_atomic_origin_receipt() {
     support::delivery::cleanup::create_delete_cleanup(delete_fixture.store.pool())
         .await
         .unwrap();
-    let delete_receipt: (String, String, String) = sqlx::query_as(
-        "SELECT command_kind, accepted_operation_state, response_discriminator
+    let delete_receipt: (String, String, String, String) = sqlx::query_as(
+        "SELECT command_kind, accepted_operation_state, response_discriminator,
+                cleanup_merged_operation_id
          FROM task_delivery_command_receipts WHERE client_request_id = ?",
     )
     .bind(support::delivery::DELETE_CLEANUP_RECEIPT_ID)
@@ -300,9 +303,76 @@ async fn each_cleanup_kind_has_one_atomic_origin_receipt() {
         (
             "delete_branch".to_owned(),
             "delete_pending".to_owned(),
-            "branch_cleanup_accepted".to_owned()
+            "branch_cleanup_accepted".to_owned(),
+            support::delivery::MERGE_OPERATION_ID.to_owned()
         )
     );
+}
+
+#[tokio::test]
+async fn cleanup_receipt_merge_anchor_is_kind_exact_foreign_keyed_and_immutable() {
+    let fixture = support::file_store().await;
+    fixture.store.migrate().await.unwrap();
+    support::delivery::merge::seed_merged_delivery(fixture.store.pool())
+        .await
+        .unwrap();
+    support::delivery::cleanup::create_remove_cleanup(
+        fixture.store.pool(),
+        support::delivery::CLEANUP_OPERATION_ID,
+        support::delivery::CLEANUP_RECEIPT_ID,
+    )
+    .await
+    .unwrap();
+
+    let merge_receipt_anchor_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_delivery_command_receipts \
+         WHERE operation_kind = 'merge_operation' \
+           AND cleanup_merged_operation_id IS NOT NULL",
+    )
+    .fetch_one(fixture.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(merge_receipt_anchor_count, 0);
+
+    sqlx::query("DROP TRIGGER task_delivery_command_receipts_no_update")
+        .execute(fixture.store.pool())
+        .await
+        .unwrap();
+    let cleanup_without_anchor = sqlx::query(
+        "UPDATE task_delivery_command_receipts SET cleanup_merged_operation_id = NULL \
+         WHERE client_request_id = ?",
+    )
+    .bind(support::delivery::CLEANUP_RECEIPT_ID)
+    .execute(fixture.store.pool())
+    .await;
+    assert!(cleanup_without_anchor.is_err());
+
+    let cleanup_with_missing_merge = sqlx::query(
+        "UPDATE task_delivery_command_receipts SET cleanup_merged_operation_id = ? \
+         WHERE client_request_id = ?",
+    )
+    .bind("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    .bind(support::delivery::CLEANUP_RECEIPT_ID)
+    .execute(fixture.store.pool())
+    .await;
+    assert!(cleanup_with_missing_merge.is_err());
+
+    let merge_with_cleanup_anchor = sqlx::query(
+        "UPDATE task_delivery_command_receipts SET cleanup_merged_operation_id = ? \
+         WHERE client_request_id = ?",
+    )
+    .bind(support::delivery::MERGE_OPERATION_ID)
+    .bind(support::delivery::PREFLIGHT_RECEIPT_ID)
+    .execute(fixture.store.pool())
+    .await;
+    assert!(merge_with_cleanup_anchor.is_err());
+
+    let trigger = super::helpers::normalized_schema_sql(
+        fixture.store.pool(),
+        "task_delivery_command_receipts_match_operation_on_insert",
+    )
+    .await;
+    assert!(trigger.contains("d.merged_operation_id = NEW.cleanup_merged_operation_id"));
 }
 
 #[tokio::test]

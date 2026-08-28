@@ -23,7 +23,7 @@ pub async fn ready(
     let request = RecordMergePreflightResultRequest::try_new(
         task_id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         result,
     )
     .unwrap();
@@ -45,7 +45,7 @@ async fn zero_path_conflict_is_durable_and_replays_exactly() {
     let request = RecordMergePreflightResultRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         result,
     )
     .unwrap();
@@ -92,7 +92,7 @@ async fn backslash_and_drive_looking_git_path_bytes_round_trip_as_utf8() {
     let request = RecordMergePreflightResultRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         result,
     )
     .unwrap();
@@ -124,7 +124,7 @@ async fn clean_preflight_result_advances_pending_to_ready_with_exact_shape() {
     let request = RecordMergePreflightResultRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         result,
     )
     .unwrap();
@@ -134,7 +134,7 @@ async fn clean_preflight_result_advances_pending_to_ready_with_exact_shape() {
         other => panic!("expected applied preflight result, got {other:?}"),
     };
     assert_eq!(receipt.state, MergeOperationState::PreflightReady);
-    assert_eq!(receipt.version, DeliveryVersion::try_new(2).unwrap());
+    assert_eq!(receipt.version, DeliveryVersion::try_new(3).unwrap());
     assert_eq!(receipt.failure_code, None);
 
     let operation = store
@@ -274,7 +274,7 @@ async fn a_different_terminal_reason_is_a_zero_write_conflict() {
     let applied = RecordMergePreflightResultRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         MergePreflightResult::rejected(PreflightRejectedReason::TargetWorktreeDirty),
     )
     .unwrap();
@@ -282,7 +282,7 @@ async fn a_different_terminal_reason_is_a_zero_write_conflict() {
     let mismatched = RecordMergePreflightResultRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         MergePreflightResult::rejected(PreflightRejectedReason::TargetBranchDetached),
     )
     .unwrap();
@@ -302,7 +302,7 @@ async fn a_different_terminal_reason_is_a_zero_write_conflict() {
     .unwrap();
     assert_eq!(
         row,
-        ("rejected".to_owned(), 2, "TARGET_WORKTREE_DIRTY".to_owned())
+        ("rejected".to_owned(), 3, "TARGET_WORKTREE_DIRTY".to_owned())
     );
 }
 
@@ -358,7 +358,7 @@ async fn invalid_utf8_path_round_trips_as_canonical_base64url() {
     let request = RecordMergePreflightResultRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         MergePreflightResult::conflict(
             GitCommitOid::from_str(MERGE_BASE).unwrap(),
             GitTreeOid::from_str(MERGE_TREE).unwrap(),
@@ -393,7 +393,7 @@ async fn assert_terminal_preflight_result(
     let request = RecordMergePreflightResultRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         result,
     )
     .unwrap();

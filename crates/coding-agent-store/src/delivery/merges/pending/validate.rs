@@ -20,7 +20,10 @@ pub(super) fn accepted_input_matches(
         && source.state == DeliverySourceState::Committed
         && source.failure_code.is_none()
         && source.provenance == operation.provenance
-        && source.candidate_tree == operation.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| source.candidate_tree == inputs.candidate_tree)
         && object_proof_matches(operation, source, request)
 }
 
@@ -35,7 +38,10 @@ pub(super) fn pending_facts_match(
         && operation.source_commit.as_ref() == source.expected_source_commit.as_ref()
         && operation.expected_merge_commit.as_ref() == Some(&request.proof.expected_merge_commit)
         && source.provenance == operation.provenance
-        && source.candidate_tree == operation.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| source.candidate_tree == inputs.candidate_tree)
         && object_proof_matches(operation, source, request)
 }
 

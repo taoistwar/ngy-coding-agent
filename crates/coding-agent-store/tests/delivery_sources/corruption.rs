@@ -5,7 +5,7 @@ use coding_agent_store::{
     AcceptMergeCommandRequest, AdvanceDeliverySourceObjectRequest, CommitDeliverySourceRequest,
     CreatePreflightOutcome, CreatePreflightRequest, DeliveryOperationId,
     DeliverySourceReconciliationReason, DeliverySourceRetryReason, DeliverySourceState,
-    DeliverySourceTransitionOutcome, DirectoryIdentity, GitBranchRef, GitCommitOid, GitTreeOid,
+    DeliverySourceTransitionOutcome, DirectoryIdentity, GitBranchRef, GitCommitOid,
     PreflightCommandRequest, ReconcileDeliverySourceOutcome, ReconcileDeliverySourceRequest,
     RecordDeliverySourceRetryRequest, Sha256Digest, Store, StoreError,
 };
@@ -16,7 +16,7 @@ use super::fixtures::{
 };
 use crate::support::delivery::eligibility::{
     ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, DELIVERY_TIMESTAMP,
-    SOURCE_COMMIT, TARGET_HEAD,
+    SOURCE_COMMIT, TARGET_CONFIG_DIGEST, TARGET_HEAD, TARGET_SECURITY_DIGEST,
 };
 use crate::support::delivery::merge::{
     accept_merge_operation_with_request_hash, mark_preflight_ready,
@@ -70,7 +70,7 @@ async fn paired_source_reconciliation_revalidates_accept_receipt_hash_and_tuple(
         source_anchor(&current_owner),
         DeliverySourceState::Committed,
         coding_agent_store::DeliveryVersion::try_new(3).unwrap(),
-        coding_agent_store::DeliveryVersion::try_new(3).unwrap(),
+        coding_agent_store::DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -319,7 +319,7 @@ async fn committed_replay_rejects_a_progressed_owner_linked_to_the_wrong_source_
     ));
     sqlx::query(
         "UPDATE task_merge_operations SET delivery_source_task_id = ?, source_commit_oid = ?, \
-             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 4, updated_at = ? \
+             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 5, updated_at = ? \
          WHERE operation_id = ?",
     )
     .bind(command.task_id().to_string())
@@ -392,8 +392,8 @@ async fn accept_receipt_with_a_missing_operation_is_a_source_invariant() {
 async fn fail_original_owner(store: &Store, command: &AcceptMergeCommandRequest) {
     let updated = sqlx::query(
         "UPDATE task_merge_operations SET delivery_source_task_id = ?, source_commit_oid = ?, \
-             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 4, updated_at = ? \
-         WHERE operation_id = ? AND state = 'accepted' AND version = 3",
+             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 5, updated_at = ? \
+         WHERE operation_id = ? AND state = 'accepted' AND version = 4",
     )
     .bind(command.task_id().to_string())
     .bind(SOURCE_COMMIT)
@@ -418,17 +418,25 @@ async fn create_unaccepted_preflight_ready(
     .unwrap();
     let preflight = CreatePreflightRequest::try_new(
         preflight_command,
-        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
-        GitCommitOid::from_str(SOURCE_COMMIT).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", COMMON_IDENTITY).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY).unwrap(),
         Sha256Digest::from_str(CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_SECURITY_DIGEST).unwrap(),
     )
     .unwrap();
     let operation_id = match store.create_merge_preflight(preflight).await.unwrap() {
         CreatePreflightOutcome::Created(receipt) => receipt.operation_id,
         other => panic!("expected second preflight, got {other:?}"),
     };
+    crate::support::delivery::merge::bind_preflight_inputs(
+        store,
+        first.task_id(),
+        operation_id,
+        CANDIDATE_TREE,
+        SOURCE_COMMIT,
+    )
+    .await;
     mark_preflight_ready(store.pool(), &operation_id.to_string())
         .await
         .unwrap();
@@ -451,7 +459,7 @@ async fn accept_preflight_ready(
         ClientRequestId::new(),
         first.task_id(),
         operation_id,
-        coding_agent_store::DeliveryVersion::try_new(2).unwrap(),
+        coding_agent_store::DeliveryVersion::try_new(3).unwrap(),
         evidence.workspace_generation(),
         evidence.workspace_fingerprint().clone(),
         GitBranchRef::from_str(TARGET_BRANCH).unwrap(),
@@ -509,8 +517,8 @@ async fn poison_reconciliation_pair(
     let merge = sqlx::query(
         "UPDATE task_merge_operations \
          SET state = 'reconciliation_required', failure_code = 'DELIVERY_SOURCE_INCONSISTENT', \
-             version = 3, updated_at = ? \
-         WHERE operation_id = ? AND state = 'preflight_ready' AND version = 2",
+             version = 4, updated_at = ? \
+         WHERE operation_id = ? AND state = 'preflight_ready' AND version = 3",
     )
     .bind(DELIVERY_TIMESTAMP)
     .bind(operation_id.to_string())

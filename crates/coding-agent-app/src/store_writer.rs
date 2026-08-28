@@ -33,6 +33,13 @@ use crate::pending_durable::{
 
 mod command;
 
+pub use command::delivery::{
+    DeliveryCleanupWriteCommand, DeliveryCleanupWriteOutcome, DeliveryCompletion,
+    DeliveryDisposition, DeliveryMergeWriteCommand, DeliveryMergeWriteOutcome,
+    DeliverySourceWriteCommand, DeliverySourceWriteOutcome, DeliverySubmission,
+    DeliverySubmissionIdentity, DeliveryWriteCommand, DeliveryWriteOutcome,
+};
+
 pub(crate) use command::execution::sqlite_code_is_retryable;
 #[cfg(test)]
 use command::execution::{StoreFailureClassification, classify_store_failure};
@@ -605,6 +612,7 @@ fn task_mutation_identities(identity: &DurableOperationIdentity) -> Vec<TaskMuta
 
 #[derive(Debug, Clone)]
 enum StoreWriterOperation {
+    Delivery(Box<DeliveryWriteCommand>),
     RegisterRepository(NewRepository),
     CreateTask(NewTask),
     RetryTask(TaskId),
@@ -647,6 +655,7 @@ enum StoreWriterOperation {
 
 #[derive(Debug)]
 enum StoreWriterOperationOutcome {
+    Delivery(Box<DeliveryWriteOutcome>),
     RegisterRepository(RegisterRepositoryOutcome),
     CreateTask(CreateTaskOutcome),
     RetryTask(RetryTaskOutcome),
@@ -671,6 +680,7 @@ enum StoreWriterOperationOutcome {
 impl StoreWriterOperation {
     fn test_kind(&self) -> StoreWriterOperationKind {
         match self {
+            Self::Delivery(command) => command.test_kind(),
             Self::RegisterRepository(_) => StoreWriterOperationKind::RegisterRepository,
             Self::CreateTask(_) => StoreWriterOperationKind::CreateTask,
             Self::RetryTask(_) => StoreWriterOperationKind::RetryTask,
@@ -715,6 +725,7 @@ impl StoreWriterOperation {
 impl StoreWriterOperationOutcome {
     fn committed_durable_state(&self) -> bool {
         match self {
+            Self::Delivery(outcome) => outcome.committed_durable_state(),
             Self::PersistStopIntentBatch(receipt) => receipt
                 .items
                 .iter()
@@ -725,6 +736,7 @@ impl StoreWriterOperationOutcome {
 
     fn has_durable_event(&self) -> bool {
         match self {
+            Self::Delivery(_) => false,
             Self::RegisterRepository(_) => false,
             Self::ReserveAttemptArtifact(_) | Self::UpdateAttemptArtifact(_) => false,
             Self::PersistStopIntentBatch(_) => false,
@@ -797,6 +809,34 @@ pub enum StoreWriterFaultPoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreWriterOperationKind {
+    AcceptWorktreeCleanup,
+    RecordWorktreeUnlocked,
+    EnterWorktreeRemovePending,
+    CompleteWorktreeCleanup,
+    RecordWorktreeCleanupFailure,
+    ReconcileWorktreeCleanup,
+    AcceptBranchCleanup,
+    RefreshBranchCleanupTarget,
+    CompleteBranchCleanup,
+    RecordBranchCleanupFailure,
+    ReconcileBranchCleanup,
+    CreateMergePreflight,
+    BindMergePreflightInputs,
+    FailUnboundMergePreflight,
+    MarkMergePreflightStale,
+    RecordMergePreflightResult,
+    AcceptMerge,
+    EnterMergePending,
+    CompleteMerge,
+    BeginMergeAbort,
+    CompleteMergeAbort,
+    RecordMergeKnownFailure,
+    ReconcileMerge,
+    CreateDeliverySource,
+    AdvanceDeliverySourceObject,
+    CommitDeliverySource,
+    RecordDeliverySourceRetry,
+    ReconcileDeliverySource,
     RegisterRepository,
     CreateTask,
     RetryTask,
@@ -1118,6 +1158,11 @@ impl StoreWriterBackend for Store {
     fn execute(&self, operation: StoreWriterOperation) -> StoreWriterBackendFuture<'_> {
         Box::pin(async move {
             let result = match operation {
+                StoreWriterOperation::Delivery(delivery_command) => {
+                    command::delivery::execute_store(self, *delivery_command)
+                        .await
+                        .map(|outcome| StoreWriterOperationOutcome::Delivery(Box::new(outcome)))
+                }
                 StoreWriterOperation::RegisterRepository(input) => self
                     .register_repository(input)
                     .await
@@ -1302,6 +1347,58 @@ impl StoreWriterHandle {
             urgent_sender,
             reconciliation_sender,
             ingress_sequences: Arc::new(Mutex::new(IngressSequenceLedger::default())),
+        }
+    }
+
+    pub fn submit_delivery(
+        &self,
+        command: DeliveryWriteCommand,
+        deadline: Instant,
+    ) -> DeliverySubmission {
+        self.submit_delivery_on(command, deadline, false)
+    }
+
+    /// Reconciles an unknown delivery write by submitting the same typed request
+    /// to the Store's receipt/journal query-first transaction on the dedicated lane.
+    pub fn reconcile_delivery(
+        &self,
+        command: DeliveryWriteCommand,
+        deadline: Instant,
+    ) -> DeliverySubmission {
+        self.submit_delivery_on(command, deadline, true)
+    }
+
+    fn submit_delivery_on(
+        &self,
+        command: DeliveryWriteCommand,
+        deadline: Instant,
+        reconciliation_lane: bool,
+    ) -> DeliverySubmission {
+        let identity = DeliverySubmissionIdentity::for_command(&command);
+        let (response, receiver) = oneshot::channel();
+        match self.reserve_normal(&[], reconciliation_lane) {
+            Ok(permit) => {
+                permit.send(WriteCommand::Delivery {
+                    identity: identity.clone(),
+                    command: command.clone(),
+                    deadline,
+                    reconciliation_lane,
+                    response,
+                });
+            }
+            Err(error) => send_delivery_ingress_rejection(
+                response,
+                identity.clone(),
+                command.clone(),
+                error,
+                reconciliation_lane,
+            ),
+        }
+        DeliverySubmission {
+            identity,
+            pending_command: command,
+            completion_channel_closed_reason: completion_channel_closed_reason(reconciliation_lane),
+            receiver,
         }
     }
 
@@ -2262,6 +2359,44 @@ fn completion_channel_closed_reason(reconciliation_lane: bool) -> OutcomeUnknown
     } else {
         OutcomeUnknownReason::CompletionChannelClosed
     }
+}
+
+fn send_delivery_ingress_rejection(
+    response: oneshot::Sender<DeliveryCompletion>,
+    identity: DeliverySubmissionIdentity,
+    command: DeliveryWriteCommand,
+    error: StoreWriterSubmitError,
+    reconciliation_lane: bool,
+) {
+    let disposition = if reconciliation_lane {
+        DeliveryDisposition::OutcomeUnknown {
+            reason: OutcomeUnknownReason::ReconciliationFailed,
+            command,
+        }
+    } else {
+        match error {
+            StoreWriterSubmitError::Full => DeliveryDisposition::KnownNotApplied {
+                reason: KnownNotAppliedReason::IngressFull,
+                outcome: None,
+                error: None,
+            },
+            StoreWriterSubmitError::Closed => DeliveryDisposition::KnownNotApplied {
+                reason: KnownNotAppliedReason::IngressClosed,
+                outcome: None,
+                error: None,
+            },
+            StoreWriterSubmitError::InvalidIdentity
+            | StoreWriterSubmitError::SequenceGap
+            | StoreWriterSubmitError::SequenceReversed => DeliveryDisposition::InvariantConflict {
+                message: "delivery ingress rejected an identity-free typed request",
+                outcome: None,
+            },
+        }
+    };
+    let _ = response.send(DeliveryCompletion {
+        identity,
+        disposition,
+    });
 }
 
 fn send_ingress_rejection<T>(

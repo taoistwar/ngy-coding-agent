@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::delivery::{DeliveryError, DirectoryIdentity, GitBranchRef, GitCommitOid, Sha256Digest};
 
+use super::super::model::MergeConflictPaths;
 use super::{MergeAutostashObservation, OtherGitOperationObservation};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub struct MergeAbortProof {
     pub(in crate::delivery::merges) config_attributes_digest: Sha256Digest,
     pub(in crate::delivery::merges) index_stages_digest: Sha256Digest,
     pub(in crate::delivery::merges) worktree_digest: Sha256Digest,
+    pub(in crate::delivery::merges) conflict_paths: MergeConflictPaths,
 }
 
 impl MergeAbortProof {
@@ -39,6 +41,7 @@ impl MergeAbortProof {
         worktree_digest: Sha256Digest,
         merge_autostash: MergeAutostashObservation,
         other_git_operation: OtherGitOperationObservation,
+        conflict_paths: MergeConflictPaths,
     ) -> Result<Self, DeliveryError> {
         if child_receipt_id.is_nil()
             || target_head.algorithm() != merge_head.algorithm()
@@ -46,6 +49,7 @@ impl MergeAbortProof {
             || fixed_lock_reason != "codex-reserved"
             || merge_autostash != MergeAutostashObservation::Absent
             || other_git_operation != OtherGitOperationObservation::Clear
+            || conflict_paths.is_empty()
         {
             return Err(DeliveryError::InvalidCommandRequest);
         }
@@ -62,6 +66,7 @@ impl MergeAbortProof {
             config_attributes_digest,
             index_stages_digest,
             worktree_digest,
+            conflict_paths,
         })
     }
 }

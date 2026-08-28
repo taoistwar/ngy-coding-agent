@@ -25,7 +25,10 @@ pub(super) async fn validate_merge_cross_rows(
     let source = load_source(&mut *connection, task_id).await?;
     if let Some(source) = source.as_ref()
         && (source.provenance != operation.provenance
-            || source.candidate_tree != operation.candidate_tree)
+            || operation
+                .preflight_inputs
+                .as_ref()
+                .is_some_and(|inputs| source.candidate_tree != inputs.candidate_tree))
     {
         return Err(ownership_invariant());
     }
@@ -162,7 +165,10 @@ async fn validate_current_source_reconciliation(
         DeliveryOperationId::from_str(operation_id).map_err(|_| ownership_invariant())?;
     let operation = load_merge_operation_local(&mut *connection, operation_id).await?;
     let exact_owner = source.provenance == operation.provenance
-        && source.candidate_tree == operation.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| source.candidate_tree == inputs.candidate_tree)
         && operation.delivery_source_task_id.is_none()
         && operation.source_commit.is_none();
     if exact_owner && reconciliation_accept_origin_is_exact(&mut *connection, &operation).await? {

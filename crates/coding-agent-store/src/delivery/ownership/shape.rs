@@ -83,9 +83,10 @@ fn merge_object_ids_are_non_degenerate(operation: &MergeOperationRecord) -> bool
 
 fn merge_oid_algorithms_match(operation: &MergeOperationRecord) -> bool {
     let algorithm = operation.provenance.base_commit.algorithm();
-    operation.candidate_tree.algorithm() == algorithm
-        && operation.preflight_source_commit.algorithm() == algorithm
-        && operation.expected_target_head.algorithm() == algorithm
+    operation.preflight_inputs.as_ref().is_none_or(|inputs| {
+        inputs.candidate_tree.algorithm() == algorithm
+            && inputs.preflight_source_commit.algorithm() == algorithm
+    }) && operation.expected_target_head.algorithm() == algorithm
         && optional_oid_algorithm(operation.source_commit.as_ref(), algorithm)
         && optional_oid_algorithm(operation.merge_base.as_ref(), algorithm)
         && operation
@@ -108,8 +109,10 @@ fn merge_identity_fields_are_coupled(operation: &MergeOperationRecord) -> bool {
     let receipts_are_distinct = operation
         .accept_receipt_id
         .is_none_or(|receipt| receipt != operation.preflight_receipt_id);
-    let preflight_source_is_distinct =
-        operation.preflight_source_commit != operation.provenance.base_commit;
+    let preflight_source_is_distinct = operation
+        .preflight_inputs
+        .as_ref()
+        .is_none_or(|inputs| inputs.preflight_source_commit != operation.provenance.base_commit);
     source_link_is_valid
         && receipts_are_distinct
         && preflight_source_is_distinct
@@ -162,6 +165,17 @@ fn merge_state_fields_are_coupled(operation: &MergeOperationRecord) -> bool {
     } else {
         operation.merged_disposition_task_id.is_none()
     };
+    let preflight_inputs_shape_is_valid = match (
+        operation.state,
+        operation.preflight_inputs.as_ref(),
+        operation.version.get(),
+    ) {
+        (PreflightPending, None, 1) | (PreflightPending, Some(_), 2) => true,
+        (PreflightPending, _, _) => false,
+        (Rejected | Stale | ReconciliationRequired, None, 2) => true,
+        (_, Some(_), _) => true,
+        (_, None, _) => false,
+    };
 
     (!early_without_accept
         || (operation.accept_receipt_id.is_none()
@@ -186,6 +200,7 @@ fn merge_state_fields_are_coupled(operation: &MergeOperationRecord) -> bool {
             || (operation.delivery_source_task_id.is_some() && operation.source_commit.is_some()))
         && (!expected_merge_required || operation.expected_merge_commit.is_some())
         && failure_shape_is_valid
+        && preflight_inputs_shape_is_valid
         && disposition_shape_is_valid
 }
 
@@ -203,15 +218,23 @@ fn merge_abort_fields_are_coupled(operation: &MergeOperationRecord) -> bool {
     let abort_pending_is_valid = operation.state != MergeOperationState::AbortPending
         || (operation.abort_child_receipt_id.is_some()
             && operation.abort_merge_head.as_ref() == operation.source_commit.as_ref());
-    group_is_valid && abort_pending_is_valid
+    let durable_conflict_is_valid = operation.abort_child_receipt_id.is_none()
+        || operation.conflict_path_count.is_some_and(|count| count > 0);
+    group_is_valid && abort_pending_is_valid && durable_conflict_is_valid
 }
 
 fn merge_conflicts_are_coupled(operation: &MergeOperationRecord) -> bool {
     match (operation.state, operation.conflict_path_count) {
-        (MergeOperationState::Conflict, Some(count)) => {
-            operation.conflicts.len() == usize::from(count)
+        (MergeOperationState::AbortPending | MergeOperationState::Conflict, Some(count)) => {
+            (operation.state != MergeOperationState::AbortPending || count > 0)
+                && operation.conflicts.len() == usize::from(count)
         }
-        (MergeOperationState::Conflict, None) => false,
+        (MergeOperationState::AbortPending | MergeOperationState::Conflict, None) => false,
+        (MergeOperationState::ReconciliationRequired, Some(count)) => {
+            operation.abort_child_receipt_id.is_some()
+                && count > 0
+                && operation.conflicts.len() == usize::from(count)
+        }
         (_, None) => operation.conflicts.is_empty(),
         (_, Some(_)) => false,
     }

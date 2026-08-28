@@ -44,9 +44,10 @@ impl RuntimeShutdown {
             .checked_sub(SHUTDOWN_FINALIZE_RESERVE)
             .unwrap_or(total_deadline);
         self.mutation_gate.begin_quiescing();
+        let delivery_join = self.delivery.begin();
         let budget_enforcer = self.spawn_runtime_budget_enforcer(total_deadline);
         let prerequisites = self
-            .await_shutdown_prerequisites(mutation_drain_deadline, total_deadline)
+            .await_shutdown_prerequisites(delivery_join, mutation_drain_deadline, total_deadline)
             .await;
         self.complete_after_process_cleanup(prerequisites, budget_enforcer, false, total_deadline)
             .await
@@ -61,8 +62,9 @@ impl RuntimeShutdown {
         let mutation_drain_deadline = total_deadline
             .checked_sub(SHUTDOWN_FINALIZE_RESERVE)
             .unwrap_or(total_deadline);
+        let delivery_join = self.delivery.begin();
         let prerequisites = self
-            .await_shutdown_prerequisites(mutation_drain_deadline, total_deadline)
+            .await_shutdown_prerequisites(delivery_join, mutation_drain_deadline, total_deadline)
             .await;
         if Instant::now() >= total_deadline && !prerequisites.process_cleanup_outlived_deadline {
             return self.complete_fail_closed_after_panic(prerequisites.proof);
@@ -80,6 +82,9 @@ impl RuntimeShutdown {
         }));
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.task_manager.freeze_and_cancel();
+        }));
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.delivery.close_intake();
         }));
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.cleanup.stop_http_now();
@@ -105,7 +110,9 @@ impl RuntimeShutdown {
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 mutation_gate.force_cancel_in_flight();
             }));
-            tokio::time::sleep_until(deadline).await;
+            if Instant::now() < deadline {
+                tokio::time::sleep_until(deadline).await;
+            }
             let _ = AssertUnwindSafe(cleanup.stop_http(Instant::now()))
                 .catch_unwind()
                 .await;
@@ -118,18 +125,22 @@ impl RuntimeShutdown {
 
     async fn await_shutdown_prerequisites(
         &self,
+        delivery_join: super::delivery::DeliveryShutdownJoin,
         mutation_deadline: Instant,
         total_deadline: Instant,
     ) -> ShutdownPrerequisites {
         let mutation_drain = self.mutation_gate.drain_until(mutation_deadline).await;
-        let (task_processes, task_cleanup_outlived_deadline) = self
+        let delivery_cleanup = delivery_join.wait();
+        let task_cleanup = self
             .task_manager
-            .freeze_and_wait_for_process_cleanup_until(total_deadline)
-            .await;
+            .freeze_and_wait_for_process_cleanup_until(total_deadline);
+        let (delivery, (task_processes, task_cleanup_outlived_deadline)) =
+            tokio::join!(delivery_cleanup, task_cleanup);
         let (instance_processes, instance_cleanup_outlived_deadline) =
             self.wait_for_instance_process_cleanup(total_deadline).await;
         ShutdownPrerequisites {
             proof: ShutdownRuntimeCleanupProof {
+                _delivery: delivery,
                 task_processes,
                 _instance_processes: instance_processes,
             },

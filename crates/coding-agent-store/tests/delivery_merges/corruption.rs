@@ -25,7 +25,7 @@ fn ready_request(
     RecordMergePreflightResultRequest::try_new(
         task_id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         MergePreflightResult::ready(
             GitCommitOid::from_str(MERGE_BASE).unwrap(),
             GitTreeOid::from_str(MERGE_TREE).unwrap(),
@@ -43,7 +43,7 @@ fn conflict_request(
     RecordMergePreflightResultRequest::try_new(
         task_id,
         operation_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         MergePreflightResult::conflict(
             GitCommitOid::from_str(MERGE_BASE).unwrap(),
             GitTreeOid::from_str(MERGE_TREE).unwrap(),
@@ -116,7 +116,7 @@ async fn preflight_result_rejects_a_missing_origin_receipt_without_transitioning
             .fetch_one(store.pool())
             .await
             .unwrap();
-    assert_eq!(state, ("preflight_pending".to_owned(), 1));
+    assert_eq!(state, ("preflight_pending".to_owned(), 2));
 }
 
 #[tokio::test]
@@ -255,7 +255,7 @@ async fn stale_entrypoint_rejects_orphaned_history_when_current_row_is_missing()
     let request = MarkPreflightStaleRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::try_new(2).unwrap(),
+        DeliveryVersion::try_new(3).unwrap(),
         PreflightStaleReason::TargetHeadChanged,
     )
     .unwrap();
@@ -310,18 +310,18 @@ async fn mutation_rejects_merge_provenance_drift_from_its_review_and_artifact_pa
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("preflight_pending".to_owned(), 1, 1));
+    assert_eq!(row, ("preflight_pending".to_owned(), 2, 2));
 }
 
 #[tokio::test]
-async fn accepted_history_rejects_a_forbidden_mismatched_abort_group() {
-    let (store, task, operation_id, accepted_version) = accepted_with_committed_source().await;
+async fn schema_rejects_a_forbidden_abort_group_on_an_accepted_operation() {
+    let (store, _task, operation_id, _accepted_version) = accepted_with_committed_source().await;
     drop_merge_update_guards(&store).await;
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE task_merge_operations \
          SET abort_child_receipt_id = ?, abort_merge_head_oid = ?, \
-             abort_index_stages_digest = ?, abort_worktree_digest = ?, \
-             abort_merge_autostash_proof = 'absent' \
+              abort_index_stages_digest = ?, abort_worktree_digest = ?, \
+              abort_merge_autostash_proof = 'absent', conflict_path_count = 1 \
          WHERE operation_id = ?",
     )
     .bind(Uuid::new_v4().to_string())
@@ -330,21 +330,8 @@ async fn accepted_history_rejects_a_forbidden_mismatched_abort_group() {
     .bind("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2")
     .bind(operation_id.to_string())
     .execute(store.pool())
-    .await
-    .unwrap();
-    let request = RecordMergeKnownFailureRequest::try_new(
-        task.id,
-        operation_id,
-        MergeOperationState::Accepted,
-        accepted_version,
-        MergeKnownNotAppliedReason::TargetHeadChanged,
-    )
-    .unwrap();
-
-    assert!(matches!(
-        store.record_merge_known_failure(request).await,
-        Err(StoreError::InvariantViolation(_))
-    ));
+    .await;
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -483,7 +470,7 @@ async fn all_row_graph_rejects_active_and_reconciliation_slots_together() {
         task.id,
         second_operation,
         MergeOperationState::Accepted,
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         MergeKnownNotAppliedReason::TargetHeadChanged,
     )
     .unwrap();
@@ -498,12 +485,12 @@ async fn all_row_graph_rejects_active_and_reconciliation_slots_together() {
         DeliverySourceAnchor::try_new(
             task.id,
             second_operation,
-            DeliveryVersion::try_new(3).unwrap(),
+            DeliveryVersion::try_new(4).unwrap(),
         )
         .unwrap(),
         DeliverySourceState::Committed,
         source.version,
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -524,7 +511,7 @@ async fn all_row_graph_rejects_active_and_reconciliation_slots_together() {
     sqlx::query(
         "UPDATE task_delivery_operation_transitions \
          SET to_state = 'reconciliation_required', failure_code = 'WORKTREE_IDENTITY_MISMATCH' \
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 5",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 6",
     )
     .bind(first_operation.to_string())
     .execute(store.pool())
@@ -612,7 +599,7 @@ async fn all_row_graph_rejects_active_or_reconciliation_alongside_merged() {
     sqlx::query(
         "UPDATE task_delivery_operation_transitions \
          SET to_state = 'merged', failure_code = NULL \
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 5",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 6",
     )
     .bind(first_operation.to_string())
     .execute(&mut *transaction)
@@ -655,7 +642,7 @@ async fn all_row_graph_rejects_active_or_reconciliation_alongside_merged() {
     sqlx::query(
         "UPDATE task_merge_operations \
          SET state = 'reconciliation_required', failure_code = 'WORKTREE_IDENTITY_MISMATCH', \
-             version = 4, updated_at = ? WHERE operation_id = ?",
+             version = 5, updated_at = ? WHERE operation_id = ?",
     )
     .bind(&accepted_at)
     .bind(second_operation.to_string())
@@ -665,10 +652,17 @@ async fn all_row_graph_rejects_active_or_reconciliation_alongside_merged() {
     sqlx::query(
         "INSERT INTO task_delivery_operation_transitions ( \
              entity_kind, entity_id, entity_version, from_state, to_state, \
-             failure_code, transitioned_at \
-         ) VALUES ('merge_operation', ?, 4, 'accepted', 'reconciliation_required', \
-                   'WORKTREE_IDENTITY_MISMATCH', ?)",
+             failure_code, target_config_attributes_digest, target_security_digest, \
+             transitioned_at \
+         ) VALUES ('merge_operation', ?, 5, 'accepted', 'reconciliation_required', \
+                   'WORKTREE_IDENTITY_MISMATCH', \
+                   (SELECT target_config_attributes_digest FROM task_merge_operations \
+                    WHERE operation_id = ?), \
+                   (SELECT target_security_digest FROM task_merge_operations \
+                    WHERE operation_id = ?), ?)",
     )
+    .bind(second_operation.to_string())
+    .bind(second_operation.to_string())
     .bind(second_operation.to_string())
     .bind(&accepted_at)
     .execute(store.pool())
@@ -723,7 +717,7 @@ async fn pending_request(
     EnterMergePendingRequest::try_new(
         task.id,
         operation_id,
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         MergeCommitObjectProof::try_new(
             GitCommitOid::from_str(MERGE_COMMIT).unwrap(),
             GitTreeOid::from_str(MERGE_TREE).unwrap(),

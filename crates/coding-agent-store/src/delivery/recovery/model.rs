@@ -3,7 +3,7 @@ use std::fmt;
 use super::audit::AuditedDeliveryOwnership;
 use crate::delivery::{
     DeliveryIdentity, DeliveryOperationId, DeliveryOwnershipSnapshot, DeliveryVersion,
-    DirectoryIdentity,
+    DirectoryIdentity, PreparedMergePreflightInputs, Sha256Digest,
 };
 
 pub const MAX_DELIVERY_RECOVERY_BATCH: usize = 64;
@@ -79,24 +79,33 @@ pub enum AcceptedDeliverySourceState {
     Committed { version: DeliveryVersion },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DeliveryRecoveryAction {
     PreflightPending {
         operation_id: DeliveryOperationId,
         version: DeliveryVersion,
+        inputs: Option<PreparedMergePreflightInputs>,
+        target_config_attributes_digest: Sha256Digest,
+        target_security_digest: Sha256Digest,
     },
     Accepted {
         operation_id: DeliveryOperationId,
         version: DeliveryVersion,
         source: AcceptedDeliverySourceState,
+        target_config_attributes_digest: Sha256Digest,
+        target_security_digest: Sha256Digest,
     },
     MergePending {
         operation_id: DeliveryOperationId,
         version: DeliveryVersion,
+        target_config_attributes_digest: Sha256Digest,
+        target_security_digest: Sha256Digest,
     },
     AbortPending {
         operation_id: DeliveryOperationId,
         version: DeliveryVersion,
+        target_config_attributes_digest: Sha256Digest,
+        target_security_digest: Sha256Digest,
     },
     UnlockPending {
         operation_id: DeliveryOperationId,
@@ -116,7 +125,90 @@ pub enum DeliveryRecoveryAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl fmt::Debug for DeliveryRecoveryAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PreflightPending {
+                operation_id,
+                version,
+                inputs,
+                ..
+            } => formatter
+                .debug_struct("PreflightPending")
+                .field("operation_id", operation_id)
+                .field("version", version)
+                .field("inputs", inputs)
+                .field("target_provenance", &"<redacted>")
+                .finish(),
+            Self::Accepted {
+                operation_id,
+                version,
+                source,
+                ..
+            } => formatter
+                .debug_struct("Accepted")
+                .field("operation_id", operation_id)
+                .field("version", version)
+                .field("source", source)
+                .field("target_provenance", &"<redacted>")
+                .finish(),
+            Self::MergePending {
+                operation_id,
+                version,
+                ..
+            } => formatter
+                .debug_struct("MergePending")
+                .field("operation_id", operation_id)
+                .field("version", version)
+                .field("target_provenance", &"<redacted>")
+                .finish(),
+            Self::AbortPending {
+                operation_id,
+                version,
+                ..
+            } => formatter
+                .debug_struct("AbortPending")
+                .field("operation_id", operation_id)
+                .field("version", version)
+                .field("target_provenance", &"<redacted>")
+                .finish(),
+            Self::UnlockPending {
+                operation_id,
+                version,
+            } => formatter
+                .debug_struct("UnlockPending")
+                .field("operation_id", operation_id)
+                .field("version", version)
+                .finish(),
+            Self::UnlockedPendingRemove {
+                operation_id,
+                version,
+            } => formatter
+                .debug_struct("UnlockedPendingRemove")
+                .field("operation_id", operation_id)
+                .field("version", version)
+                .finish(),
+            Self::RemovePending {
+                operation_id,
+                version,
+            } => formatter
+                .debug_struct("RemovePending")
+                .field("operation_id", operation_id)
+                .field("version", version)
+                .finish(),
+            Self::DeletePending {
+                operation_id,
+                version,
+            } => formatter
+                .debug_struct("DeletePending")
+                .field("operation_id", operation_id)
+                .field("version", version)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryRecoveryDisposition {
     Recover(DeliveryRecoveryAction),
     ReconciliationRequired,

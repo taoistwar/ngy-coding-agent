@@ -2,9 +2,10 @@ use std::str::FromStr;
 
 use coding_agent_domain::ClientRequestId;
 use coding_agent_store::{
-    CreatePreflightOutcome, DeliveryAcceptedOperationState, DeliveryCommand, DeliveryCommandKind,
-    DeliveryCommandLookup, DeliveryError, DeliveryVersion, MarkPreflightStaleOutcome,
-    MarkPreflightStaleRequest, MergeOperationState, PreflightStaleReason, StoreError,
+    BindMergePreflightInputsRequest, CreatePreflightOutcome, DeliveryAcceptedOperationState,
+    DeliveryCommand, DeliveryCommandKind, DeliveryCommandLookup, DeliveryError, DeliveryVersion,
+    GitCommitOid, GitTreeOid, MarkPreflightStaleOutcome, MarkPreflightStaleRequest,
+    MergeOperationState, MergeTransitionOutcome, PreflightStaleReason, StoreError,
 };
 
 #[tokio::test]
@@ -47,7 +48,7 @@ async fn merge_receipt_replay_ignores_a_valid_cleanup_operation_with_the_same_uu
 use crate::receipt_fixtures::{eligible_fixture, preflight_request, receipt, row_counts};
 use crate::support;
 use crate::support::delivery::eligibility::{
-    ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, SOURCE_COMMIT, TARGET_HEAD,
+    CANDIDATE_TREE, PREFLIGHT_SOURCE, SOURCE_COMMIT, TARGET_CONFIG_DIGEST, TARGET_SECURITY_DIGEST,
     accept_merge, create_committed_source, create_merged_delivery,
     create_worktree_cleanup_with_operation_id, fail_accepted_merge, finish_merged_delivery,
     finish_preflight_terminal, insert_preflight, mark_preflight_ready, try_accept_merge_ready,
@@ -74,20 +75,20 @@ async fn first_preflight_and_receipt_are_atomic_and_exact_replay_uses_historical
     assert_eq!(row_counts(&store).await, (1, 1, 1));
 
     mark_preflight_ready(&store, created.operation_id).await;
-    assert_eq!(row_counts(&store).await, (1, 2, 1));
+    assert_eq!(row_counts(&store).await, (1, 3, 1));
     let replayed = match store.create_merge_preflight(request).await.unwrap() {
         CreatePreflightOutcome::Existing(receipt) => receipt,
         other => panic!("expected historical replay, got {other:?}"),
     };
     assert_eq!(replayed, created);
-    assert_eq!(row_counts(&store).await, (1, 2, 1));
+    assert_eq!(row_counts(&store).await, (1, 3, 1));
     let current: (String, i64) =
         sqlx::query_as("SELECT state, version FROM task_merge_operations WHERE operation_id = ?")
             .bind(created.operation_id.to_string())
             .fetch_one(store.pool())
             .await
             .unwrap();
-    assert_eq!(current, ("preflight_ready".to_owned(), 2));
+    assert_eq!(current, ("preflight_ready".to_owned(), 3));
 }
 
 #[tokio::test]
@@ -191,8 +192,6 @@ async fn concurrent_same_uuid_with_different_hash_creates_once_and_conflicts_onc
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap(),
         )
         .unwrap(),
-        "123456789abcdef0123456789abcdef012345678".parse().unwrap(),
-        "3456789abcdef0123456789abcdef0123456789a".parse().unwrap(),
         coding_agent_store::DirectoryIdentity::try_new(
             "directory_identity_v1",
             "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
@@ -206,6 +205,8 @@ async fn concurrent_same_uuid_with_different_hash_creates_once_and_conflicts_onc
         "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3"
             .parse()
             .unwrap(),
+        TARGET_CONFIG_DIGEST.parse().unwrap(),
+        TARGET_SECURITY_DIGEST.parse().unwrap(),
     )
     .unwrap();
     let first_store = store.clone();
@@ -270,12 +271,12 @@ async fn ready_supersede_and_future_accept_cas_have_exactly_one_version_winner()
             .unwrap();
     match (replacement, accepted) {
         (Ok(CreatePreflightOutcome::Created(_)), false) => {
-            assert_eq!(old, ("superseded".to_owned(), 3));
-            assert_eq!(row_counts(&store).await, (2, 4, 2));
+            assert_eq!(old, ("superseded".to_owned(), 4));
+            assert_eq!(row_counts(&store).await, (2, 5, 2));
         }
         (Err(StoreError::DeliveryOperationInProgress), true) => {
-            assert_eq!(old, ("accepted".to_owned(), 3));
-            assert_eq!(row_counts(&store).await, (1, 3, 2));
+            assert_eq!(old, ("accepted".to_owned(), 4));
+            assert_eq!(row_counts(&store).await, (1, 4, 2));
         }
         other => panic!("expected exactly one Ready-version CAS winner, got {other:?}"),
     }
@@ -295,8 +296,6 @@ async fn global_uuid_conflict_wins_before_task_or_current_state_classification()
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap(),
         )
         .unwrap(),
-        "123456789abcdef0123456789abcdef012345678".parse().unwrap(),
-        "3456789abcdef0123456789abcdef0123456789a".parse().unwrap(),
         coding_agent_store::DirectoryIdentity::try_new(
             "directory_identity_v1",
             "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
@@ -310,6 +309,8 @@ async fn global_uuid_conflict_wins_before_task_or_current_state_classification()
         "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3"
             .parse()
             .unwrap(),
+        TARGET_CONFIG_DIGEST.parse().unwrap(),
+        TARGET_SECURITY_DIGEST.parse().unwrap(),
     )
     .unwrap();
     assert!(matches!(
@@ -335,7 +336,7 @@ async fn global_uuid_conflict_wins_before_task_or_current_state_classification()
             .unwrap_err(),
         StoreError::IdempotencyConflict
     ));
-    assert_eq!(row_counts(&store).await, (1, 3, 2));
+    assert_eq!(row_counts(&store).await, (1, 4, 2));
 }
 
 #[tokio::test]
@@ -374,8 +375,8 @@ async fn a_new_uuid_cannot_replace_pending_but_ready_is_superseded_atomically() 
             .fetch_one(store.pool())
             .await
             .unwrap();
-    assert_eq!(rolled_back, ("preflight_ready".to_owned(), 2));
-    assert_eq!(row_counts(&store).await, (1, 2, 1));
+    assert_eq!(rolled_back, ("preflight_ready".to_owned(), 3));
+    assert_eq!(row_counts(&store).await, (1, 3, 1));
     sqlx::query("DROP TRIGGER reject_replacement_preflight")
         .execute(store.pool())
         .await
@@ -394,8 +395,8 @@ async fn a_new_uuid_cannot_replace_pending_but_ready_is_superseded_atomically() 
             .fetch_one(store.pool())
             .await
             .unwrap();
-    assert_eq!(old, ("superseded".to_owned(), 3));
-    assert_eq!(row_counts(&store).await, (2, 4, 2));
+    assert_eq!(old, ("superseded".to_owned(), 4));
+    assert_eq!(row_counts(&store).await, (2, 5, 2));
 }
 
 #[tokio::test]
@@ -419,14 +420,14 @@ async fn receipt_insert_failure_rolls_back_new_pending_and_ready_supersede() {
         .create_merge_preflight(preflight_request(&task, ClientRequestId::new()))
         .await;
     assert!(matches!(outcome, Err(StoreError::Database(_))));
-    assert_eq!(row_counts(&store).await, (1, 2, 1));
+    assert_eq!(row_counts(&store).await, (1, 3, 1));
     let old: (String, i64) =
         sqlx::query_as("SELECT state, version FROM task_merge_operations WHERE operation_id = ?")
             .bind(first.operation_id.to_string())
             .fetch_one(store.pool())
             .await
             .unwrap();
-    assert_eq!(old, ("preflight_ready".to_owned(), 2));
+    assert_eq!(old, ("preflight_ready".to_owned(), 3));
 }
 
 #[tokio::test]
@@ -503,7 +504,7 @@ async fn exact_replay_audits_hidden_mutually_exclusive_task_merge_slots() {
         "UPDATE task_delivery_operation_transitions \
          SET to_state = 'reconciliation_required', \
              failure_code = 'DELIVERY_RECONCILIATION_REQUIRED' \
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 2",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 3",
     )
     .bind(first.operation_id.to_string())
     .execute(&mut *connection)
@@ -543,14 +544,14 @@ async fn exact_replay_rejects_a_historical_tuple_with_an_action_invalid_accepted
     sqlx::query(
         "UPDATE task_delivery_operation_transitions \
          SET from_state = 'absent', to_state = 'preflight_pending' \
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 2",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 3",
     )
     .bind(created.operation_id.to_string())
     .execute(&mut *connection)
     .await
     .unwrap();
     sqlx::query(
-        "UPDATE task_delivery_command_receipts SET accepted_operation_version = 2 \
+        "UPDATE task_delivery_command_receipts SET accepted_operation_version = 3 \
          WHERE client_request_id = ?",
     )
     .bind(created.client_request_id.to_string())
@@ -602,7 +603,7 @@ async fn stale_is_ready_only_exact_version_cas_and_releases_the_open_slot() {
             MarkPreflightStaleRequest::try_new(
                 task.id,
                 created.operation_id,
-                DeliveryVersion::try_new(2).unwrap(),
+                DeliveryVersion::try_new(3).unwrap(),
                 PreflightStaleReason::TargetHeadChanged,
             )
             .unwrap(),
@@ -613,7 +614,7 @@ async fn stale_is_ready_only_exact_version_cas_and_releases_the_open_slot() {
         applied,
         MarkPreflightStaleOutcome::Applied {
             operation_id: created.operation_id,
-            version: DeliveryVersion::try_new(3).unwrap(),
+            version: DeliveryVersion::try_new(4).unwrap(),
             state: MergeOperationState::Stale,
             reason: PreflightStaleReason::TargetHeadChanged,
         }
@@ -630,24 +631,29 @@ async fn stale_is_ready_only_exact_version_cas_and_releases_the_open_slot() {
         (
             "stale".to_owned(),
             Some("TARGET_HEAD_CHANGED".to_owned()),
-            3
+            4
         )
     );
-    assert!(matches!(
+    assert_eq!(
         store
             .mark_merge_preflight_stale(
                 MarkPreflightStaleRequest::try_new(
                     task.id,
                     created.operation_id,
-                    DeliveryVersion::try_new(2).unwrap(),
+                    DeliveryVersion::try_new(3).unwrap(),
                     PreflightStaleReason::TargetHeadChanged,
                 )
                 .unwrap(),
             )
             .await
             .unwrap(),
-        MarkPreflightStaleOutcome::Conflict
-    ));
+        MarkPreflightStaleOutcome::Existing {
+            operation_id: created.operation_id,
+            version: DeliveryVersion::try_new(4).unwrap(),
+            state: MergeOperationState::Stale,
+            reason: PreflightStaleReason::TargetHeadChanged,
+        }
+    );
 
     let replacement = store
         .create_merge_preflight(preflight_request(&task, ClientRequestId::new()))
@@ -687,7 +693,7 @@ async fn stale_cas_is_bound_to_the_exact_task_and_all_typed_reason_codes() {
                 MarkPreflightStaleRequest::try_new(
                     other_task.id,
                     created.operation_id,
-                    DeliveryVersion::try_new(2).unwrap(),
+                    DeliveryVersion::try_new(3).unwrap(),
                     PreflightStaleReason::EvidenceStale,
                 )
                 .unwrap(),
@@ -703,7 +709,39 @@ async fn stale_cas_is_bound_to_the_exact_task_and_all_typed_reason_codes() {
             .fetch_one(store.pool())
             .await
             .unwrap();
-    assert_eq!(unchanged, ("preflight_ready".to_owned(), 2));
+    assert_eq!(unchanged, ("preflight_ready".to_owned(), 3));
+    assert!(matches!(
+        store
+            .mark_merge_preflight_stale(
+                MarkPreflightStaleRequest::try_new(
+                    task.id,
+                    created.operation_id,
+                    DeliveryVersion::try_new(3).unwrap(),
+                    PreflightStaleReason::TargetHeadChanged,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        MarkPreflightStaleOutcome::Applied { .. }
+    ));
+    let before_wrong_task_replay = row_counts(&store).await;
+    assert_eq!(
+        store
+            .mark_merge_preflight_stale(
+                MarkPreflightStaleRequest::try_new(
+                    other_task.id,
+                    created.operation_id,
+                    DeliveryVersion::try_new(3).unwrap(),
+                    PreflightStaleReason::TargetHeadChanged,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        MarkPreflightStaleOutcome::Conflict
+    );
+    assert_eq!(row_counts(&store).await, before_wrong_task_replay);
 
     for (reason, failure_code) in [
         (
@@ -732,7 +770,7 @@ async fn stale_cas_is_bound_to_the_exact_task_and_all_typed_reason_codes() {
                 MarkPreflightStaleRequest::try_new(
                     task.id,
                     created.operation_id,
-                    DeliveryVersion::try_new(2).unwrap(),
+                    DeliveryVersion::try_new(3).unwrap(),
                     reason,
                 )
                 .unwrap(),
@@ -743,7 +781,7 @@ async fn stale_cas_is_bound_to_the_exact_task_and_all_typed_reason_codes() {
             applied,
             MarkPreflightStaleOutcome::Applied {
                 operation_id: created.operation_id,
-                version: DeliveryVersion::try_new(3).unwrap(),
+                version: DeliveryVersion::try_new(4).unwrap(),
                 state: MergeOperationState::Stale,
                 reason,
             }
@@ -758,13 +796,13 @@ async fn stale_cas_is_bound_to_the_exact_task_and_all_typed_reason_codes() {
         .unwrap();
         assert_eq!(
             stored,
-            ("stale".to_owned(), Some(failure_code.to_owned()), 3)
+            ("stale".to_owned(), Some(failure_code.to_owned()), 4)
         );
         let journal: (String, String, Option<String>, i64) = sqlx::query_as(
             "SELECT from_state, to_state, failure_code, entity_version \
              FROM task_delivery_operation_transitions \
              WHERE entity_kind = 'merge_operation' AND entity_id = ? \
-               AND entity_version = 3",
+               AND entity_version = 4",
         )
         .bind(created.operation_id.to_string())
         .fetch_one(store.pool())
@@ -776,7 +814,7 @@ async fn stale_cas_is_bound_to_the_exact_task_and_all_typed_reason_codes() {
                 "preflight_ready".to_owned(),
                 "stale".to_owned(),
                 Some(failure_code.to_owned()),
-                3,
+                4,
             )
         );
 
@@ -787,17 +825,115 @@ async fn stale_cas_is_bound_to_the_exact_task_and_all_typed_reason_codes() {
                     MarkPreflightStaleRequest::try_new(
                         task.id,
                         created.operation_id,
-                        DeliveryVersion::try_new(2).unwrap(),
+                        DeliveryVersion::try_new(3).unwrap(),
                         reason,
                     )
                     .unwrap(),
                 )
                 .await
                 .unwrap(),
-            MarkPreflightStaleOutcome::Conflict
+            MarkPreflightStaleOutcome::Existing {
+                operation_id: created.operation_id,
+                version: DeliveryVersion::try_new(4).unwrap(),
+                state: MergeOperationState::Stale,
+                reason,
+            }
         );
         assert_eq!(row_counts(&store).await, before_repeat);
     }
+}
+
+#[tokio::test]
+async fn stale_replay_rejects_wrong_reason_and_version_without_writes() {
+    let (store, task) = eligible_fixture().await;
+    let created = receipt(
+        store
+            .create_merge_preflight(preflight_request(&task, ClientRequestId::new()))
+            .await
+            .unwrap(),
+    );
+    mark_preflight_ready(&store, created.operation_id).await;
+    let applied = store
+        .mark_merge_preflight_stale(
+            MarkPreflightStaleRequest::try_new(
+                task.id,
+                created.operation_id,
+                DeliveryVersion::try_new(3).unwrap(),
+                PreflightStaleReason::TargetHeadChanged,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(applied, MarkPreflightStaleOutcome::Applied { .. }));
+    let before = row_counts(&store).await;
+
+    for request in [
+        MarkPreflightStaleRequest::try_new(
+            task.id,
+            created.operation_id,
+            DeliveryVersion::try_new(3).unwrap(),
+            PreflightStaleReason::EvidenceStale,
+        )
+        .unwrap(),
+        MarkPreflightStaleRequest::try_new(
+            task.id,
+            created.operation_id,
+            DeliveryVersion::initial(),
+            PreflightStaleReason::TargetHeadChanged,
+        )
+        .unwrap(),
+    ] {
+        assert_eq!(
+            store.mark_merge_preflight_stale(request).await.unwrap(),
+            MarkPreflightStaleOutcome::Conflict
+        );
+        assert_eq!(row_counts(&store).await, before);
+    }
+}
+
+#[tokio::test]
+async fn stale_exact_replay_fails_closed_when_the_current_journal_tuple_is_corrupt() {
+    let (store, task) = eligible_fixture().await;
+    let created = receipt(
+        store
+            .create_merge_preflight(preflight_request(&task, ClientRequestId::new()))
+            .await
+            .unwrap(),
+    );
+    mark_preflight_ready(&store, created.operation_id).await;
+    let request = MarkPreflightStaleRequest::try_new(
+        task.id,
+        created.operation_id,
+        DeliveryVersion::try_new(3).unwrap(),
+        PreflightStaleReason::TargetHeadChanged,
+    )
+    .unwrap();
+    assert!(matches!(
+        store.mark_merge_preflight_stale(request).await.unwrap(),
+        MarkPreflightStaleOutcome::Applied { .. }
+    ));
+
+    let mut connection = store.pool().acquire().await.unwrap();
+    sqlx::query("DROP TRIGGER task_delivery_operation_transitions_no_update")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE task_delivery_operation_transitions \
+         SET failure_code = 'DELIVERY_EVIDENCE_STALE' \
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 4",
+    )
+    .bind(created.operation_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        store.mark_merge_preflight_stale(request).await,
+        Err(StoreError::InvariantViolation(_))
+    ));
 }
 
 #[tokio::test]
@@ -813,37 +949,41 @@ async fn a_committed_source_requires_the_new_preflight_to_bind_its_exact_commit_
     accept_merge(&store, &task, first.operation_id).await;
     create_committed_source(&store, &task, first.operation_id).await;
     fail_accepted_merge(&store, &task, first.operation_id).await;
-    let before = row_counts(&store).await;
-    assert!(matches!(
+    let second = receipt(
         store
             .create_merge_preflight(preflight_request(&task, ClientRequestId::new()))
             .await
-            .unwrap_err(),
-        StoreError::Delivery(DeliveryError::InvalidCommandRequest)
-    ));
-    assert_eq!(row_counts(&store).await, before);
-
-    let command = coding_agent_store::PreflightCommandRequest::try_new(
-        ClientRequestId::new(),
+            .unwrap(),
+    );
+    let before_bind = row_counts(&store).await;
+    let wrong_source = BindMergePreflightInputsRequest::try_new(
         task.id,
-        "refs/heads/main".parse().unwrap(),
-        TARGET_HEAD.parse().unwrap(),
-    )
-    .unwrap();
-    let request = coding_agent_store::CreatePreflightRequest::try_new(
-        command,
-        CANDIDATE_TREE.parse().unwrap(),
-        SOURCE_COMMIT.parse().unwrap(),
-        coding_agent_store::DirectoryIdentity::try_new("directory_identity_v1", COMMON_IDENTITY)
-            .unwrap(),
-        coding_agent_store::DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY)
-            .unwrap(),
-        CONFIG_DIGEST.parse().unwrap(),
+        second.operation_id,
+        DeliveryVersion::initial(),
+        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
+        GitCommitOid::from_str(PREFLIGHT_SOURCE).unwrap(),
     )
     .unwrap();
     assert!(matches!(
-        store.create_merge_preflight(request).await.unwrap(),
-        CreatePreflightOutcome::Created(_)
+        store.bind_merge_preflight_inputs(wrong_source).await,
+        Err(StoreError::Delivery(DeliveryError::InvalidCommandRequest))
+    ));
+    assert_eq!(row_counts(&store).await, before_bind);
+
+    let exact_source = BindMergePreflightInputsRequest::try_new(
+        task.id,
+        second.operation_id,
+        DeliveryVersion::initial(),
+        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
+        GitCommitOid::from_str(SOURCE_COMMIT).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .bind_merge_preflight_inputs(exact_source)
+            .await
+            .unwrap(),
+        MergeTransitionOutcome::Applied(_)
     ));
 }
 
@@ -908,7 +1048,7 @@ async fn merged_side_effect_and_reconciliation_states_reject_without_writes() {
     .await;
     sqlx::query(
         "UPDATE task_merge_operations SET state = 'reconciliation_required', \
-             failure_code = 'DELIVERY_RECONCILIATION_REQUIRED', version = 2, updated_at = ? \
+             failure_code = 'DELIVERY_RECONCILIATION_REQUIRED', version = 3, updated_at = ? \
          WHERE operation_id = ?",
     )
     .bind(crate::support::delivery::eligibility::DELIVERY_TIMESTAMP)

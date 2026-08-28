@@ -29,6 +29,12 @@ pub(super) async fn record(
                 return Ok(MergeTransitionOutcome::Conflict);
             }
         };
+    if request.expected_state == MergeOperationState::PreflightPending
+        && operation.preflight_inputs.is_none()
+    {
+        transaction.commit().await?;
+        return Ok(MergeTransitionOutcome::Conflict);
+    }
     match lookup_transition(
         &mut transaction,
         request.operation_id,

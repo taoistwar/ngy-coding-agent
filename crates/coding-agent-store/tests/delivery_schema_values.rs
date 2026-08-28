@@ -75,7 +75,7 @@ async fn raw_sql_rejects_noncanonical_values_or_orphaned_delivery_facts() {
     .unwrap();
     let alphabetic_timestamp = sqlx::query(
         "UPDATE task_merge_operations
-         SET state = 'conflict', version = 2,
+         SET state = 'conflict', version = 3,
              updated_at = 'aaaa-aa-aaTaa:aa:aa.aaaaaaaaaZ'
          WHERE operation_id = ?",
     )
@@ -110,7 +110,7 @@ async fn raw_sql_rejects_noncanonical_values_or_orphaned_delivery_facts() {
         "UPDATE task_merge_operations
          SET state = 'conflict', failure_code = 'MERGE_CONFLICT',
              merge_base_oid = ?, candidate_merge_tree_oid = ?,
-             conflict_path_count = 1, version = 2, updated_at = ?
+             conflict_path_count = 1, version = 3, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind(support::delivery::MERGE_BASE_OID)
@@ -147,7 +147,9 @@ async fn raw_sql_rejects_embedded_nul_across_canonical_text_classes() {
         OperationId,
         ReceiptId,
         GitOid,
-        Digest,
+        SourceDigest,
+        TargetConfigDigest,
+        TargetSecurityDigest,
         BranchRef,
         WorktreePath,
         ReceiptHash,
@@ -167,8 +169,16 @@ async fn raw_sql_rejects_embedded_nul_across_canonical_text_classes() {
             format!("{}\0evil", support::delivery::CANDIDATE_TREE_OID),
         ),
         (
-            CorruptedField::Digest,
+            CorruptedField::SourceDigest,
             format!("{}\0evil", support::delivery::CONFIG_DIGEST),
+        ),
+        (
+            CorruptedField::TargetConfigDigest,
+            format!("{}\0evil", support::delivery::TARGET_CONFIG_DIGEST),
+        ),
+        (
+            CorruptedField::TargetSecurityDigest,
+            format!("{}\0evil", support::delivery::TARGET_SECURITY_DIGEST),
         ),
         (
             CorruptedField::BranchRef,
@@ -196,7 +206,11 @@ async fn raw_sql_rejects_embedded_nul_across_canonical_text_classes() {
             CorruptedField::OperationId => fixture.operation_id = &corrupted,
             CorruptedField::ReceiptId => fixture.receipt_id = &corrupted,
             CorruptedField::GitOid => fixture.candidate_tree_oid = &corrupted,
-            CorruptedField::Digest => fixture.config_attributes_digest = &corrupted,
+            CorruptedField::SourceDigest => fixture.config_attributes_digest = &corrupted,
+            CorruptedField::TargetConfigDigest => {
+                fixture.target_config_attributes_digest = &corrupted
+            }
+            CorruptedField::TargetSecurityDigest => fixture.target_security_digest = &corrupted,
             CorruptedField::BranchRef => fixture.target_branch = corrupted.as_str().into(),
             CorruptedField::WorktreePath => fixture.artifact_worktree_path = &corrupted,
             CorruptedField::ReceiptHash => fixture.request_hash = &corrupted,
@@ -257,7 +271,7 @@ async fn raw_sql_rejects_embedded_nul_across_canonical_text_classes() {
     let nul_failure = sqlx::query(
         "UPDATE task_merge_operations
          SET state = 'reconciliation_required', failure_code = ?,
-             version = 2, updated_at = ?
+             version = 3, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind("SOURCE_UNKNOWN\0EVIL")
@@ -286,7 +300,7 @@ async fn raw_sql_rejects_embedded_nul_across_canonical_text_classes() {
             "UPDATE task_merge_operations
              SET state = 'conflict', failure_code = 'MERGE_CONFLICT',
                  merge_base_oid = ?, candidate_merge_tree_oid = ?,
-                 conflict_path_count = 1, version = 2, updated_at = ?
+                 conflict_path_count = 1, version = 3, updated_at = ?
              WHERE operation_id = ?",
         )
         .bind(support::delivery::MERGE_BASE_OID)
@@ -362,7 +376,7 @@ async fn raw_sql_rejects_invalid_utf8_at_delivery_text_boundaries() {
         "UPDATE task_merge_operations
          SET state = 'conflict', failure_code = 'MERGE_CONFLICT',
              merge_base_oid = ?, candidate_merge_tree_oid = ?,
-             conflict_path_count = 1, version = 2, updated_at = ?
+             conflict_path_count = 1, version = 3, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind(support::delivery::MERGE_BASE_OID)
@@ -432,9 +446,12 @@ async fn raw_sql_rejects_nonexistent_or_out_of_range_timestamps() {
     for timestamp in invalid_timestamps {
         let result = sqlx::query(
             "UPDATE task_merge_operations
-             SET state = 'conflict', version = 2, updated_at = ?
+             SET state = 'preflight_ready', merge_base_oid = ?, candidate_merge_tree_oid = ?,
+                 version = 3, updated_at = ?
              WHERE operation_id = ?",
         )
+        .bind(support::delivery::MERGE_BASE_OID)
+        .bind(support::delivery::MERGE_TREE_OID)
         .bind(timestamp)
         .bind(support::delivery::MERGE_OPERATION_ID)
         .execute(store.pool())

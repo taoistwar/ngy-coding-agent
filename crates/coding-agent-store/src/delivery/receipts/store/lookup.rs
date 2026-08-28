@@ -27,14 +27,9 @@ pub(crate) async fn lookup_receipt(
         "SELECT r.client_request_id, r.command_kind, r.task_id, r.repository_id, r.attempt, \
                 r.request_hash_domain, r.request_hash_version, r.request_hash_algorithm, \
                 r.canonical_request_hash, r.operation_kind, r.operation_id, \
-                r.merge_operation_id, r.cleanup_operation_id, \
+                r.merge_operation_id, r.cleanup_operation_id, r.cleanup_merged_operation_id, \
                 r.accepted_operation_version, r.accepted_operation_state, \
                 r.response_discriminator, r.created_at, \
-                (SELECT d.merged_operation_id \
-                   FROM task_cleanup_operations c \
-                   JOIN task_artifact_dispositions d ON d.task_id = c.disposition_task_id \
-                  WHERE r.operation_kind = 'cleanup_operation' \
-                    AND c.operation_id = r.operation_id) AS cleanup_merged_operation_id, \
                 t.transition_id AS historical_transition_id, \
                 t.from_state AS historical_from_state, \
                 t.failure_code AS historical_failure_code, \

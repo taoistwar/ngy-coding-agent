@@ -7,14 +7,14 @@ use coding_agent_store::{
     CreatePreflightOutcome, CreatePreflightRequest, DeliveryOperationId, DeliverySourceAnchor,
     DeliverySourceObjectProof, DeliveryVersion, DirectoryIdentity, EnterMergePendingRequest,
     GitBranchRef, GitCommitOid, GitTreeOid, MergeAbortProof, MergeAutostashObservation,
-    MergeCommitObjectProof, MergeTransitionOutcome, OtherGitOperationObservation,
-    PreflightCommandRequest, Sha256Digest, Store,
+    MergeCommitObjectProof, MergeConflictPaths, MergeTransitionOutcome,
+    OtherGitOperationObservation, PreflightCommandRequest, Sha256Digest, Store,
 };
 
 use crate::support::delivery::eligibility::{
     ADMIN_IDENTITY, CANDIDATE_TREE, CONFIG_DIGEST, MERGE_COMMIT, MERGE_TREE, PREFLIGHT_SOURCE,
-    SOURCE_COMMIT, TARGET_HEAD, approved_task_on_store, create_committed_source,
-    mark_preflight_ready,
+    SOURCE_COMMIT, TARGET_CONFIG_DIGEST, TARGET_HEAD, TARGET_SECURITY_DIGEST,
+    approved_task_on_store, create_committed_source, mark_preflight_ready,
 };
 
 const TARGET_BRANCH: &str = "refs/heads/main";
@@ -58,7 +58,7 @@ pub async fn accept_existing(
         ClientRequestId::new(),
         task.id,
         operation_id,
-        DeliveryVersion::try_new(2).unwrap(),
+        DeliveryVersion::try_new(3).unwrap(),
         evidence.workspace_generation(),
         evidence.workspace_fingerprint().clone(),
         GitBranchRef::from_str(TARGET_BRANCH).unwrap(),
@@ -204,6 +204,7 @@ pub async fn abort_pending(
         Sha256Digest::from_str(WORKTREE).unwrap(),
         MergeAutostashObservation::Absent,
         OtherGitOperationObservation::Clear,
+        MergeConflictPaths::try_from_raw(vec![b"src/conflicted.rs".to_vec()]).unwrap(),
     )
     .unwrap();
     let request =
@@ -229,15 +230,24 @@ async fn create_preflight(
     .unwrap();
     let request = CreatePreflightRequest::try_new(
         command,
-        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
-        GitCommitOid::from_str(PREFLIGHT_SOURCE).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", common_identity).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY).unwrap(),
         Sha256Digest::from_str(CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_SECURITY_DIGEST).unwrap(),
     )
     .unwrap();
-    match store.create_merge_preflight(request).await.unwrap() {
+    let operation_id = match store.create_merge_preflight(request).await.unwrap() {
         CreatePreflightOutcome::Created(receipt) => receipt.operation_id,
         other => panic!("expected created preflight, got {other:?}"),
-    }
+    };
+    crate::support::delivery::merge::bind_preflight_inputs(
+        store,
+        task.id,
+        operation_id,
+        CANDIDATE_TREE,
+        PREFLIGHT_SOURCE,
+    )
+    .await;
+    operation_id
 }

@@ -24,7 +24,7 @@ async fn accept_receipt_and_ready_to_accepted_transition_commit_atomically() {
     };
     assert_eq!(
         receipt.accepted_operation_version,
-        DeliveryVersion::try_new(3).unwrap()
+        DeliveryVersion::try_new(4).unwrap()
     );
     assert_eq!(
         receipt.accepted_operation_state,
@@ -65,7 +65,7 @@ async fn rejected_conflict_stale_and_superseded_operations_cannot_be_accepted() 
     let rejected = RecordMergePreflightResultRequest::try_new(
         task.id,
         rejected_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         MergePreflightResult::rejected(PreflightRejectedReason::TargetWorktreeDirty),
     )
     .unwrap();
@@ -77,7 +77,7 @@ async fn rejected_conflict_stale_and_superseded_operations_cannot_be_accepted() 
     let conflict = RecordMergePreflightResultRequest::try_new(
         task.id,
         conflict_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         MergePreflightResult::conflict(
             GitCommitOid::from_str(MERGE_BASE).unwrap(),
             coding_agent_store::GitTreeOid::from_str(MERGE_TREE).unwrap(),
@@ -94,7 +94,7 @@ async fn rejected_conflict_stale_and_superseded_operations_cannot_be_accepted() 
     let stale = RecordMergePreflightResultRequest::try_new(
         task.id,
         stale_id,
-        DeliveryVersion::initial(),
+        DeliveryVersion::try_new(2).unwrap(),
         MergePreflightResult::stale(PreflightStaleReason::TargetHeadChanged),
     )
     .unwrap();

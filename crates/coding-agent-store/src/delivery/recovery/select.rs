@@ -147,6 +147,9 @@ fn merge_action(
         MergeOperationState::PreflightPending => DeliveryRecoveryAction::PreflightPending {
             operation_id: operation.operation_id,
             version: operation.version,
+            inputs: operation.preflight_inputs.clone(),
+            target_config_attributes_digest: operation.target_config_attributes_digest.clone(),
+            target_security_digest: operation.target_security_digest.clone(),
         },
         MergeOperationState::Accepted => {
             let source = match item.ownership.source.as_ref() {
@@ -173,6 +176,10 @@ fn merge_action(
                     operation_id: operation.operation_id,
                     version: operation.version,
                     source,
+                    target_config_attributes_digest: operation
+                        .target_config_attributes_digest
+                        .clone(),
+                    target_security_digest: operation.target_security_digest.clone(),
                 },
                 operation.initial_transition_id,
             ));
@@ -180,10 +187,14 @@ fn merge_action(
         MergeOperationState::MergePending => DeliveryRecoveryAction::MergePending {
             operation_id: operation.operation_id,
             version: operation.version,
+            target_config_attributes_digest: operation.target_config_attributes_digest.clone(),
+            target_security_digest: operation.target_security_digest.clone(),
         },
         MergeOperationState::AbortPending => DeliveryRecoveryAction::AbortPending {
             operation_id: operation.operation_id,
             version: operation.version,
+            target_config_attributes_digest: operation.target_config_attributes_digest.clone(),
+            target_security_digest: operation.target_security_digest.clone(),
         },
         _ => return Err(recovery_invariant()),
     };

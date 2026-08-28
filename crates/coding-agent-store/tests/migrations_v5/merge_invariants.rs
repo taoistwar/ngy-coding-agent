@@ -1,6 +1,74 @@
 use super::{helpers::*, support};
 
 #[tokio::test]
+async fn preflight_intent_and_prepared_input_schema_contract_is_exact() {
+    let fixture = support::file_store().await;
+    fixture.store.migrate().await.unwrap();
+    let merge_sql = normalized_schema_sql(fixture.store.pool(), "task_merge_operations").await;
+    let immutable_sql = normalized_schema_sql(
+        fixture.store.pool(),
+        "task_merge_operations_immutable_on_update",
+    )
+    .await;
+    let transition_sql = normalized_schema_sql(
+        fixture.store.pool(),
+        "task_merge_operations_transition_on_update",
+    )
+    .await;
+    let journal_sql =
+        normalized_schema_sql(fixture.store.pool(), "task_delivery_operation_transitions").await;
+
+    assert!(merge_sql.contains(
+        "candidate_tree_oid TEXT CHECK ( candidate_tree_oid IS NULL OR ( typeof(candidate_tree_oid) = 'text'"
+    ));
+    assert!(merge_sql.contains(
+        "preflight_source_commit_oid TEXT CHECK ( preflight_source_commit_oid IS NULL OR ( typeof(preflight_source_commit_oid) = 'text'"
+    ));
+    assert!(merge_sql.contains(
+        "target_config_attributes_digest TEXT NOT NULL CHECK ( typeof(target_config_attributes_digest) = 'text' AND length(CAST(target_config_attributes_digest AS BLOB)) = 64 AND target_config_attributes_digest NOT GLOB '*[^0-9a-f]*' )"
+    ));
+    assert!(merge_sql.contains(
+        "target_security_digest TEXT NOT NULL CHECK ( typeof(target_security_digest) = 'text' AND length(CAST(target_security_digest AS BLOB)) = 64 AND target_security_digest NOT GLOB '*[^0-9a-f]*' )"
+    ));
+    assert!(merge_sql.contains(
+        "state = 'preflight_pending' AND version = 1 AND candidate_tree_oid IS NULL AND preflight_source_commit_oid IS NULL"
+    ));
+    assert!(merge_sql.contains(
+        "state IN ('rejected', 'stale', 'reconciliation_required') AND version = 2 AND candidate_tree_oid IS NULL AND preflight_source_commit_oid IS NULL"
+    ));
+    assert!(merge_sql.contains(
+        "candidate_tree_oid IS NOT NULL AND preflight_source_commit_oid IS NOT NULL AND (state != 'preflight_pending' OR version = 2)"
+    ));
+    assert!(merge_sql.contains(
+        "AND NOT ( state IN ('rejected', 'stale', 'reconciliation_required') AND version = 2 )"
+    ));
+    for sql in [&immutable_sql, &transition_sql] {
+        assert!(sql.contains(
+            "OLD.state = 'preflight_pending' AND NEW.state = 'preflight_pending' AND OLD.version = 1 AND NEW.version = 2"
+        ));
+        assert!(sql.contains(
+            "OLD.candidate_tree_oid IS NULL AND OLD.preflight_source_commit_oid IS NULL AND NEW.candidate_tree_oid IS NOT NULL AND NEW.preflight_source_commit_oid IS NOT NULL"
+        ));
+    }
+    assert!(immutable_sql.contains(
+        "NEW.target_config_attributes_digest IS NOT OLD.target_config_attributes_digest"
+    ));
+    assert!(immutable_sql.contains("NEW.target_security_digest IS NOT OLD.target_security_digest"));
+    assert!(journal_sql.contains(
+        "entity_kind = 'merge_operation' AND target_config_attributes_digest IS NOT NULL AND target_security_digest IS NOT NULL"
+    ));
+    assert!(journal_sql.contains(
+        "from_state = 'preflight_pending' AND to_state = 'preflight_pending' AND entity_version = 2"
+    ));
+    assert!(
+        journal_sql.contains("to_state IN ('preflight_ready', 'conflict') AND entity_version = 3")
+    );
+    assert!(journal_sql.contains(
+        "to_state IN ('rejected', 'stale', 'reconciliation_required') AND entity_version IN (2, 3)"
+    ));
+}
+
+#[tokio::test]
 async fn active_terminal_and_reconciliation_merge_uniqueness_is_exact() {
     let fixture = support::file_store().await;
     fixture.store.migrate().await.unwrap();
@@ -35,7 +103,7 @@ async fn active_terminal_and_reconciliation_merge_uniqueness_is_exact() {
     sqlx::query(
         "UPDATE task_merge_operations
          SET state = 'reconciliation_required', failure_code = 'DELIVERY_RECONCILIATION_REQUIRED',
-             version = 2, updated_at = ? WHERE operation_id = ?",
+             version = 3, updated_at = ? WHERE operation_id = ?",
     )
     .bind(support::delivery::TIMESTAMP)
     .bind(support::delivery::MERGE_OPERATION_ID)
@@ -122,7 +190,7 @@ async fn receipts_journal_and_conflicts_are_append_only_even_via_replace() {
 
     sqlx::query(
         "UPDATE task_merge_operations
-         SET state = 'conflict', failure_code = 'MERGE_CONFLICT', version = 2,
+         SET state = 'conflict', failure_code = 'MERGE_CONFLICT', version = 3,
              merge_base_oid = ?, candidate_merge_tree_oid = ?,
              conflict_path_count = 1, updated_at = ?
          WHERE operation_id = ?",
@@ -217,7 +285,7 @@ async fn preflight_facts_are_first_set_only_by_ready_or_conflict() {
     let transition: (String, String, Option<String>) = sqlx::query_as(
         "SELECT from_state, to_state, failure_code
          FROM task_delivery_operation_transitions
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 2",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 3",
     )
     .bind(support::delivery::MERGE_OPERATION_ID)
     .fetch_one(fixture.store.pool())
@@ -249,7 +317,7 @@ async fn abort_child_receipt_is_globally_unique_across_merge_operations() {
     sqlx::query(
         "UPDATE task_merge_operations
          SET state = 'conflict', failure_code = 'MERGE_CONFLICT',
-             conflict_path_count = 0, version = 6, updated_at = ? WHERE operation_id = ?",
+             version = 7, updated_at = ? WHERE operation_id = ?",
     )
     .bind(support::delivery::TIMESTAMP)
     .bind(support::delivery::MERGE_OPERATION_ID)
@@ -341,17 +409,51 @@ async fn conflict_path_count_schema_contract_is_exact() {
         "conflict_path_count INTEGER CHECK ( conflict_path_count IS NULL OR ( typeof(conflict_path_count) = 'integer' AND conflict_path_count BETWEEN 0 AND 128 ) )"
     ));
     assert!(merge_sql.contains(
-        "(state = 'conflict' AND conflict_path_count IS NOT NULL) OR (state != 'conflict' AND conflict_path_count IS NULL)"
+        "( conflict_path_count IS NOT NULL AND ( state IN ('abort_pending', 'conflict') OR ( state = 'reconciliation_required' AND abort_child_receipt_id IS NOT NULL ) ) ) OR ( conflict_path_count IS NULL AND state NOT IN ('abort_pending', 'conflict') )"
+    ));
+    assert!(merge_sql.contains(
+        "abort_child_receipt_id IS NULL OR ( conflict_path_count IS NOT NULL AND conflict_path_count BETWEEN 1 AND 128 )"
     ));
     assert!(immutable_sql.contains(
         "OLD.conflict_path_count IS NOT NULL AND NEW.conflict_path_count IS NOT OLD.conflict_path_count"
     ));
     assert!(immutable_sql.contains(
-        "OLD.conflict_path_count IS NULL AND NEW.conflict_path_count IS NOT NULL AND NOT ( OLD.state IN ('preflight_pending', 'abort_pending') AND NEW.state = 'conflict' )"
+        "OLD.conflict_path_count IS NULL AND NEW.conflict_path_count IS NOT NULL AND NOT ( (OLD.state = 'preflight_pending' AND NEW.state = 'conflict') OR (OLD.state = 'merge_pending' AND NEW.state = 'abort_pending') )"
     ));
     assert!(conflict_parent_sql.contains(
-        "m.state = 'conflict' AND m.conflict_path_count IS NOT NULL AND NEW.ordinal < m.conflict_path_count"
+        "m.state IN ('abort_pending', 'conflict') AND m.conflict_path_count IS NOT NULL AND NEW.ordinal < m.conflict_path_count"
     ));
+}
+
+#[tokio::test]
+async fn abort_pending_schema_rejects_a_zero_path_conflict_proof() {
+    let fixture = merge_pending_fixture().await;
+    let result = sqlx::query(
+        "UPDATE task_merge_operations
+         SET abort_child_receipt_id = ?, abort_merge_head_oid = source_commit_oid,
+             abort_index_stages_digest = ?, abort_worktree_digest = ?,
+             abort_merge_autostash_proof = 'absent', conflict_path_count = 0,
+             state = 'abort_pending', failure_code = NULL, version = 6, updated_at = ?
+         WHERE operation_id = ?",
+    )
+    .bind("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    .bind(support::delivery::CHECKS_DIGEST)
+    .bind(support::delivery::COVERAGE_DIGEST)
+    .bind(support::delivery::TIMESTAMP)
+    .bind(support::delivery::MERGE_OPERATION_ID)
+    .execute(fixture.store.pool())
+    .await;
+
+    assert!(result.is_err());
+    let state: (String, i64, Option<i64>) = sqlx::query_as(
+        "SELECT state, version, conflict_path_count
+         FROM task_merge_operations WHERE operation_id = ?",
+    )
+    .bind(support::delivery::MERGE_OPERATION_ID)
+    .fetch_one(fixture.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, ("merge_pending".to_owned(), 5, None));
 }
 
 #[tokio::test]

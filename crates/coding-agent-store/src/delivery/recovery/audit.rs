@@ -143,6 +143,7 @@ async fn audit_global_orphans(connection: &mut SqliteConnection) -> Result<(), S
                      AND receipt.operation_kind = 'merge_operation' \
                      AND receipt.operation_id = receipt.merge_operation_id \
                      AND receipt.cleanup_operation_id IS NULL \
+                     AND receipt.cleanup_merged_operation_id IS NULL \
                      AND merge_operation.operation_id IS NOT NULL \
                      AND merge_operation.preflight_receipt_id = receipt.client_request_id \
                      AND merge_operation.task_id = receipt.task_id \
@@ -154,6 +155,7 @@ async fn audit_global_orphans(connection: &mut SqliteConnection) -> Result<(), S
                      AND receipt.operation_kind = 'merge_operation' \
                      AND receipt.operation_id = receipt.merge_operation_id \
                      AND receipt.cleanup_operation_id IS NULL \
+                     AND receipt.cleanup_merged_operation_id IS NULL \
                      AND merge_operation.operation_id IS NOT NULL \
                      AND merge_operation.accept_receipt_id = receipt.client_request_id \
                      AND merge_operation.task_id = receipt.task_id \
@@ -165,12 +167,19 @@ async fn audit_global_orphans(connection: &mut SqliteConnection) -> Result<(), S
                      AND receipt.operation_kind = 'cleanup_operation' \
                      AND receipt.operation_id = receipt.cleanup_operation_id \
                      AND receipt.merge_operation_id IS NULL \
+                     AND receipt.cleanup_merged_operation_id IS NOT NULL \
                      AND cleanup.operation_id IS NOT NULL \
                      AND cleanup.origin_receipt_id = receipt.client_request_id \
                      AND cleanup.kind = receipt.command_kind \
                      AND cleanup.task_id = receipt.task_id \
                      AND cleanup.repository_id = receipt.repository_id \
                      AND cleanup.attempt = receipt.attempt \
+                     AND EXISTS ( \
+                         SELECT 1 FROM task_artifact_dispositions disposition \
+                         WHERE disposition.task_id = cleanup.disposition_task_id \
+                           AND disposition.merged_operation_id \
+                               = receipt.cleanup_merged_operation_id \
+                     ) \
                  ) \
              ), 0) = 0 \
          )",

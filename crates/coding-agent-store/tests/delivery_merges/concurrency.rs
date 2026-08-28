@@ -3,7 +3,7 @@ use std::str::FromStr;
 use coding_agent_domain::{ClientRequestId, Task};
 use coding_agent_store::{
     AcceptMergeOutcome, BeginMergeAbortRequest, DirectoryIdentity, GitBranchRef, GitCommitOid,
-    MergeAbortProof, MergeAutostashObservation, MergeTransitionOutcome,
+    MergeAbortProof, MergeAutostashObservation, MergeConflictPaths, MergeTransitionOutcome,
     OtherGitOperationObservation, Sha256Digest, StoreError,
 };
 use uuid::Uuid;
@@ -94,7 +94,7 @@ async fn real_database_busy_during_accept_writes_nothing() {
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(row, ("preflight_ready".to_owned(), 2, None));
+    assert_eq!(row, ("preflight_ready".to_owned(), 3, None));
     assert!(matches!(
         store.accept_merge(request).await.unwrap(),
         AcceptMergeOutcome::Accepted(_)
@@ -165,7 +165,7 @@ async fn abort_child_receipt_is_globally_unique_under_race_and_raw_duplicates_fa
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!(loser_row, ("merge_pending".to_owned(), 4, None));
+    assert_eq!(loser_row, ("merge_pending".to_owned(), 5, None));
     assert!(matches!(
         store.begin_merge_abort(loser).await.unwrap(),
         MergeTransitionOutcome::Conflict
@@ -229,6 +229,7 @@ fn abort_request(
         Sha256Digest::from_str(WORKTREE).unwrap(),
         MergeAutostashObservation::Absent,
         OtherGitOperationObservation::Clear,
+        MergeConflictPaths::try_from_raw(vec![b"src/conflicted.rs".to_vec()]).unwrap(),
     )
     .unwrap();
     BeginMergeAbortRequest::try_new(task.id, operation_id, version, proof).unwrap()

@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SchedulerStoppingTask, Task, TaskDetail } from "../api/types";
 import type { CancelCommandState } from "../state/model";
+import { initialDeliveryState } from "../state/deliveryModel";
+import type { DeliveryPanelBinding } from "./DeliveryPanel";
 import { TaskWorkspace, type TaskWorkspaceProps } from "./TaskWorkspace";
 
 const NOW = "2026-07-15T00:00:00Z";
@@ -141,7 +143,53 @@ function props(value: Task | null, overrides: Partial<TaskWorkspaceProps> = {}):
   };
 }
 
+function deliveryBinding(taskId: string): DeliveryPanelBinding {
+  return {
+    api: {
+      newPreflight: () => {
+        throw new Error("unexpected preflight command");
+      },
+      newMerge: () => {
+        throw new Error("unexpected merge command");
+      },
+      newRemoveWorktree: () => {
+        throw new Error("unexpected worktree cleanup command");
+      },
+      newDeleteBranch: () => {
+        throw new Error("unexpected branch cleanup command");
+      },
+    },
+    controller: {
+      state: {
+        ...initialDeliveryState,
+        taskId,
+        generation: 1,
+        phase: "loading",
+      },
+      refresh: vi.fn(),
+      trackOperation: vi.fn(),
+      openModal: vi.fn(),
+      clearModal: vi.fn(),
+    },
+  };
+}
+
 describe("TaskWorkspace", () => {
+  it("only assembles the independently injected delivery controller", () => {
+    const running = task("task-delivery", "completed");
+    render(
+      <TaskWorkspace
+        {...props(running, { delivery: deliveryBinding(running.id) })}
+      />,
+    );
+
+    expect(screen.getByRole("region", { name: "Delivery" })).toBeVisible();
+    expect(
+      screen.getByRole("status", { name: "Delivery projection status" }),
+    ).toHaveTextContent("Loading delivery eligibility");
+    expect(screen.getByRole("heading", { name: "Plan" })).toBeVisible();
+  });
+
   it("renders complete empty, loading, and error states", () => {
     const { rerender } = render(<TaskWorkspace {...props(null)} />);
     expect(screen.getByRole("heading", { name: "No task selected" })).toBeVisible();

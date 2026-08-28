@@ -21,7 +21,7 @@ async fn valid_delivery_lifecycle_closes_receipts_journal_and_disposition() {
         merge,
         (
             "merged".to_owned(),
-            5,
+            6,
             Some(support::delivery::TASK_ID.to_owned())
         )
     );
@@ -36,7 +36,7 @@ async fn valid_delivery_lifecycle_closes_receipts_journal_and_disposition() {
     .fetch_one(fixture.store.pool())
     .await
     .unwrap();
-    assert_eq!(counts, (1, 1, 2, 10));
+    assert_eq!(counts, (1, 1, 2, 11));
 }
 
 #[tokio::test]
@@ -75,7 +75,7 @@ async fn merged_state_and_initial_disposition_commit_as_one_closed_transaction()
     let error = sqlx::query(
         "UPDATE task_merge_operations
          SET state = 'merged', merged_disposition_task_id = ?,
-             version = 5, updated_at = ?
+             version = 6, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind(support::delivery::TASK_ID)
@@ -92,7 +92,7 @@ async fn merged_state_and_initial_disposition_commit_as_one_closed_transaction()
             .fetch_one(fixture.store.pool())
             .await
             .unwrap();
-    assert_eq!(state, ("merge_pending".to_owned(), 4));
+    assert_eq!(state, ("merge_pending".to_owned(), 5));
     let disposition_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM task_artifact_dispositions")
             .fetch_one(fixture.store.pool())
@@ -101,7 +101,7 @@ async fn merged_state_and_initial_disposition_commit_as_one_closed_transaction()
     assert_eq!(disposition_count, 0);
     let merged_journal_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_delivery_operation_transitions
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 5",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 6",
     )
     .bind(support::delivery::MERGE_OPERATION_ID)
     .fetch_one(fixture.store.pool())
@@ -132,7 +132,7 @@ async fn initial_transition_id_is_the_only_creation_order_key() {
     .unwrap();
     sqlx::query(
         "UPDATE task_merge_operations
-         SET state = 'conflict', failure_code = 'MERGE_CONFLICT', version = 2,
+         SET state = 'conflict', failure_code = 'MERGE_CONFLICT', version = 3,
              merge_base_oid = ?, candidate_merge_tree_oid = ?,
              conflict_path_count = 0, updated_at = ?
          WHERE operation_id = ?",
@@ -210,7 +210,7 @@ async fn concurrent_preflight_origins_leave_exactly_one_closed_transaction() {
     .fetch_one(fixture.store.pool())
     .await
     .unwrap();
-    assert_eq!(counts, (1, 1, 1));
+    assert_eq!(counts, (1, 1, 2));
 
     let unique_columns: Vec<String> = sqlx::query_scalar(
         "SELECT group_concat(ii.name, ',')

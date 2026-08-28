@@ -47,6 +47,17 @@ use runtime_router::{LOCAL_READY_PATH, LOCAL_REOPEN_PATH, REQUEST_ID_HEADER};
 
 mod mutation_gate;
 
+mod delivery;
+
+pub use delivery::{ApplicationDeliveryBackend, build_application_api_router_with_delivery};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use delivery::{
+    map_delivery_busy_for_test, map_delivery_cleanup_eligibility_for_test,
+    map_delivery_command_conflict_for_test, map_delivery_eligibility_for_test,
+    map_delivery_unavailable_for_test,
+};
+
 use mutation_gate::DurableMutationIdentity;
 pub(crate) use mutation_gate::MutationDrainOutcome;
 pub use mutation_gate::{MutationGate, MutationGuard};
@@ -1102,7 +1113,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     use crate::{
         CommandRunner, FixedStartupRunnerFactory, LegacyV2Seed, PlatformPaths,
-        PreActorStartupRunnerContext, ProcessStorageSample, ProcessTestConfig,
+        PreActorStartupRunnerContext, ProcessRunnerMode, ProcessStorageSample, ProcessTestConfig,
         ProcessTestEnvironment, RepositoryControlError, RunContext, RunnerEventSink, RunnerOutcome,
         StartupDependencies, StartupRunnerFactory, StoreWriterFaultPoint, StoreWriterFaultSpec,
         StoreWriterOperationKind, StoreWriterTestController, TaskRunner, VirtualReleaseSignal,
@@ -1383,6 +1394,7 @@ mod tests {
         std::fs::write(
             &scenario,
             serde_json::to_vec(&ProcessTestConfig {
+                runner_mode: ProcessRunnerMode::ScriptedFake {},
                 runtime_config: None,
                 fake_scenarios: Vec::new(),
                 storage_samples: vec![ProcessStorageSample::Native],

@@ -12,7 +12,7 @@ use coding_agent_store::{
 use crate::snapshot::CompatibilitySnapshot;
 use crate::support::delivery::eligibility::{
     ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, MERGE_BASE, MERGE_TREE,
-    PREFLIGHT_SOURCE, TARGET_HEAD,
+    PREFLIGHT_SOURCE, TARGET_CONFIG_DIGEST, TARGET_HEAD, TARGET_SECURITY_DIGEST,
 };
 
 use super::TARGET_BRANCH;
@@ -87,17 +87,26 @@ pub async fn create_preflight(store: &Store, task: &Task) -> DeliveryOperationId
     .unwrap();
     let request = CreatePreflightRequest::try_new(
         command,
-        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
-        GitCommitOid::from_str(PREFLIGHT_SOURCE).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", COMMON_IDENTITY).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY).unwrap(),
         Sha256Digest::from_str(CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_SECURITY_DIGEST).unwrap(),
     )
     .unwrap();
-    match store.create_merge_preflight(request).await.unwrap() {
+    let operation_id = match store.create_merge_preflight(request).await.unwrap() {
         CreatePreflightOutcome::Created(receipt) => receipt.operation_id,
         other => panic!("expected created preflight, got {other:?}"),
-    }
+    };
+    crate::support::delivery::merge::bind_preflight_inputs(
+        store,
+        task.id,
+        operation_id,
+        CANDIDATE_TREE,
+        PREFLIGHT_SOURCE,
+    )
+    .await;
+    operation_id
 }
 
 pub async fn record_conflict(store: &Store, task_id: TaskId, operation_id: DeliveryOperationId) {
@@ -113,7 +122,7 @@ pub async fn record_conflict(store: &Store, task_id: TaskId, operation_id: Deliv
                 RecordMergePreflightResultRequest::try_new(
                     task_id,
                     operation_id,
-                    DeliveryVersion::initial(),
+                    DeliveryVersion::try_new(2).unwrap(),
                     result,
                 )
                 .unwrap(),
@@ -139,7 +148,7 @@ pub(super) async fn record_ready(
                 RecordMergePreflightResultRequest::try_new(
                     task_id,
                     operation_id,
-                    DeliveryVersion::initial(),
+                    DeliveryVersion::try_new(2).unwrap(),
                     result,
                 )
                 .unwrap(),
@@ -167,7 +176,7 @@ async fn record_pending_terminal(
                 RecordMergePreflightResultRequest::try_new(
                     fixture.delivery_task.id,
                     operation_id,
-                    DeliveryVersion::initial(),
+                    DeliveryVersion::try_new(2).unwrap(),
                     result,
                 )
                 .unwrap(),

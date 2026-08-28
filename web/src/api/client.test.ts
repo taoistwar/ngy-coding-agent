@@ -6,6 +6,7 @@ import {
   SessionExpiredError,
   type ApiClientOptions,
 } from "./client";
+import { AuthenticatedTransport } from "./authenticatedTransport";
 import type { BootstrapResponse, Task, TaskDetail } from "./types";
 
 const BOOTSTRAP: BootstrapResponse = {
@@ -97,6 +98,21 @@ function clientOptions(
 }
 
 describe("ApiClient session initialization", () => {
+  it("can bootstrap an injected transport shared with another typed facade", async () => {
+    const sharedFetch = vi.fn<typeof globalThis.fetch>(async () => jsonResponse(BOOTSTRAP));
+    const ignoredFetch = vi.fn<typeof globalThis.fetch>();
+    const transport = new AuthenticatedTransport({ fetch: sharedFetch });
+    const client = new ApiClient(
+      clientOptions(ignoredFetch, { transport }),
+    );
+
+    await expect(client.initialize()).resolves.toEqual(BOOTSTRAP);
+
+    expect(sharedFetch).toHaveBeenCalledOnce();
+    expect(ignoredFetch).not.toHaveBeenCalled();
+    expect(transport.csrfToken).toBe(BOOTSTRAP.csrf_token);
+  });
+
   it("removes the launch-token fragment synchronously before exchange fetch", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     let fragmentWasRemoved = false;

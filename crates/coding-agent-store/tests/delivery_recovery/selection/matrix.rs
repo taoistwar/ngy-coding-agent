@@ -155,8 +155,8 @@ fn action_for(
         .iter()
         .find(|entry| entry.identity.task_id() == task_id)
         .expect("task has a recovery entry");
-    match entry.disposition {
-        DeliveryRecoveryDisposition::Recover(action) => action,
+    match &entry.disposition {
+        DeliveryRecoveryDisposition::Recover(action) => action.clone(),
         DeliveryRecoveryDisposition::ReconciliationRequired => {
             panic!("expected executable recovery entry")
         }

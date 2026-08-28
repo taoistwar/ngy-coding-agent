@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Repository, Task } from "../api/types";
 import type { UseAgentStateResult } from "../state/useAgentState";
 import { ConnectionBanner } from "./ConnectionBanner";
+import type { DeliveryPanelBinding } from "./DeliveryPanel";
 import { ResizableWorkbench } from "./ResizableWorkbench";
 import { SchedulerSummary } from "./SchedulerSummary";
 import { Sidebar } from "./Sidebar";
@@ -11,6 +12,7 @@ import { TaskWorkspace } from "./TaskWorkspace";
 
 export interface AppShellProps {
   agent: UseAgentStateResult;
+  delivery?: DeliveryPanelBinding | null;
 }
 
 interface QuitFailure {
@@ -50,7 +52,7 @@ function quitFailure(error: unknown): QuitFailure {
   };
 }
 
-export function AppShell({ agent }: AppShellProps) {
+export function AppShell({ agent, delivery = null }: AppShellProps) {
   const repositories = useMemo(
     () => orderedValues(agent.state.repositoryOrder, agent.state.repositoriesById),
     [agent.state.repositoriesById, agent.state.repositoryOrder],
@@ -72,6 +74,9 @@ export function AppShell({ agent }: AppShellProps) {
   const quitTriggerRef = useRef<HTMLButtonElement>(null);
   const keepRunningRef = useRef<HTMLButtonElement>(null);
   const quitDialogRef = useRef<HTMLElement>(null);
+  const deliveryLifecycleRef = useRef<
+    Pick<Task, "id" | "status" | "delivery_readiness"> | null
+  >(null);
   const shuttingDown = quitting || agent.state.serviceState === "quiescing";
 
   useEffect(() => {
@@ -129,6 +134,39 @@ export function AppShell({ agent }: AppShellProps) {
       : (agent.state.scheduler.snapshot?.stopping_tasks.find(
           (stopping) => stopping.task_id === task.id,
         ) ?? null);
+  const refreshDelivery = delivery?.controller.refresh;
+
+  useEffect(() => {
+    const current =
+      selectedStateTask === null
+        ? null
+        : {
+            id: selectedStateTask.id,
+            status: selectedStateTask.status,
+            delivery_readiness: selectedStateTask.delivery_readiness,
+          };
+    const previous = deliveryLifecycleRef.current;
+    deliveryLifecycleRef.current = current;
+    if (
+      current === null ||
+      previous === null ||
+      previous.id !== current.id ||
+      refreshDelivery === undefined
+    ) {
+      return;
+    }
+    if (
+      previous.status !== current.status ||
+      previous.delivery_readiness !== current.delivery_readiness
+    ) {
+      refreshDelivery();
+    }
+  }, [
+    refreshDelivery,
+    selectedStateTask?.delivery_readiness,
+    selectedStateTask?.id,
+    selectedStateTask?.status,
+  ]);
 
   const selectTask = (taskId: string) => {
     const next = agent.state.tasksById[taskId];
@@ -216,6 +254,7 @@ export function AppShell({ agent }: AppShellProps) {
           onRetry={agent.retryTask}
           onSelectTask={selectTask}
           repository={repository}
+          delivery={delivery}
           composer={
             <TaskComposer
               repositoryId={selectedRepositoryId}

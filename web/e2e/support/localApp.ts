@@ -56,6 +56,7 @@ export type FakeScenario =
 export type StoreWriterFaultPoint =
   | "fail_before_execute"
   | "fail_unknown_before_execute"
+  | "fail_after_commit_before_reply"
   | "busy_before_execute"
   | "pause_before_execute"
   | "pause_after_commit_before_wake"
@@ -78,6 +79,14 @@ export type StoreWriterOperation =
   | "reserve_attempt_artifact"
   | "mark_attempt_artifact_ready"
   | "mark_attempt_artifact_inconsistent"
+  | "create_merge_preflight"
+  | "create_delivery_source"
+  | "advance_delivery_source_object"
+  | "enter_merge_pending"
+  | "begin_merge_abort"
+  | "accept_worktree_cleanup"
+  | "enter_worktree_remove_pending"
+  | "accept_branch_cleanup"
   | "interrupt_remaining_after_stops"
   | "recover_incomplete";
 
@@ -143,7 +152,27 @@ export interface ProcessRuntimeConfig {
   };
 }
 
+export type ProcessDeliveryProviderScenario =
+  | "approve"
+  | "conflict"
+  | "ignored_collision"
+  | "runtime_conflict";
+
+export type ProcessRunnerMode =
+  | { kind: "scripted_fake" }
+  | {
+      kind: "production_offline_delivery";
+      repository_path: string;
+      provider_scenario: ProcessDeliveryProviderScenario;
+      process_fault: "none";
+    };
+
 export interface ProcessScenario {
+  /**
+   * Input compatibility stays optional while every serialized scenario is
+   * normalized to the strict required Rust field below.
+   */
+  runner_mode?: ProcessRunnerMode;
   runtime_config: ProcessRuntimeConfig | null;
   fake_scenarios: FakeScenario[];
   storage_samples: ProcessStorageSample[];
@@ -190,6 +219,7 @@ export interface RepositorySnapshot {
 }
 
 export const successScenario = (): ProcessScenario => ({
+  runner_mode: { kind: "scripted_fake" },
   runtime_config: null,
   fake_scenarios: ["success"],
   storage_samples: [{ kind: "native" }],
@@ -237,6 +267,10 @@ export interface RuntimeIdentity {
   readonly pid: number;
   readonly port: number;
   readonly startedAt: string;
+}
+
+export interface RestartOptions {
+  readonly startupTimeoutMs?: number;
 }
 
 export interface SecondaryExit {
@@ -346,8 +380,15 @@ export class LocalApp {
     });
   }
 
-  async restart(scenarioSource: ScenarioSource = successScenario()): Promise<void> {
+  async restart(
+    scenarioSource: ScenarioSource = successScenario(),
+    options: RestartOptions = {},
+  ): Promise<void> {
     this.assertFixtureOpen("restart the primary");
+    const startupTimeoutMs = options.startupTimeoutMs ?? START_TIMEOUT_MS;
+    if (!Number.isFinite(startupTimeoutMs) || startupTimeoutMs <= 0) {
+      throw new Error("restart startup timeout must be a positive finite number");
+    }
     if (processIsRunning(this.active.child)) {
       throw new Error("the active primary must exit before restart");
     }
@@ -358,6 +399,7 @@ export class LocalApp {
       descriptorPath: this.descriptorPath,
       scenarioSource,
       previousInstanceId: previousDescriptor.instance_id,
+      startupTimeoutMs,
     }).catch((error: unknown) => {
       throw new Error(this.redact(`could not restart coding-agent: ${errorText(error)}`));
     });
@@ -672,7 +714,7 @@ export async function startLocalApp(
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
 
-    descriptor = await waitForDescriptor(descriptorPath, child);
+    descriptor = await waitForDescriptor(descriptorPath, child, START_TIMEOUT_MS);
     await assertScenarioConsumed(scenarioPath);
     const grant = await requestReopenGrant(descriptor);
     launchUrl = grant.url;
@@ -746,16 +788,42 @@ async function writeFreshScenario(
 ): Promise<string> {
   const scenario =
     typeof scenarioSource === "function" ? await scenarioSource(roots) : scenarioSource;
-  await validateScenarioReleaseSignals(scenario, roots.runtimeDir);
+  const strictScenario = await normalizeRunnerMode(scenario, roots);
+  await validateScenarioReleaseSignals(strictScenario, roots.runtimeDir);
   // Every process gets a distinct source path. Rust owns and consumes these
   // bytes once before it attempts either the primary or secondary path.
   const scenarioPath = path.join(roots.appDataDir, `scenario-${randomUUID()}.json`);
-  await writeFile(scenarioPath, `${JSON.stringify(scenario)}\n`, {
+  await writeFile(scenarioPath, `${JSON.stringify(strictScenario)}\n`, {
     encoding: "utf8",
     mode: 0o600,
     flag: "wx",
   });
   return scenarioPath;
+}
+
+async function normalizeRunnerMode(
+  scenario: ProcessScenario,
+  roots: ScenarioRoots,
+): Promise<ProcessScenario & { runner_mode: ProcessRunnerMode }> {
+  const runnerMode = scenario.runner_mode ?? { kind: "scripted_fake" as const };
+  if (runnerMode.kind === "production_offline_delivery") {
+    const repositoryPath = await validateFixtureDirectory(
+      roots.root,
+      runnerMode.repository_path,
+      "production delivery repository",
+    );
+    if (repositoryPath !== roots.repositoryDir) {
+      throw new Error("production delivery runner must use the primary fixture repository");
+    }
+    if (scenario.fake_scenarios.length !== 0) {
+      throw new Error("production delivery runner cannot also consume scripted fake scenarios");
+    }
+    return {
+      ...scenario,
+      runner_mode: { ...runnerMode, repository_path: repositoryPath },
+    };
+  }
+  return { ...scenario, runner_mode: runnerMode };
 }
 
 function spawnConfiguredProcess(
@@ -784,6 +852,7 @@ async function spawnPrimaryGeneration(options: {
   descriptorPath: string;
   scenarioSource: ScenarioSource;
   previousInstanceId?: string;
+  startupTimeoutMs: number;
 }): Promise<PrimaryGeneration> {
   const scenarioPath = await writeFreshScenario(options.roots, options.scenarioSource);
   const stdout = new BoundedLog();
@@ -803,6 +872,7 @@ async function spawnPrimaryGeneration(options: {
     descriptor = await waitForDescriptor(
       options.descriptorPath,
       child,
+      options.startupTimeoutMs,
       options.previousInstanceId,
     );
     await assertScenarioConsumed(scenarioPath);
@@ -1093,15 +1163,29 @@ async function assertPathAbsent(target: string, label: string): Promise<void> {
 }
 
 async function createRepository(repositoryDir: string): Promise<void> {
-  await mkdir(path.join(repositoryDir, "src"), { recursive: true });
+  await Promise.all([
+    mkdir(path.join(repositoryDir, "src"), { recursive: true }),
+    mkdir(path.join(repositoryDir, "tests"), { recursive: true }),
+  ]);
   await writeFile(
     path.join(repositoryDir, "Cargo.toml"),
-    '[package]\nname = "e2e-fixture"\nversion = "0.1.0"\nedition = "2024"\n',
+    '[package]\nname = "delivery_fixture"\nversion = "0.1.0"\nedition = "2024"\n',
     "utf8",
   );
+  await writeFile(path.join(repositoryDir, ".gitignore"), "/target\n", "utf8");
   await writeFile(
     path.join(repositoryDir, "src", "lib.rs"),
     "pub fn fixture_value() -> u32 { 42 }\n",
+    "utf8",
+  );
+  await writeFile(
+    path.join(repositoryDir, "src", "runtime_conflict.rs"),
+    'pub const SOURCE_SIDE: &str = "base";\n\npub const TARGET_SIDE: &str = "base";\n',
+    "utf8",
+  );
+  await writeFile(
+    path.join(repositoryDir, "tests", "answer.rs"),
+    'use delivery_fixture::fixture_value;\n\n#[test]\nfn approved_delivery_has_reviewed_value() {\n    assert_eq!(fixture_value(), 43);\n}\n',
     "utf8",
   );
   await execFileAsync("cargo", ["generate-lockfile"], { cwd: repositoryDir, windowsHide: true });
@@ -1128,9 +1212,10 @@ async function createRepository(repositoryDir: string): Promise<void> {
 async function waitForDescriptor(
   descriptorPath: string,
   child: AppProcess,
+  timeoutMs: number,
   previousInstanceId?: string,
 ): Promise<RuntimeDescriptor> {
-  const deadline = Date.now() + START_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   let spawnError: Error | null = null;
   const onSpawnError = (error: Error) => {
     spawnError = error;

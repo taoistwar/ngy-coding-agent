@@ -274,7 +274,8 @@ async fn create_receipt_helper_schema(store: &Store) {
              repository_id TEXT NOT NULL, attempt INTEGER NOT NULL, request_hash_domain TEXT NOT NULL, \
              request_hash_version INTEGER NOT NULL, request_hash_algorithm TEXT NOT NULL, \
              canonical_request_hash TEXT NOT NULL, operation_kind TEXT NOT NULL, operation_id TEXT NOT NULL, \
-             merge_operation_id TEXT, cleanup_operation_id TEXT, accepted_operation_version INTEGER NOT NULL, \
+             merge_operation_id TEXT, cleanup_operation_id TEXT, cleanup_merged_operation_id TEXT, \
+             accepted_operation_version INTEGER NOT NULL, \
              accepted_operation_state TEXT NOT NULL, response_discriminator TEXT NOT NULL, created_at TEXT NOT NULL, \
              UNIQUE(command_kind, operation_id) \
          ); \

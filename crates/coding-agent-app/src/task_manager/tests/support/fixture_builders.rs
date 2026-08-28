@@ -317,13 +317,23 @@ async fn paused_queued_cancel_fixture() -> PausedQueuedCancelFixture {
         8,
         controller.clone(),
     );
+    let resources =
+        test_task_manager_launch_resources_for_repository(1, 1, &repository, temp_dir.path());
+    let repository_key = resources
+        .repository_control()
+        .coordination_key(repository.id)
+        .expect("resolve paused queued-cancel repository control identity");
+    let admission_block = resources
+        .repository_control()
+        .try_acquire(repository_key)
+        .expect("hold paused queued-cancel repository control lease");
     let manager = TaskManagerHandle::spawn(
         store.clone(),
         writer.clone(),
         dispatcher,
         ServiceStateController::new(ServiceState::Ready),
         Arc::new(CancellingRunner::default()),
-        test_task_manager_launch_resources_for_repository(1, 1, &repository, temp_dir.path()),
+        resources,
         8,
     );
     let task = writer
@@ -345,9 +355,15 @@ async fn paused_queued_cancel_fixture() -> PausedQueuedCancelFixture {
         let manager = manager.clone();
         async move { manager.cancel(task.id).await }
     });
-    controller
-        .wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1)
-        .await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+    )
+    .await
+    .expect("queued cancel reaches its post-commit pause before admission is released");
+    admission_block
+        .clean_release()
+        .expect("release paused queued-cancel repository control lease cleanly");
     PausedQueuedCancelFixture {
         _temp_dir: temp_dir,
         store,

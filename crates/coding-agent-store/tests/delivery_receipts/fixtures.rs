@@ -1,12 +1,12 @@
 use coding_agent_domain::{ClientRequestId, Task};
 use coding_agent_store::{
     CreatePreflightOutcome, CreatePreflightRequest, DeliveryCommandReceipt, DirectoryIdentity,
-    GitBranchRef, GitCommitOid, GitTreeOid, PreflightCommandRequest, Sha256Digest, Store,
+    GitBranchRef, GitCommitOid, PreflightCommandRequest, Sha256Digest, Store,
 };
 
 use crate::support::delivery::eligibility::{
-    ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, PREFLIGHT_SOURCE, TARGET_HEAD,
-    approved_task_with_ready_artifact,
+    ADMIN_IDENTITY, COMMON_IDENTITY, CONFIG_DIGEST, TARGET_CONFIG_DIGEST, TARGET_HEAD,
+    TARGET_SECURITY_DIGEST, approved_task_with_ready_artifact,
 };
 
 pub async fn eligible_fixture() -> (Store, Task) {
@@ -26,11 +26,11 @@ pub fn preflight_request(
     .unwrap();
     CreatePreflightRequest::try_new(
         command,
-        CANDIDATE_TREE.parse::<GitTreeOid>().unwrap(),
-        PREFLIGHT_SOURCE.parse::<GitCommitOid>().unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", COMMON_IDENTITY).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY).unwrap(),
         CONFIG_DIGEST.parse::<Sha256Digest>().unwrap(),
+        TARGET_CONFIG_DIGEST.parse::<Sha256Digest>().unwrap(),
+        TARGET_SECURITY_DIGEST.parse::<Sha256Digest>().unwrap(),
     )
     .unwrap()
 }

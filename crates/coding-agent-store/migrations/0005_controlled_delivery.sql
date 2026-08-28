@@ -41,6 +41,24 @@ CREATE TABLE task_delivery_operation_transitions (
                 AND failure_code NOT GLOB '*[^A-Z0-9_]*'
             )
         ),
+    target_config_attributes_digest TEXT
+        CHECK (
+            target_config_attributes_digest IS NULL
+            OR (
+                typeof(target_config_attributes_digest) = 'text'
+                AND length(CAST(target_config_attributes_digest AS BLOB)) = 64
+                AND target_config_attributes_digest NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+    target_security_digest TEXT
+        CHECK (
+            target_security_digest IS NULL
+            OR (
+                typeof(target_security_digest) = 'text'
+                AND length(CAST(target_security_digest AS BLOB)) = 64
+                AND target_security_digest NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
     transitioned_at TEXT NOT NULL
         CHECK (
             typeof(transitioned_at) = 'text'
@@ -56,6 +74,18 @@ CREATE TABLE task_delivery_operation_transitions (
     CHECK (
         (entity_version = 1 AND from_state = 'absent')
         OR (entity_version > 1 AND from_state != 'absent')
+    ),
+    CHECK (
+        (
+            entity_kind = 'merge_operation'
+            AND target_config_attributes_digest IS NOT NULL
+            AND target_security_digest IS NOT NULL
+        )
+        OR (
+            entity_kind != 'merge_operation'
+            AND target_config_attributes_digest IS NULL
+            AND target_security_digest IS NULL
+        )
     ),
     CHECK (
         (
@@ -185,10 +215,14 @@ CREATE TABLE task_delivery_operation_transitions (
                 'reconciliation_required'
             )
             AND (
-                (from_state = 'absent' AND to_state = 'preflight_pending')
-                OR (from_state = 'preflight_pending' AND to_state IN (
-                    'preflight_ready', 'conflict', 'rejected', 'stale',
-                    'reconciliation_required'
+                (from_state = 'absent' AND to_state = 'preflight_pending'
+                    AND entity_version = 1)
+                OR (from_state = 'preflight_pending'
+                    AND to_state = 'preflight_pending' AND entity_version = 2)
+                OR (from_state = 'preflight_pending' AND (
+                    (to_state IN ('preflight_ready', 'conflict') AND entity_version = 3)
+                    OR (to_state IN ('rejected', 'stale', 'reconciliation_required')
+                        AND entity_version IN (2, 3))
                 ))
                 OR (from_state = 'preflight_ready' AND to_state IN (
                     'accepted', 'stale', 'superseded', 'reconciliation_required'
@@ -275,6 +309,8 @@ CREATE TABLE task_delivery_operation_transitions (
         AND instr(CAST(from_state AS BLOB), x'00') = 0
         AND instr(CAST(to_state AS BLOB), x'00') = 0
         AND instr(CAST(COALESCE(failure_code, '') AS BLOB), x'00') = 0
+        AND instr(CAST(COALESCE(target_config_attributes_digest, '') AS BLOB), x'00') = 0
+        AND instr(CAST(COALESCE(target_security_digest, '') AS BLOB), x'00') = 0
         AND instr(CAST(transitioned_at AS BLOB), x'00') = 0
     )
 ) STRICT;
@@ -753,17 +789,23 @@ CREATE TABLE task_merge_operations (
         ),
     fixed_lock_reason TEXT NOT NULL
         CHECK (typeof(fixed_lock_reason) = 'text' AND fixed_lock_reason = 'codex-reserved'),
-    candidate_tree_oid TEXT NOT NULL
+    candidate_tree_oid TEXT
         CHECK (
-            typeof(candidate_tree_oid) = 'text'
-            AND length(CAST(candidate_tree_oid AS BLOB)) IN (40, 64)
-            AND candidate_tree_oid NOT GLOB '*[^0-9a-f]*'
+            candidate_tree_oid IS NULL
+            OR (
+                typeof(candidate_tree_oid) = 'text'
+                AND length(CAST(candidate_tree_oid AS BLOB)) IN (40, 64)
+                AND candidate_tree_oid NOT GLOB '*[^0-9a-f]*'
+            )
         ),
-    preflight_source_commit_oid TEXT NOT NULL
+    preflight_source_commit_oid TEXT
         CHECK (
-            typeof(preflight_source_commit_oid) = 'text'
-            AND length(CAST(preflight_source_commit_oid AS BLOB)) IN (40, 64)
-            AND preflight_source_commit_oid NOT GLOB '*[^0-9a-f]*'
+            preflight_source_commit_oid IS NULL
+            OR (
+                typeof(preflight_source_commit_oid) = 'text'
+                AND length(CAST(preflight_source_commit_oid AS BLOB)) IN (40, 64)
+                AND preflight_source_commit_oid NOT GLOB '*[^0-9a-f]*'
+            )
         ),
     delivery_source_task_id TEXT
         CHECK (
@@ -851,6 +893,18 @@ CREATE TABLE task_merge_operations (
             typeof(config_attributes_digest) = 'text'
             AND length(CAST(config_attributes_digest AS BLOB)) = 64
             AND config_attributes_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+    target_config_attributes_digest TEXT NOT NULL
+        CHECK (
+            typeof(target_config_attributes_digest) = 'text'
+            AND length(CAST(target_config_attributes_digest AS BLOB)) = 64
+            AND target_config_attributes_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+    target_security_digest TEXT NOT NULL
+        CHECK (
+            typeof(target_security_digest) = 'text'
+            AND length(CAST(target_security_digest AS BLOB)) = 64
+            AND target_security_digest NOT GLOB '*[^0-9a-f]*'
         ),
     merge_base_oid TEXT
         CHECK (
@@ -1089,12 +1143,17 @@ CREATE TABLE task_merge_operations (
     FOREIGN KEY (merged_disposition_task_id, operation_id)
         REFERENCES task_artifact_dispositions (task_id, merged_operation_id)
         DEFERRABLE INITIALLY DEFERRED,
-    CHECK (artifact_base_commit != preflight_source_commit_oid),
+    CHECK (
+        preflight_source_commit_oid IS NULL
+        OR artifact_base_commit != preflight_source_commit_oid
+    ),
     CHECK (artifact_source_branch != target_branch),
     CHECK (
-        length(CAST(candidate_tree_oid AS BLOB)) = length(CAST(artifact_base_commit AS BLOB))
-        AND length(CAST(preflight_source_commit_oid AS BLOB))
-            = length(CAST(artifact_base_commit AS BLOB))
+        (candidate_tree_oid IS NULL OR length(CAST(candidate_tree_oid AS BLOB))
+            = length(CAST(artifact_base_commit AS BLOB)))
+        AND (preflight_source_commit_oid IS NULL
+            OR length(CAST(preflight_source_commit_oid AS BLOB))
+                = length(CAST(artifact_base_commit AS BLOB)))
         AND length(CAST(expected_target_head AS BLOB))
             = length(CAST(artifact_base_commit AS BLOB))
         AND (
@@ -1121,6 +1180,29 @@ CREATE TABLE task_merge_operations (
             abort_merge_head_oid IS NULL
             OR length(CAST(abort_merge_head_oid AS BLOB))
                 = length(CAST(artifact_base_commit AS BLOB))
+        )
+    ),
+    CHECK (
+        (
+            state = 'preflight_pending'
+            AND version = 1
+            AND candidate_tree_oid IS NULL
+            AND preflight_source_commit_oid IS NULL
+        )
+        OR (
+            state IN ('rejected', 'stale', 'reconciliation_required')
+            AND version = 2
+            AND candidate_tree_oid IS NULL
+            AND preflight_source_commit_oid IS NULL
+        )
+        OR (
+            candidate_tree_oid IS NOT NULL
+            AND preflight_source_commit_oid IS NOT NULL
+            AND (state != 'preflight_pending' OR version = 2)
+            AND NOT (
+                state IN ('rejected', 'stale', 'reconciliation_required')
+                AND version = 2
+            )
         )
     ),
     CHECK (
@@ -1240,17 +1322,39 @@ CREATE TABLE task_merge_operations (
         )
     ),
     CHECK (
+        abort_child_receipt_id IS NULL
+        OR (
+            conflict_path_count IS NOT NULL
+            AND conflict_path_count BETWEEN 1 AND 128
+        )
+    ),
+    CHECK (
         (state = 'merged' AND merged_disposition_task_id = task_id)
         OR (state != 'merged' AND merged_disposition_task_id IS NULL)
     ),
     CHECK (
-        (state = 'conflict' AND conflict_path_count IS NOT NULL)
-        OR (state != 'conflict' AND conflict_path_count IS NULL)
+        (
+            conflict_path_count IS NOT NULL
+            AND (
+                state IN ('abort_pending', 'conflict')
+                OR (
+                    state = 'reconciliation_required'
+                    AND abort_child_receipt_id IS NOT NULL
+                )
+            )
+        )
+        OR (
+            conflict_path_count IS NULL
+            AND state NOT IN ('abort_pending', 'conflict')
+        )
     ),
     CHECK (
         artifact_base_commit GLOB '*[1-9a-f]*'
-        AND candidate_tree_oid GLOB '*[1-9a-f]*'
-        AND preflight_source_commit_oid GLOB '*[1-9a-f]*'
+        AND (candidate_tree_oid IS NULL OR candidate_tree_oid GLOB '*[1-9a-f]*')
+        AND (
+            preflight_source_commit_oid IS NULL
+            OR preflight_source_commit_oid GLOB '*[1-9a-f]*'
+        )
         AND expected_target_head GLOB '*[1-9a-f]*'
         AND (source_commit_oid IS NULL OR source_commit_oid GLOB '*[1-9a-f]*')
         AND (merge_base_oid IS NULL OR merge_base_oid GLOB '*[1-9a-f]*')
@@ -1310,8 +1414,8 @@ CREATE TABLE task_merge_operations (
         AND instr(CAST(worktree_admin_identity_algorithm AS BLOB), x'00') = 0
         AND instr(CAST(worktree_admin_identity_digest AS BLOB), x'00') = 0
         AND instr(CAST(fixed_lock_reason AS BLOB), x'00') = 0
-        AND instr(CAST(candidate_tree_oid AS BLOB), x'00') = 0
-        AND instr(CAST(preflight_source_commit_oid AS BLOB), x'00') = 0
+        AND instr(CAST(COALESCE(candidate_tree_oid, '') AS BLOB), x'00') = 0
+        AND instr(CAST(COALESCE(preflight_source_commit_oid, '') AS BLOB), x'00') = 0
         AND instr(CAST(COALESCE(delivery_source_task_id, '') AS BLOB), x'00') = 0
         AND instr(CAST(COALESCE(source_commit_oid, '') AS BLOB), x'00') = 0
         AND instr(CAST(preflight_receipt_id AS BLOB), x'00') = 0
@@ -1319,6 +1423,8 @@ CREATE TABLE task_merge_operations (
         AND instr(CAST(target_branch AS BLOB), x'00') = 0
         AND instr(CAST(expected_target_head AS BLOB), x'00') = 0
         AND instr(CAST(config_attributes_digest AS BLOB), x'00') = 0
+        AND instr(CAST(target_config_attributes_digest AS BLOB), x'00') = 0
+        AND instr(CAST(target_security_digest AS BLOB), x'00') = 0
         AND instr(CAST(COALESCE(merge_base_oid, '') AS BLOB), x'00') = 0
         AND instr(CAST(COALESCE(candidate_merge_tree_oid, '') AS BLOB), x'00') = 0
         AND instr(CAST(COALESCE(merge_author_name, '') AS BLOB), x'00') = 0
@@ -2130,6 +2236,7 @@ CREATE TABLE task_delivery_command_receipts (
         ),
     merge_operation_id TEXT,
     cleanup_operation_id TEXT,
+    cleanup_merged_operation_id TEXT,
     accepted_operation_version INTEGER NOT NULL
         CHECK (
             typeof(accepted_operation_version) = 'integer'
@@ -2165,6 +2272,9 @@ CREATE TABLE task_delivery_command_receipts (
     FOREIGN KEY (cleanup_operation_id)
         REFERENCES task_cleanup_operations (operation_id)
         DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (cleanup_merged_operation_id)
+        REFERENCES task_merge_operations (operation_id)
+        DEFERRABLE INITIALLY DEFERRED,
     FOREIGN KEY (
         operation_kind, operation_id, accepted_operation_version,
         accepted_operation_state
@@ -2176,11 +2286,13 @@ CREATE TABLE task_delivery_command_receipts (
             operation_kind = 'merge_operation'
             AND merge_operation_id = operation_id
             AND cleanup_operation_id IS NULL
+            AND cleanup_merged_operation_id IS NULL
         )
         OR (
             operation_kind = 'cleanup_operation'
             AND cleanup_operation_id = operation_id
             AND merge_operation_id IS NULL
+            AND cleanup_merged_operation_id IS NOT NULL
         )
     ),
     CHECK (
@@ -2221,6 +2333,7 @@ CREATE TABLE task_delivery_command_receipts (
         AND instr(CAST(operation_id AS BLOB), x'00') = 0
         AND instr(CAST(COALESCE(merge_operation_id, '') AS BLOB), x'00') = 0
         AND instr(CAST(COALESCE(cleanup_operation_id, '') AS BLOB), x'00') = 0
+        AND instr(CAST(COALESCE(cleanup_merged_operation_id, '') AS BLOB), x'00') = 0
         AND instr(CAST(accepted_operation_state AS BLOB), x'00') = 0
         AND instr(CAST(response_discriminator AS BLOB), x'00') = 0
         AND instr(CAST(created_at AS BLOB), x'00') = 0
@@ -2444,6 +2557,8 @@ WHEN NOT (
               AND m.version = NEW.entity_version
               AND m.state = NEW.to_state
               AND m.failure_code IS NEW.failure_code
+              AND m.target_config_attributes_digest IS NEW.target_config_attributes_digest
+              AND m.target_security_digest IS NEW.target_security_digest
               AND m.updated_at = NEW.transitioned_at
         )
     )
@@ -2819,12 +2934,28 @@ WHEN NEW.operation_id IS NOT OLD.operation_id
     OR NEW.worktree_admin_identity_algorithm IS NOT OLD.worktree_admin_identity_algorithm
     OR NEW.worktree_admin_identity_digest IS NOT OLD.worktree_admin_identity_digest
     OR NEW.fixed_lock_reason IS NOT OLD.fixed_lock_reason
-    OR NEW.candidate_tree_oid IS NOT OLD.candidate_tree_oid
-    OR NEW.preflight_source_commit_oid IS NOT OLD.preflight_source_commit_oid
+    OR (
+        (
+            NEW.candidate_tree_oid IS NOT OLD.candidate_tree_oid
+            OR NEW.preflight_source_commit_oid IS NOT OLD.preflight_source_commit_oid
+        )
+        AND NOT (
+            OLD.state = 'preflight_pending'
+            AND NEW.state = 'preflight_pending'
+            AND OLD.version = 1
+            AND NEW.version = 2
+            AND OLD.candidate_tree_oid IS NULL
+            AND OLD.preflight_source_commit_oid IS NULL
+            AND NEW.candidate_tree_oid IS NOT NULL
+            AND NEW.preflight_source_commit_oid IS NOT NULL
+        )
+    )
     OR NEW.preflight_receipt_id IS NOT OLD.preflight_receipt_id
     OR NEW.target_branch IS NOT OLD.target_branch
     OR NEW.expected_target_head IS NOT OLD.expected_target_head
     OR NEW.config_attributes_digest IS NOT OLD.config_attributes_digest
+    OR NEW.target_config_attributes_digest IS NOT OLD.target_config_attributes_digest
+    OR NEW.target_security_digest IS NOT OLD.target_security_digest
     OR NEW.created_at IS NOT OLD.created_at
     OR (OLD.delivery_source_task_id IS NOT NULL AND NEW.delivery_source_task_id IS NOT OLD.delivery_source_task_id)
     OR (OLD.source_commit_oid IS NOT NULL AND NEW.source_commit_oid IS NOT OLD.source_commit_oid)
@@ -2872,8 +3003,8 @@ WHEN NEW.operation_id IS NOT OLD.operation_id
         OLD.conflict_path_count IS NULL
         AND NEW.conflict_path_count IS NOT NULL
         AND NOT (
-            OLD.state IN ('preflight_pending', 'abort_pending')
-            AND NEW.state = 'conflict'
+            (OLD.state = 'preflight_pending' AND NEW.state = 'conflict')
+            OR (OLD.state = 'merge_pending' AND NEW.state = 'abort_pending')
         )
     )
     OR (
@@ -2909,7 +3040,17 @@ CREATE TRIGGER task_merge_operations_transition_on_update
 BEFORE UPDATE ON task_merge_operations
 WHEN NEW.version != OLD.version + 1
     OR NOT (
-        (OLD.state = 'preflight_pending' AND NEW.state IN (
+        (
+            OLD.state = 'preflight_pending'
+            AND NEW.state = 'preflight_pending'
+            AND OLD.version = 1
+            AND NEW.version = 2
+            AND OLD.candidate_tree_oid IS NULL
+            AND OLD.preflight_source_commit_oid IS NULL
+            AND NEW.candidate_tree_oid IS NOT NULL
+            AND NEW.preflight_source_commit_oid IS NOT NULL
+        )
+        OR (OLD.state = 'preflight_pending' AND NEW.state IN (
             'preflight_ready', 'conflict', 'rejected', 'stale',
             'reconciliation_required'
         ))
@@ -2978,10 +3119,12 @@ AFTER INSERT ON task_merge_operations
 BEGIN
     INSERT INTO task_delivery_operation_transitions (
         entity_kind, entity_id, entity_version, from_state, to_state,
-        failure_code, transitioned_at
+        failure_code, target_config_attributes_digest, target_security_digest,
+        transitioned_at
     ) VALUES (
         'merge_operation', NEW.operation_id, NEW.version, 'absent', NEW.state,
-        NEW.failure_code, NEW.updated_at
+        NEW.failure_code, NEW.target_config_attributes_digest, NEW.target_security_digest,
+        NEW.updated_at
     );
 END;
 
@@ -2990,10 +3133,12 @@ AFTER UPDATE ON task_merge_operations
 BEGIN
     INSERT INTO task_delivery_operation_transitions (
         entity_kind, entity_id, entity_version, from_state, to_state,
-        failure_code, transitioned_at
+        failure_code, target_config_attributes_digest, target_security_digest,
+        transitioned_at
     ) VALUES (
         'merge_operation', NEW.operation_id, NEW.version, OLD.state, NEW.state,
-        NEW.failure_code, NEW.updated_at
+        NEW.failure_code, NEW.target_config_attributes_digest, NEW.target_security_digest,
+        NEW.updated_at
     );
 END;
 
@@ -3024,7 +3169,7 @@ WHEN NOT EXISTS (
     SELECT 1
     FROM task_merge_operations m
     WHERE m.operation_id = NEW.operation_id
-      AND m.state = 'conflict'
+      AND m.state IN ('abort_pending', 'conflict')
       AND m.conflict_path_count IS NOT NULL
       AND NEW.ordinal < m.conflict_path_count
 )
@@ -3589,6 +3734,8 @@ WHEN NOT (
         NEW.command_kind IN ('remove_worktree', 'delete_branch')
         AND EXISTS (
             SELECT 1 FROM task_cleanup_operations c
+            JOIN task_artifact_dispositions d
+              ON d.task_id = c.disposition_task_id
             WHERE c.operation_id = NEW.cleanup_operation_id
               AND c.origin_receipt_id = NEW.client_request_id
               AND c.task_id = NEW.task_id
@@ -3596,6 +3743,7 @@ WHEN NOT (
               AND c.attempt = NEW.attempt
               AND c.version = NEW.accepted_operation_version
               AND c.state = NEW.accepted_operation_state
+              AND d.merged_operation_id = NEW.cleanup_merged_operation_id
               AND (
                   (NEW.command_kind = 'remove_worktree' AND c.kind = 'remove_worktree')
                   OR (NEW.command_kind = 'delete_branch' AND c.kind = 'delete_branch')

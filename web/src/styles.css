@@ -1246,6 +1246,185 @@ ol {
   text-align: center;
 }
 
+.delivery-panel {
+  display: grid;
+  gap: 0.85rem;
+  margin: 1rem 0;
+  outline: none;
+}
+
+.delivery-panel h3,
+.delivery-panel h4,
+.delivery-panel h5,
+.delivery-dialog h2 {
+  margin: 0;
+}
+
+.delivery-boundary-note,
+.delivery-retained-default {
+  margin: 0;
+  border-left: 3px solid var(--info);
+  padding-left: 0.65rem;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.delivery-eligibility,
+.delivery-merge-progress,
+.delivery-cleanup {
+  display: grid;
+  gap: 0.65rem;
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  padding-top: 0.8rem;
+}
+
+.delivery-status,
+.delivery-empty-state,
+.delivery-conflict-bounds,
+.delivery-request-id,
+.delivery-cleanup-receipt,
+.delivery-cleanup > p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+
+.delivery-facts,
+.delivery-exact-fields,
+.delivery-disposition {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
+  gap: 0.55rem;
+  min-width: 0;
+  margin: 0;
+}
+
+.delivery-facts > div,
+.delivery-exact-fields > div,
+.delivery-disposition > div {
+  display: grid;
+  gap: 0.18rem;
+  min-width: 0;
+  border-radius: 0.5rem;
+  padding: 0.55rem;
+  background: rgb(11 12 16 / 0.42);
+}
+
+.delivery-facts dt,
+.delivery-exact-fields dt,
+.delivery-disposition dt {
+  color: var(--text-faint);
+  font-size: 0.7rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.delivery-facts dd,
+.delivery-exact-fields dd,
+.delivery-disposition dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.delivery-long-value,
+.delivery-value,
+.delivery-value code,
+.delivery-conflict-path,
+.delivery-request-id code,
+.delivery-cleanup-receipt code,
+.delivery-failure-code code {
+  display: inline;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.delivery-reasons,
+.delivery-conflicts ul {
+  display: grid;
+  gap: 0.4rem;
+  min-width: 0;
+  padding-left: 1.15rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  list-style: disc;
+}
+
+.delivery-conflicts {
+  display: grid;
+  gap: 0.45rem;
+  min-width: 0;
+  border: 1px solid rgb(244 197 106 / 0.4);
+  border-radius: 0.6rem;
+  padding: 0.65rem;
+  background: rgb(94 69 22 / 0.18);
+}
+
+.delivery-conflicts p,
+.delivery-conflicts li {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.delivery-conflicts li {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.delivery-path-encoding {
+  color: var(--warning);
+  font-size: 0.7rem;
+}
+
+.delivery-cleanup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.delivery-load-error,
+.delivery-command-error,
+.delivery-stale {
+  border: 1px solid rgb(255 139 145 / 0.42);
+  border-radius: 0.65rem;
+  padding: 0.65rem;
+  background: rgb(92 29 38 / 0.24);
+  color: var(--danger);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.delivery-load-error,
+.delivery-command-error {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.delivery-load-error p,
+.delivery-command-error p,
+.delivery-stale {
+  margin: 0;
+}
+
+.delivery-success {
+  color: var(--success);
+}
+
+.delivery-failure-code {
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+
 .modal-backdrop {
   position: fixed;
   z-index: 100;
@@ -1257,7 +1436,8 @@ ol {
   backdrop-filter: blur(8px);
 }
 
-.quit-dialog {
+.quit-dialog,
+.delivery-dialog {
   width: min(100%, 31rem);
   border: 1px solid var(--border-strong);
   border-radius: 1rem;
@@ -1266,7 +1446,18 @@ ol {
   box-shadow: var(--shadow);
 }
 
-.quit-dialog > p {
+.delivery-dialog {
+  display: grid;
+  gap: 0.85rem;
+  width: min(100%, 46rem);
+  max-height: min(90vh, 52rem);
+  overflow: auto;
+  outline: none;
+}
+
+.quit-dialog > p,
+.delivery-dialog > p {
+  margin: 0;
   color: var(--text-muted);
   line-height: 1.55;
 }
@@ -1278,9 +1469,16 @@ ol {
   margin-top: 1rem;
 }
 
-.dialog-actions button:last-child {
+.quit-dialog .dialog-actions button:last-child,
+.delivery-destructive-action {
   border-color: rgb(255 139 145 / 0.55);
   color: #ffd7da;
+}
+
+.delivery-primary-action {
+  border-color: rgb(152 168 255 / 0.58);
+  background: var(--accent-surface);
+  color: var(--accent-strong);
 }
 
 .visually-hidden {

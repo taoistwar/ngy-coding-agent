@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::command_policy::{
-    CommandPolicyError, ExecutionDirectory, GitCommandBinding, ValidatedCommand, child_visible_path,
+    CommandPolicyError, ExecutionDirectory, GitCommandBinding, ValidatedCommand,
 };
 use crate::native_fs::read_directory_names;
 use crate::process_supervisor::{
@@ -23,10 +23,22 @@ use crate::{
     GitTools, ProcessLivenessScope, RelativePath, RootCapability, ToolchainPaths,
 };
 
-const ADMIN_FILE_LIMIT: u64 = 16 * 1024;
-const MAX_ADMIN_ENTRIES: usize = 4_096;
 const MAX_LOCAL_CONFIG_ENTRIES: usize = 4_096;
 const MAX_LOCAL_CONFIG_KEY_BYTES: usize = 1_024;
+
+mod authentication;
+
+#[allow(unused_imports)]
+pub(crate) use authentication::{
+    CleanupAbsentAuthentication, CleanupPresentAuthentication, CleanupTopologyIntentV1,
+    CleanupTopologyObservation, CleanupWorktreeAuthenticator, CleanupWorktreeTarget,
+    LinkedWorktreeAuthentication, LinkedWorktreeAuthenticator, LinkedWorktreeCommandContext,
+    RetainedDirectory,
+};
+use authentication::{
+    admin_commondir_matches, find_reserved_git_directory, list_worktree_admin_entries,
+    read_admin_gitdir, read_admin_line,
+};
 
 /// Stable, application-owned identity for one task attempt.
 ///
@@ -399,6 +411,14 @@ pub enum WorktreeSideEffectTestOutcome {
 }
 
 impl WorktreeProvisioner {
+    /// Returns the exact opaque process-liveness scope retained by this
+    /// provisioner. Delivery cleanup uses this crate-private view to bind a
+    /// sealed worker proof to the scope that actually owned worktree child
+    /// processes instead of accepting a caller-selected substitute.
+    pub(crate) const fn process_liveness_scope(&self) -> &ProcessLivenessScope {
+        &self.process_liveness_scope
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn from_trusted_paths(
         toolchain: &ToolchainPaths,
@@ -483,6 +503,20 @@ impl WorktreeProvisioner {
     /// its directory path or platform identity components.
     pub const fn common_git_identity_marker(&self) -> DirectoryIdentityMarker {
         self.common_git_identity
+    }
+
+    pub(crate) fn delivery_source_authenticator(
+        &self,
+        expected_git: &Arc<crate::PinnedExecutable>,
+    ) -> Result<LinkedWorktreeAuthenticator, WorktreeError> {
+        LinkedWorktreeAuthenticator::from_provisioner(self, expected_git)
+    }
+
+    pub(crate) fn delivery_cleanup_authenticator(
+        &self,
+        expected_git: &Arc<crate::PinnedExecutable>,
+    ) -> Result<CleanupWorktreeAuthenticator, WorktreeError> {
+        CleanupWorktreeAuthenticator::from_provisioner(self, expected_git)
     }
 
     /// Clones the retained, authenticated common-Git directory capability for
@@ -1649,58 +1683,11 @@ impl WorktreeProvisioner {
         &self,
         reservation: &WorktreeReservation,
     ) -> Result<Option<PathBuf>, WorktreeError> {
-        let current = list_worktree_admin_entries(&self.common_git_capability)?;
-        let mut matches = Vec::new();
-        for name in current {
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if RelativePath::parse(name.to_owned()).is_err() || name.contains('/') {
-                continue;
-            }
-            let pointer = match read_admin_gitdir(&self.common_git_capability, name) {
-                Ok(pointer) => pointer,
-                Err(WorktreeError::LinkedMetadataInvalid) => continue,
-                Err(error) => return Err(error),
-            };
-            if !admin_backlink_matches(&pointer, reservation.worktree_path())? {
-                continue;
-            }
-            if read_admin_line(&self.common_git_capability, name, "HEAD")?
-                != format!("ref: refs/heads/{}", reservation.branch_name())
-                || read_admin_line(&self.common_git_capability, name, "locked")? != "codex-reserved"
-                || !admin_commondir_matches(
-                    &self.common_git_capability,
-                    &self.common_git_directory,
-                    name,
-                )?
-            {
-                return Err(WorktreeError::LinkedMetadataInvalid);
-            }
-            matches.push(self.common_git_directory.join("worktrees").join(name));
-        }
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(matches.pop()),
-            _ => Err(WorktreeError::LinkedMetadataInvalid),
-        }
-    }
-}
-
-fn admin_backlink_matches(pointer: &Path, worktree_path: &Path) -> Result<bool, WorktreeError> {
-    let expected = child_visible_path(worktree_path).join(".git");
-    match (
-        std::fs::canonicalize(pointer),
-        std::fs::canonicalize(&expected),
-    ) {
-        (Ok(pointer), Ok(expected)) => Ok(pointer == expected),
-        (Err(pointer_error), _) if pointer_error.kind() != io::ErrorKind::NotFound => {
-            Err(WorktreeError::Io(pointer_error))
-        }
-        (_, Err(expected_error)) if expected_error.kind() != io::ErrorKind::NotFound => {
-            Err(WorktreeError::Io(expected_error))
-        }
-        _ => Ok(pointer == expected),
+        find_reserved_git_directory(
+            &self.common_git_capability,
+            &self.common_git_directory,
+            reservation,
+        )
     }
 }
 
@@ -1798,92 +1785,6 @@ fn validate_relative_directory_mapping(
     } else {
         Err(WorktreeError::CargoWorkspaceOutsideRepository)
     }
-}
-
-fn list_worktree_admin_entries(
-    capability: &RootCapability,
-) -> Result<BTreeSet<OsString>, WorktreeError> {
-    let relative = RelativePath::parse("worktrees".to_owned())
-        .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
-    let mut directory = match capability.open_directory(&relative) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => return Err(WorktreeError::Io(error)),
-    };
-    let names =
-        read_directory_names(&mut directory, MAX_ADMIN_ENTRIES).map_err(WorktreeError::Io)?;
-    Ok(names
-        .into_iter()
-        .filter(|name| name != "." && name != "..")
-        .collect())
-}
-
-fn read_admin_gitdir(capability: &RootCapability, name: &str) -> Result<PathBuf, WorktreeError> {
-    let value = read_admin_line(capability, name, "gitdir")?;
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err(WorktreeError::LinkedMetadataInvalid)
-    }
-}
-
-fn read_admin_line(
-    capability: &RootCapability,
-    name: &str,
-    file_name: &str,
-) -> Result<String, WorktreeError> {
-    let relative = RelativePath::parse(format!("worktrees/{name}/{file_name}"))
-        .map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
-    let mut file = match capability.open_file_for_read(&relative) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(WorktreeError::LinkedMetadataInvalid);
-        }
-        Err(error) => return Err(WorktreeError::Io(error)),
-    };
-    let mut bytes = Vec::new();
-    file.by_ref()
-        .take(ADMIN_FILE_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(WorktreeError::Io)?;
-    if bytes.len() as u64 > ADMIN_FILE_LIMIT || bytes.contains(&0) {
-        return Err(WorktreeError::LinkedMetadataInvalid);
-    }
-    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-        bytes.pop();
-    }
-    let value = std::str::from_utf8(&bytes).map_err(|_| WorktreeError::LinkedMetadataInvalid)?;
-    if value.is_empty() || value.contains(['\r', '\n']) {
-        Err(WorktreeError::LinkedMetadataInvalid)
-    } else {
-        Ok(value.to_owned())
-    }
-}
-
-fn admin_commondir_matches(
-    capability: &RootCapability,
-    common_git_directory: &Path,
-    name: &str,
-) -> Result<bool, WorktreeError> {
-    let commondir = read_admin_line(capability, name, "commondir")?;
-    // Git's common-side linked-worktree layout is fixed. Requiring the exact
-    // relative backlink avoids treating arbitrary metadata text as a path
-    // authority, while canonical identity checks catch namespace rebinding.
-    if commondir != "../.." {
-        return Ok(false);
-    }
-    let resolved = match std::fs::canonicalize(
-        common_git_directory
-            .join("worktrees")
-            .join(name)
-            .join(&commondir),
-    ) {
-        Ok(resolved) => resolved,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(WorktreeError::Io(error)),
-    };
-    Ok(resolved == common_git_directory)
 }
 
 fn validate_worktree_list_record(

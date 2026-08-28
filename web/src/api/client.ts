@@ -1,6 +1,5 @@
 import type {
   AddRepositoryRequest,
-  ApiErrorResponse,
   BootstrapResponse,
   CancellationAcceptedResponse,
   CreateTaskRequest,
@@ -12,7 +11,6 @@ import type {
   TaskEvent,
 } from "./types";
 import {
-  ValidationError,
   validateBootstrapResponse,
   validateCancellationResponse,
   validateQuitResponse,
@@ -23,6 +21,12 @@ import {
   validateTaskEventList,
   validateTaskList,
 } from "./validation";
+import {
+  AuthenticatedTransport,
+  SessionExpiredError,
+} from "./authenticatedTransport";
+
+export { ApiError, SessionExpiredError } from "./authenticatedTransport";
 
 export interface LocationLike {
   readonly hash: string;
@@ -36,6 +40,7 @@ export interface HistoryLike {
 }
 
 export interface ApiClientOptions {
+  transport?: AuthenticatedTransport;
   fetch?: typeof globalThis.fetch;
   location?: LocationLike;
   history?: HistoryLike;
@@ -43,78 +48,27 @@ export interface ApiClientOptions {
   onSessionExpired?: (error: SessionExpiredError) => void;
 }
 
-export class ApiError extends Error {
-  readonly status: number;
-  readonly code: string;
-  readonly retryable: boolean;
-  readonly requestId: string | null;
-  readonly details: Record<string, unknown>;
-
-  constructor(
-    status: number,
-    code: string,
-    message: string,
-    retryable: boolean,
-    requestId: string | null,
-    details: Record<string, unknown>,
-    options?: ErrorOptions,
-  ) {
-    super(message, options);
-    this.name = "ApiError";
-    this.status = status;
-    this.code = code;
-    this.retryable = retryable;
-    this.requestId = requestId;
-    this.details = details;
-  }
-}
-
-export class SessionExpiredError extends ApiError {
-  constructor(
-    status: number,
-    code: string,
-    message: string,
-    retryable: boolean,
-    requestId: string | null,
-    details: Record<string, unknown>,
-  ) {
-    super(status, code, message, retryable, requestId, details);
-    this.name = "SessionExpiredError";
-  }
-}
-
 export interface CreateTaskCommand {
   readonly clientRequestId: string;
   execute(): Promise<Task>;
 }
 
-interface RequestOptions {
-  method?: "GET" | "POST";
-  body?: unknown;
-  mutation?: boolean;
-  signal?: AbortSignal;
-}
-
-type ResponseValidator<T> = (value: unknown) => T;
-
-const API_JSON_HEADERS = {
-  accept: "application/json",
-  "content-type": "application/json",
-} as const;
-
 export class ApiClient {
-  readonly #fetch: typeof globalThis.fetch;
+  readonly #transport: AuthenticatedTransport;
   readonly #randomUUID: () => string;
-  readonly #onSessionExpired: ((error: SessionExpiredError) => void) | undefined;
   #launchToken: string | null;
-  #csrfToken: string | null = null;
-  #sessionExpired: SessionExpiredError | null = null;
   #initialization: Promise<BootstrapResponse> | null = null;
 
   constructor(options: ApiClientOptions = {}) {
-    this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
+    this.#transport =
+      options.transport ??
+      new AuthenticatedTransport({
+        ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+        ...(options.onSessionExpired === undefined
+          ? {}
+          : { onSessionExpired: options.onSessionExpired }),
+      });
     this.#randomUUID = options.randomUUID ?? (() => globalThis.crypto.randomUUID());
-    this.#onSessionExpired = options.onSessionExpired;
 
     const location = options.location ?? globalThis.location;
     const history = options.history ?? globalThis.history;
@@ -126,7 +80,7 @@ export class ApiClient {
   }
 
   get csrfToken(): string | null {
-    return this.#csrfToken;
+    return this.#transport.csrfToken;
   }
 
   initialize(): Promise<BootstrapResponse> {
@@ -147,7 +101,7 @@ export class ApiClient {
     this.#launchToken = null;
     if (launchToken !== null) {
       const body: SessionExchangeRequest = { token: launchToken };
-      await this.#request<void>("/api/session/exchange", {
+      await this.#transport.request<void>("/api/session/exchange", {
         method: "POST",
         body,
       });
@@ -156,19 +110,19 @@ export class ApiClient {
   }
 
   async bootstrap(signal?: AbortSignal): Promise<BootstrapResponse> {
-    const bootstrap = await this.#request<BootstrapResponse>(
+    const bootstrap = await this.#transport.request<BootstrapResponse>(
       "/api/bootstrap",
       {
         ...(signal === undefined ? {} : { signal }),
       },
       validateBootstrapResponse,
     );
-    this.#csrfToken = bootstrap.csrf_token;
+    this.#transport.setCsrfToken(bootstrap.csrf_token);
     return bootstrap;
   }
 
   listRepositories(): Promise<Repository[]> {
-    return this.#request<Repository[]>(
+    return this.#transport.request<Repository[]>(
       "/api/repositories",
       {},
       validateRepositoryList,
@@ -177,7 +131,7 @@ export class ApiClient {
 
   addRepository(path: string): Promise<Repository> {
     const body: AddRepositoryRequest = { path };
-    return this.#request<Repository>(
+    return this.#transport.request<Repository>(
       "/api/repositories",
       {
         method: "POST",
@@ -189,7 +143,7 @@ export class ApiClient {
   }
 
   async pickRepository(): Promise<Repository | null> {
-    return this.#request<Repository | null>(
+    return this.#transport.request<Repository | null>(
       "/api/repositories/pick",
       {
         method: "POST",
@@ -204,7 +158,7 @@ export class ApiClient {
       repositoryId === undefined
         ? ""
         : `?${new URLSearchParams({ repository_id: repositoryId }).toString()}`;
-    return this.#request<Task[]>(
+    return this.#transport.request<Task[]>(
       `/api/tasks${query}`,
       {},
       validateTaskList,
@@ -212,7 +166,7 @@ export class ApiClient {
   }
 
   createTask(request: CreateTaskRequest): Promise<Task> {
-    return this.#request<Task>(
+    return this.#transport.request<Task>(
       "/api/tasks",
       {
         method: "POST",
@@ -237,7 +191,7 @@ export class ApiClient {
   }
 
   taskDetail(taskId: string): Promise<TaskDetail> {
-    return this.#request<TaskDetail>(
+    return this.#transport.request<TaskDetail>(
       `/api/tasks/${encodeURIComponent(taskId)}`,
       {},
       validateTaskDetail,
@@ -245,7 +199,7 @@ export class ApiClient {
   }
 
   async cancelTask(taskId: string): Promise<CancellationAcceptedResponse> {
-    const response = await this.#request<Task | CancellationAcceptedResponse>(
+    const response = await this.#transport.request<Task | CancellationAcceptedResponse>(
       `/api/tasks/${encodeURIComponent(taskId)}/cancel`,
       { method: "POST", mutation: true },
       validateCancellationResponse,
@@ -256,7 +210,7 @@ export class ApiClient {
   }
 
   retryTask(taskId: string): Promise<Task> {
-    return this.#request<Task>(
+    return this.#transport.request<Task>(
       `/api/tasks/${encodeURIComponent(taskId)}/retry`,
       {
         method: "POST",
@@ -268,7 +222,7 @@ export class ApiClient {
 
   taskEvents(taskId: string, after?: number): Promise<TaskEvent[]> {
     const query = after === undefined ? "" : `?${new URLSearchParams({ after: String(after) })}`;
-    return this.#request<TaskEvent[]>(
+    return this.#transport.request<TaskEvent[]>(
       `/api/tasks/${encodeURIComponent(taskId)}/events${query}`,
       {},
       validateTaskEventList,
@@ -276,7 +230,7 @@ export class ApiClient {
   }
 
   quit(): Promise<QuitResponse> {
-    return this.#request<QuitResponse>(
+    return this.#transport.request<QuitResponse>(
       "/api/app/quit",
       {
         method: "POST",
@@ -286,149 +240,11 @@ export class ApiClient {
     );
   }
 
-  async #request<T>(
-    path: string,
-    options: RequestOptions = {},
-    validate?: ResponseValidator<T>,
-  ): Promise<T> {
-    if (this.#sessionExpired !== null) {
-      throw this.#sessionExpired;
-    }
-
-    const method = options.method ?? "GET";
-    const headers: Record<string, string> = { ...API_JSON_HEADERS };
-    if (options.mutation === true) {
-      if (this.#csrfToken === null) {
-        throw new ApiError(
-          0,
-          "SESSION_NOT_INITIALIZED",
-          "bootstrap must complete before a mutation",
-          false,
-          null,
-          {},
-        );
-      }
-      headers["x-csrf-token"] = this.#csrfToken;
-    }
-
-    const init: RequestInit = {
-      method,
-      credentials: "same-origin",
-      headers,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-      ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-    };
-    let response: Response;
-    try {
-      response = await this.#fetch(path, init);
-    } catch (cause) {
-      throw new ApiError(
-        0,
-        "NETWORK_ERROR",
-        "the network request failed",
-        true,
-        null,
-        {},
-        { cause },
-      );
-    }
-    if (!response.ok) {
-      throw await this.#responseError(response);
-    }
-    if (response.status === 204) {
-      return null as T;
-    }
-
-    const value = await decodeJson(response);
-    if (validate === undefined) {
-      return value as T;
-    }
-    try {
-      return validate(value);
-    } catch (cause) {
-      if (!(cause instanceof ValidationError)) {
-        throw cause;
-      }
-      throw new ApiError(
-        response.status,
-        "INVALID_RESPONSE",
-        "the server response violated the API contract",
-        false,
-        response.headers.get("x-request-id"),
-        { path: cause.path },
-        { cause },
-      );
-    }
-  }
-
-  async #responseError(response: Response): Promise<ApiError> {
-    const payload = await readApiError(response);
-    const requestId = payload?.request_id ?? response.headers.get("x-request-id");
-    const code = payload?.code ?? `HTTP_${response.status}`;
-    const message = payload?.message ?? `request failed with HTTP ${response.status}`;
-    const retryable = payload?.retryable ?? false;
-    const details = payload?.details ?? {};
-
-    if (response.status === 401) {
-      const expired = new SessionExpiredError(
-        response.status,
-        code,
-        message,
-        retryable,
-        requestId,
-        details,
-      );
-      this.#sessionExpired = expired;
-      this.#csrfToken = null;
-      this.#onSessionExpired?.(expired);
-      return expired;
-    }
-
-    return new ApiError(response.status, code, message, retryable, requestId, details);
-  }
 }
 
 function readLaunchToken(hash: string): string | null {
   if (hash.length === 0) return null;
   return new URLSearchParams(hash.startsWith("#") ? hash.slice(1) : hash).get("token");
-}
-
-async function decodeJson(response: Response): Promise<unknown> {
-  const text = await response.text();
-  try {
-    return JSON.parse(text) as unknown;
-  } catch (cause) {
-    throw new ApiError(
-      response.status,
-      "INVALID_RESPONSE",
-      "the server returned invalid JSON",
-      false,
-      response.headers.get("x-request-id"),
-      {},
-      { cause },
-    );
-  }
-}
-
-async function readApiError(response: Response): Promise<ApiErrorResponse | null> {
-  let candidate: unknown;
-  try {
-    candidate = await response.json();
-  } catch {
-    return null;
-  }
-  return isApiErrorResponse(candidate) ? candidate : null;
-}
-
-function isApiErrorResponse(value: unknown): value is ApiErrorResponse {
-  if (!isRecord(value)) return false;
-  return (
-    typeof value.code === "string" &&
-    typeof value.message === "string" &&
-    typeof value.retryable === "boolean" &&
-    typeof value.request_id === "string" &&
-    isRecord(value.details)
-  );
 }
 
 function isCancellationAccepted(

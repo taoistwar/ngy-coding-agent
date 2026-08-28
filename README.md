@@ -1,10 +1,10 @@
 # ngy 编码代理
 
-本仓库包含本地浏览器编码代理的 Project 4 / P4-A 实现。该应用程序是一个 Rust 进程，
+本仓库包含本地浏览器编码代理的 Project 4（P4-A + P4-B）实现。该应用程序是一个 Rust 进程，
 负责运行 Axum、SQLite、任务编排、原生对话框、隔离的 Git 工作树运行时，以及
 兼容 OpenAI 的提供方客户端；React UI 则通过随机的 `127.0.0.1` 端口提供服务。
 
-## Project 4 / P4-A 范围
+## Project 4 范围
 
 P4-A 在 Project 3 的质量闭环上增加受控并发和资源准入。默认最多同时运行两个任务，
 同一仓库也最多运行两个；每个尝试仍基于已注册仓库所提交的 `HEAD` 获得唯一分支和
@@ -30,11 +30,49 @@ generation、digest、完整 diff coverage 和全部必需检查一致时才生�
 保持 `Completed + Unreviewed`，不会生成伪造的 review evidence。
 
 `ReviewApproved` 是本应用自动 Reviewer 对有界证据的判断，**不**代表人工审查、已经
-合并、可部署、已签名或生产安全。应用不提供 merge/approve 用户控件，也绝不会自动
-merge；保留的 Git 工作树和分支仍是供用户独立检查的权威构件。
+合并、可部署、已签名或生产安全。它只允许用户进入受控的本地交付流程；应用绝不会因
+Reviewer approval、页面刷新、后台调度或启动恢复而自动 merge。保留的 Git 工作树和
+分支仍是供用户独立检查的权威构件。
 
-P4-A 不提供自动 merge、worktree cleanup、构件或历史生命周期、动态运行时设置、
-安装程序、代码签名、公证或自动更新；这些属于后续项目范围，不是 P4-A 的完成条件。
+Project 4 不提供自动 merge/cleanup、远程 push、PR、rebase、squash、自动冲突解决、
+构件历史/配额生命周期、动态运行时设置、安装程序、代码签名、公证或自动更新。
+
+## 受控本地交付
+
+只有当前 attempt 同时为 `Completed + ReviewApproved`，最终 review generation、工作区
+fingerprint、检查证据和保留构件仍完全一致，而且没有存活或结果未知的任务进程时，
+Delivery panel 才会允许预检。服务端会重新观察已登记仓库**当前 checkout 的 symbolic
+本地分支**及其 HEAD；应用不会替用户 checkout、switch，也不能把目标改成任意分支。
+目标处于 detached HEAD、工作树不干净、HEAD 已变化、存在 ignored path collision、
+不安全 Git 配置或其他 Git 操作时，交付会被拒绝。
+
+预检只计算候选 tree、目标身份和冲突结果，不修改目标分支、目标 index 或目标工作树。
+预检显示的 generation、fingerprint、source、target branch 和 target HEAD 必须保持新鲜；
+用户随后还要对同一个 Ready operation/version 进行第二次明确确认。只有这次确认被持久
+接受后，应用才会把已批准工作区固化为具有固定元数据的本地 source commit，并对刚才
+认证的目标执行固定 `--no-ff` merge。成功的 merge commit 必须有目标和 source 两个
+精确 parent；不提供 fast-forward、squash、rebase 或自定义 strategy。
+
+冲突预检和实际 merge 冲突都不会提交目标修改。UI 只显示有界的相对冲突路径摘要，
+不提供自动编辑或自动解决；请在外部修复目标状态后重新预检。网络断开、页面刷新或
+HTTP 回复丢失不会生成新的请求身份，UI 会从 SQLite 中的 operation projection 恢复并
+继续 polling。若 Git 子进程结果或现场身份无法证明，操作进入恢复/隔离状态，不会猜测
+成功，也不会把未知结果当作普通重试。
+
+merge 成功后，source worktree 和 source branch **默认永久保留**。移除 worktree 与
+删除 source branch 是两个独立按钮、两个确认对话框和两个幂等 receipt：移除 worktree
+不会顺带删分支；只有 worktree 已移除、source 已证明合入目标且目标 branch/HEAD 仍与
+确认值一致时，才允许原子删除 source branch。两步都不使用 force，不执行
+`reset --hard`、`clean`、stash 或 `branch -D`。移除前的“clean”也包含没有 ignored 或
+untracked 文件；例如保留的 Cargo `target/` 构建输出需要由用户先在应用外清理。应用会把
+首次请求遇到的这类现场作为可恢复的前置条件拒绝，不创建 cleanup receipt，也不升级成仓库
+隔离；若请求已经持久化后现场才变脏，应用仍不会删除，并会按所处阶段记录失败或进入需要
+人工检查的恢复/隔离状态。
+
+这条路径只做本机 Git 交付，不会 fetch、pull、push、访问 remote、创建 PR 或联系代码
+托管服务。应用内的 repository coordination 只约束本进程自己的任务和交付操作；它
+**不是操作系统级或全局 Git 锁**。外部程序仍可改变仓库，因此每个副作用前后都会重新认证，
+发现漂移时会停止并要求重新预检或人工检查。
 
 ## 前置条件
 
@@ -383,7 +421,8 @@ cargo run -p coding-agent-app
 approval。只有最终 diff/test 已获得持久确认后，最终 review、readiness 和 terminal
 lifecycle 才会在同一事务中提交。
 
-每次尝试的构件都会保留以供检查。分支采用
+每次尝试的构件默认都会保留以供检查；只有成功 merge 后，用户才能按上一节所述分别
+确认移除 worktree 和删除 source branch。分支采用
 `codex/task-<task-id>-attempt-<attempt>` 格式，工作树存储在私有数据目录下的
 `worktrees/<repository-id>/<task-id>/<attempt>`。SQLite 会记录不可变的仓库、
 任务及尝试标识，以及基础提交、分支、工作树路径和 `reserved`、`ready` 或
@@ -401,9 +440,10 @@ lifecycle 才会在同一事务中提交。
 
 ## 退出应用程序与恢复浏览器访问
 
-请使用 Web UI 中的应用程序菜单，并选择 **Quit local application**。进程会关闭
-变更门禁，妥善收尾进行中的工作，等待已启动进程树得到退出证明，完成持久停止意图或
-将其余运行任务持久化为中断，再尝试执行最终的 SQLite 检查点、移除描述符并释放
+请使用 Web UI 中的应用程序菜单，并选择 **Quit local application**。进程会先关闭
+变更门禁和新的 delivery 准入，妥善收尾已经持久接受的任务与本地 Git 阶段，等待全部
+已启动进程树得到退出证明，完成持久停止意图或留下可恢复的 delivery pending，再尝试
+执行最终的 SQLite 检查点、移除描述符并释放
 单实例锁。如果出现降级警告或
 `unclean-shutdown.json`，说明正常的持久化/检查点流程未能干净完成。关闭标签页
 或整个浏览器**不会**停止任务或应用程序。
@@ -492,6 +532,14 @@ UI 显示的错误包含稳定的代码和请求 ID。将错误与本地日志�
 | `SECURITY_INVALID_LAUNCHER_SECRET` / `SECURITY_INVALID_LAUNCH_TOKEN` / `SECURITY_DUPLICATE_HEADER` | 启动器能力凭证已过期、无效、被重放或含义不明确。请丢弃该 URL，并再次启动可执行文件。 |
 | `INVALID_PROMPT` / `INVALID_REPOSITORY_PATH` | 请更正 UI 显示的任务文本或仓库路径。 |
 | `IDEMPOTENCY_CONFLICT` | 同一请求 UUID 被用于不同内容。请从 UI 将其作为新操作重试。 |
+| `TASK_NOT_MERGE_ELIGIBLE` / `DELIVERY_EVIDENCE_STALE` / `DELIVERY_SOURCE_CHANGED` / `DELIVERY_PREFLIGHT_STALE` | 当前任务、最终审查证据、source 工作区或预检版本已不再满足交付条件。刷新 Delivery panel；若任务仍 eligible，请运行一次新的预检，不要重放旧确认。 |
+| `DELIVERY_OPERATION_IN_PROGRESS` | 同一 attempt 已有持久的交付操作。先查询并等待该 operation 收敛；不要生成新的请求 UUID 进行盲重试。 |
+| `TARGET_BRANCH_DETACHED` / `TARGET_BRANCH_MISMATCH` / `TARGET_HEAD_CHANGED` / `TARGET_WORKTREE_DIRTY` | 已登记仓库的当前 checkout 与预检目标不一致，或预检目标/待移除的 retained source worktree 不再严格 clean。应用不会 checkout、reset、clean、stash 或删除 ignored/untracked 内容；请在外部清理正确的 worktree，确认目标仍是 clean symbolic branch，再刷新面板或重新预检。 |
+| `TARGET_IGNORED_PATH_COLLISION` / `TARGET_GIT_OPERATION_IN_PROGRESS` / `UNSAFE_GIT_CONFIGURATION` / `UNSUPPORTED_GIT_ATTRIBUTES` | 目标存在 ignored collision、并发 Git 操作或不受支持的配置/attributes。先在仓库外部消除原因，再重新预检；不要放宽安全检查。 |
+| `MERGE_CONFLICT` / `SOURCE_ALREADY_IN_TARGET` | 当前预检不能合法确认 merge，或 source 已经是目标祖先。冲突不会修改目标；检查有界相对路径摘要并在外部修复后重新预检。 |
+| `ARTIFACT_CLEANUP_NOT_ALLOWED` / `ARTIFACT_PROCESS_STILL_ACTIVE` / `WORKTREE_IDENTITY_MISMATCH` / `SOURCE_BRANCH_NOT_MERGED` | 清理前置条件未满足。worktree 与 branch 默认保留；等待进程退出并刷新状态，只有成功 merge 后才能按顺序执行两个独立清理动作。 |
+| `DELIVERY_RECONCILIATION_REQUIRED` / `DELIVERY_SOURCE_INCONSISTENT` / `REPOSITORY_CONTROL_POISONED` | 应用无法证明某个 Git 副作用或现场身份，已隔离相应仓库而不会猜测结果。保留完整数据目录和 Git 现场，重新启动让恢复先运行；仍未收敛时请人工检查，不要删除 receipt、refs 或数据库行。 |
+| `REPOSITORY_CONTROL_BUSY` | 同一仓库正在执行受控任务或交付阶段。先查询当前状态，等已有操作完成后再重试；其他仓库仍可继续。 |
 | `TASK_NOT_FOUND` / `TASK_NOT_RETRYABLE` / `TASK_NOT_CANCELLABLE` | 请刷新任务状态；该任务不存在，或其持久化状态已不再允许执行该操作。 |
 | `NETWORK_ERROR` / `INTERNAL_ERROR` | 请重新打开应用程序并重试一次；如果错误再次发生，请保留请求 ID 和日志。 |
 | `SHUTDOWN_PERSISTENCE_FAILED` | 进程以非零状态退出，并为下次启动留下恢复状态；请保留数据目录并重新启动。 |

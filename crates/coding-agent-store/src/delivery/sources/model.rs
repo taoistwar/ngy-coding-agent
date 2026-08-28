@@ -2,6 +2,10 @@ use std::fmt;
 
 use coding_agent_domain::TaskId;
 
+use crate::delivery::mutation::{
+    DeliveryMutationEntity, DeliveryMutationEntityKind, DeliveryMutationKey, DeliveryMutationKind,
+    DeliveryMutationReceiptIdentity, impl_delivery_mutation_request,
+};
 use crate::delivery::{
     AcceptMergeCommandRequest, DeliveryError, DeliveryOperationId, DeliverySourceRecord,
     DeliverySourceState, DeliveryTimestamp, DeliveryVersion, FailureCode,
@@ -38,6 +42,37 @@ impl fmt::Debug for CreateDeliverySourceRequest {
             .finish()
     }
 }
+
+impl_delivery_mutation_request!(CreateDeliverySourceRequest, |request| {
+    let command = request.accept_command();
+    let accepted_version = command
+        .expected_operation_version()
+        .next()
+        .expect("accept requests validate their next operation version");
+    DeliveryMutationKey::new(
+        DeliveryMutationKind::CreateDeliverySource,
+        command.task_id(),
+        vec![
+            DeliveryMutationEntity::task(
+                DeliveryMutationEntityKind::DeliverySource,
+                command.task_id(),
+                None,
+            ),
+            DeliveryMutationEntity::operation(
+                DeliveryMutationEntityKind::MergeOperation,
+                command.preflight_operation_id(),
+                accepted_version,
+            ),
+        ],
+        Some(DeliveryMutationReceiptIdentity::new(
+            command.client_request_id(),
+            super::super::DeliveryCommandKind::AcceptMerge,
+            command.canonical_request_hash(),
+            accepted_version,
+            Some(command.preflight_operation_id()),
+        )),
+    )
+});
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateDeliverySourceOutcome {
@@ -129,6 +164,14 @@ impl fmt::Debug for AdvanceDeliverySourceObjectRequest {
     }
 }
 
+impl_delivery_mutation_request!(AdvanceDeliverySourceObjectRequest, |request| {
+    source_transition_key(
+        DeliveryMutationKind::AdvanceDeliverySourceObject,
+        request.anchor,
+        request.expected_source_version,
+    )
+});
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct CommitDeliverySourceRequest {
     pub(super) anchor: DeliverySourceAnchor,
@@ -161,6 +204,14 @@ impl fmt::Debug for CommitDeliverySourceRequest {
             .finish()
     }
 }
+
+impl_delivery_mutation_request!(CommitDeliverySourceRequest, |request| {
+    source_transition_key(
+        DeliveryMutationKind::CommitDeliverySource,
+        request.anchor,
+        request.expected_source_version,
+    )
+});
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordDeliverySourceRetryRequest {
@@ -201,6 +252,14 @@ impl fmt::Debug for RecordDeliverySourceRetryRequest {
             .finish()
     }
 }
+
+impl_delivery_mutation_request!(RecordDeliverySourceRetryRequest, |request| {
+    source_transition_key(
+        DeliveryMutationKind::RecordDeliverySourceRetry,
+        request.anchor,
+        request.expected_source_version,
+    )
+});
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReconcileDeliverySourceRequest {
@@ -253,6 +312,50 @@ impl fmt::Debug for ReconcileDeliverySourceRequest {
             .field("reason", &"<redacted>")
             .finish()
     }
+}
+
+impl_delivery_mutation_request!(ReconcileDeliverySourceRequest, |request| {
+    DeliveryMutationKey::new(
+        DeliveryMutationKind::ReconcileDeliverySource,
+        request.anchor.task_id,
+        vec![
+            DeliveryMutationEntity::task(
+                DeliveryMutationEntityKind::DeliverySource,
+                request.anchor.task_id,
+                Some(request.expected_source_version),
+            ),
+            DeliveryMutationEntity::operation(
+                DeliveryMutationEntityKind::MergeOperation,
+                request.anchor.accepted_operation_id,
+                request.expected_current_merge_version,
+            ),
+        ],
+        None,
+    )
+});
+
+fn source_transition_key(
+    kind: DeliveryMutationKind,
+    anchor: DeliverySourceAnchor,
+    expected_source_version: DeliveryVersion,
+) -> DeliveryMutationKey {
+    DeliveryMutationKey::new(
+        kind,
+        anchor.task_id,
+        vec![
+            DeliveryMutationEntity::task(
+                DeliveryMutationEntityKind::DeliverySource,
+                anchor.task_id,
+                Some(expected_source_version),
+            ),
+            DeliveryMutationEntity::operation(
+                DeliveryMutationEntityKind::MergeOperation,
+                anchor.accepted_operation_id,
+                anchor.accepted_receipt_version,
+            ),
+        ],
+        None,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

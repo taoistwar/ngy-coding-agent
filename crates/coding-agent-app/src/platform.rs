@@ -66,6 +66,13 @@ impl PlatformPaths {
     pub(crate) fn prepare_runtime_directory(&self) -> io::Result<()> {
         create_private_directory(&self.runtime_dir)
     }
+
+    /// Reauthenticates the runtime directory and returns the exact descriptor
+    /// that was hardened. Callers which need a capability must hand this
+    /// descriptor forward rather than opening `runtime_dir` by name again.
+    pub(crate) fn retain_private_runtime_directory(&self) -> io::Result<File> {
+        prepare_private_directory(&self.runtime_dir)
+    }
 }
 
 #[derive(Debug)]
@@ -298,6 +305,18 @@ impl BrowserLauncher {
 }
 
 pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
+    drop(prepare_private_directory(path)?);
+    Ok(())
+}
+
+fn prepare_private_directory(path: &Path) -> io::Result<File> {
+    ensure_private_directory_exists(path)?;
+    let directory = open_private_directory(path)?;
+    harden_private_directory(&directory)?;
+    Ok(directory)
+}
+
+fn ensure_private_directory_exists(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) => {
             return Err(io::Error::new(
@@ -317,7 +336,58 @@ pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
         }
         Err(error) => return Err(error),
     }
-    make_private(path, true)
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_directory(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn open_private_directory(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(windows_private_directory_access_mode())
+        .custom_flags(windows_private_directory_open_flags());
+    options.open(path)
+}
+
+fn harden_private_directory(directory: &File) -> io::Result<()> {
+    validate_private_directory_handle(directory)?;
+    harden_private_directory_permissions(directory)?;
+    validate_private_directory_permissions(directory)
+}
+
+fn validate_private_directory_handle(directory: &File) -> io::Result<()> {
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private directory handle is not a directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        if !windows_attributes_are_non_reparse(metadata.file_attributes()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private directory handle is a reparse point",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn metadata_is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
@@ -346,16 +416,16 @@ fn windows_attributes_are_non_reparse(attributes: u32) -> bool {
 #[cfg(windows)]
 pub(crate) fn windows_private_file_access_mode() -> u32 {
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
+    use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 
-    GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER
+    GENERIC_READ | GENERIC_WRITE | WRITE_DAC
 }
 
 #[cfg(windows)]
 fn windows_private_directory_access_mode() -> u32 {
-    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC, WRITE_OWNER};
+    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
 
-    READ_CONTROL | WRITE_DAC | WRITE_OWNER
+    READ_CONTROL | WRITE_DAC
 }
 
 #[cfg(windows)]
@@ -367,39 +437,54 @@ fn windows_private_directory_open_flags() -> u32 {
     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn make_private(path: &Path, directory: bool) -> io::Result<()> {
+#[cfg(unix)]
+fn harden_private_directory_permissions(directory: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mode = if directory { 0o700 } else { 0o600 };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    validate_private_unix_directory_owner(directory)?;
+    directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    #[cfg(target_os = "macos")]
+    crate::macos_acl::clear_extended_acl(directory)?;
+    Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn make_private(path: &Path, directory: bool) -> io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+fn validate_private_directory_permissions(directory: &File) -> io::Result<()> {
+    validate_private_unix_directory_owner(directory)?;
 
-    if !directory {
+    use std::os::unix::fs::PermissionsExt;
+
+    if directory.metadata()?.permissions().mode() & 0o7777 != 0o700 {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path-based private hardening is restricted to directories",
+            io::ErrorKind::PermissionDenied,
+            "private directory permissions are not owner-only",
         ));
     }
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    let directory = options.open(path)?;
+    #[cfg(target_os = "macos")]
+    crate::macos_acl::validate_no_extended_acl(directory)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_unix_directory_owner(directory: &File) -> io::Result<()> {
+    validate_private_unix_directory_owner_as(directory, unsafe { libc::geteuid() })
+}
+
+#[cfg(unix)]
+fn validate_private_unix_directory_owner_as(
+    directory: &File,
+    expected_owner: u32,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
     let metadata = directory.metadata()?;
-    if !metadata.is_dir() {
+    if !metadata.is_dir() || metadata.uid() != expected_owner {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "private directory handle is not a directory",
+            io::ErrorKind::PermissionDenied,
+            "private directory is not owned by the current user",
         ));
     }
-    directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-    crate::macos_acl::clear_extended_acl(&directory)?;
-    validate_private_macos_directory(&directory)
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -463,48 +548,15 @@ fn validate_private_unix_file_permissions(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn validate_private_macos_directory(directory: &File) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir()
-        || metadata.permissions().mode() & 0o7777 != 0o700
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "private directory permissions are not owner-only",
-        ));
-    }
-    crate::macos_acl::validate_no_extended_acl(directory)
+#[cfg(windows)]
+fn harden_private_directory_permissions(directory: &File) -> io::Result<()> {
+    validate_windows_current_user_owner(directory)?;
+    make_private_windows_handle(directory, true)
 }
 
 #[cfg(windows)]
-fn make_private(path: &Path, directory: bool) -> io::Result<()> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-
-    if !directory {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path-based private hardening is restricted to directories",
-        ));
-    }
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .access_mode(windows_private_directory_access_mode())
-        .custom_flags(windows_private_directory_open_flags());
-    let directory = options.open(path)?;
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir() || !windows_attributes_are_non_reparse(metadata.file_attributes()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "private directory handle is not a plain directory",
-        ));
-    }
-    make_private_windows_handle(&directory, true)?;
-    validate_private_file_permissions(&directory)
+fn validate_private_directory_permissions(directory: &File) -> io::Result<()> {
+    validate_private_file_permissions(directory)
 }
 
 #[cfg(windows)]
@@ -519,22 +571,67 @@ fn make_private_windows_handle(file: &File, directory: bool) -> io::Result<()> {
 
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    with_windows_user_owner_and_acl(directory, |owner, acl| unsafe {
+    with_windows_user_acl(directory, |acl| unsafe {
         SetSecurityInfo(
             file.as_raw_handle(),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
-            owner,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
             null_mut(),
             acl,
             null(),
         )
     })
+}
+
+#[cfg(windows)]
+fn validate_windows_current_user_owner(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{EqualSid, OWNER_SECURITY_INFORMATION};
+
+    let mut owner = null_mut();
+    let mut descriptor = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+
+    let validation = (|| {
+        if owner.is_null() {
+            return Err(invalid_private_permissions());
+        }
+        let user_buffer = current_user_token_buffer()?;
+        let user = unsafe {
+            &*user_buffer
+                .as_ptr()
+                .cast::<windows_sys::Win32::Security::TOKEN_USER>()
+        };
+        if unsafe { EqualSid(owner, user.User.Sid) } == 0 {
+            return Err(invalid_private_permissions());
+        }
+        Ok(())
+    })();
+
+    unsafe { LocalFree(descriptor) };
+    validation
 }
 
 #[cfg(windows)]
@@ -638,12 +735,9 @@ fn invalid_private_permissions() -> io::Error {
 }
 
 #[cfg(windows)]
-fn with_windows_user_owner_and_acl(
+fn with_windows_user_acl(
     directory: bool,
-    apply: impl FnOnce(
-        windows_sys::Win32::Security::PSID,
-        *mut windows_sys::Win32::Security::ACL,
-    ) -> u32,
+    apply: impl FnOnce(*mut windows_sys::Win32::Security::ACL) -> u32,
 ) -> io::Result<()> {
     use std::ptr::{null, null_mut};
 
@@ -677,7 +771,7 @@ fn with_windows_user_owner_and_acl(
         return Err(io::Error::from_raw_os_error(acl_status as i32));
     }
 
-    let status = apply(user.User.Sid, acl);
+    let status = apply(acl);
     unsafe { LocalFree(acl.cast()) };
     if status == ERROR_SUCCESS {
         Ok(())
@@ -808,6 +902,124 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn private_directory_permissions_stay_bound_to_the_opened_directory_during_a_path_swap() {
+        let temp = tempfile::tempdir().expect("create directory permission fixture");
+        let path = temp.path().join("runtime");
+        let opened_path = temp.path().join("opened-runtime");
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&path).expect("create private directory");
+        std::fs::create_dir(&victim).expect("create directory permission victim");
+        make_test_directory_broad(&victim);
+        let victim_permissions = permission_fingerprint(&victim);
+
+        let directory = open_private_directory(&path).expect("open original private directory");
+        std::fs::rename(&path, &opened_path).expect("rename opened directory");
+        std::os::unix::fs::symlink(&victim, &path).expect("install replacement directory link");
+
+        harden_private_directory(&directory)
+            .expect("harden through the original opened directory handle");
+
+        assert_eq!(
+            permission_fingerprint(&victim),
+            victim_permissions,
+            "directory hardening must not follow the replacement path"
+        );
+        assert_eq!(
+            permission_fingerprint(&opened_path),
+            0o700,
+            "the opened directory itself must be hardened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_current_user_directory_is_hardened_before_use() {
+        let temp = tempfile::tempdir().expect("create existing directory fixture");
+        let path = temp.path().join("runtime");
+        std::fs::create_dir(&path).expect("create existing runtime directory");
+        make_test_directory_broad(&path);
+
+        create_private_directory(&path).expect("harden current-user runtime directory");
+
+        assert_eq!(permission_fingerprint(&path), 0o700);
+    }
+
+    #[test]
+    fn retained_runtime_authority_requires_the_expected_namespace_identity() {
+        let temporary = tempfile::tempdir().expect("create retained runtime fixture");
+        let paths = PlatformPaths::new(
+            temporary.path().join("data"),
+            temporary.path().join("runtime"),
+        );
+        let retained = paths
+            .retain_private_runtime_directory()
+            .expect("prepare and retain private runtime directory");
+        let replacement = temporary.path().join("replacement-runtime");
+        std::fs::create_dir(&replacement).expect("create replacement runtime directory");
+
+        assert!(matches!(
+            coding_agent_runtime::ExecutionDirectory::from_retained_directory(
+                &replacement,
+                retained,
+            ),
+            Err(coding_agent_runtime::CommandPolicyError::IdentityChanged)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_runtime_authority_rejects_a_namespace_replacement() {
+        let temporary = tempfile::tempdir().expect("create retained runtime fixture");
+        let paths = PlatformPaths::new(
+            temporary.path().join("data"),
+            temporary.path().join("runtime"),
+        );
+        let retained = paths
+            .retain_private_runtime_directory()
+            .expect("prepare and retain private runtime directory");
+        let held = paths.runtime_dir.with_extension("held");
+        let replacement = paths.runtime_dir.with_extension("replacement");
+        std::fs::create_dir(&replacement).expect("create current-user replacement directory");
+        std::fs::rename(&paths.runtime_dir, &held).expect("move retained runtime directory");
+        std::fs::rename(&replacement, &paths.runtime_dir)
+            .expect("install replacement runtime directory");
+
+        assert!(matches!(
+            coding_agent_runtime::ExecutionDirectory::from_retained_directory(
+                &paths.runtime_dir,
+                retained,
+            ),
+            Err(coding_agent_runtime::CommandPolicyError::IdentityChanged)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_directory_owner_is_rejected_before_permissions_change() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().expect("create foreign-owner directory fixture");
+        let path = temp.path().join("runtime");
+        std::fs::create_dir(&path).expect("create candidate runtime directory");
+        make_test_directory_broad(&path);
+        let original_permissions = permission_fingerprint(&path);
+        let directory = open_private_directory(&path).expect("open candidate runtime directory");
+        let actual_owner = directory.metadata().expect("read owner metadata").uid();
+        let foreign_owner = if actual_owner == 0 { 1 } else { 0 };
+
+        let error = validate_private_unix_directory_owner_as(&directory, foreign_owner)
+            .expect_err("foreign directory owner must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            permission_fingerprint(&path),
+            original_permissions,
+            "owner validation must occur before chmod"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn snapshot_validation_accepts_an_open_inode_unlinked_by_atomic_replacement() {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -890,12 +1102,23 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_private_file_handle_can_set_an_explicit_user_owner() {
-        use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
+    fn windows_private_handles_harden_the_acl_without_owner_mutation() {
+        use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
 
         assert_eq!(
+            windows_private_file_access_mode() & WRITE_DAC,
+            WRITE_DAC,
+            "private file hardening must retain DACL authority"
+        );
+        assert_eq!(
             windows_private_file_access_mode() & WRITE_OWNER,
-            WRITE_OWNER
+            0,
+            "private file hardening must not take ownership of another principal's file"
+        );
+        assert_eq!(
+            windows_private_directory_access_mode() & WRITE_OWNER,
+            0,
+            "private directory hardening must reject foreign ownership rather than replace it"
         );
     }
 
@@ -977,6 +1200,14 @@ mod tests {
 
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
             .expect("make Unix permission victim broad");
+    }
+
+    #[cfg(unix)]
+    fn make_test_directory_broad(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make Unix directory permission victim broad");
     }
 
     #[cfg(unix)]

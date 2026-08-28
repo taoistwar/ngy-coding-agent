@@ -1,5 +1,6 @@
 use crate::delivery::{MergeOperationRecord, MergeOperationState};
 
+use super::super::conflicts::conflict_paths_match;
 use super::super::model::{BeginMergeAbortRequest, CompleteMergeAbortRequest};
 
 pub(super) fn begin_input_matches(
@@ -19,6 +20,8 @@ pub(super) fn begin_input_matches(
         && operation.provenance.fixed_lock_reason == request.proof.fixed_lock_reason
         && operation.provenance.config_attributes_digest == request.proof.config_attributes_digest
         && operation.source_commit.as_ref() == Some(&request.proof.merge_head)
+        && operation.conflict_path_count.is_none()
+        && operation.conflicts.is_empty()
 }
 
 pub(super) fn abort_facts_match(
@@ -39,6 +42,8 @@ pub(super) fn abort_facts_match(
         && operation.provenance.worktree_admin_identity == request.proof.worktree_admin_identity
         && operation.provenance.fixed_lock_reason == request.proof.fixed_lock_reason
         && operation.provenance.config_attributes_digest == request.proof.config_attributes_digest
+        && operation.conflict_path_count.is_some_and(|count| count > 0)
+        && conflict_paths_match(operation, &request.proof.conflict_paths)
 }
 
 pub(super) fn abort_applied_proof_matches(
@@ -58,4 +63,6 @@ pub(super) fn abort_applied_proof_matches(
         && operation.provenance.worktree_admin_identity == request.proof.worktree_admin_identity
         && operation.provenance.fixed_lock_reason == request.proof.fixed_lock_reason
         && operation.provenance.config_attributes_digest == request.proof.config_attributes_digest
+        && operation.conflict_path_count.is_some_and(|count| count > 0)
+        && operation.conflicts.len() == operation.conflict_path_count.map_or(0, usize::from)
 }

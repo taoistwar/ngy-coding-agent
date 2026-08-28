@@ -947,6 +947,54 @@ describe("useAgentState", () => {
     expect(testFixture.stop).toHaveBeenCalledTimes(1);
   });
 
+  it("coalesces a transport expiry callback with the same REST rejection", async () => {
+    const testFixture = fixture(async (taskId) => detail(taskId));
+    const pendingRepository = deferred<Repository>();
+    let notifyTransportExpiry: () => void = () => {
+      throw new Error("transport expiry handler was not installed");
+    };
+    testFixture.addRepository.mockImplementationOnce(() => {
+      notifyTransportExpiry();
+      return pendingRepository.promise;
+    });
+    const { result } = renderHook(() => useAgentState(testFixture.dependencies));
+    await waitFor(() => expect(testFixture.start).toHaveBeenCalled());
+    notifyTransportExpiry = result.current.expireSession;
+
+    let command!: Promise<Repository>;
+    act(() => {
+      command = result.current.addRepository("C:/expired-session");
+    });
+    await waitFor(() => expect(result.current.state.connection).toBe("session_expired"));
+    const stateAfterTransportNotification = result.current.state;
+
+    await act(async () => {
+      pendingRepository.reject(sessionExpiredError());
+      await command.catch(() => undefined);
+    });
+
+    expect(result.current.state).toBe(stateAfterTransportNotification);
+    expect(testFixture.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts a fresh session-expiry latch for a new hook session", async () => {
+    const firstFixture = fixture(async (taskId) => detail(taskId));
+    const first = renderHook(() => useAgentState(firstFixture.dependencies));
+    await waitFor(() => expect(firstFixture.start).toHaveBeenCalled());
+    act(() => first.result.current.expireSession());
+    expect(first.result.current.state.connection).toBe("session_expired");
+    first.unmount();
+
+    const nextFixture = fixture(async (taskId) => detail(taskId));
+    const next = renderHook(() => useAgentState(nextFixture.dependencies));
+    await waitFor(() => expect(nextFixture.start).toHaveBeenCalled());
+    expect(next.result.current.state.connection).toBe("live");
+
+    act(() => next.result.current.expireSession());
+    expect(next.result.current.state.connection).toBe("session_expired");
+    expect(nextFixture.stop).toHaveBeenCalledTimes(1);
+  });
+
   it("upserts command results and preserves one create UUID across execute retries", async () => {
     const testFixture = fixture(async (taskId) => detail(taskId));
     testFixture.createTaskExecute

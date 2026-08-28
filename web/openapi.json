@@ -144,6 +144,95 @@
         }
       }
     },
+    "/api/delivery-operations/{operation_id}": {
+      "get": {
+        "operationId": "delivery_operation",
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "description": "Delivery operation ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryOperationDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/events": {
       "get": {
         "operationId": "events",
@@ -1183,6 +1272,691 @@
           }
         }
       }
+    },
+    "/api/tasks/{task_id}/cleanup/branch": {
+      "post": {
+        "operationId": "delete_branch",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeliveryDeleteBranchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryCommandResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryCommandResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/cleanup/worktree": {
+      "post": {
+        "operationId": "remove_worktree",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeliveryRemoveWorktreeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryCommandResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryCommandResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/delivery": {
+      "get": {
+        "operationId": "task_delivery",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryTaskDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/merge": {
+      "post": {
+        "operationId": "accept_merge",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeliveryMergeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryCommandResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryCommandResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/merge/preflight": {
+      "post": {
+        "operationId": "preflight",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeliveryPreflightRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryCommandResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryCommandResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1576,12 +2350,973 @@
           }
         }
       },
+      "DeliveryAllowedActionDto": {
+        "type": "string",
+        "enum": [
+          "run_preflight",
+          "accept_merge",
+          "remove_worktree",
+          "delete_branch"
+        ]
+      },
+      "DeliveryArtifactDispositionDto": {
+        "type": "object",
+        "required": [
+          "merged_operation_id",
+          "source_ref",
+          "source_oid",
+          "worktree",
+          "branch"
+        ],
+        "properties": {
+          "branch": {
+            "$ref": "#/components/schemas/DeliveryBranchDispositionDto"
+          },
+          "merged_operation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "source_oid": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "source_ref": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          },
+          "worktree": {
+            "$ref": "#/components/schemas/DeliveryWorktreeDispositionDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryAvailableTargetDto": {
+        "type": "object",
+        "required": [
+          "available",
+          "branch",
+          "head"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "branch": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          },
+          "head": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryBranchDispositionDto": {
+        "type": "object",
+        "required": [
+          "state",
+          "version",
+          "failure"
+        ],
+        "properties": {
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryOperationFailureDto"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeliveryBranchDispositionStateDto"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryBranchDispositionStateDto": {
+        "type": "string",
+        "enum": [
+          "retained",
+          "deleted",
+          "reconciliation_required"
+        ]
+      },
+      "DeliveryCleanupKindDto": {
+        "type": "string",
+        "enum": [
+          "remove_worktree",
+          "delete_branch"
+        ]
+      },
+      "DeliveryCleanupOperationDto": {
+        "type": "object",
+        "required": [
+          "operation_id",
+          "cleanup_kind",
+          "version",
+          "state",
+          "expected_disposition_version",
+          "expected_merge_operation_id",
+          "expected_source_ref",
+          "expected_source_oid",
+          "target_branch",
+          "target_head",
+          "failure"
+        ],
+        "properties": {
+          "cleanup_kind": {
+            "$ref": "#/components/schemas/DeliveryCleanupKindDto"
+          },
+          "expected_disposition_version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          },
+          "expected_merge_operation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expected_source_oid": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "expected_source_ref": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryOperationFailureDto"
+              }
+            ]
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeliveryCleanupStateDto"
+          },
+          "target_branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          },
+          "target_head": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryCleanupOperationEnvelopeDto": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DeliveryCleanupOperationDto"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "$ref": "#/components/schemas/DeliveryCleanupOperationKindDto"
+              }
+            }
+          }
+        ]
+      },
+      "DeliveryCleanupOperationKindDto": {
+        "type": "string",
+        "enum": [
+          "cleanup"
+        ]
+      },
+      "DeliveryCleanupStateDto": {
+        "type": "string",
+        "enum": [
+          "unlock_pending",
+          "unlocked_pending_remove",
+          "remove_pending",
+          "delete_pending",
+          "completed",
+          "failed",
+          "reconciliation_required"
+        ]
+      },
+      "DeliveryCommandResponse": {
+        "type": "object",
+        "required": [
+          "receipt",
+          "operation"
+        ],
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/DeliveryOperationDto"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/DeliveryReceiptDispositionDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryConflictPathDto": {
+        "type": "object",
+        "required": [
+          "encoding",
+          "path"
+        ],
+        "properties": {
+          "encoding": {
+            "$ref": "#/components/schemas/DeliveryConflictPathEncodingDto"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryConflictPathEncodingDto": {
+        "type": "string",
+        "enum": [
+          "utf8",
+          "base64url"
+        ]
+      },
+      "DeliveryConflictSummaryDto": {
+        "type": "object",
+        "required": [
+          "path_count",
+          "paths",
+          "payload_bytes",
+          "truncated"
+        ],
+        "properties": {
+          "path_count": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 128,
+            "minimum": 0
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeliveryConflictPathDto"
+            },
+            "maxItems": 128
+          },
+          "payload_bytes": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 65536,
+            "minimum": 0
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryDeleteBranchRequest": {
+        "type": "object",
+        "required": [
+          "client_request_id",
+          "expected_disposition_version",
+          "expected_merge_operation_id",
+          "expected_source_ref",
+          "expected_source_oid",
+          "target_branch",
+          "target_head"
+        ],
+        "properties": {
+          "client_request_id": {
+            "type": "string",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "expected_disposition_version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          },
+          "expected_merge_operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "expected_source_oid": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "expected_source_ref": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          },
+          "target_branch": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          },
+          "target_head": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryEligibilityDto": {
+        "type": "string",
+        "enum": [
+          "eligible",
+          "ineligible",
+          "unavailable"
+        ]
+      },
+      "DeliveryEligibilityReasonDto": {
+        "type": "string",
+        "enum": [
+          "task_not_completed",
+          "review_not_approved",
+          "approved_evidence_missing",
+          "attempt_artifact_missing",
+          "attempt_artifact_not_ready",
+          "task_active",
+          "process_cleanup_unproven",
+          "target_branch_detached",
+          "target_branch_mismatch",
+          "target_head_changed",
+          "target_worktree_dirty",
+          "target_ignored_path_collision",
+          "target_git_operation_in_progress",
+          "unsafe_git_configuration",
+          "unsupported_git_attributes",
+          "source_already_in_target",
+          "runtime_drift",
+          "delivery_owned",
+          "already_merged",
+          "reconciliation_required",
+          "repository_busy",
+          "repository_unavailable",
+          "store_unavailable",
+          "runtime_observation_unavailable",
+          "service_not_ready"
+        ]
+      },
+      "DeliveryEvidenceSummaryDto": {
+        "type": "object",
+        "required": [
+          "review_generation",
+          "workspace_fingerprint"
+        ],
+        "properties": {
+          "review_generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "workspace_fingerprint": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryMergeOperationDto": {
+        "type": "object",
+        "required": [
+          "operation_id",
+          "version",
+          "state",
+          "review_generation",
+          "workspace_fingerprint",
+          "candidate_source_tree",
+          "preflight_source_commit",
+          "source_commit",
+          "target_branch",
+          "target_head",
+          "conflicts",
+          "failure"
+        ],
+        "properties": {
+          "candidate_source_tree": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "conflicts": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryConflictSummaryDto"
+              }
+            ]
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryOperationFailureDto"
+              }
+            ]
+          },
+          "operation_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "preflight_source_commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "review_generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "source_commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeliveryMergeStateDto"
+          },
+          "target_branch": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          },
+          "target_head": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          },
+          "workspace_fingerprint": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryMergeOperationEnvelopeDto": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DeliveryMergeOperationDto"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "$ref": "#/components/schemas/DeliveryMergeOperationKindDto"
+              }
+            }
+          }
+        ]
+      },
+      "DeliveryMergeOperationKindDto": {
+        "type": "string",
+        "enum": [
+          "merge"
+        ]
+      },
+      "DeliveryMergeRequest": {
+        "type": "object",
+        "required": [
+          "client_request_id",
+          "preflight_operation_id",
+          "expected_operation_version",
+          "expected_review_generation",
+          "expected_workspace_fingerprint",
+          "target_branch",
+          "expected_target_head"
+        ],
+        "properties": {
+          "client_request_id": {
+            "type": "string",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "expected_operation_version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          },
+          "expected_review_generation": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 0
+          },
+          "expected_target_head": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "expected_workspace_fingerprint": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "preflight_operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "target_branch": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryMergeStateDto": {
+        "type": "string",
+        "enum": [
+          "preflight_pending",
+          "preflight_ready",
+          "accepted",
+          "merge_pending",
+          "merged",
+          "abort_pending",
+          "conflict",
+          "rejected",
+          "stale",
+          "superseded",
+          "failed",
+          "reconciliation_required"
+        ]
+      },
+      "DeliveryOperationDto": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/DeliveryMergeOperationEnvelopeDto"
+          },
+          {
+            "$ref": "#/components/schemas/DeliveryCleanupOperationEnvelopeDto"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "cleanup": "#/components/schemas/DeliveryCleanupOperationEnvelopeDto",
+            "merge": "#/components/schemas/DeliveryMergeOperationEnvelopeDto"
+          }
+        }
+      },
+      "DeliveryOperationFailureDto": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Z][A-Z0-9_]*$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryPreflightRequest": {
+        "type": "object",
+        "required": [
+          "client_request_id",
+          "target_branch",
+          "expected_target_head"
+        ],
+        "properties": {
+          "client_request_id": {
+            "type": "string",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "expected_target_head": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "target_branch": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          }
+        },
+        "additionalProperties": false
+      },
       "DeliveryReadinessDto": {
         "type": "string",
         "enum": [
           "unreviewed",
           "review_approved",
           "review_rejected"
+        ]
+      },
+      "DeliveryReceiptDispositionDto": {
+        "type": "string",
+        "enum": [
+          "created",
+          "existing"
+        ]
+      },
+      "DeliveryRemoveWorktreeRequest": {
+        "type": "object",
+        "required": [
+          "client_request_id",
+          "expected_disposition_version",
+          "expected_merge_operation_id",
+          "expected_source_ref",
+          "expected_source_oid"
+        ],
+        "properties": {
+          "client_request_id": {
+            "type": "string",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "expected_disposition_version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          },
+          "expected_merge_operation_id": {
+            "type": "string",
+            "format": "uuid",
+            "maxLength": 36,
+            "minLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "expected_source_oid": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "expected_source_ref": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliverySourceDto": {
+        "type": "object",
+        "required": [
+          "state",
+          "version",
+          "source_ref",
+          "source_oid"
+        ],
+        "properties": {
+          "source_oid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 64,
+            "minLength": 40,
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "source_ref": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 12,
+            "pattern": "^refs/heads/.{1,4085}$"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeliverySourceStateDto"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliverySourceStateDto": {
+        "type": "string",
+        "enum": [
+          "object_pending",
+          "commit_pending",
+          "committed",
+          "reconciliation_required"
+        ]
+      },
+      "DeliveryTargetObservationDto": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/DeliveryAvailableTargetDto"
+          },
+          {
+            "$ref": "#/components/schemas/DeliveryUnavailableTargetDto"
+          }
+        ]
+      },
+      "DeliveryTargetUnavailableReasonDto": {
+        "type": "string",
+        "enum": [
+          "detached",
+          "branch_mismatch",
+          "observation_unavailable",
+          "repository_busy",
+          "repository_poisoned",
+          "service_not_ready"
+        ]
+      },
+      "DeliveryTaskDto": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "eligibility",
+          "reasons",
+          "evidence",
+          "target",
+          "source",
+          "latest_merge",
+          "latest_cleanup",
+          "disposition",
+          "allowed_actions"
+        ],
+        "properties": {
+          "allowed_actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeliveryAllowedActionDto"
+            },
+            "maxItems": 4
+          },
+          "disposition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryArtifactDispositionDto"
+              }
+            ]
+          },
+          "eligibility": {
+            "$ref": "#/components/schemas/DeliveryEligibilityDto"
+          },
+          "evidence": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryEvidenceSummaryDto"
+              }
+            ]
+          },
+          "latest_cleanup": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryCleanupOperationDto"
+              }
+            ]
+          },
+          "latest_merge": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryMergeOperationDto"
+              }
+            ]
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeliveryEligibilityReasonDto"
+            },
+            "maxItems": 32
+          },
+          "source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliverySourceDto"
+              }
+            ]
+          },
+          "target": {
+            "$ref": "#/components/schemas/DeliveryTargetObservationDto"
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryUnavailableTargetDto": {
+        "type": "object",
+        "required": [
+          "available",
+          "reason"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/DeliveryTargetUnavailableReasonDto"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryWorktreeDispositionDto": {
+        "type": "object",
+        "required": [
+          "state",
+          "version",
+          "failure"
+        ],
+        "properties": {
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeliveryOperationFailureDto"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeliveryWorktreeDispositionStateDto"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeliveryWorktreeDispositionStateDto": {
+        "type": "string",
+        "enum": [
+          "retained_locked",
+          "retained_unlocked",
+          "removed",
+          "reconciliation_required"
         ]
       },
       "DiffFileDto": {

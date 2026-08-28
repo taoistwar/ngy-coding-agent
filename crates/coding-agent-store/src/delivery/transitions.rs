@@ -3,7 +3,13 @@ use coding_agent_domain::TaskId;
 use crate::tasks::current_timestamp;
 use crate::{Store, StoreError};
 
-use super::merges::{OperationLookup, load_operation_for_caller};
+use super::merges::{
+    OperationLookup, TransitionLookup, load_operation_for_caller, lookup_transition,
+};
+use super::mutation::{
+    DeliveryMutationEntity, DeliveryMutationEntityKind, DeliveryMutationKey, DeliveryMutationKind,
+    impl_delivery_mutation_request,
+};
 use super::ownership::load_merge_operation_exact;
 use super::{
     DeliveryIdentity, DeliveryOperationId, DeliveryTimestamp, DeliveryVersion, MergeOperationState,
@@ -48,6 +54,7 @@ impl MarkPreflightStaleRequest {
         if task_id.as_uuid().is_nil() || operation_id.as_uuid().is_nil() {
             return Err(super::DeliveryError::InvalidCommandRequest);
         }
+        expected_version.next()?;
         Ok(Self {
             task_id,
             operation_id,
@@ -57,9 +64,28 @@ impl MarkPreflightStaleRequest {
     }
 }
 
+impl_delivery_mutation_request!(MarkPreflightStaleRequest, |request| {
+    DeliveryMutationKey::new(
+        DeliveryMutationKind::MarkMergePreflightStale,
+        request.task_id,
+        vec![DeliveryMutationEntity::operation(
+            DeliveryMutationEntityKind::MergeOperation,
+            request.operation_id,
+            request.expected_version,
+        )],
+        None,
+    )
+});
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkPreflightStaleOutcome {
     Applied {
+        operation_id: DeliveryOperationId,
+        version: DeliveryVersion,
+        state: MergeOperationState,
+        reason: PreflightStaleReason,
+    },
+    Existing {
         operation_id: DeliveryOperationId,
         version: DeliveryVersion,
         state: MergeOperationState,
@@ -94,6 +120,7 @@ impl Store {
         &self,
         request: MarkPreflightStaleRequest,
     ) -> Result<MarkPreflightStaleOutcome, StoreError> {
+        let target_version = request.expected_version.next()?;
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let operation_lookup =
             load_operation_for_caller(&mut transaction, request.operation_id, request.task_id)
@@ -114,6 +141,39 @@ impl Store {
             }
         };
         validate_stale_reason_binding(&current, request.task_id, request.reason)?;
+        if current.state == MergeOperationState::Stale && current.version == target_version {
+            if current.failure_code.as_ref().map(|code| code.as_str())
+                != Some(request.reason.as_failure_code())
+            {
+                transaction.commit().await?;
+                return Ok(MarkPreflightStaleOutcome::Conflict);
+            }
+            match lookup_transition(
+                &mut transaction,
+                request.operation_id,
+                target_version,
+                MergeOperationState::PreflightReady,
+                MergeOperationState::Stale,
+                Some(request.reason.as_failure_code()),
+            )
+            .await?
+            {
+                TransitionLookup::Exact(receipt)
+                    if receipt.transitioned_at == current.updated_at =>
+                {
+                    transaction.commit().await?;
+                    return Ok(MarkPreflightStaleOutcome::Existing {
+                        operation_id: request.operation_id,
+                        version: target_version,
+                        state: MergeOperationState::Stale,
+                        reason: request.reason,
+                    });
+                }
+                TransitionLookup::Exact(_)
+                | TransitionLookup::Missing
+                | TransitionLookup::Conflict => return Err(transition_invariant()),
+            }
+        }
         if current.state != MergeOperationState::PreflightReady
             || current.version != request.expected_version
         {
@@ -243,11 +303,13 @@ fn validate_stale_reason_binding(
                     == operation.provenance.base_commit.algorithm()
         }
         PreflightStaleReason::SourceChanged => {
-            operation.preflight_source_commit.algorithm()
-                == operation.provenance.base_commit.algorithm()
-                && operation.preflight_source_commit != operation.provenance.base_commit
-                && operation.candidate_tree.algorithm()
+            operation.preflight_inputs.as_ref().is_some_and(|inputs| {
+                inputs.preflight_source_commit.algorithm()
                     == operation.provenance.base_commit.algorithm()
+                    && inputs.preflight_source_commit != operation.provenance.base_commit
+                    && inputs.candidate_tree.algorithm()
+                        == operation.provenance.base_commit.algorithm()
+            })
         }
     };
     if bound {

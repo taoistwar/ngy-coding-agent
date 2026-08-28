@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use coding_agent_app::{TaskModelProviderFactory, TaskModelSession};
 use coding_agent_core::{
@@ -12,7 +11,7 @@ use coding_agent_core::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::{CHANGED_SOURCE, INTEGRATION_TEST, PACKAGE};
+use super::{CHANGED_SOURCE, E2E_NO_PROGRESS_TIMEOUT, INTEGRATION_TEST, PACKAGE};
 
 pub(super) struct ScriptedProviderFactory {
     role_barrier: Arc<RoleLoopBarrier>,
@@ -411,12 +410,10 @@ impl RoleLoopBarrier {
     }
 
     async fn enter_and_wait(&self) {
-        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
-        self.maximum_active.fetch_max(active, Ordering::AcqRel);
+        let _active = ActiveRoleLoopGuard::enter(self);
         self.entered.fetch_add(1, Ordering::AcqRel);
         self.entered_notify.notify_waiters();
         self.release.cancelled().await;
-        self.active.fetch_sub(1, Ordering::AcqRel);
     }
 
     pub(super) async fn wait_for_entries(&self, expected: usize) {
@@ -424,22 +421,34 @@ impl RoleLoopBarrier {
             expected, self.expected,
             "the test must wait for the configured role-loop barrier size"
         );
-        tokio::time::timeout(Duration::from_secs(120), async {
-            loop {
-                let notified = self.entered_notify.notified();
-                if self.entered.load(Ordering::Acquire) >= expected {
+        let mut observed = self.entered.load(Ordering::Acquire);
+        let mut no_progress_deadline = tokio::time::Instant::now() + E2E_NO_PROGRESS_TIMEOUT;
+        loop {
+            let notified = self.entered_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let entered = self.entered.load(Ordering::Acquire);
+            if entered >= expected {
+                return;
+            }
+            if entered > observed {
+                observed = entered;
+                no_progress_deadline = tokio::time::Instant::now() + E2E_NO_PROGRESS_TIMEOUT;
+            }
+            if tokio::time::timeout_at(no_progress_deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
+                let entered = self.entered.load(Ordering::Acquire);
+                if entered >= expected {
                     return;
                 }
-                notified.await;
+                panic!(
+                    "only {entered} of {expected} role loops reached the barrier; no new entry for {:?}",
+                    E2E_NO_PROGRESS_TIMEOUT
+                );
             }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "only {} of {expected} role loops reached the barrier",
-                self.entered.load(Ordering::Acquire)
-            )
-        });
+        }
     }
 
     pub(super) fn release(&self) {
@@ -448,5 +457,28 @@ impl RoleLoopBarrier {
 
     pub(super) fn maximum_active(&self) -> usize {
         self.maximum_active.load(Ordering::Acquire)
+    }
+
+    pub(super) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+struct ActiveRoleLoopGuard<'a> {
+    barrier: &'a RoleLoopBarrier,
+}
+
+impl<'a> ActiveRoleLoopGuard<'a> {
+    fn enter(barrier: &'a RoleLoopBarrier) -> Self {
+        let active = barrier.active.fetch_add(1, Ordering::AcqRel) + 1;
+        barrier.maximum_active.fetch_max(active, Ordering::AcqRel);
+        Self { barrier }
+    }
+}
+
+impl Drop for ActiveRoleLoopGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.barrier.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "role-loop active counter underflow");
     }
 }

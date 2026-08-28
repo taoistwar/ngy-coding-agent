@@ -874,10 +874,14 @@ fn map_git_process_error(error: ProcessError) -> ToolDiscoveryError {
         ProcessError::SpawnFailed(_)
         | ProcessError::TreeSetupFailed(_)
         | ProcessError::LivenessSetupFailed(_) => ToolDiscoveryError::BootstrapGitSpawnFailed,
-        ProcessError::MissingOutputPipe | ProcessError::OutputDrainFailed(_) => {
-            ToolDiscoveryError::BootstrapGitOutputFailed
-        }
+        ProcessError::MissingOutputPipe
+        | ProcessError::MissingInputPipe
+        | ProcessError::InputClosedEarly
+        | ProcessError::InputWriteFailed(_)
+        | ProcessError::InputCloseFailed(_)
+        | ProcessError::OutputDrainFailed(_) => ToolDiscoveryError::BootstrapGitOutputFailed,
         ProcessError::WaitFailed(_)
+        | ProcessError::InputCompletionUnknown
         | ProcessError::TreeControlLost(_)
         | ProcessError::TreeCleanupFailed(_)
         | ProcessError::CleanupTimedOut
@@ -936,10 +940,14 @@ fn map_bootstrap_process_error(error: ProcessError) -> ToolDiscoveryError {
         ProcessError::SpawnFailed(_)
         | ProcessError::TreeSetupFailed(_)
         | ProcessError::LivenessSetupFailed(_) => ToolDiscoveryError::BootstrapSpawnFailed,
-        ProcessError::MissingOutputPipe | ProcessError::OutputDrainFailed(_) => {
-            ToolDiscoveryError::BootstrapOutputFailed
-        }
+        ProcessError::MissingOutputPipe
+        | ProcessError::MissingInputPipe
+        | ProcessError::InputClosedEarly
+        | ProcessError::InputWriteFailed(_)
+        | ProcessError::InputCloseFailed(_)
+        | ProcessError::OutputDrainFailed(_) => ToolDiscoveryError::BootstrapOutputFailed,
         ProcessError::WaitFailed(_)
+        | ProcessError::InputCompletionUnknown
         | ProcessError::TreeControlLost(_)
         | ProcessError::TreeCleanupFailed(_)
         | ProcessError::CleanupTimedOut

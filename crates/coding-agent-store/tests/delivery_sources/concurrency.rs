@@ -29,7 +29,7 @@ async fn same_old_version_advance_retry_and_reconcile_have_one_atomic_winner() {
         anchor,
         DeliverySourceState::ObjectPending,
         source.version,
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -88,6 +88,6 @@ async fn same_old_version_advance_retry_and_reconcile_have_one_atomic_winner() {
         assert!(current.current_transition_id < operation.current_transition_id);
     } else {
         assert_eq!(operation.state, MergeOperationState::Accepted);
-        assert_eq!(operation.version, DeliveryVersion::try_new(3).unwrap());
+        assert_eq!(operation.version, DeliveryVersion::try_new(4).unwrap());
     }
 }

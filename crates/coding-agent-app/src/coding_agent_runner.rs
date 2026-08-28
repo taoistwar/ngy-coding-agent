@@ -1510,7 +1510,8 @@ fn repository_poison_reason(error: RepositoryControlError) -> RepositoryControlP
         RepositoryControlError::IdentityUnavailable => {
             RepositoryControlPoisonReason::IdentityUnavailable
         }
-        RepositoryControlError::Busy
+        RepositoryControlError::DeliveryMutationsFrozen
+        | RepositoryControlError::Busy
         | RepositoryControlError::Poisoned
         | RepositoryControlError::UnknownRepository
         | RepositoryControlError::UnknownCoordinationKey

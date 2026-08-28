@@ -36,6 +36,15 @@ async fn quiesce_waits_for_a_detached_queued_cancel_before_generic_interrupt() {
         8,
         controller.clone(),
     );
+    let launch_resources =
+        test_task_manager_launch_resources_for_repository(1, 1, &repository, temp_dir.path());
+    let repository_control = launch_resources.repository_control();
+    let coordination_key = repository_control
+        .coordination_key(repository.id)
+        .expect("resolve detached queued-cancel repository control identity");
+    let queued_lease = repository_control
+        .try_acquire(coordination_key)
+        .expect("hold detached queued-cancel task in the queue");
     let service_state = ServiceStateController::new(ServiceState::Ready);
     let manager = TaskManagerHandle::spawn(
         store.clone(),
@@ -43,7 +52,7 @@ async fn quiesce_waits_for_a_detached_queued_cancel_before_generic_interrupt() {
         dispatcher,
         service_state.clone(),
         Arc::new(CancellingRunner::default()),
-        test_task_manager_launch_resources_for_repository(1, 1, &repository, temp_dir.path()),
+        launch_resources,
         8,
     );
     let task = writer
@@ -65,9 +74,15 @@ async fn quiesce_waits_for_a_detached_queued_cancel_before_generic_interrupt() {
         let manager = manager.clone();
         async move { manager.cancel(task.id).await }
     });
-    controller
-        .wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1)
-        .await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller.wait_until_reached(StoreWriterFaultPoint::PauseAfterCommitBeforeWake, 1),
+    )
+    .await
+    .expect("detached queued cancel commits before its bounded wait expires");
+    queued_lease
+        .clean_release()
+        .expect("release detached queued-cancel repository lease after its durable commit");
 
     let quiesce = tokio::spawn({
         let manager = manager.clone();
@@ -111,9 +126,12 @@ async fn quiesce_waits_for_a_detached_queued_cancel_before_generic_interrupt() {
             .expect("detached queued cancel remains connected"),
         CancelOutcome::Cancelled { task: cancelled } if cancelled.id == task.id
     ));
-    controller
-        .wait_until_reached(StoreWriterFaultPoint::PauseBeforeExecute, 1)
-        .await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller.wait_until_reached(StoreWriterFaultPoint::PauseBeforeExecute, 1),
+    )
+    .await
+    .expect("generic interrupt reaches its bounded pause");
     assert_eq!(
         controller.release(StoreWriterFaultPoint::PauseBeforeExecute),
         1

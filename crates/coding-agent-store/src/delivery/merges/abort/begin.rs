@@ -5,6 +5,7 @@ use crate::delivery::{
 use crate::tasks::current_timestamp;
 use crate::{Store, StoreError};
 
+use super::super::conflicts::insert_conflict_paths;
 use super::super::merge_invariant;
 use super::super::model::{BeginMergeAbortRequest, MergeTransitionOutcome, MergeTransitionReceipt};
 use super::super::replay::{
@@ -105,18 +106,21 @@ async fn apply_begin_abort(
     let updated = sqlx::query(
         "UPDATE task_merge_operations \
          SET abort_child_receipt_id = ?, abort_merge_head_oid = ?, \
-             abort_index_stages_digest = ?, abort_worktree_digest = ?, \
-             abort_merge_autostash_proof = 'absent', state = 'abort_pending', \
-             failure_code = NULL, version = ?, updated_at = ? \
+              abort_index_stages_digest = ?, abort_worktree_digest = ?, \
+              abort_merge_autostash_proof = 'absent', conflict_path_count = ?, \
+              state = 'abort_pending', \
+              failure_code = NULL, version = ?, updated_at = ? \
          WHERE operation_id = ? AND task_id = ? AND state = 'merge_pending' AND version = ? \
            AND abort_child_receipt_id IS NULL AND abort_merge_head_oid IS NULL \
-           AND abort_index_stages_digest IS NULL AND abort_worktree_digest IS NULL \
-           AND abort_merge_autostash_proof IS NULL AND source_commit_oid = ?",
+            AND abort_index_stages_digest IS NULL AND abort_worktree_digest IS NULL \
+            AND abort_merge_autostash_proof IS NULL AND conflict_path_count IS NULL \
+            AND source_commit_oid = ?",
     )
     .bind(request.proof.child_receipt_id.to_string())
     .bind(request.proof.merge_head.as_str())
     .bind(request.proof.index_stages_digest.as_str())
     .bind(request.proof.worktree_digest.as_str())
+    .bind(i64::try_from(request.proof.conflict_paths.len()).map_err(|_| merge_invariant())?)
     .bind(version_i64(target_version)?)
     .bind(timestamp.to_string())
     .bind(operation.operation_id.to_string())
@@ -128,6 +132,12 @@ async fn apply_begin_abort(
     if updated.rows_affected() != 1 {
         return Err(merge_invariant());
     }
+    insert_conflict_paths(
+        &mut *connection,
+        request.operation_id,
+        &request.proof.conflict_paths,
+    )
+    .await?;
     require_begin_transition(connection, request, target_version).await
 }
 

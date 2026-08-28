@@ -246,7 +246,7 @@ pub async fn merge_fixture(shape: MergeShape) -> (Store, Task, DeliveryOperation
             sqlx::query(
                 "UPDATE task_merge_operations SET state = 'reconciliation_required', \
                      failure_code = 'DELIVERY_RECONCILIATION_REQUIRED', \
-                     version = 2, updated_at = ? \
+                     version = 3, updated_at = ? \
                  WHERE operation_id = ?",
             )
             .bind(DELIVERY_TIMESTAMP)
@@ -819,7 +819,7 @@ async fn reconcile_source_and_merge(store: &Store, task: &Task, operation_id: De
     let mut transaction = store.pool().begin().await.unwrap();
     sqlx::query(
         "UPDATE task_merge_operations SET state = 'reconciliation_required', \
-             failure_code = 'DELIVERY_SOURCE_INCONSISTENT', version = 4, updated_at = ? \
+             failure_code = 'DELIVERY_SOURCE_INCONSISTENT', version = 5, updated_at = ? \
          WHERE operation_id = ?",
     )
     .bind(DELIVERY_TIMESTAMP)
@@ -843,7 +843,7 @@ async fn reconcile_source_and_merge(store: &Store, task: &Task, operation_id: De
 async fn mark_merge_pending(store: &Store, task: &Task, operation_id: DeliveryOperationId) {
     sqlx::query(
         "UPDATE task_merge_operations SET delivery_source_task_id = ?, source_commit_oid = ?, \
-             expected_merge_commit_oid = ?, state = 'merge_pending', version = 4, updated_at = ? \
+             expected_merge_commit_oid = ?, state = 'merge_pending', version = 5, updated_at = ? \
          WHERE operation_id = ?",
     )
     .bind(task.id.to_string())
@@ -858,15 +858,25 @@ async fn mark_merge_pending(store: &Store, task: &Task, operation_id: DeliveryOp
 
 async fn mark_abort_pending(store: &Store, operation_id: DeliveryOperationId) {
     sqlx::query(
-        "UPDATE task_merge_operations SET state = 'abort_pending', version = 5, \
+        "UPDATE task_merge_operations SET state = 'abort_pending', version = 6, \
              abort_child_receipt_id = ?, abort_merge_head_oid = source_commit_oid, \
              abort_index_stages_digest = ?, abort_worktree_digest = ?, \
-             abort_merge_autostash_proof = 'absent', updated_at = ? WHERE operation_id = ?",
+             abort_merge_autostash_proof = 'absent', conflict_path_count = 1, \
+             updated_at = ? WHERE operation_id = ?",
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(ABORT_INDEX_DIGEST)
     .bind(ABORT_WORKTREE_DIGEST)
     .bind(DELIVERY_TIMESTAMP)
+    .bind(operation_id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_merge_conflicts \
+             (operation_id, ordinal, path_encoding, path_value) \
+         VALUES (?, 0, 'utf8', 'src/conflicted.rs')",
+    )
     .bind(operation_id.to_string())
     .execute(store.pool())
     .await
@@ -877,7 +887,7 @@ async fn complete_merge(store: &Store, task: &Task, operation_id: DeliveryOperat
     let mut transaction = store.pool().begin().await.unwrap();
     sqlx::query(
         "UPDATE task_merge_operations SET state = 'merged', merged_disposition_task_id = ?, \
-             version = 5, updated_at = ? WHERE operation_id = ?",
+             version = 6, updated_at = ? WHERE operation_id = ?",
     )
     .bind(task.id.to_string())
     .bind(DELIVERY_TIMESTAMP)

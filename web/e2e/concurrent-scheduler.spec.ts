@@ -134,7 +134,7 @@ test("retains and replays one exact command after a real queue-full response", a
       });
 
       await expect(input).toHaveValue(REPLAY_PROMPT);
-      await expect(page.getByRole("alert")).toContainText(queueFull.message);
+      await expect(page.locator(".composer-error")).toContainText(queueFull.message);
       await expect(
         page.getByText(`Request ID: ${queueFull.request_id}`, { exact: true }),
       ).toBeVisible();

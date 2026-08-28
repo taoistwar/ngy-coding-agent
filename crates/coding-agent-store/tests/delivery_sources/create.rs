@@ -94,7 +94,10 @@ async fn accepted_receipt_creates_exact_store_owned_object_pending_source() {
         operation.provenance.config_attributes_digest
     );
     assert_eq!(source.candidate_tree.as_str(), CANDIDATE_TREE);
-    assert_eq!(source.candidate_tree, operation.candidate_tree);
+    assert_eq!(
+        source.candidate_tree,
+        operation.preflight_inputs.unwrap().candidate_tree
+    );
     assert_eq!(source.expected_parent.as_str(), BASE_COMMIT);
     assert_eq!(source.expected_source_commit, None);
     assert_eq!(source.commit_metadata.author_name, "Coding Agent");
@@ -187,7 +190,7 @@ async fn create_replay_is_existing_after_source_commit_and_a_later_legal_merge_s
 
     sqlx::query(
         "UPDATE task_merge_operations SET delivery_source_task_id = ?, source_commit_oid = ?, \
-             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 4, updated_at = ? \
+             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 5, updated_at = ? \
          WHERE operation_id = ?",
     )
     .bind(command.task_id().to_string())

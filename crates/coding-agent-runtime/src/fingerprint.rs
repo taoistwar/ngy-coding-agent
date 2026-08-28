@@ -28,6 +28,15 @@ use crate::process_supervisor::{
 use crate::root_capability::{ensure_plain_directory, ensure_plain_file};
 use crate::tool_discovery::ToolchainPaths;
 
+mod delivery_snapshot;
+
+#[allow(unused_imports)]
+pub(crate) use delivery_snapshot::DeliverySnapshotGitMode;
+pub(crate) use delivery_snapshot::{
+    DeliveryFingerprintObservation, DeliverySnapshotEntry, DeliverySourceSnapshot,
+    parse_delivery_tracked_paths,
+};
+
 const FINGERPRINT_DOMAIN: &[u8] = b"coding-agent-workspace-fingerprint-v1\0";
 const MAX_GIT_PATH_BYTES: usize = 4_096;
 const MAX_GIT_COMPONENT_BYTES: usize = 255;
@@ -57,6 +66,14 @@ impl FingerprintLimits {
             max_file_bytes,
             max_total_bytes,
         })
+    }
+
+    /// The source-object builder must materialize a captured file through a
+    /// bounded exact stdin channel. This crate-private projection lets that
+    /// boundary reject a configuration which the ordinary fingerprinter could
+    /// otherwise accept but the source builder could not replay.
+    pub(crate) const fn max_file_bytes(&self) -> u64 {
+        self.max_file_bytes
     }
 }
 
@@ -103,15 +120,24 @@ impl WorkspaceFingerprinter {
         let status_before = self.read_status(cancellation.clone()).await?;
         let tracked_before = self.read_tracked(cancellation.clone()).await?;
         let untracked_before = self.read_untracked(cancellation.clone()).await?;
-        let first_entries =
-            parse_entries(&tracked_before, &untracked_before, self.limits.max_files)?;
-        let first = self.hash_entries(first_entries, &cancellation)?;
+        let first_entries = parse_entries(
+            &tracked_before,
+            &untracked_before,
+            self.limits.max_files,
+            None,
+        )?;
+        let first = Self::hash_entries(&self.work_tree, self.limits, first_entries, &cancellation)?;
 
         let tracked_after = self.read_tracked(cancellation.clone()).await?;
         let untracked_after = self.read_untracked(cancellation.clone()).await?;
-        let second_entries =
-            parse_entries(&tracked_after, &untracked_after, self.limits.max_files)?;
-        let second = self.hash_entries(second_entries, &cancellation)?;
+        let second_entries = parse_entries(
+            &tracked_after,
+            &untracked_after,
+            self.limits.max_files,
+            None,
+        )?;
+        let second =
+            Self::hash_entries(&self.work_tree, self.limits, second_entries, &cancellation)?;
         let status_after = self.read_status(cancellation).await?;
 
         if status_before != status_after
@@ -182,7 +208,8 @@ impl WorkspaceFingerprinter {
     }
 
     fn hash_entries(
-        &self,
+        work_tree: &ExecutionDirectory,
+        limits: FingerprintLimits,
         entries: BTreeMap<Vec<u8>, FingerprintEntry>,
         cancellation: &CancellationToken,
     ) -> Result<HashedWorkspace, FingerprintError> {
@@ -196,12 +223,8 @@ impl WorkspaceFingerprinter {
 
         for (raw_path, entry) in entries {
             check_cancelled(cancellation)?;
-            hash_frame(&mut hasher, 1, &raw_path)?;
-            match &entry.origin {
-                EntryOrigin::Tracked { metadata } => hash_frame(&mut hasher, 2, metadata)?,
-                EntryOrigin::Untracked => hash_frame(&mut hasher, 3, &[])?,
-            }
-            match open_worktree_file(&self.work_tree, &entry.path) {
+            hash_entry_prefix(&mut hasher, &raw_path, &entry.origin)?;
+            match open_worktree_file(work_tree, &entry.path) {
                 Ok(mut opened) => {
                     #[cfg(windows)]
                     let lease = reopen_file_read_lease(&opened.file)
@@ -211,35 +234,21 @@ impl WorkspaceFingerprinter {
                         .metadata()
                         .map_err(FingerprintError::UnsafeEntry)?;
                     ensure_plain_file(&opened.file).map_err(FingerprintError::UnsafeEntry)?;
-                    let length = before.len();
-                    if length > self.limits.max_file_bytes {
-                        return Err(FingerprintError::FileTooLarge);
-                    }
-                    total_bytes = total_bytes
-                        .checked_add(length)
-                        .ok_or(FingerprintError::TotalTooLarge)?;
-                    if total_bytes > self.limits.max_total_bytes {
-                        return Err(FingerprintError::TotalTooLarge);
-                    }
+                    let length = check_entry_length(
+                        length_within_limits(&before, limits)?,
+                        &mut total_bytes,
+                        limits,
+                    )?;
                     hash_file_type(&mut hasher, &before)?;
                     hasher.update(length.to_be_bytes());
                     stream_file(
                         &mut opened.file,
                         length,
-                        self.limits.max_file_bytes,
+                        limits.max_file_bytes,
                         cancellation,
                         &mut hasher,
                     )?;
-                    let after = opened
-                        .file
-                        .metadata()
-                        .map_err(FingerprintError::UnsafeEntry)?;
-                    if !same_observed_file(&before, &after)
-                        || !worktree_child_matches(&opened.parent, &opened.name, &opened.file)
-                            .map_err(FingerprintError::UnsafeEntry)?
-                    {
-                        return Err(FingerprintError::WorkspaceChanged);
-                    }
+                    validate_opened_entry(&opened, &before)?;
                     #[cfg(windows)]
                     leases.push(lease);
                 }
@@ -248,9 +257,7 @@ impl WorkspaceFingerprinter {
                 {
                     hash_frame(&mut hasher, 4, &[])?;
                 }
-                Err(OpenWorktreeError::Missing) => {
-                    return Err(FingerprintError::WorkspaceChanged);
-                }
+                Err(OpenWorktreeError::Missing) => return Err(FingerprintError::WorkspaceChanged),
                 Err(OpenWorktreeError::Unsafe(error)) => {
                     return Err(FingerprintError::UnsafeEntry(error));
                 }
@@ -281,10 +288,65 @@ enum EntryOrigin {
     Untracked,
 }
 
+fn hash_entry_prefix(
+    hasher: &mut Sha256,
+    raw_path: &[u8],
+    origin: &EntryOrigin,
+) -> Result<(), FingerprintError> {
+    hash_frame(hasher, 1, raw_path)?;
+    match origin {
+        EntryOrigin::Tracked { metadata } => hash_frame(hasher, 2, metadata),
+        EntryOrigin::Untracked => hash_frame(hasher, 3, &[]),
+    }
+}
+
+fn length_within_limits(
+    metadata: &Metadata,
+    limits: FingerprintLimits,
+) -> Result<u64, FingerprintError> {
+    let length = metadata.len();
+    if length > limits.max_file_bytes {
+        return Err(FingerprintError::FileTooLarge);
+    }
+    Ok(length)
+}
+
+fn check_entry_length(
+    length: u64,
+    total_bytes: &mut u64,
+    limits: FingerprintLimits,
+) -> Result<u64, FingerprintError> {
+    *total_bytes = total_bytes
+        .checked_add(length)
+        .ok_or(FingerprintError::TotalTooLarge)?;
+    if *total_bytes > limits.max_total_bytes {
+        return Err(FingerprintError::TotalTooLarge);
+    }
+    Ok(length)
+}
+
+fn validate_opened_entry(
+    opened: &OpenedWorktreeFile,
+    before: &Metadata,
+) -> Result<(), FingerprintError> {
+    let after = opened
+        .file
+        .metadata()
+        .map_err(FingerprintError::UnsafeEntry)?;
+    if !same_observed_file(before, &after)
+        || !worktree_child_matches(&opened.parent, &opened.name, &opened.file)
+            .map_err(FingerprintError::UnsafeEntry)?
+    {
+        return Err(FingerprintError::WorkspaceChanged);
+    }
+    Ok(())
+}
+
 fn parse_entries(
     tracked: &[u8],
     untracked: &[u8],
     max_files: usize,
+    object_id_hexadecimal_length: Option<usize>,
 ) -> Result<BTreeMap<Vec<u8>, FingerprintEntry>, FingerprintError> {
     let mut entries = BTreeMap::new();
     for record in nul_records(tracked)? {
@@ -294,7 +356,7 @@ fn parse_entries(
             .ok_or(FingerprintError::ListingInvalid)?;
         let metadata = &record[..tab];
         let path = RawGitPath::parse(&record[tab + 1..])?;
-        validate_tracked_metadata(metadata)?;
+        validate_tracked_metadata(metadata, object_id_hexadecimal_length)?;
         insert_entry(
             &mut entries,
             max_files,
@@ -343,12 +405,18 @@ fn nul_records(output: &[u8]) -> Result<Vec<&[u8]>, FingerprintError> {
     Ok(records)
 }
 
-fn validate_tracked_metadata(metadata: &[u8]) -> Result<(), FingerprintError> {
+fn validate_tracked_metadata(
+    metadata: &[u8],
+    object_id_hexadecimal_length: Option<usize>,
+) -> Result<(), FingerprintError> {
     let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
     if fields.len() != 4
         || fields[0].len() != 1
         || !matches!(fields[0][0], b'H' | b'C' | b'R')
-        || fields[2].len() != 40 && fields[2].len() != 64
+        || !object_id_hexadecimal_length.map_or_else(
+            || matches!(fields[2].len(), 40 | 64),
+            |expected| fields[2].len() == expected,
+        )
         || !fields[2].iter().all(u8::is_ascii_hexdigit)
         || fields[3] != b"0"
     {

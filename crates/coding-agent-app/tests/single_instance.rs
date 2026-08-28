@@ -10,8 +10,9 @@ use std::time::Duration;
 use axum::Router;
 #[cfg(feature = "test-support")]
 use coding_agent_app::{
-    ActorPausePoint, FakeScenario, LegacyV2Seed, ProcessStorageSample, ProcessTestConfig,
-    ProcessTestEnvironment, VirtualReleaseSignal, VirtualReleaseTarget,
+    ActorPausePoint, FakeRunnerConfig, FakeScenario, FixedStartupRunnerFactory, LegacyV2Seed,
+    ProcessRunnerMode, ProcessStorageSample, ProcessTestConfig, ProcessTestEnvironment,
+    ScriptedFakeRunner, VirtualReleaseSignal, VirtualReleaseTarget,
 };
 use coding_agent_app::{
     InstanceLock, PreActorStartupRunnerContext, ProductionStartupRunnerFactory, RuntimeDescriptor,
@@ -24,7 +25,13 @@ use coding_agent_domain::{
     CanonicalPath, ClientRequestId, DeliveryReadiness, NewRepository, NewTask, TaskEventKind,
     TaskStatus, UtcTimestamp,
 };
-use coding_agent_runtime::{HeldProcessLivenessTreeForTest, ProcessLivenessDirectory};
+use coding_agent_runtime::{
+    HeldProcessLivenessTreeForTest, ProcessLivenessDirectory, ProcessLivenessScope,
+};
+#[cfg(feature = "test-support")]
+use coding_agent_runtime::{
+    NativeVolumeSampler, RootCapability, VolumeSample, VolumeSampleError, VolumeSampler,
+};
 use coding_agent_store::{CreateTaskOutcome, RegisterRepositoryOutcome, Store};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
@@ -40,6 +47,42 @@ impl StartupRunnerFactory for PanicStartupRunnerFactory {
         _context: StartupRunnerContext,
     ) -> Result<StartupRunnerSelection, StartupRunnerFactoryError> {
         panic!("a secondary instance must never initialize the task runner")
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct AmpleStorageVolumeSampler;
+
+#[cfg(feature = "test-support")]
+impl VolumeSampler for AmpleStorageVolumeSampler {
+    fn sample(&self, root: &RootCapability) -> Result<VolumeSample, VolumeSampleError> {
+        const AVAILABLE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+        let native = NativeVolumeSampler::new().sample(root)?;
+        Ok(VolumeSample::for_test(native.identity(), AVAILABLE_BYTES))
+    }
+}
+
+struct FailingDeliveryGitProbeFactory {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StartupRunnerFactory for FailingDeliveryGitProbeFactory {
+    async fn probe_delivery_git_pre_database(
+        &self,
+        _paths: &coding_agent_app::PlatformPaths,
+        _process_liveness_scope: ProcessLivenessScope,
+    ) -> Result<Arc<dyn std::any::Any + Send + Sync>, StartupRunnerFactoryError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(StartupRunnerFactoryError::new("DELIVERY_GIT_PROBE_FAILED"))
+    }
+
+    async fn create(
+        &self,
+        _context: StartupRunnerContext,
+    ) -> Result<StartupRunnerSelection, StartupRunnerFactoryError> {
+        panic!("a failed delivery Git probe must stop before runner construction")
     }
 }
 
@@ -310,6 +353,36 @@ async fn database_open_or_migration_failure_stops_before_listener_publication() 
     assert!(
         InstanceLock::try_acquire(&fixture.paths.instance_lock)
             .expect("database failure releases lock")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn delivery_git_probe_failure_stops_before_database_recovery_or_listener_binding() {
+    let fixture = support::StartupFixture::new();
+    let probe_calls = Arc::new(AtomicUsize::new(0));
+    let mut dependencies = fixture.dependencies(support::StartupBehavior::default());
+    dependencies.runner_factory = Arc::new(FailingDeliveryGitProbeFactory {
+        calls: Arc::clone(&probe_calls),
+    });
+
+    let result = launch(dependencies).await;
+
+    match result {
+        Err(StartupError::Runner(error)) => {
+            assert_eq!(error.code(), "DELIVERY_GIT_PROBE_FAILED");
+        }
+        Err(error) => panic!("unexpected primary startup error: {error:?}"),
+        Ok(_) => panic!("a failed delivery Git probe must fail closed"),
+    }
+    assert_eq!(probe_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.calls.store_opens(), 0);
+    assert_eq!(fixture.calls.listener_binds(), 0);
+    assert!(!fixture.paths.database_path.exists());
+    assert!(!fixture.paths.instance_descriptor.exists());
+    assert!(
+        InstanceLock::try_acquire(&fixture.paths.instance_lock)
+            .expect("probe failure releases the primary lock")
             .is_some()
     );
 }
@@ -808,6 +881,7 @@ async fn process_test_legacy_v2_seed_migrates_before_primary_store_projection() 
     std::fs::write(
         &scenario,
         serde_json::to_vec(&ProcessTestConfig {
+            runner_mode: ProcessRunnerMode::ScriptedFake {},
             runtime_config: None,
             fake_scenarios: Vec::new(),
             storage_samples: vec![ProcessStorageSample::Native],
@@ -873,7 +947,7 @@ async fn process_test_legacy_v2_seed_migrates_before_primary_store_projection() 
             .fetch_all(store.pool())
             .await
             .expect("read migrated schema versions");
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     let stop_intent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_stop_intents")
         .fetch_one(store.pool())
         .await
@@ -942,8 +1016,17 @@ async fn cancelling_startup_with_a_held_runner_retains_lock_until_cleanup_proof(
     let fixture = support::StartupFixture::new();
     fixture.prepare();
     let queued = seed_queued_task(&fixture, "hold startup cleanup proof").await;
-    let (dependencies, reached) =
-        descriptor_pause_dependencies(&fixture, vec![FakeScenario::Blocking], "cancel-held-runner");
+    let runner = Arc::new(ScriptedFakeRunner::new(
+        FakeRunnerConfig::default(),
+        [FakeScenario::Blocking],
+    ));
+    let (mut dependencies, reached) =
+        descriptor_pause_dependencies(&fixture, Vec::new(), "cancel-held-runner");
+    dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new_with_volume_sampler(
+        runner.clone(),
+        NonZeroU32::new(4).expect("test concurrency is nonzero"),
+        Arc::new(AmpleStorageVolumeSampler),
+    ));
     let launch_task = tokio::spawn(launch(dependencies));
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -955,26 +1038,13 @@ async fn cancelling_startup_with_a_held_runner_retains_lock_until_cleanup_proof(
     .expect("startup reaches the descriptor pause");
     let descriptor = RuntimeDescriptor::read(&fixture.paths.instance_descriptor)
         .expect("descriptor is available at the pause");
-    let observer = Store::open(&fixture.paths.database_path)
-        .await
-        .expect("open startup cleanup observer");
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let status = observer
-                .task_detail(queued.id)
-                .await
-                .expect("read startup cleanup task")
-                .expect("startup cleanup task exists")
-                .task
-                .status;
-            if status == TaskStatus::Running {
-                return;
-            }
+        while !runner.started_task_ids().contains(&queued.id) {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the recovered task starts before startup is cancelled");
+    .expect("the recovered runner crosses the registered launch gate before cancellation");
 
     let liveness = ProcessLivenessDirectory::open(&fixture.paths.runtime_dir)
         .expect("open startup cleanup liveness namespace");
@@ -1133,6 +1203,7 @@ fn descriptor_pause_dependencies(
     std::fs::write(
         &scenario,
         serde_json::to_vec(&ProcessTestConfig {
+            runner_mode: ProcessRunnerMode::ScriptedFake {},
             runtime_config: None,
             fake_scenarios,
             storage_samples: vec![ProcessStorageSample::Native],

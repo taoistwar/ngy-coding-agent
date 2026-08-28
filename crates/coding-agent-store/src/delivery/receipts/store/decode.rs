@@ -109,15 +109,18 @@ fn validate_pointer_union(
 ) -> Result<(), StoreError> {
     let merge_operation_id = optional_text(row, "merge_operation_id")?;
     let cleanup_operation_id = optional_text(row, "cleanup_operation_id")?;
+    let cleanup_merged_operation_id = optional_text(row, "cleanup_merged_operation_id")?;
     let operation_id = operation_id.to_string();
     let matches = match operation_kind {
         DeliveryOperationKind::MergeOperation => {
             merge_operation_id.as_deref() == Some(operation_id.as_str())
                 && cleanup_operation_id.is_none()
+                && cleanup_merged_operation_id.is_none()
         }
         DeliveryOperationKind::CleanupOperation => {
             cleanup_operation_id.as_deref() == Some(operation_id.as_str())
                 && merge_operation_id.is_none()
+                && cleanup_merged_operation_id.is_some()
         }
     };
     if matches {

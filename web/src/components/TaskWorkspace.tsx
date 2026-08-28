@@ -9,6 +9,10 @@ import type {
 } from "../api/types";
 import type { CancelCommandState } from "../state/model";
 import { ActivityPane } from "./ActivityPane";
+import {
+  DeliveryPanel,
+  type DeliveryPanelBinding,
+} from "./DeliveryPanel";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { PlanPane } from "./PlanPane";
 import { ResultPane } from "./ResultPane";
@@ -32,6 +36,7 @@ export interface TaskWorkspaceProps {
   onSelectTask: (taskId: string) => void;
   repository?: Repository | null;
   composer?: ReactNode;
+  delivery?: DeliveryPanelBinding | null;
 }
 
 const STATUS_GLYPH: Record<Task["status"], string> = {
@@ -162,6 +167,7 @@ export function TaskWorkspace({
   onSelectTask,
   repository = null,
   composer = null,
+  delivery = null,
 }: TaskWorkspaceProps) {
   const [retryByTaskId, setRetryByTaskId] = useState<
     Record<string, RetryCommandViewState>
@@ -329,6 +335,15 @@ export function TaskWorkspace({
               <p>Request ID: {retryState.error.requestId}</p>
             ) : null}
           </div>
+        ) : null}
+
+        {delivery !== null ? (
+          <DeliveryPanel
+            key={task.id}
+            taskId={task.id}
+            api={delivery.api}
+            controller={delivery.controller}
+          />
         ) : null}
 
         {detailLoading ? (

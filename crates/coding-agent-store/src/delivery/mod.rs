@@ -3,6 +3,8 @@ mod eligibility;
 mod error;
 mod evidence;
 mod merges;
+mod mutation;
+mod operation;
 mod ownership;
 mod receipts;
 mod records;
@@ -25,14 +27,23 @@ pub use cleanup::{
 pub use eligibility::{DeliveryEligibilitySnapshot, PersistentEligibilityBlocker};
 pub use error::DeliveryError;
 pub use merges::{
-    AcceptMergeOutcome, BeginMergeAbortRequest, CompleteMergeAbortRequest, CompleteMergeRequest,
+    AcceptMergeOutcome, BeginMergeAbortRequest, BindMergePreflightInputsOutcome,
+    BindMergePreflightInputsRequest, CompleteMergeAbortRequest, CompleteMergeRequest,
     CreatePreflightOutcome, CreatePreflightRequest, EnterMergePendingRequest,
-    MergeAbortAppliedProof, MergeAbortProof, MergeAppliedProof, MergeAutostashObservation,
-    MergeCommitObjectProof, MergeConflictPaths, MergeKnownNotAppliedReason, MergePreflightResult,
+    FailUnboundMergePreflightOutcome, FailUnboundMergePreflightRequest, MergeAbortAppliedProof,
+    MergeAbortProof, MergeAppliedProof, MergeAutostashObservation, MergeCommitObjectProof,
+    MergeConflictPaths, MergeKnownNotAppliedReason, MergePreflightResult,
     MergeReconciliationReason, MergeTransitionOutcome, MergeTransitionReceipt,
     OtherGitOperationObservation, PreflightRejectedReason, ReconcileMergeRequest,
     RecordMergeKnownFailureRequest, RecordMergePreflightResultRequest,
+    UnboundMergePreflightFailure,
 };
+pub use mutation::{
+    DeliveryMutationEntity, DeliveryMutationEntityId, DeliveryMutationEntityKind,
+    DeliveryMutationKey, DeliveryMutationKind, DeliveryMutationReceiptIdentity,
+    DeliveryMutationRequest,
+};
+pub use operation::DeliveryOperationSnapshot;
 pub use ownership::DeliveryOwnershipSnapshot;
 pub use receipts::{
     AcceptMergeCommandRequest, DELIVERY_COMMAND_REQUEST_HASH_ALGORITHM,
@@ -45,6 +56,7 @@ pub use records::{
     ArtifactDispositionRecord, CleanupOperationRecord, CleanupTargetHeadObservationRecord,
     DeliveryArtifactProvenance, DeliveryCommitMetadata, DeliverySourceRecord,
     MergeConflictPathEncoding, MergeConflictRecord, MergeOperationRecord,
+    PreparedMergePreflightInputs,
 };
 pub use recovery::{
     AcceptedDeliverySourceState, DeliveryRecoveryAction, DeliveryRecoveryBatch,

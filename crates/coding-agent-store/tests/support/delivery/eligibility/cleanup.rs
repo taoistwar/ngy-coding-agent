@@ -331,7 +331,7 @@ pub async fn reconcile_branch_cleanup(
 async fn mark_merge_pending(store: &Store, task: &Task, operation_id: DeliveryOperationId) {
     sqlx::query(
         "UPDATE task_merge_operations SET delivery_source_task_id = ?, source_commit_oid = ?, \
-             expected_merge_commit_oid = ?, state = 'merge_pending', version = 4, updated_at = ? \
+             expected_merge_commit_oid = ?, state = 'merge_pending', version = 5, updated_at = ? \
          WHERE operation_id = ?",
     )
     .bind(task.id.to_string())
@@ -352,7 +352,7 @@ async fn complete_merge_with_disposition(
     let mut transaction = store.pool().begin().await.unwrap();
     sqlx::query(
         "UPDATE task_merge_operations SET state = 'merged', merged_disposition_task_id = ?, \
-             version = 5, updated_at = ? WHERE operation_id = ?",
+             version = 6, updated_at = ? WHERE operation_id = ?",
     )
     .bind(task.id.to_string())
     .bind(DELIVERY_TIMESTAMP)
@@ -505,10 +505,11 @@ async fn create_cleanup(
         "INSERT INTO task_delivery_command_receipts (client_request_id, command_kind, task_id, \
              repository_id, attempt, request_hash_domain, request_hash_version, \
              request_hash_algorithm, canonical_request_hash, operation_kind, operation_id, \
-             merge_operation_id, cleanup_operation_id, accepted_operation_version, \
+             merge_operation_id, cleanup_operation_id, cleanup_merged_operation_id, \
+             accepted_operation_version, \
              accepted_operation_state, response_discriminator, created_at) VALUES (?, ?, ?, ?, ?, \
              'coding-agent-delivery-command-request', 1, 'sha256', ?, 'cleanup_operation', ?, \
-             NULL, ?, 1, ?, ?, ?)",
+             NULL, ?, ?, 1, ?, ?, ?)",
     )
     .bind(receipt_id.to_string())
     .bind(fixture.command_kind)
@@ -518,6 +519,7 @@ async fn create_cleanup(
     .bind(request_hash.as_str())
     .bind(operation_id.to_string())
     .bind(operation_id.to_string())
+    .bind(merged_operation_id)
     .bind(fixture.state)
     .bind(fixture.response_discriminator)
     .bind(DELIVERY_TIMESTAMP)

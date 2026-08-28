@@ -2,6 +2,8 @@
 
 #[cfg(feature = "test-support")]
 pub mod concurrent_e2e;
+#[cfg(feature = "test-support")]
+pub mod delivery;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -650,7 +652,55 @@ pub struct StoreFixture {
     pub store: Store,
     pub repository: Repository,
     root: PathBuf,
-    _temp_dir: TempDir,
+    _temp_dir: StoreFixtureRoot,
+}
+
+struct StoreFixtureRoot {
+    temp_dir: Option<TempDir>,
+    retain_on_unexpected_drop: bool,
+}
+
+impl StoreFixtureRoot {
+    fn new(temp_dir: TempDir) -> Self {
+        Self {
+            temp_dir: Some(temp_dir),
+            retain_on_unexpected_drop: false,
+        }
+    }
+
+    fn arm_delivery_root_for_explicit_close(&mut self) {
+        self.retain_on_unexpected_drop = true;
+    }
+
+    fn path(&self) -> &Path {
+        self.temp_dir
+            .as_ref()
+            .expect("store fixture root remains owned")
+            .path()
+    }
+
+    fn take_for_explicit_close(&mut self) -> TempDir {
+        self.retain_on_unexpected_drop = false;
+        self.temp_dir
+            .take()
+            .expect("store fixture root closes exactly once")
+    }
+}
+
+impl Drop for StoreFixtureRoot {
+    fn drop(&mut self) {
+        if !self.retain_on_unexpected_drop {
+            return;
+        }
+        let Some(temp_dir) = self.temp_dir.take() else {
+            return;
+        };
+        let retained_root = temp_dir.keep();
+        eprintln!(
+            "delivery fixture retained after unexpected drop: {}",
+            retained_root.display()
+        );
+    }
 }
 
 impl StoreFixture {
@@ -660,6 +710,50 @@ impl StoreFixture {
             .expect("create store-fixture runtime directory");
         instance_process_scope(&runtime_directory)
     }
+
+    pub fn arm_delivery_root_for_explicit_close(&mut self) {
+        self._temp_dir.arm_delivery_root_for_explicit_close();
+    }
+
+    pub async fn close(self) -> Result<(), String> {
+        let Self {
+            store,
+            repository,
+            root: _,
+            _temp_dir: mut root_guard,
+        } = self;
+        let mut failures = Vec::new();
+        let store_close_timed_out = tokio::time::timeout(Duration::from_secs(10), store.close())
+            .await
+            .is_err();
+        if store_close_timed_out {
+            failures.push("store close timed out".to_owned());
+        }
+        drop(store);
+        drop(repository);
+
+        let temporary_root = root_guard.path().to_path_buf();
+        if store_close_timed_out {
+            drop(root_guard);
+            return Err(failures.join("; "));
+        }
+        let temp_dir = root_guard.take_for_explicit_close();
+        drop(root_guard);
+        if let Err(error) = temp_dir.close() {
+            failures.push(format!("temporary directory close failed: {error}"));
+        }
+        if temporary_root.exists() {
+            failures.push(format!(
+                "temporary directory leaked: {}",
+                temporary_root.display()
+            ));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
 }
 
 pub struct WriterFixture {
@@ -668,7 +762,7 @@ pub struct WriterFixture {
     pub writer: StoreWriterHandle,
     pub wake: Arc<CountingWake>,
     root: PathBuf,
-    _temp_dir: TempDir,
+    _temp_dir: StoreFixtureRoot,
 }
 
 pub struct DispatcherFixture {
@@ -676,7 +770,7 @@ pub struct DispatcherFixture {
     pub dispatcher: EventDispatcherHandle,
     pub startup_cursor: EventCursor,
     running_task: Task,
-    _temp_dir: TempDir,
+    _temp_dir: StoreFixtureRoot,
 }
 
 pub struct TaskManagerFixture {
@@ -688,7 +782,7 @@ pub struct TaskManagerFixture {
     pub runner: Arc<ControlledRunner>,
     pub state: ServiceStateController,
     busy_lock: AsyncMutex<Option<BusyLock>>,
-    _temp_dir: TempDir,
+    _temp_dir: StoreFixtureRoot,
 }
 
 pub struct DegradedFixture {
@@ -703,7 +797,7 @@ pub struct DegradedFixture {
     recovery_results: AsyncMutex<tokio::sync::broadcast::Receiver<DegradedRecoveryResult>>,
     busy_lock: AsyncMutex<Option<BusyLock>>,
     database_path: PathBuf,
-    _temp_dir: TempDir,
+    _temp_dir: StoreFixtureRoot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -939,7 +1033,7 @@ struct RunnerFixtureCore {
     repository: Repository,
     writer: StoreWriterHandle,
     manager: TaskManagerHandle,
-    _temp_dir: TempDir,
+    _temp_dir: StoreFixtureRoot,
 }
 
 struct BusyLock {
@@ -974,7 +1068,7 @@ pub async fn store_fixture() -> StoreFixture {
         store,
         repository,
         root,
-        _temp_dir: temp_dir,
+        _temp_dir: StoreFixtureRoot::new(temp_dir),
     }
 }
 

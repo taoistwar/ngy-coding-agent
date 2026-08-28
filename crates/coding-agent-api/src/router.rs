@@ -23,9 +23,11 @@ use uuid::Uuid;
 use crate::{
     AddRepositoryRequest, ApiBackend, ApiDoc, ApiError, ApiErrorResponse, ApiResult,
     BootstrapResponse, CancelResult, CancellationAcceptedResponse, CreateResult, CreateTaskRequest,
-    QuitResponse, RepositoryDto, RequestSecurity, SessionExchangeRequest, SseBackend,
-    TaskDetailDto, TaskDto, TaskEventDto,
+    DeliveryBackend, QuitResponse, RepositoryDto, RequestSecurity, SessionExchangeRequest,
+    SseBackend, TaskDetailDto, TaskDto, TaskEventDto,
 };
+
+mod delivery;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
@@ -34,6 +36,7 @@ struct ApiState {
     backend: Arc<dyn ApiBackend>,
     security: Arc<dyn RequestSecurity>,
     sse: Arc<dyn SseBackend>,
+    delivery: Arc<dyn DeliveryBackend>,
 }
 
 #[derive(Clone)]
@@ -44,10 +47,25 @@ pub fn build_api_router(
     security: Arc<dyn RequestSecurity>,
     sse: Arc<dyn SseBackend>,
 ) -> axum::Router {
+    build_api_router_with_delivery(
+        backend,
+        security,
+        sse,
+        Arc::new(crate::backend::UnavailableDeliveryBackend),
+    )
+}
+
+pub fn build_api_router_with_delivery(
+    backend: Arc<dyn ApiBackend>,
+    security: Arc<dyn RequestSecurity>,
+    sse: Arc<dyn SseBackend>,
+    delivery: Arc<dyn DeliveryBackend>,
+) -> axum::Router {
     let state = ApiState {
         backend,
         security,
         sse,
+        delivery,
     };
     let router: axum::Router<ApiState> = unbound_api_router().into();
     router
@@ -63,7 +81,7 @@ pub fn api_openapi() -> OpenApi {
 }
 
 fn unbound_api_router() -> OpenApiRouter<ApiState> {
-    OpenApiRouter::with_openapi(ApiDoc::openapi())
+    let router = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(exchange_session))
         .routes(routes!(bootstrap))
         .routes(routes!(repositories))
@@ -76,7 +94,8 @@ fn unbound_api_router() -> OpenApiRouter<ApiState> {
         .routes(routes!(retry_task))
         .routes(routes!(task_events))
         .routes(routes!(events))
-        .routes(routes!(quit))
+        .routes(routes!(quit));
+    delivery::add_routes(router)
 }
 
 #[utoipa::path(

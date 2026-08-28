@@ -7,8 +7,8 @@ use crate::StoreError;
 use crate::delivery::receipts::lookup_receipt;
 use crate::delivery::{
     ArtifactDispositionRecord, CleanupKind, CleanupOperationRecord, CleanupOperationState,
-    DeleteBranchCommandRequest, DeliveryAcceptedOperationState, DeliveryOperationId,
-    DeliveryVersion, MergeOperationRecord, RemoveWorktreeCommandRequest, validate_cleanup_state,
+    DeleteBranchCommandRequest, DeliveryAcceptedOperationState, DeliveryVersion,
+    MergeOperationRecord, RemoveWorktreeCommandRequest, validate_cleanup_state,
 };
 
 use super::super::decode::{parse_branch_state, parse_version, parse_worktree_state};
@@ -52,14 +52,7 @@ pub(in crate::delivery::ownership) async fn validate_cleanup_origin(
         CleanupKind::RemoveWorktree => worktree.version,
         CleanupKind::DeleteBranch => branch.version,
     };
-    validate_origin_receipt(
-        &mut *connection,
-        cleanup,
-        merged.operation_id,
-        origin_version,
-        initial_state,
-    )
-    .await
+    validate_origin_receipt(&mut *connection, cleanup, origin_version, initial_state).await
 }
 
 async fn load_initial_cleanup_state(
@@ -132,6 +125,7 @@ fn validate_historical_anchors(
     };
     let exact = cleanup.identity == disposition.identity
         && cleanup.disposition_task_id == disposition.identity.task_id()
+        && cleanup.expected_merge_operation_id == merged.operation_id
         && disposition.merged_operation_id == merged.operation_id
         && merged.provenance.identity == cleanup.identity
         && merged.current_transition_id < cleanup.initial_transition_id
@@ -153,7 +147,6 @@ fn validate_historical_anchors(
 async fn validate_origin_receipt(
     connection: &mut SqliteConnection,
     cleanup: &CleanupOperationRecord,
-    merged_operation_id: DeliveryOperationId,
     origin_version: DeliveryVersion,
     initial_state: CleanupOperationState,
 ) -> Result<(), StoreError> {
@@ -166,7 +159,7 @@ async fn validate_origin_receipt(
                 client_request_id,
                 cleanup.identity.task_id(),
                 origin_version,
-                merged_operation_id,
+                cleanup.expected_merge_operation_id,
                 cleanup.expected_source_ref.clone(),
                 cleanup.expected_source_oid.clone(),
             )
@@ -178,7 +171,7 @@ async fn validate_origin_receipt(
                 client_request_id,
                 cleanup.identity.task_id(),
                 origin_version,
-                merged_operation_id,
+                cleanup.expected_merge_operation_id,
                 cleanup.expected_source_ref.clone(),
                 cleanup.expected_source_oid.clone(),
                 cleanup

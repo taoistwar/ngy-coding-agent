@@ -3,6 +3,29 @@ use sqlx::SqlitePool;
 use super::parents::seed_eligible_delivery_parents;
 use super::*;
 
+pub async fn bind_preflight_inputs(
+    store: &coding_agent_store::Store,
+    task_id: coding_agent_domain::TaskId,
+    operation_id: coding_agent_store::DeliveryOperationId,
+    candidate_tree: &str,
+    preflight_source_commit: &str,
+) {
+    use std::str::FromStr as _;
+
+    let request = coding_agent_store::BindMergePreflightInputsRequest::try_new(
+        task_id,
+        operation_id,
+        coding_agent_store::DeliveryVersion::initial(),
+        coding_agent_store::GitTreeOid::from_str(candidate_tree).unwrap(),
+        coding_agent_store::GitCommitOid::from_str(preflight_source_commit).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.bind_merge_preflight_inputs(request).await.unwrap(),
+        coding_agent_store::MergeTransitionOutcome::Applied(_)
+    ));
+}
+
 pub async fn create_preflight(
     pool: &SqlitePool,
     final_review_event_id: i64,
@@ -61,6 +84,7 @@ pub async fn create_preflight_with_fixture(
     let mut transaction = pool.begin().await?;
     insert_preflight_operation(&mut transaction, final_review_event_id, fixture).await?;
     insert_merge_receipt(&mut transaction, merge_receipt_from_preflight(fixture)).await?;
+    bind_preflight_inputs_raw(&mut transaction, fixture).await?;
     transaction.commit().await
 }
 
@@ -81,7 +105,8 @@ async fn insert_preflight_operation(
              candidate_tree_oid, preflight_source_commit_oid,
              delivery_source_task_id, source_commit_oid, preflight_receipt_id,
              accept_receipt_id, target_branch, expected_target_head,
-             config_attributes_digest, merge_base_oid, candidate_merge_tree_oid,
+             config_attributes_digest, target_config_attributes_digest,
+             target_security_digest, merge_base_oid, candidate_merge_tree_oid,
              merge_author_name, merge_author_email, merge_committer_name,
              merge_committer_email, merge_author_date_bytes,
              merge_committer_date_bytes, merge_message_template_version,
@@ -98,10 +123,10 @@ async fn insert_preflight_operation(
              ?, 'directory_identity_v1',
              ?, 'directory_identity_v1',
              ?, 'codex-reserved',
-             ?, ?,
+             NULL, NULL,
              NULL, NULL, ?,
              NULL, CAST(? AS TEXT), ?,
-             ?, NULL, NULL,
+             ?, ?, ?, NULL, NULL,
              NULL, NULL, NULL,
              NULL, NULL,
              NULL, NULL,
@@ -124,8 +149,6 @@ async fn insert_preflight_operation(
     .bind(fixture.artifact_worktree_path)
     .bind(COMMON_IDENTITY_DIGEST)
     .bind(ADMIN_IDENTITY_DIGEST)
-    .bind(fixture.candidate_tree_oid)
-    .bind(PREFLIGHT_SOURCE_OID)
     .bind(fixture.receipt_id);
     let query = match fixture.target_branch {
         SqlTextFixture::Utf8(value) => query.bind(value),
@@ -134,11 +157,33 @@ async fn insert_preflight_operation(
     query
         .bind(TARGET_HEAD_OID)
         .bind(fixture.config_attributes_digest)
+        .bind(fixture.target_config_attributes_digest)
+        .bind(fixture.target_security_digest)
         .bind(TIMESTAMP)
         .bind(TIMESTAMP)
         .execute(&mut **transaction)
         .await
         .map(|_| ())
+}
+
+async fn bind_preflight_inputs_raw(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    fixture: PreflightFixture<'_>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE task_merge_operations \
+         SET candidate_tree_oid = ?, preflight_source_commit_oid = ?, \
+             version = 2, updated_at = ? \
+         WHERE operation_id = ? AND state = 'preflight_pending' AND version = 1 \
+           AND candidate_tree_oid IS NULL AND preflight_source_commit_oid IS NULL",
+    )
+    .bind(fixture.candidate_tree_oid)
+    .bind(PREFLIGHT_SOURCE_OID)
+    .bind(TIMESTAMP)
+    .bind(fixture.operation_id)
+    .execute(&mut **transaction)
+    .await
+    .map(|_| ())
 }
 
 fn merge_receipt_from_preflight(fixture: PreflightFixture<'_>) -> MergeReceiptFixture<'_> {
@@ -160,9 +205,9 @@ pub async fn mark_preflight_ready(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE task_merge_operations
-         SET state = 'preflight_ready', version = 2,
+         SET state = 'preflight_ready', version = 3,
              merge_base_oid = ?, candidate_merge_tree_oid = ?, updated_at = ?
-         WHERE operation_id = ?",
+         WHERE operation_id = ? AND state = 'preflight_pending' AND version = 2",
     )
     .bind(MERGE_BASE_OID)
     .bind(MERGE_TREE_OID)
@@ -233,7 +278,7 @@ pub async fn accept_merge_operation_with_request_hash(
     let mut transaction = pool.begin().await?;
     sqlx::query(
         "UPDATE task_merge_operations \
-         SET state = 'accepted', version = 3, accept_receipt_id = ?, \
+         SET state = 'accepted', version = 4, accept_receipt_id = ?, \
              merge_author_name = 'Coding Agent', \
              merge_author_email = 'coding-agent@localhost', \
              merge_committer_name = 'Coding Agent', \
@@ -243,7 +288,7 @@ pub async fn accept_merge_operation_with_request_hash(
              merge_message_template_version = 1, \
              merge_message_bytes = CAST('coding-agent: merge task ' || task_id || \
                  ' attempt ' || attempt || char(10) AS BLOB), updated_at = ? \
-         WHERE operation_id = ? AND state = 'preflight_ready' AND version = 2",
+         WHERE operation_id = ? AND state = 'preflight_ready' AND version = 3",
     )
     .bind(receipt_id)
     .bind(TIMESTAMP)
@@ -260,7 +305,7 @@ pub async fn accept_merge_operation_with_request_hash(
          ) \
          SELECT ?, 'accept_merge', task_id, repository_id, attempt, \
              'coding-agent-delivery-command-request', 1, 'sha256', ?, \
-             'merge_operation', operation_id, operation_id, NULL, 3, 'accepted', \
+             'merge_operation', operation_id, operation_id, NULL, 4, 'accepted', \
              'merge_accepted', ? \
          FROM task_merge_operations WHERE operation_id = ?",
     )
@@ -283,7 +328,7 @@ async fn accept_merge_with_date_bytes_and_request_hash(
     let mut transaction = pool.begin().await?;
     let query = sqlx::query(
         "UPDATE task_merge_operations
-         SET state = 'accepted', version = 3, accept_receipt_id = ?,
+         SET state = 'accepted', version = 4, accept_receipt_id = ?,
              merge_author_name = 'Coding Agent',
              merge_author_email = 'coding-agent@localhost',
              merge_committer_name = 'Coding Agent',
@@ -316,7 +361,7 @@ async fn accept_merge_with_date_bytes_and_request_hash(
             receipt_id,
             command_kind: "accept_merge",
             operation_id,
-            accepted_version: 3,
+            accepted_version: 4,
             accepted_state: "accepted",
             response_discriminator: "merge_accepted",
             request_hash,
@@ -410,7 +455,7 @@ pub async fn mark_merge_pending(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "UPDATE task_merge_operations
          SET delivery_source_task_id = ?, source_commit_oid = ?,
              expected_merge_commit_oid = ?, state = 'merge_pending',
-             version = 4, updated_at = ?
+             version = 5, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind(TASK_ID)
@@ -428,7 +473,7 @@ pub async fn complete_merge_with_disposition(pool: &SqlitePool) -> Result<(), sq
     sqlx::query(
         "UPDATE task_merge_operations
          SET state = 'merged', merged_disposition_task_id = ?,
-             version = 5, updated_at = ?
+             version = 6, updated_at = ?
          WHERE operation_id = ?",
     )
     .bind(TASK_ID)

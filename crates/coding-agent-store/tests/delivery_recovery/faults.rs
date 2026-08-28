@@ -19,7 +19,7 @@ async fn explicit_delivery_transaction_rollback_leaves_recovery_snapshot_unchang
 
     let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     let updated = sqlx::query(
-        "UPDATE task_merge_operations SET state = 'preflight_ready', version = 2, \
+        "UPDATE task_merge_operations SET state = 'preflight_ready', version = 3, \
              merge_base_oid = ?, candidate_merge_tree_oid = ?, updated_at = ? \
          WHERE operation_id = ?",
     )
@@ -39,11 +39,11 @@ async fn explicit_delivery_transaction_rollback_leaves_recovery_snapshot_unchang
     .fetch_one(&mut *transaction)
     .await
     .unwrap();
-    assert_eq!(in_transaction_journal_count, 2);
+    assert_eq!(in_transaction_journal_count, 3);
     transaction.rollback().await.unwrap();
 
     assert_eq!(recovery_batch(&store).await, before);
-    assert_merge_state_and_journal(&store, operation_id, "preflight_pending", 1, 1).await;
+    assert_merge_state_and_journal(&store, operation_id, "preflight_pending", 2, 2).await;
 }
 
 #[tokio::test]
@@ -134,14 +134,14 @@ async fn lost_reply_after_commit_is_recovered_from_only_the_committed_stage() {
     let entry = &first.entries[0];
     assert_eq!(entry.identity.task_id(), task.id);
     assert!(matches!(
-        entry.disposition,
+        &entry.disposition,
         DeliveryRecoveryDisposition::Recover(DeliveryRecoveryAction::Accepted {
             operation_id: recovered,
             source: AcceptedDeliverySourceState::ObjectPending { .. },
             ..
-        }) if recovered == operation_id
+        }) if *recovered == operation_id
     ));
-    assert_merge_state_and_journal(&store, operation_id, "accepted", 3, 3).await;
+    assert_merge_state_and_journal(&store, operation_id, "accepted", 4, 4).await;
     let source_journal_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_delivery_operation_transitions \
          WHERE entity_kind = 'delivery_source' AND entity_id = ?",
@@ -165,7 +165,7 @@ async fn assert_accepted_without_source(
     task_id: coding_agent_domain::TaskId,
     operation_id: coding_agent_store::DeliveryOperationId,
 ) {
-    assert_merge_state_and_journal(store, operation_id, "accepted", 3, 3).await;
+    assert_merge_state_and_journal(store, operation_id, "accepted", 4, 4).await;
     let source_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_delivery_sources \
          WHERE origin_accepted_operation_id = ?",

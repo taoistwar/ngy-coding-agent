@@ -93,6 +93,7 @@ P4-B 能保证：
 P4-B 不能保证：
 
 - 阻止用户或其他进程在应用命令前后运行外部 Git。
+- 对不参与本应用 repository coordinator 的外部 Git writer 提供真实 index 的原子 compare-and-swap。最终 sampled revalidation 与 `read-tree --reset` 自己取得 Git index lock 之间仍可能有外部写入；若该写入在后续 observation 中可见则进入 `ReconciliationRequired`，但本阶段不能承诺检测已经被该固定 stage 覆盖的同一窗口写入或保留其 staging。
 - 在外部进程与应用同时修改同一 checkout 时无条件自动恢复。
 - 在磁盘、权限或设备故障后凭日志推断 Git side effect。
 - 执行仓库自定义程序仍保持安全；因此本阶段直接拒绝 executable filter、hook 和 custom merge driver。
@@ -252,19 +253,19 @@ dirty 是本方法的预期状态，但“任意 dirty”不是资格。任何�
 
 ### 7.3 临时 index
 
-直接 `git add` 会改变 index metadata，从而改变 `workspace_fingerprint_v1`。固定顺序为：
+直接 `git add` 会改变 index metadata，并可能在读取 live worktree 时触发 filter/helper；它不能用于 candidate 构造。固定顺序为：
 
 1. 保持真实 index 不变，完成最终 fingerprint 认证。
-2. 创建应用私有临时 index capability。
-3. 从精确 `base_commit` 执行 `read-tree`。
-4. 在临时 index 执行 bounded `add -A -- .`。
+2. 从已认证 worktree 采集 no-follow、identity-bound snapshot，固定每个 approved tracked/untracked entry 的 raw path、mode 与 exact bytes；目录、symlink/reparse、identity 或读取不一致一律拒绝。
+3. 创建应用私有临时 index capability，并从精确 `base_commit` 执行 `read-tree`。
+4. 对 snapshot 的每个文件仅以固定 `hash-object -w --no-filters --stdin` 写入 exact bytes；再以 typed `update-index --add --replace -z --index-info`（`--index-info` 固定置于末尾）精确替换/移除临时 index entries，不读取 live 路径内容。
 5. `write-tree` 得到候选 tree OID。
-6. 再次读取真实 index 下的 fingerprint，必须仍等于 approved fingerprint。
+6. 再次认证真实 index/worktree并重新采集 snapshot/fingerprint，必须仍精确等于 approved fingerprint。
 7. 持久写入 source `ObjectPending`，绑定 tree、parent、metadata 和 evidence tuple。
 8. 生成并验证不可达 source commit object，持久写入 `CommitPending` 和 exact OID。
 9. 才允许修改真实 index 或 source ref。
 
-临时 index 路径不进入日志/API，失败后只删除应用自己创建且身份匹配的临时文件。
+candidate 命令路径不得依赖仅重定向 worktree attributes 的保护；它必须结构上不调用 filter/helper，即使 `$GIT_DIR/info/attributes` 在认证后发生变化也没有 helper 执行面。临时 index 路径不进入日志/API，失败后只删除应用自己创建且身份匹配的临时文件。
 
 ## 8. source commit 状态机
 
@@ -314,14 +315,18 @@ source commit metadata 固定：
 持有 repository lease 时：
 
 1. 重新认证 source identity、fixed lock reason、HEAD、fingerprint 和 config/attributes digest。
-2. 在真实 index 执行固定 `add -A -- .`。
-3. `write-tree` 必须精确等于 candidate tree。
-4. 再次验证 expected source commit object shape。
-5. 使用 `update-ref <source-ref> <expected-source> <base>` 做 CAS 更新。
-6. 验证 source ref/HEAD、commit shape、index tree 和 clean status。
-7. StoreWriter 原子写 `Committed` 和 transition。
+2. 证明 candidate OID 的 object type 精确为 `tree`，并证明 expected source commit shape 的 tree 精确等于 candidate。
+3. 在真实 index 执行固定 `read-tree --reset <candidate>`，不使用 `-u`，不读取 live worktree。
+4. 紧接着只执行固定、无路径输入的 `update-index --refresh -q`，仅刷新已 staged 条目的 stat cache；它不读取文件内容、不使用 filter/helper，也不改变 worktree。
+5. 使用固定 `diff-index` predicate 证明真实 index 精确等于 candidate tree。
+6. 再次验证 expected source commit object shape。
+7. 使用 `update-ref <source-ref> <expected-source> <base>` 做 CAS 更新。
+8. 验证 source ref/HEAD、commit shape、index tree 和 clean status。
+9. StoreWriter 原子写 `Committed` 和 transition。
 
 不运行 `git commit`，从而避免 commit hook/editor；`commit-tree` 仍必须显式禁用签名并使用清理环境。
+
+repository lease 只串行本应用 mutation，不是跨进程 Git index lock。第 4 节所述最终外部-writer 窗口不能靠额外 predicate 或仅观察 `index.lock` 消除；若产品需要不丢弃任意非协作外部 staging，必须另行设计真实 index ownership 或原子 index-CAS，而不是把本阶段的 sampled drift detection 表述为全局排他。
 
 ### 8.4 source recovery
 
@@ -330,10 +335,12 @@ source commit metadata 固定：
 `CommitPending` 恢复只接受：
 
 - source ref=`base`、真实 index/worktree 仍是 approved fingerprint：ref/index side effect 未开始，可继续。
-- source ref=`base`、真实 index tree=`candidate tree` 且 worktree与 index 一致：stage 已完成，可继续 CAS `update-ref`。
+- source ref=`base`、真实 index tree=`candidate tree` 且 worktree与 index 一致：stage 已完成，可继续 CAS `update-ref`。若进程在 `read-tree` 成功、stat cache refresh 前终止，纯观察无法可靠区分 zero-stat 假阳性与实际 drift，必须保守进入 `ReconciliationRequired`，绝不在 classifier 中刷新真实 index。
 - source ref=`expected source commit`，commit shape 精确且 worktree/index clean：side effect 已完成，补写 `Committed`。
 
 其他 ref、tree、index、worktree 或 evidence 组合一律 `ReconciliationRequired` 并 poison repository。恢复不 reset、clean 或猜测哪一方正确。
+
+runtime recovery intent 不能由原始 OID、fingerprint 或 directory identity 字段公开构造。它只可从已认证的 source capability、已绑定的 candidate tree 和（如有）expected source commit capture，连同不进入 API/日志/错误的 opaque common/admin durable identity evidence；每次 fresh bind 都必须与当前 source capability 精确比较，比较失败不得构造 candidate 或执行 Git 命令。跨进程把 Store record 转为该 runtime intent 的受信 adapter 属于 Task 21 边界，Task 12 不宣称已完成该 adapter。
 
 ## 9. 目标 checkout
 
@@ -580,8 +587,8 @@ Store outcome commit 回执未知时，DeliveryManager 保持 lease，先查询 
 
 - 复用 P4-A `GitCommandBinding` 的完整固定前缀与 capability revalidation，包括 `--no-replace-objects`、`--no-lazy-fetch`、`core.fsmonitor=false`、`core.untrackedCache=false`、`submodule.recurse=false`、empty external excludes/attributes 和 `diff.external=`；不能为 P4-B 另造较弱的命令路径。
 - `GIT_CONFIG_NOSYSTEM=1`。
-- `GIT_CONFIG_SYSTEM`/`GIT_CONFIG_GLOBAL` 指向应用私有空配置。
-- app-private empty `core.hooksPath`。
+- Unix 的 `GIT_CONFIG_SYSTEM`/`GIT_CONFIG_GLOBAL` 绑定到应用私有空配置的 retained FD：`0600` exclusive create 后立即 unlink，防止后续 namespace 替换或按路径重开。该边界不防御同一 UID 的恶意方在 unlink 前已取得可写 FD；若需该保证，必须使用 OS-specific anonymous FD 或隔离。Windows 使用固定 `NUL` 空配置端点。
+- `core.hooksPath` 固定为 Unix `/dev/null` 或 Windows `NUL`，不使用可写的应用目录。
 - `commit.gpgSign=false`、`merge.gpgSign=false`。
 - `merge.verifySignatures=false`。
 - `merge.autoStash=false`、`rerere.enabled=false`。
@@ -597,14 +604,17 @@ Store outcome commit 回执未知时，DeliveryManager 保持 lease，先查询 
 - submodule/gitlink。
 - 需要外部程序的 diff/working-tree encoding 组合。
 
+candidate tree 不通过 `add` 读取 live worktree；它只把已审计 snapshot 的 exact bytes 经 `hash-object --no-filters` 和 typed index-info 写入临时 index。因此 attributes 重验仍是必要认证步骤，但不是该构造路径防止 filter/helper 执行的唯一防线。
+
 ### 14.3 命令构造
 
 允许的高层 typed 动作：
 
 - rev/object/symbolic-ref/status/config/attribute 观察。
-- 临时 index `read-tree/add/write-tree`。
+- 临时 index `read-tree`、固定 `hash-object -w --no-filters --stdin`、typed `update-index --add --replace -z --index-info` 和 `write-tree`；真实 source index 的固定 `read-tree --reset <candidate>`、`update-index --refresh -q` stat-cache refresh 与 `diff-index` exact predicate。
 - `commit-tree` 和 CAS `update-ref`。
-- `merge-tree` preflight。
+- target preflight 的 `merge-base --all <target> <source>`（输出必须恰好一个 typed base）与 `merge-tree --write-tree --messages --name-only -z <target> <source>`。
+- clean merge result 的固定 `diff-tree --no-commit-id --name-only -r -z --no-renames --no-ext-diff <target> <merged-tree>` write-set scan，以及固定 `ls-files --others --ignored --exclude-standard --directory -z --` ignored-untracked scan。
 - 固定 `merge --no-ff --strategy=ort --no-edit --no-verify --no-verify-signatures --no-gpg-sign --no-autostash --no-rerere-autoupdate --no-overwrite-ignore --no-log --no-stat --cleanup=verbatim -m <fixed-message> -- <source-oid>`；`--no-log` 防止 `merge.log` 改写 expected message，`--no-stat` 固定输出边界；启动 probe 必须证明当前 Git 支持完整 option set。
 - exact `merge --abort`。
 - `merge-base --is-ancestor`。
@@ -1110,8 +1120,8 @@ polling 使用有界退避，例如 500ms 起、最多 2s；进入 terminal stat
 - dirty reviewed source 可安全 reopen；P4-A `open_ready` 仍拒绝 dirty。
 - source branch/path/admin/common Git/fixed lock reason mismatch 拒绝。
 - approved fingerprint stale 拒绝且零 ref/index side effect。
-- temp-index tree 与批准内容绑定。
-- real index tree 必须等于 candidate tree。
+- temp-index tree 从no-follow、identity-bound snapshot的exact bytes构造并与批准内容绑定；filter/helper对该构造路径零执行。
+- real index 只经固定`read-tree --reset <candidate>`写入，随后`diff-index`必须证明其等于candidate tree；candidate先有`tree` type proof。
 - deterministic commit-tree/CAS ref。
 - hook/signing/filter/custom driver 零执行。
 - source commit 每个 crash point 恢复。

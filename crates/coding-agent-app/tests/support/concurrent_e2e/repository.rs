@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
-use std::time::Duration;
 
 use coding_agent_app::{CodingAttemptError, RepositoryWorktreeProvisionerFactory};
 use coding_agent_domain::{CanonicalPath, Repository};
@@ -10,7 +9,10 @@ use coding_agent_runtime::{
     discover_toolchain,
 };
 
-use super::{COMMITTED_STAGED, COMMITTED_UNSTAGED, INITIAL_SOURCE};
+use super::{
+    COMMITTED_STAGED, COMMITTED_UNSTAGED, INITIAL_SOURCE, PROCESS_CLEANUP_TIMEOUT,
+    PROCESS_COMMAND_TIMEOUT, WORKTREE_ORCHESTRATION_TIMEOUT,
+};
 
 pub(super) async fn discover_e2e_toolchain(
     runtime_directory: &Path,
@@ -48,11 +50,11 @@ pub(super) fn provisioner_factory(
                 ProcessLimits::try_new(
                     512 * 1024,
                     256 * 1024,
-                    Duration::from_secs(2 * 60),
-                    Duration::from_secs(5),
+                    PROCESS_COMMAND_TIMEOUT,
+                    PROCESS_CLEANUP_TIMEOUT,
                 )
                 .expect("valid concurrent E2E process limits"),
-                WorktreeLimits::try_new(Duration::from_secs(30))
+                WorktreeLimits::try_new(WORKTREE_ORCHESTRATION_TIMEOUT)
                     .expect("valid concurrent E2E worktree limits"),
             )
             .map(Arc::new)
@@ -130,6 +132,29 @@ pub(super) fn git_line(repository: &Path, arguments: &[&str]) -> String {
         .expect("Git output is UTF-8")
         .trim()
         .to_owned()
+}
+
+pub(super) fn git_bytes(repository: &Path, arguments: &[&str]) -> Vec<u8> {
+    let output = git_output(repository, arguments);
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+pub(super) fn git_optional_ref(repository: &Path, reference: &str) -> Option<String> {
+    let output = git_output(repository, &["show-ref", "--quiet", "--verify", reference]);
+    match output.status.code() {
+        Some(0) => Some(git_line(repository, &["rev-parse", reference])),
+        Some(1) => None,
+        other => panic!(
+            "git show-ref --verify returned {other:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
 }
 
 fn git_output(repository: &Path, arguments: &[&str]) -> Output {

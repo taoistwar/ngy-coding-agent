@@ -19,13 +19,22 @@ async fn every_delivery_transition_entity_kind_rejects_an_orphan_journal_row() {
         sqlx::query(
             "INSERT INTO task_delivery_operation_transitions ( \
                  entity_kind, entity_id, entity_version, from_state, to_state, \
-                 failure_code, transitioned_at \
+                 failure_code, target_config_attributes_digest, target_security_digest, \
+                 transitioned_at \
              ) VALUES (?, 'aaaaaaaa-1111-4111-8111-111111111111', 1, ?, ?, NULL, \
+                 CASE WHEN ? = 'merge_operation' THEN \
+                     'f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4' \
+                     ELSE NULL END, \
+                 CASE WHEN ? = 'merge_operation' THEN \
+                     'a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5' \
+                     ELSE NULL END, \
                  '2026-08-04T00:00:00.000000000Z')",
         )
         .bind(entity_kind)
         .bind(from_state)
         .bind(to_state)
+        .bind(entity_kind)
+        .bind(entity_kind)
         .execute(store.pool())
         .await
         .unwrap();

@@ -47,7 +47,10 @@ use crate::{
     SystemWallClock, WallClock,
 };
 #[cfg(feature = "test-support")]
-use crate::{EventDispatcherHandle, MutationGate, StoreWriterHandle, TaskManagerHandle};
+use crate::{
+    DeliveryManagerHandle, EventDispatcherHandle, MutationGate, StoreWriterHandle,
+    TaskManagerHandle,
+};
 
 mod start_primary;
 
@@ -779,6 +782,8 @@ pub struct PrimaryRuntime {
     test_handles: PrimaryRuntimeTestHandles,
     #[cfg(feature = "test-support")]
     _test_signal_watchers: ProcessTestWatchers,
+    #[cfg(feature = "test-support")]
+    _process_test_support: Option<Arc<crate::test_support::ProcessTestRuntime>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -788,6 +793,7 @@ pub struct PrimaryRuntimeTestHandles {
     pub writer: StoreWriterHandle,
     pub dispatcher: EventDispatcherHandle,
     pub task_manager: TaskManagerHandle,
+    pub delivery_manager: DeliveryManagerHandle,
     pub mutation_gate: MutationGate,
     repository_registrar: RepositoryRuntimeRegistrar,
     process_liveness_scope: ProcessLivenessScope,
@@ -852,7 +858,40 @@ impl PrimaryRuntime {
     }
 
     pub async fn shutdown(&self) -> ShutdownOutcome {
-        self.shutdown.shutdown().await
+        let outcome = self.shutdown.shutdown().await;
+        #[cfg(feature = "test-support")]
+        {
+            let watcher_shutdown = self._test_signal_watchers.shutdown_and_join().await;
+            if let Err(error) = watcher_shutdown {
+                tracing::warn!(
+                    ?error,
+                    error_code = "PROCESS_TEST_WATCHER_SHUTDOWN_INCOMPLETE",
+                    "process-test signal watchers did not release their capabilities before shutdown"
+                );
+            }
+            let signal_capability_close = self
+                ._process_test_support
+                .as_ref()
+                .map(|support| support.close_signal_capability())
+                .transpose();
+            if let Err(error) = signal_capability_close {
+                tracing::warn!(
+                    ?error,
+                    error_code = "PROCESS_TEST_SIGNAL_CAPABILITY_CLOSE_FAILED",
+                    "process-test signal capability remained open after shutdown"
+                );
+            }
+            if outcome == ShutdownOutcome::Clean
+                && watcher_shutdown.is_ok()
+                && signal_capability_close.is_ok()
+            {
+                ShutdownOutcome::Clean
+            } else {
+                ShutdownOutcome::Degraded
+            }
+        }
+        #[cfg(not(feature = "test-support"))]
+        outcome
     }
 
     #[cfg(feature = "test-support")]

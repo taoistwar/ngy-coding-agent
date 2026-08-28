@@ -2,6 +2,10 @@ use coding_agent_domain::{ClientRequestId, TaskId};
 use serde::{Deserialize, Serialize};
 
 use super::{domain_client_request_id, parse_task_id, validate_request_ids};
+use crate::delivery::mutation::{
+    DeliveryMutationEntity, DeliveryMutationEntityKind, DeliveryMutationKey, DeliveryMutationKind,
+    DeliveryMutationReceiptIdentity, impl_delivery_mutation_request,
+};
 use crate::delivery::receipts::hash;
 use crate::delivery::receipts::model::{
     CanonicalCommandRequest, CommandActionAnchor, CommandRequestKey, DeliveryCommandKind,
@@ -70,6 +74,19 @@ impl RemoveWorktreeCommandRequest {
         hash::remove_worktree(self)
     }
 }
+
+impl_delivery_mutation_request!(RemoveWorktreeCommandRequest, |request| {
+    cleanup_acceptance_key(
+        DeliveryMutationKind::AcceptWorktreeCleanup,
+        DeliveryMutationEntityKind::WorktreeDisposition,
+        request.client_request_id,
+        request.task_id,
+        request.expected_disposition_version,
+        request.expected_merge_operation_id,
+        DeliveryCommandKind::RemoveWorktree,
+        request.canonical_request_hash(),
+    )
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -186,6 +203,51 @@ impl DeleteBranchCommandRequest {
     pub fn canonical_request_hash(&self) -> Sha256Digest {
         hash::delete_branch(self)
     }
+}
+
+impl_delivery_mutation_request!(DeleteBranchCommandRequest, |request| {
+    cleanup_acceptance_key(
+        DeliveryMutationKind::AcceptBranchCleanup,
+        DeliveryMutationEntityKind::BranchDisposition,
+        request.client_request_id,
+        request.task_id,
+        request.expected_disposition_version,
+        request.expected_merge_operation_id,
+        DeliveryCommandKind::DeleteBranch,
+        request.canonical_request_hash(),
+    )
+});
+
+#[allow(clippy::too_many_arguments)]
+fn cleanup_acceptance_key(
+    kind: DeliveryMutationKind,
+    disposition_kind: DeliveryMutationEntityKind,
+    client_request_id: DeliveryCommandId,
+    task_id: TaskId,
+    expected_disposition_version: DeliveryVersion,
+    expected_merge_operation_id: DeliveryOperationId,
+    command_kind: DeliveryCommandKind,
+    canonical_request_hash: Sha256Digest,
+) -> DeliveryMutationKey {
+    DeliveryMutationKey::new(
+        kind,
+        task_id,
+        vec![
+            DeliveryMutationEntity::pending(DeliveryMutationEntityKind::CleanupOperation),
+            DeliveryMutationEntity::task(
+                disposition_kind,
+                task_id,
+                Some(expected_disposition_version),
+            ),
+        ],
+        Some(DeliveryMutationReceiptIdentity::new(
+            client_request_id,
+            command_kind,
+            canonical_request_hash,
+            DeliveryVersion::initial(),
+            Some(expected_merge_operation_id),
+        )),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

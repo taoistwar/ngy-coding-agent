@@ -10,13 +10,13 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use sqlx::Connection as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 
 use crate::PrivateFile;
 use crate::platform::{create_private_directory, harden_private_file};
@@ -25,10 +25,16 @@ use crate::{
     NativeMessageSink, PlatformPaths, ScriptedFakeRunner, StartupDependencies, StartupPaths,
     StoreFactory, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterTestController,
 };
+use coding_agent_domain::{CanonicalPath, NewRepository};
 use coding_agent_store::{Store, StoreError};
 
+mod delivery;
 mod process_storage;
 
+use delivery::ProcessOfflineDeliveryRuntime;
+pub use delivery::{
+    ProcessDeliveryProcessFault, ProcessDeliveryProviderScenario, ProcessRunnerMode,
+};
 pub use process_storage::ProcessStorageSample;
 use process_storage::ProcessVolumeSampler;
 
@@ -39,6 +45,8 @@ pub const TEST_SCENARIO_ENV: &str = "CODING_AGENT_TEST_SCENARIO";
 const MAX_SCENARIO_BYTES: u64 = 1024 * 1024;
 const MAX_SIGNAL_NAME_BYTES: usize = 64;
 const SIGNAL_DIRECTORY_NAME: &str = "signals";
+const PROCESS_TEST_WATCHER_SHUTDOWN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 pub const TEST_PICKER_PROBE_FILE: &str = "native-picker-invoked.probe";
 pub const TEST_BROWSER_PROBE_FILE: &str = "browser-invoked.probe";
 pub const TEST_STARTUP_RECOVERY_PROBE_FILE: &str = "startup-recovery.json";
@@ -186,6 +194,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessTestConfig {
+    pub runner_mode: ProcessRunnerMode,
     #[serde(deserialize_with = "deserialize_required_runtime_config")]
     pub runtime_config: Option<ProcessRuntimeConfig>,
     pub fake_scenarios: Vec<FakeScenario>,
@@ -244,6 +253,7 @@ impl ProcessTestConfig {
     }
 
     fn validate(&self) -> Result<(), ProcessTestConfigError> {
+        self.validate_runner_mode()?;
         if self.storage_samples.is_empty() {
             return Err(ProcessTestConfigError::EmptyStorageSamples);
         }
@@ -387,6 +397,36 @@ impl ProcessTestConfig {
         }
         Ok(())
     }
+
+    fn validate_runner_mode(&self) -> Result<(), ProcessTestConfigError> {
+        let ProcessRunnerMode::ProductionOfflineDelivery {
+            repository_path,
+            provider_scenario,
+            process_fault,
+        } = &self.runner_mode
+        else {
+            return Ok(());
+        };
+        if *process_fault != ProcessDeliveryProcessFault::None
+            && *provider_scenario != ProcessDeliveryProviderScenario::Approve
+        {
+            return Err(ProcessTestConfigError::ProductionProcessFaultRequiresApprove);
+        }
+        if !self.fake_scenarios.is_empty() {
+            return Err(ProcessTestConfigError::ProductionRunnerHasFakeScenarios);
+        }
+        if !matches!(self.legacy_v2_seed, LegacyV2Seed::None) {
+            return Err(ProcessTestConfigError::ProductionRunnerHasLegacySeed);
+        }
+        if self
+            .virtual_release_signals
+            .iter()
+            .any(|signal| signal.target == VirtualReleaseTarget::RunnerNext)
+        {
+            return Err(ProcessTestConfigError::ProductionRunnerHasFakeRelease);
+        }
+        validate_delivery_repository(repository_path)
+    }
 }
 
 #[derive(Debug)]
@@ -465,10 +505,16 @@ impl ProcessTestEnvironment {
         self,
         mut dependencies: StartupDependencies,
     ) -> Result<StartupDependencies, ProcessTestConfigError> {
+        let production_repository = self
+            .config
+            .runner_mode
+            .production_repository()
+            .map(Path::to_path_buf);
         dependencies.stores = Arc::new(ProcessTestStoreFactory {
             inner: dependencies.stores.clone(),
             database_path: self.paths.database_path.clone(),
             seed: self.config.legacy_v2_seed.clone(),
+            production_repository,
             seeded: OnceCell::new(),
         });
         let writer_controller = Arc::new(
@@ -497,16 +543,36 @@ impl ProcessTestEnvironment {
             self.config.storage_samples.clone(),
         ));
         let picker_probe = self.paths.runtime_dir.join(TEST_PICKER_PROBE_FILE);
+        let offline_runtime_path = self.paths.runtime_dir.clone();
         dependencies.paths = Arc::new(ProcessStartupPaths(self.paths));
         dependencies.browser = Arc::new(ProcessBrowserOpener {
             signals: self.signals.clone(),
         });
         dependencies.messages = Arc::new(ProcessNativeMessageSink);
         dependencies.dialog = Some(crate::NativeDialogService::process_test_probe(picker_probe));
-        dependencies.runner_factory = Arc::new(FixedStartupRunnerFactory::new_for_process_test(
-            runner.clone(),
-            storage_sampler.clone(),
-        ));
+        let offline_delivery = self
+            .config
+            .runner_mode
+            .offline_delivery()
+            .map(|(repository_path, scenario, process_fault)| {
+                ProcessOfflineDeliveryRuntime::start(
+                    repository_path,
+                    offline_runtime_path.as_path(),
+                    scenario,
+                    process_fault,
+                )
+            })
+            .transpose()
+            .map_err(ProcessTestConfigError::OfflineDeliveryHarness)?;
+        dependencies.runner_factory = offline_delivery.as_ref().map_or_else(
+            || {
+                Arc::new(FixedStartupRunnerFactory::new_for_process_test(
+                    runner.clone(),
+                    storage_sampler.clone(),
+                )) as Arc<dyn crate::StartupRunnerFactory>
+            },
+            ProcessOfflineDeliveryRuntime::factory,
+        );
         dependencies.process_test_support = Some(Arc::new(ProcessTestRuntime {
             config: self.config,
             writer_controller,
@@ -514,6 +580,7 @@ impl ProcessTestEnvironment {
             storage_sampler,
             actor_pauses,
             signals: self.signals,
+            _offline_delivery: offline_delivery,
         }));
         Ok(dependencies)
     }
@@ -552,26 +619,59 @@ struct ProcessTestStoreFactory {
     inner: Arc<dyn StoreFactory>,
     database_path: PathBuf,
     seed: LegacyV2Seed,
+    production_repository: Option<PathBuf>,
     seeded: OnceCell<()>,
 }
 
 #[async_trait::async_trait]
 impl StoreFactory for ProcessTestStoreFactory {
     async fn open(&self, path: &Path) -> Result<Store, StoreError> {
-        if !matches!(self.seed, LegacyV2Seed::None) {
+        if !matches!(self.seed, LegacyV2Seed::None) || self.production_repository.is_some() {
             self.seeded
                 .get_or_try_init(|| async {
                     if path != self.database_path {
                         return Err(StoreError::InvariantViolation(
-                            "legacy v2 process seed database path mismatch",
+                            "process seed database path mismatch",
                         ));
                     }
-                    seed_legacy_v2_database(path, &self.seed).await
+                    if let Some(repository_path) = &self.production_repository {
+                        seed_production_delivery_repository(path, repository_path).await
+                    } else {
+                        seed_legacy_v2_database(path, &self.seed).await
+                    }
                 })
                 .await?;
         }
         self.inner.open(path).await
     }
+}
+
+async fn seed_production_delivery_repository(
+    path: &Path,
+    repository_path: &Path,
+) -> Result<(), StoreError> {
+    let repository_path = fs::canonicalize(repository_path)
+        .map_err(|source| StoreError::Database(sqlx::Error::Io(source)))?;
+    let canonical = CanonicalPath::try_from_canonical(repository_path.clone())
+        .map_err(|_| StoreError::InvariantViolation("delivery repository path is not canonical"))?;
+    let display_name = repository_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("offline-delivery-repository")
+        .to_owned();
+    let store = Store::open(path).await?;
+    store.migrate().await?;
+    store
+        .register_repository(NewRepository {
+            selected_path: canonical.clone(),
+            display_name,
+            git_root: canonical.clone(),
+            cargo_workspace_root: canonical,
+        })
+        .await?;
+    store.close().await;
+    Ok(())
 }
 
 async fn seed_legacy_v2_database(path: &Path, seed: &LegacyV2Seed) -> Result<(), StoreError> {
@@ -717,9 +817,14 @@ pub(crate) struct ProcessTestRuntime {
     runner: Arc<ScriptedFakeRunner>,
     storage_sampler: Arc<ProcessVolumeSampler>,
     signals: Arc<ProcessSignalDirectory>,
+    _offline_delivery: Option<ProcessOfflineDeliveryRuntime>,
 }
 
 impl ProcessTestRuntime {
+    pub(crate) fn close_signal_capability(&self) -> Result<(), ProcessSignalCapabilityCloseError> {
+        self.signals.close_capability()
+    }
+
     pub(crate) fn publish_startup_recovery_probe(
         &self,
         interrupted_count: usize,
@@ -822,19 +927,102 @@ impl ProcessTestRuntime {
                 })
             })
             .collect();
-        ProcessTestWatchers(watchers)
+        ProcessTestWatchers::new(watchers)
     }
 }
 
-#[derive(Default)]
-pub(crate) struct ProcessTestWatchers(Vec<tokio::task::JoinHandle<()>>);
+pub(crate) struct ProcessTestWatchers {
+    watchers: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    completion: watch::Sender<Option<Result<(), ProcessTestWatcherShutdownError>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessTestWatcherShutdownError {
+    DeadlineExceeded,
+    WatcherPanicked,
+    CoordinatorUnavailable,
+}
+
+impl ProcessTestWatchers {
+    fn new(watchers: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        let (completion, _) = watch::channel(None);
+        Self {
+            watchers: Mutex::new(Some(watchers)),
+            completion,
+        }
+    }
+
+    pub(crate) async fn shutdown_and_join(&self) -> Result<(), ProcessTestWatcherShutdownError> {
+        if let Some(outcome) = *self.completion.borrow() {
+            return outcome;
+        }
+        let deadline = tokio::time::Instant::now() + PROCESS_TEST_WATCHER_SHUTDOWN_TIMEOUT;
+        let watchers = self
+            .watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(watchers) = watchers {
+            let completion = self.completion.clone();
+            tokio::spawn(async move {
+                let outcome = join_process_test_watchers(watchers, deadline).await;
+                let _ = completion.send_replace(Some(outcome));
+            });
+        }
+        let mut completion = self.completion.subscribe();
+        loop {
+            if let Some(outcome) = *completion.borrow_and_update() {
+                return outcome;
+            }
+            match tokio::time::timeout_at(deadline, completion.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    return Err(ProcessTestWatcherShutdownError::CoordinatorUnavailable);
+                }
+                Err(_) => return Err(ProcessTestWatcherShutdownError::DeadlineExceeded),
+            }
+        }
+    }
+}
+
+impl Default for ProcessTestWatchers {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
 
 impl Drop for ProcessTestWatchers {
     fn drop(&mut self) {
-        for watcher in &self.0 {
-            watcher.abort();
+        if let Some(watchers) = self
+            .watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            for watcher in watchers {
+                watcher.abort();
+            }
         }
     }
+}
+
+async fn join_process_test_watchers(
+    watchers: Vec<tokio::task::JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+) -> Result<(), ProcessTestWatcherShutdownError> {
+    for watcher in &watchers {
+        watcher.abort();
+    }
+    let mut outcome = Ok(());
+    for watcher in watchers {
+        match tokio::time::timeout_at(deadline, watcher).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(Err(_)) => outcome = Err(ProcessTestWatcherShutdownError::WatcherPanicked),
+            Err(_) => outcome = Err(ProcessTestWatcherShutdownError::DeadlineExceeded),
+        }
+    }
+    outcome
 }
 
 pub(crate) struct ActorPauseController {
@@ -992,6 +1180,18 @@ pub enum ProcessTestConfigError {
     InvalidLegacyV2Repository(PathBuf),
     #[error("legacy v2 completed task prompt is invalid")]
     InvalidLegacyV2Prompt,
+    #[error("production offline delivery runner requires fake_scenarios to be empty")]
+    ProductionRunnerHasFakeScenarios,
+    #[error("production offline delivery runner cannot be combined with legacy_v2_seed")]
+    ProductionRunnerHasLegacySeed,
+    #[error("production offline delivery runner cannot use runner_next release targets")]
+    ProductionRunnerHasFakeRelease,
+    #[error("production offline delivery process faults require the approve provider scenario")]
+    ProductionProcessFaultRequiresApprove,
+    #[error("production offline delivery repository is invalid: {0}")]
+    InvalidDeliveryRepository(PathBuf),
+    #[error("production offline delivery harness could not start: {0}")]
+    OfflineDeliveryHarness(#[source] std::io::Error),
     #[error("process storage sample script must contain at least one sample")]
     EmptyStorageSamples,
     #[error(
@@ -1245,6 +1445,40 @@ fn validate_absolute(field: &'static str, path: &Path) -> Result<(), ProcessTest
     Ok(())
 }
 
+fn validate_delivery_repository(path: &Path) -> Result<(), ProcessTestConfigError> {
+    validate_absolute("production offline delivery repository", path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| ProcessTestConfigError::InvalidDeliveryRepository(path.to_path_buf()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProcessTestConfigError::InvalidDeliveryRepository(
+            path.to_path_buf(),
+        ));
+    }
+    fs::canonicalize(path)
+        .map_err(|_| ProcessTestConfigError::InvalidDeliveryRepository(path.to_path_buf()))?;
+    let required_directories = [path.join(".git"), path.join("src")];
+    if required_directories.iter().any(|required| {
+        fs::symlink_metadata(required).map_or(true, |metadata| {
+            metadata.file_type().is_symlink() || !metadata.is_dir()
+        })
+    }) {
+        return Err(ProcessTestConfigError::InvalidDeliveryRepository(
+            path.to_path_buf(),
+        ));
+    }
+    let required_files = [path.join("Cargo.toml"), path.join("src").join("lib.rs")];
+    if required_files.iter().any(|required| {
+        fs::symlink_metadata(required).map_or(true, |metadata| {
+            metadata.file_type().is_symlink() || !metadata.is_file()
+        })
+    }) {
+        return Err(ProcessTestConfigError::InvalidDeliveryRepository(
+            path.to_path_buf(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_signal_name(name: &str) -> Result<(), ProcessTestConfigError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_SIGNAL_NAME_BYTES
@@ -1318,7 +1552,12 @@ fn is_reserved_probe_path(path: &Path) -> bool {
 #[derive(Debug)]
 struct ProcessSignalDirectory {
     path: PathBuf,
-    _handle: File,
+    capability: Mutex<Option<File>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSignalCapabilityCloseError {
+    LockPoisoned,
 }
 
 impl ProcessSignalDirectory {
@@ -1341,11 +1580,39 @@ impl ProcessSignalDirectory {
             })?;
         Ok(Self {
             path: canonical,
-            _handle: handle,
+            capability: Mutex::new(Some(handle)),
         })
     }
 
+    fn close_capability(&self) -> Result<(), ProcessSignalCapabilityCloseError> {
+        let mut capability = self
+            .capability
+            .lock()
+            .map_err(|_| ProcessSignalCapabilityCloseError::LockPoisoned)?;
+        drop(capability.take());
+        Ok(())
+    }
+
+    fn with_capability<T>(&self, operation: impl FnOnce(&File) -> io::Result<T>) -> io::Result<T> {
+        let capability = self.capability.lock().map_err(|_| {
+            io::Error::other("process signal directory capability lock is poisoned")
+        })?;
+        let capability = capability.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "process signal directory capability is closed",
+            )
+        })?;
+        operation(capability)
+    }
+
     fn validate_child(&self, path: &Path) -> Result<(), ProcessTestConfigError> {
+        self.with_capability(|_| Ok(()))
+            .map_err(|source| ProcessTestConfigError::Io {
+                action: "validate open process signal capability",
+                path: self.path.clone(),
+                source,
+            })?;
         validate_release_path(path)?;
         let parent = path
             .parent()
@@ -1373,32 +1640,36 @@ impl ProcessSignalDirectory {
     }
 
     fn release_ready(&self, name: &OsStr) -> io::Result<bool> {
-        let Some(file) = self.open_child_no_follow(name)? else {
-            return Ok(false);
-        };
-        let metadata = file.metadata()?;
-        if !release_metadata_is_regular(&metadata) || metadata.len() != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "release signal is not an empty regular file",
-            ));
-        }
-        Ok(true)
+        self.with_capability(|directory| {
+            let Some(file) = self.open_child_no_follow(directory, name)? else {
+                return Ok(false);
+            };
+            let metadata = file.metadata()?;
+            if !release_metadata_is_regular(&metadata) || metadata.len() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "release signal is not an empty regular file",
+                ));
+            }
+            Ok(true)
+        })
     }
 
     fn publish_probe_bytes(&self, name: &OsStr, payload: &[u8]) -> io::Result<()> {
-        self.remove_child_if_present(name)?;
-        self.publish_bytes(name, payload)
+        self.with_capability(|directory| {
+            self.remove_child_if_present(directory, name)?;
+            self.publish_bytes(directory, name, payload)
+        })
     }
 
     #[cfg(unix)]
-    fn remove_child_if_present(&self, name: &OsStr) -> io::Result<()> {
+    fn remove_child_if_present(&self, directory: &File, name: &OsStr) -> io::Result<()> {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
 
         let name = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "signal name contains NUL"))?;
-        let result = unsafe { libc::unlinkat(self._handle.as_raw_fd(), name.as_ptr(), 0) };
+        let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
         if result == 0 {
             return Ok(());
         }
@@ -1411,7 +1682,7 @@ impl ProcessSignalDirectory {
     }
 
     #[cfg(windows)]
-    fn remove_child_if_present(&self, name: &OsStr) -> io::Result<()> {
+    fn remove_child_if_present(&self, _directory: &File, name: &OsStr) -> io::Result<()> {
         match fs::remove_file(self.path.join(name)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1420,7 +1691,7 @@ impl ProcessSignalDirectory {
     }
 
     #[cfg(unix)]
-    fn open_child_no_follow(&self, name: &OsStr) -> io::Result<Option<File>> {
+    fn open_child_no_follow(&self, directory: &File, name: &OsStr) -> io::Result<Option<File>> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::ffi::OsStrExt as _;
 
@@ -1428,7 +1699,7 @@ impl ProcessSignalDirectory {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "signal name contains NUL"))?;
         let descriptor = unsafe {
             libc::openat(
-                self._handle.as_raw_fd(),
+                directory.as_raw_fd(),
                 name.as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             )
@@ -1444,7 +1715,7 @@ impl ProcessSignalDirectory {
     }
 
     #[cfg(windows)]
-    fn open_child_no_follow(&self, name: &OsStr) -> io::Result<Option<File>> {
+    fn open_child_no_follow(&self, _directory: &File, name: &OsStr) -> io::Result<Option<File>> {
         use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
@@ -1461,11 +1732,11 @@ impl ProcessSignalDirectory {
 
     #[cfg(unix)]
     fn publish_reached(&self, name: &OsStr) -> io::Result<()> {
-        self.publish_bytes(name, &[])
+        self.with_capability(|directory| self.publish_bytes(directory, name, &[]))
     }
 
     #[cfg(unix)]
-    fn publish_bytes(&self, name: &OsStr, payload: &[u8]) -> io::Result<()> {
+    fn publish_bytes(&self, directory: &File, name: &OsStr, payload: &[u8]) -> io::Result<()> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::ffi::OsStrExt as _;
 
@@ -1477,7 +1748,7 @@ impl ProcessSignalDirectory {
             uuid::Uuid::new_v4()
         ))
         .expect("generated reached marker name has no NUL");
-        let directory = self._handle.as_raw_fd();
+        let directory = directory.as_raw_fd();
         let descriptor = unsafe {
             libc::openat(
                 directory,
@@ -1526,11 +1797,11 @@ impl ProcessSignalDirectory {
 
     #[cfg(windows)]
     fn publish_reached(&self, name: &OsStr) -> io::Result<()> {
-        self.publish_bytes(name, &[])
+        self.with_capability(|directory| self.publish_bytes(directory, name, &[]))
     }
 
     #[cfg(windows)]
-    fn publish_bytes(&self, name: &OsStr, payload: &[u8]) -> io::Result<()> {
+    fn publish_bytes(&self, _directory: &File, name: &OsStr, payload: &[u8]) -> io::Result<()> {
         let temporary_path = self.path.join(format!(
             ".process-probe-{}-{}.tmp",
             std::process::id(),
@@ -1748,9 +2019,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ActorPauseController, ActorPausePoint, LegacyV2Seed, ProcessSignalDirectory,
-        ProcessStorageSample, ProcessTestConfig, ProcessTestConfigError, StoreWriterFaultPoint,
-        StoreWriterFaultSpec, VirtualReleaseSignal, VirtualReleaseTarget, wait_for_virtual_signal,
+        ActorPauseController, ActorPausePoint, LegacyV2Seed, ProcessRunnerMode,
+        ProcessSignalDirectory, ProcessStorageSample, ProcessTestConfig, ProcessTestConfigError,
+        ProcessTestWatchers, StoreWriterFaultPoint, StoreWriterFaultSpec, VirtualReleaseSignal,
+        VirtualReleaseTarget, wait_for_virtual_signal,
     };
     use crate::StoreWriterOperationKind;
 
@@ -1761,6 +2033,54 @@ mod tests {
                 .expect("prepare process-signal capability"),
         );
         (fixture, signals)
+    }
+
+    #[test]
+    fn process_signal_capability_close_is_idempotent_and_rejects_later_io() {
+        let (fixture, signals) = signal_fixture();
+        let signal_name = OsStr::new("closed.signal");
+        assert!(!signals.release_ready(signal_name).unwrap());
+
+        assert_eq!(signals.close_capability(), Ok(()));
+        assert_eq!(signals.close_capability(), Ok(()));
+        for error in [
+            signals.release_ready(signal_name).unwrap_err(),
+            signals.publish_reached(signal_name).unwrap_err(),
+            signals
+                .publish_probe_bytes(signal_name, b"closed")
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+
+        drop(signals);
+        let root = fixture.path().to_path_buf();
+        fixture
+            .close()
+            .expect("closed signal capability releases its fixture directory");
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn process_test_watcher_shutdown_joins_once_and_replays_to_concurrent_callers() {
+        let capability = Arc::new(());
+        let released = Arc::downgrade(&capability);
+        let watcher = tokio::spawn(async move {
+            let _capability = capability;
+            std::future::pending::<()>().await;
+        });
+        let watchers = ProcessTestWatchers::new(vec![watcher]);
+
+        let (first, concurrent) =
+            tokio::join!(watchers.shutdown_and_join(), watchers.shutdown_and_join());
+
+        assert_eq!(first, Ok(()));
+        assert_eq!(concurrent, Ok(()));
+        assert_eq!(watchers.shutdown_and_join().await, Ok(()));
+        assert!(
+            released.upgrade().is_none(),
+            "successful watcher shutdown releases task-owned capabilities"
+        );
     }
 
     #[tokio::test]
@@ -1899,6 +2219,7 @@ mod tests {
             count: 1,
         };
         let base = ProcessTestConfig {
+            runner_mode: ProcessRunnerMode::ScriptedFake {},
             runtime_config: None,
             fake_scenarios: Vec::new(),
             storage_samples: vec![ProcessStorageSample::Native],

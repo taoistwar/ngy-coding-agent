@@ -83,6 +83,8 @@ impl ReconcileMergeRequest {
                     | MergeOperationState::MergePending
                     | MergeOperationState::AbortPending
             )
+            || (expected_state == MergeOperationState::PreflightPending
+                && expected_version.get() != 2)
         {
             return Err(DeliveryError::InvalidCommandRequest);
         }

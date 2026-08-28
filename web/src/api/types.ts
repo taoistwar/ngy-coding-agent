@@ -69,3 +69,36 @@ export type ReviewEvidence = components["schemas"]["ReviewEvidenceDto"];
 export type SseMessage = components["schemas"]["SseMessage"];
 export type ServiceState = components["schemas"]["ServiceStateDto"];
 export type StreamReset = components["schemas"]["StreamResetControl"];
+export type DeliveryAllowedAction =
+  components["schemas"]["DeliveryAllowedActionDto"];
+export type DeliveryArtifactDisposition =
+  components["schemas"]["DeliveryArtifactDispositionDto"];
+export type DeliveryCleanupKind =
+  components["schemas"]["DeliveryCleanupKindDto"];
+export type DeliveryCleanupOperation =
+  components["schemas"]["DeliveryCleanupOperationDto"];
+export type DeliveryCleanupOperationEnvelope =
+  components["schemas"]["DeliveryCleanupOperationEnvelopeDto"];
+export type DeliveryCleanupState =
+  components["schemas"]["DeliveryCleanupStateDto"];
+export type DeliveryCommandResponse =
+  components["schemas"]["DeliveryCommandResponse"];
+export type DeliveryConflictSummary =
+  components["schemas"]["DeliveryConflictSummaryDto"];
+export type DeliveryDeleteBranchRequest =
+  components["schemas"]["DeliveryDeleteBranchRequest"];
+export type DeliveryMergeOperation =
+  components["schemas"]["DeliveryMergeOperationDto"];
+export type DeliveryMergeOperationEnvelope =
+  components["schemas"]["DeliveryMergeOperationEnvelopeDto"];
+export type DeliveryMergeRequest =
+  components["schemas"]["DeliveryMergeRequest"];
+export type DeliveryMergeState =
+  components["schemas"]["DeliveryMergeStateDto"];
+export type DeliveryOperation =
+  components["schemas"]["DeliveryOperationDto"];
+export type DeliveryPreflightRequest =
+  components["schemas"]["DeliveryPreflightRequest"];
+export type DeliveryRemoveWorktreeRequest =
+  components["schemas"]["DeliveryRemoveWorktreeRequest"];
+export type DeliveryTask = components["schemas"]["DeliveryTaskDto"];

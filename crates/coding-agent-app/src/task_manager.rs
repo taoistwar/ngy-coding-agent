@@ -24,6 +24,7 @@ use tokio::time::{Instant, MissedTickBehavior, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 mod active_ownership;
+pub use active_ownership::TaskActiveOwnership;
 #[cfg(any(test, feature = "test-support"))]
 mod actor_test_support;
 mod cancel;
@@ -243,7 +244,7 @@ pub enum QuiesceResult {
     },
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskManagerSafetySnapshot {
     pub active_count: usize,
@@ -1267,6 +1268,16 @@ impl TaskManagerHandle {
         receiver.await.map_err(|_| TaskManagerError::Closed)?
     }
 
+    /// Publishes the exact durable scheduler snapshot while startup admission
+    /// remains closed. This is intentionally separate from
+    /// `notify_admission_changed`, which requests a task-claim scan.
+    pub(crate) async fn refresh_startup_snapshot(&self) -> Result<(), TaskManagerError> {
+        let (response, receiver) = oneshot::channel();
+        self.send(TaskManagerMessage::RefreshStartupSnapshot { response })
+            .await?;
+        receiver.await.map_err(|_| TaskManagerError::Closed)?
+    }
+
     pub async fn cancel(&self, task_id: TaskId) -> Result<CancelOutcome, TaskManagerError> {
         let (response, receiver) = oneshot::channel();
         self.send(TaskManagerMessage::Cancel { task_id, response })
@@ -1712,7 +1723,7 @@ impl TaskManagerHandle {
         receiver.await.map_err(|_| TaskManagerError::Closed)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub async fn safety_snapshot_for_test(
         &self,
@@ -1785,6 +1796,13 @@ pub(crate) enum TaskManagerMessage {
     AdmissionChanged {
         response: oneshot::Sender<Result<(), TaskManagerError>>,
     },
+    RefreshStartupSnapshot {
+        response: oneshot::Sender<Result<(), TaskManagerError>>,
+    },
+    ActiveOwnership {
+        task_id: TaskId,
+        response: oneshot::Sender<TaskActiveOwnership>,
+    },
     Cancel {
         task_id: TaskId,
         response: oneshot::Sender<Result<CancelOutcome, TaskManagerError>>,
@@ -1828,7 +1846,7 @@ pub(crate) enum TaskManagerMessage {
     InspectPendingDurableResults {
         response: oneshot::Sender<Vec<PendingDurableResult>>,
     },
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     InspectRecoverySafety {
         response: oneshot::Sender<Result<TaskManagerSafetySnapshot, TaskManagerError>>,
     },
@@ -4102,6 +4120,17 @@ impl TaskManager {
                 };
                 let _ = response.send(result);
             }
+            TaskManagerMessage::RefreshStartupSnapshot { response } => {
+                let result = self
+                    .refresh_scheduler_projection()
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| TaskManagerError::StoreDegraded);
+                let _ = response.send(result);
+            }
+            TaskManagerMessage::ActiveOwnership { task_id, response } => {
+                let _ = response.send(self.active_ownership(task_id));
+            }
             TaskManagerMessage::Cancel { task_id, response } => {
                 self.begin_cancel(task_id, response);
             }
@@ -4170,7 +4199,7 @@ impl TaskManager {
             TaskManagerMessage::InspectPendingDurableResults { response } => {
                 let _ = response.send(self.pending_durable_results.clone());
             }
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             TaskManagerMessage::InspectRecoverySafety { response } => {
                 let result = if self.is_frozen() {
                     Err(TaskManagerError::Frozen)

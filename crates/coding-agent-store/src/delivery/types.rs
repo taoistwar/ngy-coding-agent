@@ -267,27 +267,17 @@ impl<'de> Deserialize<'de> for EvidenceIdentityV1 {
 /// bind the two validated storage parts directly, and API projections must define a
 /// separate DTO that never exposes either value.
 ///
-/// Raw storage access is deliberately unavailable outside `coding-agent-store`:
+/// The validated storage parts are exposed together so runtime recovery adapters
+/// cannot accidentally persist or compare a digest without its domain separator.
 ///
-/// ```compile_fail
-/// use coding_agent_store::DirectoryIdentity;
-///
-/// let identity = DirectoryIdentity::try_new(
-///     "directory_identity_v1",
-///     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-/// )?;
-/// let _ = identity.digest();
-/// # Ok::<(), coding_agent_store::DeliveryError>(())
 /// ```
-///
-/// ```compile_fail
 /// use coding_agent_store::DirectoryIdentity;
 ///
 /// let identity = DirectoryIdentity::try_new(
 ///     "directory_identity_v1",
 ///     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 /// )?;
-/// let _ = identity.storage_parts();
+/// assert_eq!(identity.storage_parts().0, "directory_identity_v1");
 /// # Ok::<(), coding_agent_store::DeliveryError>(())
 /// ```
 #[derive(Clone, PartialEq, Eq)]
@@ -317,5 +307,10 @@ impl DirectoryIdentity {
 
     pub const fn algorithm(&self) -> &'static str {
         DIRECTORY_IDENTITY_ALGORITHM_V1
+    }
+
+    /// Returns the validated, domain-separated persistence representation.
+    pub fn storage_parts(&self) -> (&'static str, &str) {
+        (DIRECTORY_IDENTITY_ALGORITHM_V1, self.digest.as_str())
     }
 }

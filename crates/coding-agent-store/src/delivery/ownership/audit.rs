@@ -13,6 +13,8 @@ WITH operations AS (
         version AS current_version,
         state AS current_state,
         failure_code AS current_failure,
+        target_config_attributes_digest AS current_target_config_attributes_digest,
+        target_security_digest AS current_target_security_digest,
         updated_at AS current_timestamp
     FROM task_merge_operations
     WHERE task_id = ?
@@ -23,6 +25,8 @@ WITH operations AS (
         version AS current_version,
         state AS current_state,
         failure_code AS current_failure,
+        NULL AS current_target_config_attributes_digest,
+        NULL AS current_target_security_digest,
         updated_at AS current_timestamp
     FROM task_cleanup_operations
     WHERE task_id = ?
@@ -33,6 +37,8 @@ WITH operations AS (
         operation.current_version,
         operation.current_state,
         operation.current_failure,
+        operation.current_target_config_attributes_digest,
+        operation.current_target_security_digest,
         operation.current_timestamp,
         COUNT(transition.transition_id) AS row_count,
         MIN(transition.entity_version) AS minimum_version,
@@ -61,7 +67,16 @@ WITH operations AS (
                 WHEN transition.entity_version = operation.current_version
                 THEN transition.transitioned_at
             END
-        ) AS journal_current_timestamp
+        ) AS journal_current_timestamp,
+        MAX(
+            CASE
+                WHEN transition.target_config_attributes_digest
+                        IS NOT operation.current_target_config_attributes_digest
+                  OR transition.target_security_digest
+                        IS NOT operation.current_target_security_digest
+                THEN 1 ELSE 0
+            END
+        ) AS target_provenance_mismatch
     FROM operations AS operation
     LEFT JOIN task_delivery_operation_transitions AS transition
       ON transition.entity_kind = operation.entity_kind
@@ -72,6 +87,8 @@ WITH operations AS (
         operation.current_version,
         operation.current_state,
         operation.current_failure,
+        operation.current_target_config_attributes_digest,
+        operation.current_target_security_digest,
         operation.current_timestamp
 )
 SELECT EXISTS (
@@ -86,6 +103,7 @@ SELECT EXISTS (
        OR summary.journal_current_state IS NOT summary.current_state
        OR summary.journal_current_failure IS NOT summary.current_failure
        OR summary.journal_current_timestamp IS NOT summary.current_timestamp
+       OR summary.target_provenance_mismatch != 0
        OR EXISTS (
             SELECT 1
             FROM task_delivery_operation_transitions AS current_transition
@@ -163,12 +181,19 @@ SELECT EXISTS (
                                 (
                                     current_transition.from_state = 'absent'
                                     AND current_transition.to_state = 'preflight_pending'
+                                    AND current_transition.entity_version = 1
                                 )
                                 OR (
                                     current_transition.from_state = 'preflight_pending'
-                                    AND current_transition.to_state IN (
-                                        'preflight_ready', 'conflict', 'rejected', 'stale',
-                                        'reconciliation_required'
+                                    AND (
+                                        (current_transition.to_state = 'preflight_pending'
+                                            AND current_transition.entity_version = 2)
+                                        OR (current_transition.to_state IN (
+                                            'preflight_ready', 'conflict'
+                                        ) AND current_transition.entity_version = 3)
+                                        OR (current_transition.to_state IN (
+                                            'rejected', 'stale', 'reconciliation_required'
+                                        ) AND current_transition.entity_version IN (2, 3))
                                     )
                                 )
                                 OR (

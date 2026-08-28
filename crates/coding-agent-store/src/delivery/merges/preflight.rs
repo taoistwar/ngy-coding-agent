@@ -84,6 +84,15 @@ async fn try_existing_preflight(
     {
         return Err(preflight_invariant());
     }
+    if operation.provenance.common_git_identity != *request.common_git_identity()
+        || operation.provenance.worktree_admin_identity != *request.worktree_admin_identity()
+        || operation.provenance.config_attributes_digest
+            != *request.source_config_attributes_digest()
+        || operation.target_config_attributes_digest != *request.target_config_attributes_digest()
+        || operation.target_security_digest != *request.target_security_digest()
+    {
+        return Err(invalid_preflight_request());
+    }
     Ok(Some(receipt))
 }
 
@@ -115,7 +124,6 @@ impl PreparedPreflight {
             .parse::<GitBranchRef>()
             .map_err(|_| preflight_invariant())?;
         let input_matches_repository = artifact_base.algorithm() == request.object_algorithm()
-            && artifact_base != *request.preflight_source_commit()
             && artifact_source_branch != *request.command().target_branch();
         if !input_matches_repository {
             return Err(invalid_preflight_request());
@@ -127,10 +135,7 @@ impl PreparedPreflight {
         )
         .map_err(|_| preflight_invariant())?;
         if let Some(source) = snapshot.ownership.source.as_ref()
-            && (source.candidate_tree != *request.candidate_tree()
-                || source.expected_source_commit.as_ref()
-                    != Some(request.preflight_source_commit())
-                || source.provenance.identity != identity
+            && (source.provenance.identity != identity
                 || source.provenance.evidence != evidence
                 || source.provenance.base_commit != artifact_base
                 || source.provenance.source_branch != artifact_source_branch
@@ -139,7 +144,7 @@ impl PreparedPreflight {
                 || source.provenance.worktree_admin_identity != *request.worktree_admin_identity()
                 || source.provenance.fixed_lock_reason != "codex-reserved"
                 || source.provenance.config_attributes_digest
-                    != *request.config_attributes_digest())
+                    != *request.source_config_attributes_digest())
         {
             return Err(invalid_preflight_request());
         }
@@ -218,7 +223,8 @@ async fn insert_preflight_operation(
              worktree_admin_identity_digest, fixed_lock_reason, candidate_tree_oid, \
              preflight_source_commit_oid, delivery_source_task_id, source_commit_oid, \
              preflight_receipt_id, accept_receipt_id, target_branch, expected_target_head, \
-             config_attributes_digest, merge_base_oid, candidate_merge_tree_oid, \
+             config_attributes_digest, target_config_attributes_digest, \
+             target_security_digest, merge_base_oid, candidate_merge_tree_oid, \
              merge_author_name, merge_author_email, merge_committer_name, merge_committer_email, \
              merge_author_date_bytes, merge_committer_date_bytes, merge_message_template_version, \
              merge_message_bytes, expected_merge_commit_oid, abort_child_receipt_id, \
@@ -227,8 +233,8 @@ async fn insert_preflight_operation(
              version, created_at, updated_at \
          ) VALUES ( \
              ?, ?, ?, ?, 'evidence_identity_v1', ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-             'directory_identity_v1', ?, 'directory_identity_v1', ?, 'codex-reserved', ?, ?, \
-             NULL, NULL, ?, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, \
+             'directory_identity_v1', ?, 'directory_identity_v1', ?, 'codex-reserved', NULL, NULL, \
+             NULL, NULL, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, \
              NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
              'preflight_pending', NULL, 1, ?, ? \
          )",
@@ -251,12 +257,12 @@ async fn insert_preflight_operation(
     .bind(&prepared.artifact_worktree_path)
     .bind(request.common_git_identity().digest.as_str())
     .bind(request.worktree_admin_identity().digest.as_str())
-    .bind(request.candidate_tree().as_str())
-    .bind(request.preflight_source_commit().as_str())
     .bind(request.command().client_request_id().to_string())
     .bind(request.command().target_branch().as_str())
     .bind(request.command().expected_target_head().as_str())
-    .bind(request.config_attributes_digest().as_str())
+    .bind(request.source_config_attributes_digest().as_str())
+    .bind(request.target_config_attributes_digest().as_str())
+    .bind(request.target_security_digest().as_str())
     .bind(timestamp.to_string())
     .bind(timestamp.to_string())
     .execute(&mut *connection)
@@ -281,6 +287,7 @@ async fn verify_inserted_snapshot(
     if operation.state != MergeOperationState::PreflightPending
         || operation.version != DeliveryVersion::initial()
         || operation.preflight_receipt_id != receipt.client_request_id
+        || operation.preflight_inputs.is_some()
     {
         return Err(preflight_invariant());
     }

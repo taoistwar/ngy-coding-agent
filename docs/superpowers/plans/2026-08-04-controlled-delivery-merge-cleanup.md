@@ -326,16 +326,16 @@ cargo test -p coding-agent-store --test delivery_event_compatibility --locked --
 - 修改 `crates/coding-agent-app/src/single_instance/start_primary.rs`
 - 修改 `crates/coding-agent-app/tests/single_instance.rs`
 
-- [ ] RED：现有command默认仍使用null stdin；只有crate-private validated delivery command可携带bounded `ExactChildInput`，超限在spawn前拒绝。
-- [ ] RED：exact input写完必须关闭stdin；payload bytes不进入Debug、日志、错误、trace或child argv，commit message和ref transaction逐字节到达fixture child。
-- [ ] RED：区分stdin write/close成功、child early-exit/broken-pipe、timeout、cancel、wait/channel unknown和process-tree cleanup-unproven；writer task不能泄漏或让未知结果变成普通command failure。
-- [ ] RED：应用私有临时probe repository实际证明Git >=2.45、object format、完整merge option set、merge-tree和update-ref transaction语法；probe目录/child清理无法证明时startup fail closed。
-- [ ] RED：Git capability probe在SQLite open/migrate之前完成；probe失败时StoreFactory open、recovery和listener bind调用数均为0。
-- [ ] RED：probe成功才返回字段私有、跨crate可传递但不可构造/伪造的`ProbedDeliveryGit` opaque handle；它绑定本次实际探测的同一个`Arc<PinnedExecutable>` identity/digest与capability结果，Git-A handle不能授权Git-B runtime或替换后的executable。
-- [ ] RED：所有delivery mutation runtime/command factory只能从`ProbedDeliveryGit`取得；没有handle、handle/executable identity不匹配或probe后executable替换时无法构造/执行Git delivery mutation。
-- [ ] GREEN：实现non-logging exact stdin capability、supervised writer lifecycle和pre-DB probe factory；factory直接返回绑定同一pinned executable的opaque delivery runtime handle，composition root只注入该handle，不传裸token。
-- [ ] REFACTOR：`process_supervisor.rs`只保留编排并委托input模块；无stdin command路径行为/性能不变。
-- [ ] 验证：
+- [x] RED：现有command默认仍使用null stdin；只有crate-private validated delivery command可携带bounded `ExactChildInput`，超限在spawn前拒绝。
+- [x] RED：exact input写完必须关闭stdin；payload bytes不进入Debug、日志、错误、trace或child argv，commit message和ref transaction逐字节到达fixture child。
+- [x] RED：区分stdin write/close成功、child early-exit/broken-pipe、timeout、cancel、wait/channel unknown和process-tree cleanup-unproven；writer task不能泄漏或让未知结果变成普通command failure。
+- [x] RED：应用私有临时probe repository实际证明Git >=2.45、object format、完整merge option set、merge-tree和update-ref transaction语法；probe目录/child清理无法证明时startup fail closed。
+- [x] RED：Git capability probe在SQLite open/migrate之前完成；probe失败时StoreFactory open、recovery和listener bind调用数均为0。
+- [x] RED：probe成功才返回字段私有、跨crate可传递但不可构造/伪造的`ProbedDeliveryGit` opaque handle；它绑定本次实际探测的同一个`Arc<PinnedExecutable>` identity/digest与capability结果，Git-A handle不能授权Git-B runtime或替换后的executable。
+- [x] RED：所有delivery mutation runtime/command factory只能从`ProbedDeliveryGit`取得；没有handle、handle/executable identity不匹配或probe后executable替换时无法构造/执行Git delivery mutation。
+- [x] GREEN：实现non-logging exact stdin capability、supervised writer lifecycle和pre-DB probe factory；factory直接返回绑定同一pinned executable的opaque delivery runtime handle，composition root只注入该handle，不传裸token。
+- [x] REFACTOR：`process_supervisor.rs`只保留编排并委托input模块；无stdin command路径行为/性能不变。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test process_stdin --locked --offline -- --nocapture
@@ -356,21 +356,22 @@ cargo test -p coding-agent-app --test single_instance --features test-support --
 - 新建 `crates/coding-agent-runtime/tests/{delivery_source,delivery_security}.rs`
 - 修改 `crates/coding-agent-runtime/src/{command_policy,root_capability,worktree,lib}.rs`
 
-- [ ] RED：所有delivery command复用pinned Git、common/admin/worktree capability、fixed `--git-dir/--work-tree`、no replace/lazy fetch、fsmonitor/untracked cache/submodule禁用和clean environment。
-- [ ] RED：`open_delivery_source` 接受exact reviewed dirty source，证明common/admin/path/branch/base HEAD、fixed lock reason、index无unmerged、无gitlink和approved fingerprint；P4-A `open_ready`仍拒绝dirty。
-- [ ] RED：拒绝 include/includeIf、`extensions.worktreeConfig`或任何admin `config.worktree`、executable filter/diff、custom merge driver、branch.*.mergeOptions、unsafe hooks/signing组合、config injection env和attributes外部程序；独立dirty-source入口必须保持P4-A既有拒绝边界，不能只扫描common config。
-- [ ] RED：覆盖`config.worktree`文件在观察前后创建、symlink/reparse或identity替换、扩展开关TOCTOU；一律在任何filter/driver/hook/helper和delivery mutation前fail closed且探针零调用。
-- [ ] RED：覆盖symlink/reparse-point、case/SUBST alias、admin/common-dir替换、lock reason drift、non-UTF8/非法ref、oversized status/config/attributes和command timeout。
-- [ ] RED：从已认证common Git directory和worktree admin的真实平台identity生成两个domain-separated `directory_identity_v1` SHA-256；同对象跨reopen/新进程稳定、合法alias相同、替换对象不同，Windows/Unix字段使用无歧义framing且两个domain不能碰撞。
-- [ ] RED：证明现有进程随机 `DirectoryIdentityMarker::opaque_hash` 不能进入任何durable row；新digest不进入Debug、API、日志或错误，只可在typed Store provenance中比较。
-- [ ] GREEN：实现独立 `DeliverySourceCapability`、delivery config/attribute digest、allowlisted environment和typed command builder；不向Agent Git tools暴露mutation。
-- [ ] GREEN：在 `worktree/authentication.rs` 实现 `DurableDirectoryIdentityV1`，从root capability已证明的platform fields构造common/admin digest；保留random marker仅作进程内快速identity用途。
-- [ ] REFACTOR：新命令放入delivery职责模块，认证基元从大 `worktree.rs` 拆出，既有 `command_policy.rs` 只保留共享primitive/委托。
-- [ ] 验证：
+- [x] RED：所有delivery command复用pinned Git、common/admin/worktree capability、fixed `--git-dir/--work-tree`、no replace/lazy fetch、fsmonitor/untracked cache/submodule禁用和clean environment。
+- [x] RED：`open_delivery_source` 接受exact reviewed dirty source，证明common/admin/path/branch/base HEAD、fixed lock reason、index无unmerged、无gitlink和approved fingerprint；P4-A `open_ready`仍拒绝dirty。
+- [x] RED：拒绝 include/includeIf、`extensions.worktreeConfig`或任何admin `config.worktree`、executable filter/diff、custom merge driver、branch.*.mergeOptions、unsafe hooks/signing组合、config injection env和attributes外部程序；独立dirty-source入口必须保持P4-A既有拒绝边界，不能只扫描common config。
+- [x] RED：覆盖`config.worktree`文件在观察前后创建、symlink/reparse或identity替换、扩展开关TOCTOU；一律在任何filter/driver/hook/helper和delivery mutation前fail closed且探针零调用。
+- [x] RED：覆盖symlink/reparse-point、case/SUBST alias、admin/common-dir替换、lock reason drift、non-UTF8/非法ref、oversized status/config/attributes和command timeout。
+- [x] 边界：Unix 空配置使用 `0600` create→unlink retained FD，防后续 namespace 替换或按路径重开；它不防御同一 UID 在 unlink 前已取得可写 FD，除非采用 OS-specific anonymous FD 或隔离。
+- [x] RED：从已认证common Git directory和worktree admin的真实平台identity生成两个domain-separated `directory_identity_v1` SHA-256；同对象跨reopen/新进程稳定、合法alias相同、替换对象不同，Windows/Unix字段使用无歧义framing且两个domain不能碰撞。
+- [x] RED：证明现有进程随机 `DirectoryIdentityMarker::opaque_hash` 不能进入任何durable row；新digest不进入Debug、API、日志或错误，只可在typed Store provenance中比较。
+- [x] GREEN：实现独立 `DeliverySourceCapability`、delivery config/attribute digest、allowlisted environment和typed command builder；不向Agent Git tools暴露mutation。
+- [x] GREEN：在 `worktree/authentication.rs` 实现 `DurableDirectoryIdentityV1`，从root capability已证明的platform fields构造common/admin digest；保留random marker仅作进程内快速identity用途。
+- [x] REFACTOR：新命令放入delivery职责模块，认证基元从大 `worktree.rs` 拆出，既有 `command_policy.rs` 只保留共享primitive/委托。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test delivery_source --locked --offline -- --nocapture
-cargo test -p coding-agent-runtime --test delivery_security --locked --offline -- --nocapture
+cargo test -p coding-agent-runtime --test delivery_security --features test-support --locked --offline -- --nocapture
 cargo test -p coding-agent-runtime --test worktree --locked --offline
 cargo test -p coding-agent-runtime --test path_security --locked --offline
 cargo test -p coding-agent-runtime command_policy --lib --locked --offline -- --nocapture
@@ -387,19 +388,21 @@ cargo test -p coding-agent-runtime command_policy --lib --locked --offline -- --
 - 新建 `crates/coding-agent-runtime/tests/delivery_source_commit.rs`
 - 修改 `crates/coding-agent-runtime/tests/delivery_security.rs`
 
-- [ ] RED：在真实index不变时，以private temp index从exact base执行read-tree、bounded add -A、write-tree；candidate tree精确覆盖tracked/untracked approved内容且不包含ignored/gitlink。
-- [ ] RED：temp-index `write-tree`完成后、Store写`ObjectPending`之前，必须从真实index/worktree重新计算fingerprint并精确等于approved；在两次认证间插入文件/index变化时零durable intent、零真实index/ref副作用。
-- [ ] RED：temp index path不进入log/error/API；create/write/delete只作用于应用自建identity-matched文件，崩溃残留可安全识别。
-- [ ] RED：用persisted author/committer epoch-second +0000和exact ASCII+LF message bytes重放commit-tree，每次得到相同source OID；object shape逐字段验证。
-- [ ] RED：hook/editor/template/cleanup/signing/filter/fsmonitor/config injection均不执行；stdout/stderr/timeout/channel unknown得到typed outcome。
-- [ ] GREEN：实现candidate-tree builder、deterministic commit-object builder和object inspector；ObjectPending之前不修改真实index/ref，Accepted/PreflightPending是tree/object写入的durable上层intent。
-- [ ] REFACTOR：把temp capability生命周期、command construction和object validation拆开，主方法只编排阶段。
-- [ ] 验证：
+- [x] RED：在真实index不变时，以private temp index从exact base执行`read-tree`；candidate只从no-follow、identity-bound snapshot的exact bytes/mode构造，固定使用`hash-object -w --no-filters --stdin`、typed `update-index --add --replace -z --index-info`和`write-tree`，精确覆盖tracked/untracked approved内容且不包含ignored/gitlink。
+- [x] RED：temp-index `write-tree`完成后、Store写`ObjectPending`之前，必须重新认证真实index/worktree并重新采集no-follow snapshot/fingerprint，精确等于approved；在两次认证间插入文件/index变化时零durable intent、零真实index/ref副作用。
+- [x] RED：temp index path不进入log/error/API；create/write/delete只作用于应用自建identity-matched文件，崩溃残留可安全识别。
+- [x] RED：用persisted author/committer epoch-second +0000和exact ASCII+LF message bytes重放commit-tree，每次得到相同source OID；object shape逐字段验证。
+- [x] RED：hook/editor/template/cleanup/signing/filter/fsmonitor/config injection均不执行；在candidate构造前注入config、`info/attributes`或worktree attributes时，filter/helper sentinel仍不得执行，随后fresh revalidation必须fail closed；stdout/stderr/timeout/channel unknown得到typed outcome。
+- [x] GREEN：实现candidate-tree builder、deterministic commit-object builder和object inspector；ObjectPending之前不修改真实index/ref，Accepted/PreflightPending是tree/object写入的durable上层intent。
+- [x] REFACTOR：把temp capability生命周期、command construction和object validation拆开，主方法只编排阶段。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test delivery_source_commit --locked --offline -- --nocapture
 cargo test -p coding-agent-runtime --test delivery_source --locked --offline
 cargo test -p coding-agent-runtime --test delivery_security --locked --offline -- --nocapture
+cargo test -p coding-agent-runtime --test delivery_source_commit --features test-support --locked --offline -- --nocapture --test-threads=1
+cargo test -p coding-agent-runtime --test delivery_security --locked --offline -- --nocapture --test-threads=1
 ```
 
 检查点：相同persisted输入跨重启产生同一source OID，真实index/ref仍为零副作用。
@@ -413,14 +416,14 @@ cargo test -p coding-agent-runtime --test delivery_security --locked --offline -
 - 新建 `crates/coding-agent-runtime/tests/delivery_recovery.rs`
 - 修改 `crates/coding-agent-runtime/tests/delivery_source_commit.rs`
 
-- [ ] RED：CommitPending后fresh revalidation必须重新证明source committed前置现场：source identity/fixed lock/HEAD、approved fingerprint、config/attributes digest和object shape；成功后才对真实index固定add -A/write-tree并要求tree=candidate，CAS `update-ref source expected base`前再次验证object shape。
-- [ ] RED：覆盖side effect前、stage部分/完成、CAS前、CAS成功后、post-verify前和Store reply前的每个crash point。
-- [ ] RED：恢复先按durable state分流：`ObjectPending`只接受source ref=base且真实index/worktree仍为approved pre-stage fingerprint，随后只重放deterministic object并推进CommitPending；即使现场恰为candidate-staged或expected-source也必须ReconciliationRequired。
-- [ ] RED：只有`CommitPending`接受三种组合：base+approved pre-stage、base+candidate index/worktree一致、expected source+clean exact commit；跨状态组合和其余ref/tree/index/worktree/config组合全部ReconciliationRequired。
-- [ ] RED：外部文件、index、branch、lock/admin/common identity漂移时不reset/clean/checkout；known未应用error保持可重试pending。
-- [ ] GREEN：实现source apply和纯观察classifier，返回continue/stage-complete/applied/reconciliation typed disposition，不直接写Store或poison。
-- [ ] REFACTOR：把fresh identity、index tree、ref CAS、postcondition和recovery classification各自抽成单职责方法。
-- [ ] 验证：
+- [x] RED：CommitPending后fresh revalidation必须重新证明source committed前置现场：source identity/fixed lock/HEAD、approved fingerprint、config/attributes digest、candidate的`tree` type proof和expected object shape；成功后才以固定`read-tree --reset <candidate>`（无`-u`）写入真实index，紧接固定`update-index --refresh -q`只刷新stat cache，并以`diff-index` predicate证明其精确等于candidate，CAS `update-ref source expected base`前再次验证object shape。若停在stage与refresh之间，纯观察只能保守reconcile，不能为恢复而写真实index。
+- [x] RED：覆盖runtime side effect前、stage部分/完成、CAS前、CAS成功后和post-verify前的crash point；Store reply属于后续应用层StoreWriter边界，不在runtime直接伪造。
+- [x] RED：恢复先按durable state分流：`ObjectPending`只接受source ref=base且真实index/worktree仍为approved pre-stage fingerprint，随后只重放deterministic object并推进CommitPending；即使现场恰为candidate-staged或expected-source也必须ReconciliationRequired。runtime recovery intent只能从已认证source、typed candidate和（如有）expected source capture opaque common/admin evidence；每次fresh bind精确比较，不能由原始持久字段公开构造。
+- [x] RED：只有`CommitPending`接受三种组合：base+approved pre-stage、base+candidate index/worktree一致、expected source+clean exact commit；跨状态组合和其余ref/tree/index/worktree/config组合全部ReconciliationRequired。
+- [x] RED：外部文件、index、branch、lock/admin/common identity漂移时不reset/clean/checkout；known未应用error保持可重试pending。repository lease只覆盖本应用；最终revalidation与`read-tree`取得Git index lock之间的非协作外部index writer不提供原子保留保证，后续可观察漂移必须reconcile，真正index CAS/ownership留作单独设计。
+- [x] GREEN：实现以exact candidate tree写入真实index的source apply和纯观察classifier，返回continue/stage-complete/applied/reconciliation typed disposition，不直接写Store或poison；跨进程Store record到runtime recovery intent的受信adapter明确留在Task 21，不在Task 12宣称完成。
+- [x] REFACTOR：把fresh identity、index tree、ref CAS、postcondition和recovery classification各自抽成单职责方法。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test delivery_source_commit --locked --offline -- --nocapture
@@ -435,23 +438,23 @@ cargo test -p coding-agent-runtime --test worktree --locked --offline
 
 **文件：**
 
-- 新建 `crates/coding-agent-runtime/src/delivery/{target,preflight}.rs`
+- 新建 `crates/coding-agent-runtime/src/{target_checkout.rs,delivery/{collision,target,preflight}.rs}`
 - 新建 `crates/coding-agent-runtime/tests/{delivery_target,delivery_preflight}.rs`
-- 修改 `crates/coding-agent-runtime/src/delivery/{config,command,types,mod}.rs`
+- 修改 `crates/coding-agent-runtime/src/{command_policy/git_delivery.rs,delivery/{config,command,observation,source_commit,types,mod}.rs}`
 
-- [ ] RED：只接受登记repository path当前symbolic local branch和exact HEAD；detached、branch mismatch、dirty含untracked、unmerged index和merge/rebase/cherry-pick/revert/bisect状态零副作用拒绝。
-- [ ] RED：对candidate write-set及父级检测ignored-untracked file/dir/symlink collision；preflight与后续actual命令之间新增collision仍由`--no-overwrite-ignore`保护。
-- [ ] RED：source未Committed时使用ephemeral candidate commit，已Committed时使用exact persisted source；`merge-tree --write-tree --messages --name-only -z` clean/conflict结果不修改任何ref/index/file。
-- [ ] RED：source已是target ancestor稳定 `SOURCE_ALREADY_IN_TARGET`；target head/evidence/source fingerprint drift写Stale而非自动merge。
-- [ ] RED：conflict path exact UTF-8/base64url、count/size bounds；malformed/oversized/unknown output fail closed且不返回stderr/content。
-- [ ] GREEN：实现target capability、write-set/ignored scan、preflight object/merge-tree parser和pure result classifier。
-- [ ] REFACTOR：observation、collision、command和parser分文件；避免用porcelain human text或path string拼shell。
-- [ ] 验证：
+- [x] RED：只接受登记repository path当前symbolic local branch和exact HEAD；detached、branch mismatch、dirty含untracked、unmerged index和merge/rebase/cherry-pick/revert/bisect状态零副作用拒绝。
+- [x] RED：对candidate write-set及父级检测ignored-untracked file/dir/symlink collision；preflight与后续actual命令之间新增collision仍由`--no-overwrite-ignore`保护。
+- [x] RED：source未Committed时使用ephemeral candidate commit，已Committed时使用exact persisted source；`merge-tree --write-tree --messages --name-only -z` clean/conflict结果不修改任何ref/index/file。
+- [x] RED：source已是target ancestor稳定 `SOURCE_ALREADY_IN_TARGET`；target head/evidence/source fingerprint drift返回typed stale/rejection，由上层将已有preflight operation写Stale，而非自动merge。
+- [x] RED：conflict path exact UTF-8/base64url、count/size bounds；malformed/oversized/unknown output fail closed且不返回stderr/content。
+- [x] GREEN：实现target capability、write-set/ignored scan、preflight object/merge-tree parser和pure result classifier。
+- [x] REFACTOR：observation、collision、command和parser分文件；避免用porcelain human text或path string拼shell。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test delivery_target --locked --offline -- --nocapture
 cargo test -p coding-agent-runtime --test delivery_preflight --locked --offline -- --nocapture
-cargo test -p coding-agent-runtime --test delivery_security --locked --offline
+cargo test -p coding-agent-runtime --test delivery_security --features test-support --locked --offline -- --nocapture --test-threads=1
 ```
 
 检查点：preflight最多写不可达objects，target checkout逐字节保持不变。
@@ -464,15 +467,15 @@ cargo test -p coding-agent-runtime --test delivery_security --locked --offline
 - 新建 `crates/coding-agent-runtime/tests/delivery_merge.rs`
 - 修改 `crates/coding-agent-runtime/src/delivery/{command,types,mod}.rs`
 
-- [ ] RED：Accepted绑定candidate tree、target第一parent、source第二parent、UTC秒+0000和exact message；commit-tree重放得到同一expected merge OID。
-- [ ] RED：actual argv精确含 `--no-ff --strategy=ort --no-edit --no-verify --no-verify-signatures --no-gpg-sign --no-autostash --no-rerere-autoupdate --no-overwrite-ignore --no-log --no-stat --cleanup=verbatim`、fixed message、`--`和source OID。
-- [ ] RED：恶意 `branch.*.mergeOptions` 拒绝，`merge.verifySignatures=true` 被exact override/CLI中和且不启动GPG/SSH程序；hooks/editor/signing/autostash/rerere/custom driver均零执行。
-- [ ] RED：postcondition要求HEAD=expected OID、tree=candidate、parents顺序/metadata/message精确、target clean、无merge state；Already-up-to-date和不同OID不能伪装成功。
-- [ ] RED：expected object构造可能耗时；actual merge child spawn前必须再次认证source ref=Committed exact OID、source worktree clean/fixed lock、target symbolic branch/exact old HEAD/clean/config、ancestry和ignored collision。任一漂移零actual-merge副作用并返回typed stale/rejection。
-- [ ] RED：command known-zero-effect、conflict、timeout、wait/channel unknown和postcondition mismatch分别返回typed outcome，不运行reset/clean。
-- [ ] GREEN：实现expected merge object builder、fixed merge command和exact postcondition inspector。
-- [ ] REFACTOR：共享source/merge commit metadata primitive，但保留不同template/version和parent不变量。
-- [ ] 验证：
+- [x] RED：Accepted绑定candidate tree、target第一parent、source第二parent、UTC秒+0000和exact message；commit-tree重放得到同一expected merge OID。
+- [x] RED：actual argv精确含 `--no-ff --strategy=ort --no-edit --no-verify --no-verify-signatures --no-gpg-sign --no-autostash --no-rerere-autoupdate --no-overwrite-ignore --no-log --no-stat --cleanup=verbatim`、fixed message、`--`和source OID。
+- [x] RED：恶意 `branch.*.mergeOptions` 拒绝，`merge.verifySignatures=true` 被exact override/CLI中和且不启动GPG/SSH程序；hooks/editor/signing/autostash/rerere/custom driver均零执行。
+- [x] RED：postcondition要求HEAD=expected OID、tree=candidate、parents顺序/metadata/message精确、target clean、无merge state；Already-up-to-date和不同OID不能伪装成功。
+- [x] RED：expected object构造可能耗时；actual merge child spawn前必须再次认证source ref=Committed exact OID、source worktree clean/fixed lock、target symbolic branch/exact old HEAD/clean/config、ancestry和ignored collision。任一漂移零actual-merge副作用并返回typed stale/rejection。
+- [x] RED：command known-zero-effect、conflict、timeout、wait/channel unknown和postcondition mismatch分别返回typed outcome，不运行reset/clean。
+- [x] GREEN：实现expected merge object builder、fixed merge command和exact postcondition inspector。
+- [x] REFACTOR：共享source/merge commit metadata primitive，但保留不同template/version和parent不变量。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test delivery_merge --locked --offline -- --nocapture
@@ -491,14 +494,14 @@ cargo test -p coding-agent-runtime --test delivery_security --locked --offline -
 - 新建 `crates/coding-agent-runtime/tests/delivery_abort.rs`
 - 修改 `crates/coding-agent-runtime/tests/{delivery_merge,delivery_recovery}.rs`
 
-- [ ] RED：只有known conflict child outcome、old HEAD、exact MERGE_HEAD=source、index stages/worktree digest一致且MERGE_AUTOSTASH明确absent才生成可持久AbortPending proof。
-- [ ] RED：每次abort retry前重验proof和MERGE_AUTOSTASH absent；存在/不可观察时绝不执行abort，返回ReconciliationRequired。
-- [ ] RED：abort后只接受old HEAD、clean、无merge state/autostash且source ref不变；任何额外untracked/外部修改不reset/clean。
-- [ ] RED：MergePending分类区分old+clean未应用、exact expected commit已应用、无durable conflict receipt的conflict=reconciliation；AbortPending区分exact conflict可重试和old+clean已abort。
-- [ ] RED：Store reply lost只影响上层补写，不让runtime重新执行已证明成功的merge/abort。
-- [ ] GREEN：实现conflict observation digest、abort capability和按durable state分流的pure classifier。
-- [ ] REFACTOR：MergePending与AbortPending使用不同枚举/方法，禁止共享含糊布尔classifier。
-- [ ] 验证：
+- [x] RED：只有known conflict child outcome、old HEAD、exact MERGE_HEAD=source、index stages/worktree digest一致且MERGE_AUTOSTASH明确absent才生成可持久AbortPending proof。
+- [x] RED：每次abort retry前重验proof和MERGE_AUTOSTASH absent；存在/不可观察时绝不执行abort，返回ReconciliationRequired。
+- [x] RED：abort后只接受old HEAD、clean、无merge state/autostash且source ref不变；任何额外untracked/外部修改不reset/clean。
+- [x] RED：MergePending分类区分old+clean未应用、exact expected commit已应用、无durable conflict receipt的conflict=reconciliation；AbortPending区分exact conflict可重试和old+clean已abort。
+- [x] RED：Store reply lost只影响上层补写，不让runtime重新执行已证明成功的merge/abort。
+- [x] GREEN：实现conflict observation digest、abort capability和按durable state分流的pure classifier。
+- [x] REFACTOR：MergePending与AbortPending使用不同枚举/方法，禁止共享含糊布尔classifier。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test delivery_abort --locked --offline -- --nocapture
@@ -516,13 +519,13 @@ cargo test -p coding-agent-runtime --test delivery_merge --locked --offline
 - 新建 `crates/coding-agent-runtime/tests/delivery_cleanup.rs`
 - 修改 `crates/coding-agent-runtime/src/delivery/{command,recovery,mod}.rs`
 
-- [ ] RED：只接受应用owned、fixed lock reason、clean、HEAD/source exact、无active/unknown process proof的source worktree；外部unlock/relock/admin/path/common identity drift拒绝。
-- [ ] RED：exact unlock后观察unlocked；remove命令不带force且只有RemovePending可执行。dirty新增文件导致known-not-applied并保留worktree。
-- [ ] RED：按durable phase分别恢复：`UnlockPending`只接受exact locked/present继续unlock或exact unlocked/present补写下一阶段；`UnlockedPendingRemove`只接受exact unlocked/present持久RemovePending。两阶段的path/admin absent、relocked、partial或identity mismatch一律reconciliation，不能猜测removed。
-- [ ] RED：只有`RemovePending`可在exact unlocked/present时重试non-force remove，或在path+admin都absent、authenticated common identity与source ref均exact时分类Removed；只缺一侧、common/source漂移或不可观察进入reconciliation。
-- [ ] GREEN：实现unlock/remove命令、fact observer和phase-specific recovery disposition。
-- [ ] REFACTOR：worktree cleanup不复用会force或猜测删除的P4-A reservation recovery helper。
-- [ ] 验证：
+- [x] RED：只接受应用owned、fixed lock reason、clean、HEAD/source exact、无active/unknown process proof的source worktree；外部unlock/relock/admin/path/common identity drift拒绝。
+- [x] RED：exact unlock后观察unlocked；remove命令不带force且只有RemovePending可执行。dirty新增文件导致known-not-applied并保留worktree。
+- [x] RED：按durable phase分别恢复：`UnlockPending`只接受exact locked/present继续unlock或exact unlocked/present补写下一阶段；`UnlockedPendingRemove`只接受exact unlocked/present持久RemovePending。两阶段的path/admin absent、relocked、partial或identity mismatch一律reconciliation，不能猜测removed。
+- [x] RED：只有`RemovePending`可在exact unlocked/present时重试non-force remove，或在path+admin都absent、authenticated common identity与source ref均exact时分类Removed；只缺一侧、common/source漂移或不可观察进入reconciliation。
+- [x] GREEN：实现unlock/remove命令、fact observer和phase-specific recovery disposition。
+- [x] REFACTOR：worktree cleanup不复用会force或猜测删除的P4-A reservation recovery helper。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test delivery_cleanup --locked --offline -- --nocapture
@@ -540,14 +543,14 @@ cargo test -p coding-agent-runtime --test worktree --locked --offline
 - 新建 `crates/coding-agent-runtime/tests/delivery_branch_cleanup.rs`
 - 修改 `crates/coding-agent-runtime/src/delivery/{command,recovery}.rs`
 
-- [ ] RED：delete前fresh证明worktree Removed、source ref=expected、未被其他worktree checkout、source object shape正确且source是fresh target HEAD ancestor。
-- [ ] RED：单个 `update-ref --stdin` transaction执行 target verify + source delete；检查后外部target reset或source drift使整批零删除失败。
-- [ ] RED：target合法前进且仍含source返回RefreshExpectedTarget，要求上层先持久新DeletePending version/head再重试；不沿用旧proof。
-- [ ] RED：source absent只有在fresh target ancestry与persisted expected source object shape同时精确成立时分类Deleted；source present但target不含source分类known-not-applied；source drift、object shape不符或source absent且任一proof不明分类reconciliation，不自动重建ref。
-- [ ] RED：命令不使用 `branch -D`、shell或单ref先删后查；non-UTF8/非法target ref在构造前拒绝。
-- [ ] GREEN：实现ancestry observer、atomic ref transaction builder和DeletePending-specific recovery disposition。
-- [ ] REFACTOR：ref transaction输入只接受validated ref/OID types，command stdout/parser有固定bounds。
-- [ ] 验证：
+- [x] RED：delete前fresh证明worktree Removed、source ref=expected、未被其他worktree checkout、source object shape正确且source是fresh target HEAD ancestor。
+- [x] RED：单个 `update-ref --stdin` transaction执行 target verify + source delete；检查后外部target reset或source drift使整批零删除失败。
+- [x] RED：target合法前进且仍含source返回RefreshExpectedTarget，要求上层先持久新DeletePending version/head再重试；不沿用旧proof。
+- [x] RED：source absent只有在fresh target ancestry与persisted expected source object shape同时精确成立时分类Deleted；source present但target不含source分类known-not-applied；source drift、object shape不符或source absent且任一proof不明分类reconciliation，不自动重建ref。
+- [x] RED：命令不使用 `branch -D`、shell或单ref先删后查；non-UTF8/非法target ref在构造前拒绝。
+- [x] GREEN：实现ancestry observer、atomic ref transaction builder和DeletePending-specific recovery disposition。
+- [x] REFACTOR：ref transaction输入只接受validated ref/OID types，command stdout/parser有固定bounds。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --test delivery_branch_cleanup --locked --offline -- --nocapture
@@ -565,13 +568,13 @@ cargo test -p coding-agent-runtime --test delivery_security --locked --offline
 - 修改 `crates/coding-agent-runtime/tests/delivery_{source,source_commit,target,preflight,merge,abort,cleanup,branch_cleanup,security,recovery}.rs`
 - 修改 `crates/coding-agent-runtime/src/{process_supervisor,lib}.rs`
 
-- [ ] RED：为每种Git child注入spawn前/后、stdout overflow、deadline、kill/wait/channel unknown和process-tree cleanup failure，锁定是否可重试、是否需reconciliation。
-- [ ] RED：Windows case/reparse/SUBST与Unix symlink/bind alias不能绕过common/admin/path identity；不同object format OID长度正确。
-- [ ] RED：恶意hook/filter/diff/merge driver/fsmonitor/signature helper/editor/askpass探针均保持零调用；环境和错误输出不泄露值/路径。
-- [ ] RED：长期重复preflight产生的仅为可接受dangling objects，不自动GC；temp index cleanup不删除非应用文件。
-- [ ] GREEN：补齐共享临时Git fixture、process fault controller、probe assertions和platform-specific capability tests。
-- [ ] REFACTOR：共享fixture不提供绕过真实command policy的shortcut；每个测试结束证明无存活child。
-- [ ] 验证：
+- [x] RED：为每种Git child注入spawn前/后、stdout overflow、deadline、kill/wait/channel unknown和process-tree cleanup failure，锁定是否可重试、是否需reconciliation。
+- [x] RED：Windows case/reparse/SUBST与Unix symlink/bind alias不能绕过common/admin/path identity；不同object format OID长度正确。
+- [x] RED：恶意hook/filter/diff/merge driver/fsmonitor/signature helper/editor/askpass探针均保持零调用；环境和错误输出不泄露值/路径。
+- [x] RED：长期重复preflight产生的仅为可接受dangling objects，不自动GC；temp index cleanup不删除非应用文件。
+- [x] GREEN：补齐共享临时Git fixture、process fault controller、probe assertions和platform-specific capability tests。
+- [x] REFACTOR：共享fixture不提供绕过真实command policy的shortcut；每个测试结束证明无存活child。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-runtime --all-targets --locked --offline -- --nocapture
@@ -592,13 +595,13 @@ cargo clippy -p coding-agent-runtime --all-targets --locked --offline -- -D warn
 - 新建 `crates/coding-agent-app/tests/delivery_store_writer.rs`
 - 修改 `crates/coding-agent-app/tests/store_writer.rs`
 
-- [ ] RED：为eligibility read以外的receipt、preflight/source/merge/conflict/disposition/cleanup current+journal写入提供exact typed command和receipt；禁止generic SQL closure。
-- [ ] RED：覆盖enqueue前/后、execute前/后、commit前/后、reply前、channel close、busy、rollback和writer degraded的KnownApplied/KnownNotApplied/OutcomeUnknown分类。
-- [ ] RED：query-first重放按 `(entity kind,id,version)` 和command receipt恢复；不能把reply lost当未执行或重复advance。
-- [ ] RED：StoreWriter command不获取repository lease、不调用DeliveryManager/TaskManager/Scheduler；delivery mutation不产生task event或dispatcher wake。
-- [ ] GREEN：实现delivery command enum/dispatcher/execution receipt，并把Store事务API封装到单一生产writer路径。
-- [ ] REFACTOR：按source、merge、cleanup拆分执行函数；主match只做路由，避免扩张现有大文件。
-- [ ] 验证：
+- [x] RED：为eligibility read以外的receipt、preflight/source/merge/conflict/disposition/cleanup current+journal写入提供exact typed command和receipt；禁止generic SQL closure。
+- [x] RED：覆盖enqueue前/后、execute前/后、commit前/后、reply前、channel close、busy、rollback和writer degraded的KnownApplied/KnownNotApplied/OutcomeUnknown分类。
+- [x] RED：query-first重放按 `(entity kind,id,version)` 和command receipt恢复；不能把reply lost当未执行或重复advance。
+- [x] RED：StoreWriter command不获取repository lease、不调用DeliveryManager/TaskManager/Scheduler；delivery mutation不产生task event或dispatcher wake。
+- [x] GREEN：实现delivery command enum/dispatcher/execution receipt，并把Store事务API封装到单一生产writer路径。
+- [x] REFACTOR：按source、merge、cleanup拆分执行函数；主match只做路由，避免扩张现有大文件。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-app --test delivery_store_writer --features test-support --locked --offline -- --nocapture
@@ -618,15 +621,15 @@ cargo test -p coding-agent-store --test delivery_recovery --locked --offline
 - 修改 `crates/coding-agent-app/src/{repository_control,service_state,lib}.rs`
 - 修改 `crates/coding-agent-app/tests/repository_control.rs`
 
-- [ ] RED：GET query先取一个Store eligibility snapshot，再结合TaskManager active ownership、process-tree proof和fresh runtime observation生成typed eligibility/reason/allowed actions；不靠message解析。
-- [ ] RED：preflight先做只读receipt query-first；首次请求等待global cap时不持lease，随后获取同common Git identity non-blocking lease，最后才同事务写receipt+PreflightPending。repository busy释放cap并返回stable retryable outcome，零receipt/operation副作用。
-- [ ] RED：全局Git-operation cap固定2；同repository由lease串行，不同repository最多2个并行；actor mailbox在worker/Store/Git慢时仍可响应query/shutdown。
-- [ ] RED：known-not-applied且无child/side-effect ownership时，可在持久pending diagnostic后验证释放lease/cap并bounded backoff，重试按cap->lease重新认证；outcome/cleanup unknown时不得释放。
-- [ ] RED：已有Pending/Ready/side-effect-active/Merged/reconciliation和idempotent replay遵守Store优先级；用户断开不取消durable accepted preflight。
-- [ ] RED：preflight每个fresh drift写Stale/Superseded/Rejected/Conflict/Ready准确状态；GET只查询，不自动重跑terminal或创建operation。
-- [ ] GREEN：实现actor command loop、bounded worker ownership、query projection和preflight orchestration，复用RepositoryControlCoordinator lease/poison。
-- [ ] REFACTOR：actor只管理调度/ownership；eligibility、lease acquisition、runtime call和Store transition分方法/文件。
-- [ ] 验证：
+- [x] RED：GET query先取一个Store eligibility snapshot，再结合TaskManager active ownership、process-tree proof和fresh runtime observation生成typed eligibility/reason/allowed actions；不靠message解析。
+- [x] RED：preflight先做只读receipt query-first；首次请求等待global cap时不持lease，随后获取同common Git identity non-blocking lease，最后才同事务写receipt+PreflightPending。repository busy释放cap并返回stable retryable outcome，零receipt/operation副作用。
+- [x] RED：全局Git-operation cap固定2；同repository由lease串行，不同repository最多2个并行；actor mailbox在worker/Store/Git慢时仍可响应query/shutdown。
+- [x] RED：known-not-applied且无child/side-effect ownership时，可在持久pending diagnostic后验证释放lease/cap并bounded backoff，重试按cap->lease重新认证；outcome/cleanup unknown时不得释放。
+- [x] RED：已有Pending/Ready/side-effect-active/Merged/reconciliation和idempotent replay遵守Store优先级；用户断开不取消durable accepted preflight。
+- [x] RED：preflight每个fresh drift写Stale/Superseded/Rejected/Conflict/Ready准确状态；GET只查询，不自动重跑terminal或创建operation。
+- [x] GREEN：实现actor command loop、bounded worker ownership、query projection和preflight orchestration，复用RepositoryControlCoordinator lease/poison。
+- [x] REFACTOR：actor只管理调度/ownership；eligibility、lease acquisition、runtime call和Store transition分方法/文件。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-app --test delivery_manager --features test-support --locked --offline -- --nocapture
@@ -645,18 +648,18 @@ cargo test -p coding-agent-app --test task_manager --features test-support --loc
 - 修改 `crates/coding-agent-app/src/delivery_manager/{mod,command}.rs`
 - 修改 `crates/coding-agent-app/tests/delivery_manager.rs`
 
-- [ ] RED：merge POST先query-first replay；首次accept必须按global cap -> repository lease -> fresh operation/evidence/source/target/candidate-tree/ancestry/ignored-collision validation -> Store transaction写独立accept receipt和Ready->Accepted；durable Accepted后才返回202并驱动source。
-- [ ] RED：Accepted严格驱动 ObjectPending -> deterministic source object -> CommitPending -> real index/ref -> Committed；source pending known error保持Accepted并bounded backoff。
-- [ ] RED：source Committed后才构造/验证expected merge object，持久MergePending exact OID，再执行actual merge；任何步骤顺序倒置由pause gate测试失败。
-- [ ] RED：source commit与expected-object阶段可能耗时；actual merge child spawn前再次认证source committed exact OID/shape、source clean/fixed lock、target exact clean/branch/old HEAD/config、ancestry和ignored collision，不能沿用accept时的旧capability或观察。
-- [ ] RED：live actual merge返回known conflict时，先把child receipt、old HEAD、source、MERGE_HEAD、index stages、worktree digest和`MERGE_AUTOSTASH=absent` proof原子持久为`AbortPending`；Store未确认前绝不abort。随后exact abort与postcondition成功才写`Conflict`。
-- [ ] RED：MergePending live/recovery统一按可证明现场分流：old HEAD+clean+无merge state可重试exact merge；exact expected commit补写Merged+default disposition；known-zero-target-effect可Failed；无durable conflict receipt的conflict或其余unknown/mismatch写ReconciliationRequired并poison。
-- [ ] RED：AbortPending只允许exact persisted conflict重试abort或old HEAD+clean+无merge state补写Conflict；reply lost先查exact transition，proof漂移或autostash不可证明时reconcile+poison且不reset/clean。
-- [ ] RED：Store commit reply lost、HTTP disconnect、双击、restart和外部HEAD/config/file drift下side effect最多一次且operation可查询。
-- [ ] RED：same-repo reservation/admission与source/merge严格串行；既有已运行task不自动停止，后续交付面对新target head。
-- [ ] GREEN：实现source/merge/abort阶段编排、typed pending receipt query、lease lifecycle、poison和worker completion回传。
-- [ ] REFACTOR：source、merge与abort三个orchestrator文件；每个方法只做一阶段decision/transition，避免单个巨型pipeline方法。
-- [ ] 验证：
+- [x] RED：merge POST先query-first replay；首次accept必须按global cap -> repository lease -> fresh operation/evidence/source/target/candidate-tree/ancestry/ignored-collision validation -> Store transaction写独立accept receipt和Ready->Accepted；durable Accepted后才返回202并驱动source。
+- [x] RED：Accepted严格驱动 ObjectPending -> deterministic source object -> CommitPending -> real index/ref -> Committed；source pending known error保持Accepted并bounded backoff。
+- [x] RED：source Committed后才构造/验证expected merge object，持久MergePending exact OID，再执行actual merge；任何步骤顺序倒置由pause gate测试失败。
+- [x] RED：source commit与expected-object阶段可能耗时；actual merge child spawn前再次认证source committed exact OID/shape、source clean/fixed lock、target exact clean/branch/old HEAD/config、ancestry和ignored collision，不能沿用accept时的旧capability或观察。
+- [x] RED：live actual merge返回known conflict时，先把child receipt、old HEAD、source、MERGE_HEAD、index stages、worktree digest和`MERGE_AUTOSTASH=absent` proof原子持久为`AbortPending`；Store未确认前绝不abort。随后exact abort与postcondition成功才写`Conflict`。
+- [x] RED：MergePending live/recovery统一按可证明现场分流：old HEAD+clean+无merge state可重试exact merge；exact expected commit补写Merged+default disposition；known-zero-target-effect可Failed；无durable conflict receipt的conflict或其余unknown/mismatch写ReconciliationRequired并poison。
+- [x] RED：AbortPending只允许exact persisted conflict重试abort或old HEAD+clean+无merge state补写Conflict；reply lost先查exact transition，proof漂移或autostash不可证明时reconcile+poison且不reset/clean。
+- [x] RED：Store commit reply lost、HTTP disconnect、双击、restart和外部HEAD/config/file drift下side effect最多一次且operation可查询。
+- [x] RED：same-repo reservation/admission与source/merge严格串行；既有已运行task不自动停止，后续交付面对新target head。
+- [x] GREEN：实现source/merge/abort阶段编排、typed pending receipt query、lease lifecycle、poison和worker completion回传。
+- [x] REFACTOR：source、merge与abort三个orchestrator文件；每个方法只做一阶段decision/transition，避免单个巨型pipeline方法。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-app --test delivery_merge --features test-support --locked --offline -- --nocapture
@@ -675,15 +678,15 @@ cargo test -p coding-agent-app --test artifact_reconciliation --features test-su
 - 新建 `crates/coding-agent-app/tests/delivery_cleanup.rs`
 - 修改 `crates/coding-agent-app/src/delivery_manager/{mod,command,recovery}.rs`
 
-- [ ] RED：cleanup先query-first replay；首次receipt也必须在global cap和repository lease之后写入。未Merged、source非Committed、worktree identity/clean/lock/process proof失败、active operation或poison时remove receipt零副作用拒绝。
-- [ ] RED：一个remove receipt自动驱动 UnlockPending -> UnlockedPendingRemove -> RemovePending -> Completed；崩溃在RetainedUnlocked后无需第二次用户确认。
-- [ ] RED：已知未应用remove留下`Failed + RetainedUnlocked`时，fresh新receipt在重新验证clean/identity/process proof后直接持久`RemovePending + RetainedUnlocked`并重试remove；app不得重新执行unlock。
-- [ ] RED：branch cleanup必须是第二个独立receipt，只在worktree Removed、source ref exact、无checkout、fresh target ancestry成立时进入DeletePending。
-- [ ] RED：target合法前进时先持久新expected target version/head再重试atomic ref transaction；target不再含source时Failed+Retained，source drift/unknown时reconcile+poison。
-- [ ] RED：remove/delete reply lost和双击不重复unlock/remove/delete；Failed fresh retry使用新receipt且不覆盖旧operation history。
-- [ ] GREEN：实现remove/delete acceptance、phase loop、fact transition、expected-target refresh和runtime outcome mapping。
-- [ ] REFACTOR：worktree和branch cleanup使用不同typed command/result；UI allowed-actions由fresh projection计算，不由按钮本地状态推断。
-- [ ] 验证：
+- [x] RED：cleanup先query-first replay；首次receipt也必须在global cap和repository lease之后写入。未Merged、source非Committed、worktree identity/clean/lock/process proof失败、active operation或poison时remove receipt零副作用拒绝。
+- [x] RED：一个remove receipt自动驱动 UnlockPending -> UnlockedPendingRemove -> RemovePending -> Completed；崩溃在RetainedUnlocked后无需第二次用户确认。
+- [x] RED：已知未应用remove留下`Failed + RetainedUnlocked`时，fresh新receipt在重新验证clean/identity/process proof后直接持久`RemovePending + RetainedUnlocked`并重试remove；app不得重新执行unlock。
+- [x] RED：branch cleanup必须是第二个独立receipt，只在worktree Removed、source ref exact、无checkout、fresh target ancestry成立时进入DeletePending。
+- [x] RED：target合法前进时先持久新expected target version/head再重试atomic ref transaction；target不再含source时Failed+Retained，source drift/unknown时reconcile+poison。
+- [x] RED：remove/delete reply lost和双击不重复unlock/remove/delete；Failed fresh retry使用新receipt且不覆盖旧operation history。
+- [x] GREEN：实现remove/delete acceptance、phase loop、fact transition、expected-target refresh和runtime outcome mapping。
+- [x] REFACTOR：worktree和branch cleanup使用不同typed command/result；UI allowed-actions由fresh projection计算，不由按钮本地状态推断。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-app --test delivery_cleanup --features test-support --locked --offline -- --nocapture
@@ -707,15 +710,15 @@ cargo test -p coding-agent-app --test repository_control --features test-support
 - 新建 `crates/coding-agent-app/tests/{delivery_recovery,delivery_startup}.rs`
 - 修改 `crates/coding-agent-app/tests/{artifact_reconciliation,single_instance,event_dispatcher}.rs`
 
-- [ ] RED：启动保持P4-A完整顺序并插入已批准probe：lock/config/private paths -> held sentinel proof -> private Git capability probe -> DB history/v1-v5 -> coordinator -> ownership join -> non-owned Reserved reconciliation -> atomic P4-A recovery/high watermark -> EventDispatcher -> StoreWriter -> delivery recovery -> actors/bootstrap -> Web Ready。
-- [ ] RED：delivery-owned Committed、Merged、RetainedUnlocked、Removed、Deleted不进入P4-A base/worktree observer；非owned artifact继续原行为。
-- [ ] RED：Reserved/Inconsistent+delivery row、missing/attempt mismatch、Merged缺disposition、journal gap和无法界定common identity使startup fail closed，不回退猜测。
-- [ ] RED：按common identity和creation order恢复PreflightPending、Accepted/source pending、MergePending、AbortPending、active cleanup；只校正durable accepted operation，不创建新用户意图。
-- [ ] RED：每种runtime observation映射continue/applied/known failure/reconciliation+poison；Store reply lost只补写exact transition。
-- [ ] RED：P4-A recover_after_restart、committed high watermark、11 events、dispatcher cursor、Running=0和Scheduler bootstrap证据不漏失/重排。
-- [ ] GREEN：实现ownership router、delivery recovery coordinator和startup phase接线；Web Ready只在两套恢复全部闭合后开放。
-- [ ] REFACTOR：使用显式startup phase types，禁止在production StoreWriter启动后调用startup direct Store helper。
-- [ ] 验证：
+- [x] RED：启动保持P4-A完整顺序并插入已批准probe：lock/config/private paths -> held sentinel proof -> private Git capability probe -> DB history/v1-v5 -> coordinator -> ownership join -> non-owned Reserved reconciliation -> atomic P4-A recovery/high watermark -> EventDispatcher -> StoreWriter -> delivery recovery -> actors/bootstrap -> Web Ready。
+- [x] RED：delivery-owned Committed、Merged、RetainedUnlocked、Removed、Deleted不进入P4-A base/worktree observer；非owned artifact继续原行为。
+- [x] RED：Reserved/Inconsistent+delivery row、missing/attempt mismatch、Merged缺disposition、journal gap和无法界定common identity使startup fail closed，不回退猜测。
+- [x] RED：按common identity和creation order恢复PreflightPending、Accepted/source pending、MergePending、AbortPending、active cleanup；只校正durable accepted operation，不创建新用户意图。
+- [x] RED：每种runtime observation映射continue/applied/known failure/reconciliation+poison；Store reply lost只补写exact transition。
+- [x] RED：P4-A recover_after_restart、committed high watermark、11 events、dispatcher cursor、Running=0和Scheduler bootstrap证据不漏失/重排。
+- [x] GREEN：实现ownership router、delivery recovery coordinator和startup phase接线；Web Ready只在两套恢复全部闭合后开放。
+- [x] REFACTOR：使用显式startup phase types，禁止在production StoreWriter启动后调用startup direct Store helper。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-app --test delivery_startup --features test-support --locked --offline -- --nocapture
@@ -739,14 +742,14 @@ cargo test -p coding-agent-app --test event_dispatcher --features test-support -
 - 新建 `crates/coding-agent-app/tests/delivery_shutdown.rs`
 - 修改 `crates/coding-agent-app/tests/{shutdown,degraded_recovery,single_instance}.rs`
 
-- [ ] RED：shutdown先关mutation gate和DeliveryManager intake，不再接受operation；已durable accepted worker完成当前可证明阶段或留下recoverable pending。
-- [ ] RED：等待全部Git child/process tree cleanup proof；outcome unknown时保留repository lease、worker ownership、global slot和primary lock，关闭HTTP且不有限安全退出。
-- [ ] RED：Store degraded但Git known applied时保留typed pending并query-first replay；Store/child双unknown不能降级为普通503/busy或释放poison。
-- [ ] RED：poison只隔离exact authenticated common identity；另一个repository仍可查询/运行，无法界定identity时冻结全部delivery mutation但不停止既有TaskManager safety cleanup。
-- [ ] RED：P4-A Scheduler/TaskManager quiesce、stop intent和process cleanup顺序不被DeliveryManager反向等待造成deadlock。
-- [ ] GREEN：把DeliveryManager纳入service quiesce barrier、shutdown join和single-instance failsafe，使用显式worker/child ownership receipt。
-- [ ] REFACTOR：delivery shutdown与TaskManager shutdown共享顶层相位，不共享含糊pending枚举或互相等待callback。
-- [ ] 验证：
+- [x] RED：shutdown先关mutation gate和DeliveryManager intake，不再接受operation；已durable accepted worker完成当前可证明阶段或留下recoverable pending。
+- [x] RED：等待全部Git child/process tree cleanup proof；outcome unknown时保留repository lease、worker ownership、global slot和primary lock，关闭HTTP且不有限安全退出。
+- [x] RED：Store degraded但Git known applied时保留typed pending并query-first replay；Store/child双unknown不能降级为普通503/busy或释放poison。
+- [x] RED：poison只隔离exact authenticated common identity；另一个repository仍可查询/运行，无法界定identity时冻结全部delivery mutation但不停止既有TaskManager safety cleanup。
+- [x] RED：P4-A Scheduler/TaskManager quiesce、stop intent和process cleanup顺序不被DeliveryManager反向等待造成deadlock。
+- [x] GREEN：把DeliveryManager纳入service quiesce barrier、shutdown join和single-instance failsafe，使用显式worker/child ownership receipt。
+- [x] REFACTOR：delivery shutdown与TaskManager shutdown共享顶层相位，不共享含糊pending枚举或互相等待callback。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-app --test delivery_shutdown --features test-support --locked --offline -- --nocapture
@@ -821,16 +824,16 @@ cargo test -p coding-agent-app --test single_instance --features test-support --
 - 修改 `crates/coding-agent-app/tests/{server,security}.rs`
 - 修改 `web/openapi.json` 与 `web/src/api/generated/schema.d.ts`
 
-- [ ] RED：锁定两个GET、preflight、merge accept、remove worktree、delete branch的exact request/response、required fields、deny unknown、UUID/OID/ref/fingerprint/version/conflict bounds和HTTP status。
-- [ ] RED：API把validated typed command交给Store共享canonical hash实现，不在router复制算法；逐字段变化、跨action UUID复用和JSON顺序/空白等价向量与Store tests一致。
-- [ ] RED：所有POST覆盖session、exact loopback Origin、CSRF、content type、mutation gate Ready和bounded body；GET仍需session。
-- [ ] RED：handler只等待command receipt/durable acceptance，不获取repository lease、不执行Git、不等待完整merge/cleanup；HTTP断开不取消operation。
-- [ ] RED：stable errors逐项映射status/code/message/retryable/details；响应不含prompt、diff、绝对路径、stderr、环境/config值或conflict内容。
-- [ ] RED：operation GET为discriminated exact DTO并按version投影；task delivery GET包含eligibility/evidence summary、fresh target observation `{available, branch, head, reason}`、source/latest merge/disposition/allowed actions，供Web构造preflight的exact target branch/HEAD；观察不可用时禁用action且不接受客户端猜测。
-- [ ] RED：OpenAPI path/schema/enum/maxLength/maxItems/status精确；SSE `oneOf`、11种task event和cursor tests逐字节不变。
-- [ ] GREEN：实现独立Delivery backend port、短router委托、app projection/error mapping和六条route；同一变更导出OpenAPI并生成TypeScript。
-- [ ] REFACTOR：delivery contract/backend/router/error各自子模块，禁止继续堆进现有大文件；API DTO不导出Store/runtime内部identity。
-- [ ] 验证：
+- [x] RED：锁定两个GET、preflight、merge accept、remove worktree、delete branch的exact request/response、required fields、deny unknown、UUID/OID/ref/fingerprint/version/conflict bounds和HTTP status。
+- [x] RED：API把validated typed command交给Store共享canonical hash实现，不在router复制算法；逐字段变化、跨action UUID复用和JSON顺序/空白等价向量与Store tests一致。
+- [x] RED：所有POST覆盖session、exact loopback Origin、CSRF、content type、mutation gate Ready和bounded body；GET仍需session。
+- [x] RED：handler只等待command receipt/durable acceptance，不获取repository lease、不执行Git、不等待完整merge/cleanup；HTTP断开不取消operation。
+- [x] RED：stable errors逐项映射status/code/message/retryable/details；响应不含prompt、diff、绝对路径、stderr、环境/config值或conflict内容。
+- [x] RED：operation GET为discriminated exact DTO并按version投影；task delivery GET包含eligibility/evidence summary、fresh target observation `{available, branch, head, reason}`、source/latest merge/disposition/allowed actions，供Web构造preflight的exact target branch/HEAD；观察不可用时禁用action且不接受客户端猜测。
+- [x] RED：OpenAPI path/schema/enum/maxLength/maxItems/status精确；SSE `oneOf`、11种task event和cursor tests逐字节不变。
+- [x] GREEN：实现独立Delivery backend port、短router委托、app projection/error mapping和六条route；同一变更导出OpenAPI并生成TypeScript。
+- [x] REFACTOR：delivery contract/backend/router/error各自子模块，禁止继续堆进现有大文件；API DTO不导出Store/runtime内部identity。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-api --test delivery --locked --offline -- --nocapture
@@ -855,15 +858,15 @@ npm --prefix web run api:check
 - 修改 `web/src/api/{client,client.test,types}.ts`
 - 修改 `web/src/main.tsx`
 
-- [ ] RED：exact validator拒绝未知/缺失/null/unsafe integer、非canonical UUID/OID/ref/fingerprint、非法state组合和oversized conflict payload。
-- [ ] RED：四个POST各自生成/持有独立client request ID；网络结果未知时同action重试复用原ID，不同action或用户fresh retry使用新ID。
-- [ ] RED：reload/task切换先GET delivery；durable accepted后按operation ID/version polling，500ms起、最多2s，version前进重置退避，terminal停止并刷新delivery projection。
-- [ ] RED：unmount/task切换abort旧请求并忽略迟到response；旧operation不得覆盖新task/newer version，stale modal清空。
-- [ ] RED：polling/reducer不订阅或伪造SSE delivery event，不修改`applied_task_event_id`、membership cursor或scheduler snapshot。
-- [ ] RED：existing ApiClient与DeliveryClient共用唯一authenticated transport；session cookie/CSRF、401/session-expiry、request ID、abort、JSON/error envelope和network error语义逐项一致，禁止复制私有`#request`逻辑。
-- [ ] GREEN：从现有ApiClient抽取共享authenticated transport，实现独立delivery typed facade、pure reducer和effect hook；Agent lifecycle state与Delivery controller分离注入组件。
-- [ ] REFACTOR：不继续扩大通用`validation.ts`/`useAgentState.ts`；timer、network、validation和pure state各自单职责。
-- [ ] 验证：
+- [x] RED：exact validator拒绝未知/缺失/null/unsafe integer、非canonical UUID/OID/ref/fingerprint、非法state组合和oversized conflict payload。
+- [x] RED：四个POST各自生成/持有独立client request ID；网络结果未知时同action重试复用原ID，不同action或用户fresh retry使用新ID。
+- [x] RED：reload/task切换先GET delivery；durable accepted后按operation ID/version polling，500ms起、最多2s，version前进重置退避，terminal停止并刷新delivery projection。
+- [x] RED：unmount/task切换abort旧请求并忽略迟到response；旧operation不得覆盖新task/newer version，stale modal清空。
+- [x] RED：polling/reducer不订阅或伪造SSE delivery event，不修改`applied_task_event_id`、membership cursor或scheduler snapshot。
+- [x] RED：existing ApiClient与DeliveryClient共用唯一authenticated transport；session cookie/CSRF、401/session-expiry、request ID、abort、JSON/error envelope和network error语义逐项一致，禁止复制私有`#request`逻辑。
+- [x] GREEN：从现有ApiClient抽取共享authenticated transport，实现独立delivery typed facade、pure reducer和effect hook；Agent lifecycle state与Delivery controller分离注入组件。
+- [x] REFACTOR：不继续扩大通用`validation.ts`/`useAgentState.ts`；timer、network、validation和pure state各自单职责。
+- [x] 验证：
 
 ```powershell
 npm --prefix web run test:run -- src/api/authenticatedTransport.test.ts src/api/client.test.ts src/api/deliveryClient.test.ts src/api/deliveryValidation.test.ts src/state/deliveryReducer.test.ts src/state/useDeliveryPolling.test.ts
@@ -882,14 +885,14 @@ npm --prefix web run typecheck
 - 修改 `web/src/components/{TaskWorkspace,TaskWorkspace.test,AppShell,AppShell.test}.tsx`
 - 修改 `web/src/styles.css`
 
-- [ ] RED：ineligible只显示稳定原因且没有可点击Merge；eligible显示服务端target branch/HEAD和evidence摘要，不显示绝对路径/diff。
-- [ ] RED：preflight modal展示exact generation/fingerprint/source/target和clean/conflict结果；Merge二次确认只能提交同一Ready operation/version，stale modal禁用。
-- [ ] RED：accepted/pending按operation projection禁用重复动作；terminal/reload恢复，Conflict只显示bounded relative path summary和“重新预检”，不提供自动编辑。
-- [ ] RED：Merged后默认明确显示worktree/branch保留；Remove worktree与Delete branch是两个按钮、两个dialog、两个receipt，branch只在allowed action出现。
-- [ ] RED：覆盖keyboard、focus return、Escape、ARIA dialog/labels、long OID/ref/path wrapping和loading/error/retry状态。
-- [ ] GREEN：实现最小可访问panel和modal，所有allowed action来自typed server projection，组件不解析message或Git文本。
-- [ ] REFACTOR：TaskWorkspace只装配panel；展示、preflight、progress、cleanup分组件，modal共享仅限可访问性primitive，不合并两个cleanup语义。
-- [ ] 验证：
+- [x] RED：ineligible只显示稳定原因且没有可点击Merge；eligible显示服务端target branch/HEAD和evidence摘要，不显示绝对路径/diff。
+- [x] RED：preflight modal展示exact generation/fingerprint/source/target和clean/conflict结果；Merge二次确认只能提交同一Ready operation/version，stale modal禁用。
+- [x] RED：accepted/pending按operation projection禁用重复动作；terminal/reload恢复，Conflict只显示bounded relative path summary和“重新预检”，不提供自动编辑。
+- [x] RED：Merged后默认明确显示worktree/branch保留；Remove worktree与Delete branch是两个按钮、两个dialog、两个receipt，branch只在allowed action出现。
+- [x] RED：覆盖keyboard、focus return、Escape、ARIA dialog/labels、long OID/ref/path wrapping和loading/error/retry状态。
+- [x] GREEN：实现最小可访问panel和modal，所有allowed action来自typed server projection，组件不解析message或Git文本。
+- [x] REFACTOR：TaskWorkspace只装配panel；展示、preflight、progress、cleanup分组件，modal共享仅限可访问性primitive，不合并两个cleanup语义。
+- [x] 验证：
 
 ```powershell
 npm --prefix web run test:run -- src/components/DeliveryPanel.test.tsx src/components/TaskWorkspace.test.tsx src/components/AppShell.test.tsx
@@ -912,15 +915,15 @@ npm --prefix web run build
 - 修改 `crates/coding-agent-app/tests/{process_support,offline_e2e,multi_role_offline_e2e,concurrent_offline_e2e}.rs`
 - 修改 `crates/coding-agent-app/tests/support/mod.rs`
 
-- [ ] RED：临时真实Git/Cargo仓库+scripted provider证明Approved task在点击前无source commit/merge，显式accept后得到exact no-ff双parent commit和clean target。
-- [ ] RED：historical Completed+Unreviewed、Rejected、非Completed、dirty/detached/stale target、ignored collision和source fingerprint drift全部拒绝且用户bytes/ref不变。
-- [ ] RED：clean/conflict preflight目标byte-for-byte不变；外部修复/推进后新preflight成功，source已在target ancestor稳定拒绝。
-- [ ] RED：source ObjectPending/CommitPending、MergePending/AbortPending、unlock/remove/delete每个关键pause/crash/reply-lost点重启收敛且side effect最多一次。
-- [ ] RED：同repo merge/reservation/cleanup串行、不同repo最多2并行、poison隔离、shutdown unknown child持有primary lock和delivery ownership。
-- [ ] RED：完整startup ownership overlay证明Committed/Removed/Deleted不被P4-A误判，P4-A high watermark/11 events/Scheduler bootstrap保持。
-- [ ] GREEN：扩展deny-unknown strict ProcessTestConfig、delivery fault/pause/release和真实Git assertions；不增加生产测试后门。
-- [ ] REFACTOR：Git fixture、crash controller、receipt replay和process cleanup assertions放共享test support；测试结束证明无child/held sentinel/temp leak。
-- [ ] 验证：
+- [x] RED：临时真实Git/Cargo仓库+scripted provider证明Approved task在点击前无source commit/merge，显式accept后得到exact no-ff双parent commit和clean target。
+- [x] RED：historical Completed+Unreviewed、Rejected、非Completed、dirty/detached/stale target、ignored collision和source fingerprint drift全部拒绝且用户bytes/ref不变。
+- [x] RED：clean/conflict preflight目标byte-for-byte不变；外部修复/推进后新preflight成功，source已在target ancestor稳定拒绝。
+- [x] RED：source ObjectPending/CommitPending、MergePending/AbortPending、unlock/remove/delete每个关键pause/crash/reply-lost点重启收敛且side effect最多一次。
+- [x] RED：同repo merge/reservation/cleanup串行、不同repo最多2并行、poison隔离、shutdown unknown child持有primary lock和delivery ownership。
+- [x] RED：完整startup ownership overlay证明Committed/Removed/Deleted不被P4-A误判，P4-A high watermark/11 events/Scheduler bootstrap保持。
+- [x] GREEN：扩展deny-unknown strict ProcessTestConfig、delivery fault/pause/release和真实Git assertions；不增加生产测试后门。
+- [x] REFACTOR：Git fixture、crash controller、receipt replay和process cleanup assertions放共享test support；测试结束证明无child/held sentinel/temp leak。
+- [x] 验证：
 
 ```powershell
 cargo test -p coding-agent-app --test controlled_delivery_offline_e2e --all-features --locked --offline -- --nocapture
@@ -942,14 +945,14 @@ cargo test -p coding-agent-api --test delivery --locked --offline
 - 修改 `web/e2e/{core-workflows,fault-recovery,lifecycle,security,startup-order,ui-edge-cases}.spec.ts`
 - 修改 `README.md`
 
-- [ ] RED：浏览器证明未点击不merge、preflight详情/二次确认、pending polling/reload、conflict无目标修改、stale后重新preflight和成功no-ff merge。
-- [ ] RED：证明两个cleanup modal/receipt独立；remove后branch默认Retained，delete后Deleted，reply lost/double click不重复副作用。
-- [ ] RED：安全场景覆盖session/Origin/CSRF、unknown fields、脱敏errors、恶意config、ignored collision和绝对路径不显示。
-- [ ] RED：强杀primary覆盖source/merge/abort/cleanup pending，重启先recovery后Ready；network guard证明零remote/provider流量。
-- [ ] GREEN：实现typed localApp delivery helper和最小Playwright场景；只使用execFile/临时本地repo，不用shell拼Git命令。
-- [ ] GREEN：README记录资格、current checkout目标、固定no-ff、默认保留、冲突边界、两步cleanup、恢复/poison和“非OS/全局Git锁”。
-- [ ] REFACTOR：UI driver、Git断言、crash orchestration分离；teardown等待所有进程并清理临时目录。
-- [ ] 验证：
+- [x] RED：浏览器证明未点击不merge、preflight详情/二次确认、pending polling/reload、conflict无目标修改、stale后重新preflight和成功no-ff merge。
+- [x] RED：证明两个cleanup modal/receipt独立；remove后branch默认Retained，delete后Deleted，reply lost/double click不重复副作用。
+- [x] RED：安全场景覆盖session/Origin/CSRF、unknown fields、脱敏errors、恶意config、ignored collision和绝对路径不显示。
+- [x] RED：强杀primary覆盖source/merge/abort/cleanup pending，重启先recovery后Ready；network guard证明零remote/provider流量。
+- [x] GREEN：实现typed localApp delivery helper和最小Playwright场景；只使用execFile/临时本地repo，不用shell拼Git命令。
+- [x] GREEN：README记录资格、current checkout目标、固定no-ff、默认保留、冲突边界、两步cleanup、恢复/poison和“非OS/全局Git锁”。
+- [x] REFACTOR：UI driver、Git断言、crash orchestration分离；teardown等待所有进程并清理临时目录。
+- [x] 验证：
 
 ```powershell
 cargo build --locked --offline -p coding-agent-app --features e2e
@@ -971,13 +974,13 @@ CODING_AGENT_E2E_BINARY="$PWD/target/debug/coding-agent-app" npm --prefix web ru
 
 ## 任务 30：独立代码审查与完整验收
 
-- [ ] 并行至少三路独立审查：
+- [x] 并行至少三路独立审查：
   - Store/迁移/receipt/事务：v5、evidence/directory identity、state/nullability、journal、idempotency、11-event兼容。
   - Runtime/Git安全：exact stdin、command policy、source/merge OID、ignored/config/attributes、abort、atomic ref transaction、process proof。
   - App/API/Web：lease/cap、startup/shutdown/poison、HTTP/security/OpenAPI、polling/UI/E2E和范围边界。
-- [ ] 解决全部 Blocker/High findings；每次修复先补RED或运行已有失败测试，再运行聚焦和完整门禁。
-- [ ] 人工逐条核对最终diff：无第7种TaskStatus、无第12种event、无SSE delivery、无auto merge/cleanup、无remote/PR、无P4-C/P4-D、无大文件/大方法回归。
-- [ ] 执行：
+- [x] 解决全部 Blocker/High findings；每次修复先补RED或运行已有失败测试，再运行聚焦和完整门禁。
+- [x] 人工逐条核对最终diff：无第7种TaskStatus、无第12种event、无SSE delivery、无auto merge/cleanup、无remote/PR、无P4-C/P4-D、无大文件/大方法回归。
+- [x] 执行：
 
 ```powershell
 npm --prefix web ci

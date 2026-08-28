@@ -7,9 +7,8 @@ use coding_agent_store::{
     CreateDeliverySourceRequest, CreatePreflightOutcome, CreatePreflightRequest,
     DeliveryOperationId, DeliverySourceAnchor, DeliverySourceReconciliationReason,
     DeliverySourceRetryReason, DeliverySourceState, DeliveryVersion, DirectoryIdentity,
-    GitBranchRef, GitCommitOid, GitTreeOid, PreflightCommandRequest,
-    ReconcileDeliverySourceRequest, RecordDeliverySourceRetryRequest, Sha256Digest, Store,
-    StoreError,
+    GitBranchRef, GitCommitOid, PreflightCommandRequest, ReconcileDeliverySourceRequest,
+    RecordDeliverySourceRetryRequest, Sha256Digest, Store, StoreError,
 };
 
 use super::fixtures::{
@@ -18,7 +17,7 @@ use super::fixtures::{
 };
 use crate::support::delivery::eligibility::{
     ADMIN_IDENTITY, CANDIDATE_TREE, COMMON_IDENTITY, CONFIG_DIGEST, DELIVERY_TIMESTAMP,
-    SOURCE_COMMIT, TARGET_HEAD,
+    SOURCE_COMMIT, TARGET_CONFIG_DIGEST, TARGET_HEAD, TARGET_SECURITY_DIGEST,
 };
 use crate::support::delivery::merge::{
     accept_merge_operation_with_request_hash, mark_preflight_ready,
@@ -40,7 +39,7 @@ async fn orphaned_object_pending_source_owner_blocks_every_source_entrypoint_wit
     );
     assert_eq!(
         source.origin_accepted_version,
-        DeliveryVersion::try_new(3).unwrap()
+        DeliveryVersion::try_new(4).unwrap()
     );
     let anchor = source_anchor(&command);
     let create = CreateDeliverySourceRequest::try_new(command.clone()).unwrap();
@@ -58,7 +57,7 @@ async fn orphaned_object_pending_source_owner_blocks_every_source_entrypoint_wit
         anchor,
         DeliverySourceState::ObjectPending,
         source.version,
-        DeliveryVersion::try_new(3).unwrap(),
+        DeliveryVersion::try_new(4).unwrap(),
         DeliverySourceReconciliationReason::SourceInconsistent,
     )
     .unwrap();
@@ -164,7 +163,7 @@ async fn damaged_accepted_transition_invalidates_source_origin_without_writes() 
     sqlx::query(
         "UPDATE task_delivery_operation_transitions \
          SET transitioned_at = '2026-08-04T00:00:01.000000000Z' \
-         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 3",
+         WHERE entity_kind = 'merge_operation' AND entity_id = ? AND entity_version = 4",
     )
     .bind(command.preflight_operation_id().to_string())
     .execute(&mut *connection)
@@ -243,17 +242,25 @@ async fn accept_another(
             GitCommitOid::from_str(TARGET_HEAD).unwrap(),
         )
         .unwrap(),
-        GitTreeOid::from_str(CANDIDATE_TREE).unwrap(),
-        GitCommitOid::from_str(SOURCE_COMMIT).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", COMMON_IDENTITY).unwrap(),
         DirectoryIdentity::try_new("directory_identity_v1", ADMIN_IDENTITY).unwrap(),
         Sha256Digest::from_str(CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_CONFIG_DIGEST).unwrap(),
+        Sha256Digest::from_str(TARGET_SECURITY_DIGEST).unwrap(),
     )
     .unwrap();
     let operation_id = match store.create_merge_preflight(preflight).await.unwrap() {
         CreatePreflightOutcome::Created(receipt) => receipt.operation_id,
         other => panic!("expected a new preflight, got {other:?}"),
     };
+    crate::support::delivery::merge::bind_preflight_inputs(
+        store,
+        first.task_id(),
+        operation_id,
+        CANDIDATE_TREE,
+        SOURCE_COMMIT,
+    )
+    .await;
     mark_preflight_ready(store.pool(), &operation_id.to_string())
         .await
         .unwrap();
@@ -261,7 +268,7 @@ async fn accept_another(
         ClientRequestId::new(),
         first.task_id(),
         operation_id,
-        DeliveryVersion::try_new(2).unwrap(),
+        DeliveryVersion::try_new(3).unwrap(),
         evidence.workspace_generation(),
         evidence.workspace_fingerprint().clone(),
         GitBranchRef::from_str(TARGET_BRANCH).unwrap(),
@@ -282,8 +289,8 @@ async fn accept_another(
 async fn fail_owner(store: &Store, command: &AcceptMergeCommandRequest) {
     let updated = sqlx::query(
         "UPDATE task_merge_operations SET delivery_source_task_id = ?, source_commit_oid = ?, \
-             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 4, updated_at = ? \
-         WHERE operation_id = ? AND state = 'accepted' AND version = 3",
+             state = 'failed', failure_code = 'TARGET_HEAD_CHANGED', version = 5, updated_at = ? \
+         WHERE operation_id = ? AND state = 'accepted' AND version = 4",
     )
     .bind(command.task_id().to_string())
     .bind(SOURCE_COMMIT)
@@ -351,7 +358,7 @@ async fn delete_accepted_owner(
     .execute(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(deleted_transitions.rows_affected(), 3);
+    assert_eq!(deleted_transitions.rows_affected(), 4);
     let deleted = sqlx::query("DELETE FROM task_merge_operations WHERE operation_id = ?")
         .bind(command.preflight_operation_id().to_string())
         .execute(&mut *connection)

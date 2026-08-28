@@ -50,10 +50,13 @@ pub enum RepositoryControlPoisonReason {
     IdentityDrift,
     SideEffectIdentityMismatch,
     AliasConflict,
+    DeliveryReconciliationRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RepositoryControlError {
+    #[error("delivery mutation is frozen because the common Git identity could not be bounded")]
+    DeliveryMutationsFrozen,
     #[error("the repository identity is unavailable")]
     IdentityUnavailable,
     #[error("the repository identity changed")]
@@ -90,6 +93,7 @@ struct CoordinatorInner {
 #[derive(Clone, Default)]
 struct CoordinatorState {
     next_lease_id: u64,
+    delivery_mutations_frozen: bool,
     repositories: HashMap<RepositoryId, RepositoryAlias>,
     seeds: HashMap<String, RepositoryCoordinationKey>,
     groups: HashMap<RepositoryCoordinationKey, CoordinationGroup>,
@@ -204,7 +208,9 @@ impl RepositoryControlCoordinator {
     pub fn observe_identity_unavailable(&self, lookup: &RepositoryIdentityLookup) {
         let mut state = lock_state(&self.inner.state);
         let mut poison_events = Vec::new();
-        record_identity_unavailable(&mut state, &mut poison_events, lookup);
+        if !record_identity_unavailable(&mut state, &mut poison_events, lookup) {
+            state.delivery_mutations_frozen = true;
+        }
     }
 
     /// Resolves every callback before taking the coordinator lock, then
@@ -236,7 +242,9 @@ impl RepositoryControlCoordinator {
             let marker = match marker {
                 Ok(marker) => marker,
                 Err(RepositoryIdentityResolutionError::Unavailable) => {
-                    record_identity_unavailable(&mut candidate, &mut poison_events, &lookup);
+                    if !record_identity_unavailable(&mut candidate, &mut poison_events, &lookup) {
+                        candidate.delivery_mutations_frozen = true;
+                    }
                     first_error.get_or_insert(RepositoryControlError::IdentityUnavailable);
                     continue;
                 }
@@ -254,6 +262,7 @@ impl RepositoryControlCoordinator {
 
         if let Some(error) = first_error {
             apply_poison_events(&mut state, poison_events);
+            state.delivery_mutations_frozen |= candidate.delivery_mutations_frozen;
             return Err(error);
         }
         *state = candidate;
@@ -270,6 +279,30 @@ impl RepositoryControlCoordinator {
             .get(&repository_id)
             .map(|alias| alias.key)
             .ok_or(RepositoryControlError::UnknownRepository)
+    }
+
+    /// Delivery mutation routing is fail-closed globally when a durable
+    /// repository cannot be mapped to one authenticated common identity.
+    /// Read-only queries continue to use `coordination_key`.
+    pub fn delivery_coordination_key(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<RepositoryCoordinationKey, RepositoryControlError> {
+        let mut state = lock_state(&self.inner.state);
+        if state.delivery_mutations_frozen {
+            return Err(RepositoryControlError::DeliveryMutationsFrozen);
+        }
+        match state
+            .repositories
+            .get(&repository_id)
+            .map(|alias| alias.key)
+        {
+            Some(key) => Ok(key),
+            None => {
+                state.delivery_mutations_frozen = true;
+                Err(RepositoryControlError::DeliveryMutationsFrozen)
+            }
+        }
     }
 
     pub fn control_state(
@@ -382,11 +415,36 @@ impl RepositoryControlCoordinator {
         &self,
         key: RepositoryCoordinationKey,
     ) -> Result<RepositoryControlLease, RepositoryControlError> {
+        self.try_acquire_operation(key, false)
+    }
+
+    /// Delivery-only non-blocking acquisition. An unbounded common-identity
+    /// failure freezes this path globally without blocking TaskManager's
+    /// existing repository-control safety cleanup.
+    pub fn try_acquire_delivery(
+        &self,
+        key: RepositoryCoordinationKey,
+    ) -> Result<RepositoryControlLease, RepositoryControlError> {
+        self.try_acquire_operation(key, true)
+    }
+
+    pub fn delivery_mutations_frozen(&self) -> bool {
+        lock_state(&self.inner.state).delivery_mutations_frozen
+    }
+
+    fn try_acquire_operation(
+        &self,
+        key: RepositoryCoordinationKey,
+        delivery_only: bool,
+    ) -> Result<RepositoryControlLease, RepositoryControlError> {
         let mut state = match self.inner.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => return Err(RepositoryControlError::Busy),
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
         };
+        if delivery_only && state.delivery_mutations_frozen {
+            return Err(RepositoryControlError::DeliveryMutationsFrozen);
+        }
         let group = state
             .groups
             .get(&key)
@@ -1063,7 +1121,7 @@ fn record_identity_unavailable(
     state: &mut CoordinatorState,
     poison_events: &mut Vec<(RepositoryCoordinationKey, RepositoryControlPoisonReason)>,
     lookup: &RepositoryIdentityLookup,
-) {
+) -> bool {
     let seed_key = state.seeds.get(&lookup.git_identity_key).copied();
     let repository_key = state
         .repositories
@@ -1087,6 +1145,7 @@ fn record_identity_unavailable(
             RepositoryControlPoisonReason::IdentityUnavailable,
         );
     }
+    seed_key.is_some() || repository_key.is_some()
 }
 
 fn record_poison_once(
@@ -1162,6 +1221,7 @@ const fn poison_reason_bit(reason: RepositoryControlPoisonReason) -> u16 {
         RepositoryControlPoisonReason::IdentityDrift => 1 << 6,
         RepositoryControlPoisonReason::SideEffectIdentityMismatch => 1 << 7,
         RepositoryControlPoisonReason::AliasConflict => 1 << 8,
+        RepositoryControlPoisonReason::DeliveryReconciliationRequired => 1 << 9,
     }
 }
 

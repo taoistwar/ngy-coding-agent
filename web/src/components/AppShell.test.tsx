@@ -20,12 +20,14 @@ import type {
   TaskDetail,
 } from "../api/types";
 import { initialAgentState, type AgentState } from "../state/model";
+import { initialDeliveryState } from "../state/deliveryModel";
 import type { UseAgentStateResult } from "../state/useAgentState";
 import {
   initialSchedulerProjection,
   type SchedulerProjectionState,
 } from "../state/schedulerProjection";
 import { AppShell } from "./AppShell";
+import type { DeliveryPanelBinding } from "./DeliveryPanel";
 import { ConnectionBanner } from "./ConnectionBanner";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { repositoryPathForDisplay, Sidebar } from "./Sidebar";
@@ -151,6 +153,7 @@ function agentFixture(overrides: Partial<AgentState> = {}) {
   };
   const result: UseAgentStateResult = {
     state,
+    expireSession: vi.fn(),
     selectTask: vi.fn(),
     addRepository: vi.fn(async (path) => ({
       ...repository("repo-added"),
@@ -166,6 +169,37 @@ function agentFixture(overrides: Partial<AgentState> = {}) {
     quit: vi.fn(async () => ({ status: "shutting_down" as const })),
   };
   return { result, command, execute, created };
+}
+
+function deliveryBinding(taskId: string): DeliveryPanelBinding {
+  return {
+    api: {
+      newPreflight: () => {
+        throw new Error("unexpected preflight command");
+      },
+      newMerge: () => {
+        throw new Error("unexpected merge command");
+      },
+      newRemoveWorktree: () => {
+        throw new Error("unexpected worktree cleanup command");
+      },
+      newDeleteBranch: () => {
+        throw new Error("unexpected branch cleanup command");
+      },
+    },
+    controller: {
+      state: {
+        ...initialDeliveryState,
+        taskId,
+        generation: 1,
+        phase: "loading",
+      },
+      refresh: vi.fn(),
+      trackOperation: vi.fn(),
+      openModal: vi.fn(),
+      clearModal: vi.fn(),
+    },
+  };
 }
 
 describe("Sidebar", () => {
@@ -670,6 +704,66 @@ describe("ConnectionBanner", () => {
 });
 
 describe("AppShell", () => {
+  it("refreshes delivery once when the selected task lifecycle advances", async () => {
+    const fixture = agentFixture();
+    const taskId = fixture.result.state.selectedTaskId ?? "missing";
+    const binding = deliveryBinding(taskId);
+    const refresh = vi.mocked(binding.controller.refresh);
+    const { rerender } = render(
+      <AppShell agent={fixture.result} delivery={binding} />,
+    );
+    expect(refresh).not.toHaveBeenCalled();
+
+    const previous = fixture.result.state.tasksById[taskId]!;
+    const approved: Task = {
+      ...previous,
+      status: "completed",
+      delivery_readiness: "review_approved",
+      last_event_id: previous.last_event_id + 1,
+    };
+    const approvedAgent: UseAgentStateResult = {
+      ...fixture.result,
+      state: {
+        ...fixture.result.state,
+        tasksById: { ...fixture.result.state.tasksById, [taskId]: approved },
+        selectedDetail: detail(approved),
+      },
+    };
+    rerender(<AppShell agent={approvedAgent} delivery={binding} />);
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+
+    const newerEvidence = { ...approved, last_event_id: approved.last_event_id + 1 };
+    rerender(
+      <AppShell
+        agent={{
+          ...approvedAgent,
+          state: {
+            ...approvedAgent.state,
+            tasksById: { ...approvedAgent.state.tasksById, [taskId]: newerEvidence },
+            selectedDetail: detail(newerEvidence),
+          },
+        }}
+        delivery={binding}
+      />,
+    );
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+  });
+
+  it("passes the independent delivery binding into the selected task workspace", () => {
+    const { result } = agentFixture();
+    render(
+      <AppShell
+        agent={result}
+        delivery={deliveryBinding(result.state.selectedTaskId ?? "missing")}
+      />,
+    );
+
+    expect(screen.getByRole("region", { name: "Delivery" })).toBeVisible();
+    expect(
+      screen.getByRole("status", { name: "Delivery projection status" }),
+    ).toBeVisible();
+  });
+
   it("provides titled header, navigation, main, aside, and a polite connection status", () => {
     const fixture = agentFixture();
     render(<AppShell agent={fixture.result} />);

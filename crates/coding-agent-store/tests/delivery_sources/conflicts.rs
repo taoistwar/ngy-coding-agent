@@ -29,7 +29,7 @@ async fn caller_anchor_and_expected_version_mismatches_are_typed_conflicts_witho
         DeliverySourceAnchor::try_new(
             exact.task_id(),
             exact.accepted_operation_id(),
-            DeliveryVersion::try_new(4).unwrap(),
+            DeliveryVersion::try_new(3).unwrap(),
         )
         .unwrap(),
     ];

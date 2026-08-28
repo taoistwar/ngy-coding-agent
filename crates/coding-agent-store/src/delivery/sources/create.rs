@@ -124,7 +124,10 @@ fn validate_existing_source(
     operation: &MergeOperationRecord,
 ) -> Result<(), StoreError> {
     let valid = source.provenance == operation.provenance
-        && source.candidate_tree == operation.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| source.candidate_tree == inputs.candidate_tree)
         && source.expected_parent == operation.provenance.base_commit
         && source.commit_metadata.author_name == SOURCE_AUTHOR_NAME
         && source.commit_metadata.author_email == SOURCE_AUTHOR_EMAIL
@@ -176,6 +179,10 @@ async fn insert_object_pending(
 ) -> Result<(), StoreError> {
     let identity = operation.provenance.identity;
     let evidence = &operation.provenance.evidence;
+    let preflight_inputs = operation
+        .preflight_inputs
+        .as_ref()
+        .ok_or_else(source_invariant)?;
     let result = sqlx::query(
         "INSERT INTO task_delivery_sources ( \
              task_id, repository_id, attempt, evidence_algorithm, final_review_round, \
@@ -219,7 +226,7 @@ async fn insert_object_pending(
             .to_string(),
     )
     .bind(i64::try_from(operation.version.get()).map_err(|_| source_invariant())?)
-    .bind(operation.candidate_tree.as_str())
+    .bind(preflight_inputs.candidate_tree.as_str())
     .bind(operation.provenance.base_commit.as_str())
     .bind(&metadata.author_name)
     .bind(&metadata.author_email)

@@ -62,7 +62,7 @@ async fn legal_source_reconciliation_is_a_typed_blocker_at_origin_operation_orde
         vec![source_task.id, later_task.id]
     );
     assert!(matches!(
-        batch.entries[0].disposition,
+        &batch.entries[0].disposition,
         DeliveryRecoveryDisposition::ReconciliationRequired
     ));
     assert!(batch.entries[0].ownership.requires_reconciliation());
@@ -102,7 +102,7 @@ async fn cleanup_reconciliation_orders_by_cleanup_creation_not_earlier_dispositi
         vec![middle_task.id, cleanup_task.id]
     );
     assert!(matches!(
-        batch.entries[1].disposition,
+        &batch.entries[1].disposition,
         DeliveryRecoveryDisposition::ReconciliationRequired
     ));
 }

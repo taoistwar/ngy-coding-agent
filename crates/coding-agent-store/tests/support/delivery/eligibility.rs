@@ -40,4 +40,8 @@ pub const COMMON_IDENTITY: &str =
     "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
 pub const ADMIN_IDENTITY: &str = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
 pub const CONFIG_DIGEST: &str = "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3";
+pub const TARGET_CONFIG_DIGEST: &str =
+    "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4";
+pub const TARGET_SECURITY_DIGEST: &str =
+    "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5";
 pub const DELIVERY_TIMESTAMP: &str = "2026-08-04T00:00:00.000000000Z";

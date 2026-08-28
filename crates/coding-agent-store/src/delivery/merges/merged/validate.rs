@@ -28,7 +28,10 @@ pub(super) async fn require_committed_source(
     let exact = source.state == DeliverySourceState::Committed
         && source.failure_code.is_none()
         && source.provenance == operation.provenance
-        && source.candidate_tree == operation.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| source.candidate_tree == inputs.candidate_tree)
         && source.expected_source_commit.as_ref() == operation.source_commit.as_ref()
         && operation.delivery_source_task_id == Some(operation.provenance.identity.task_id());
     if exact {

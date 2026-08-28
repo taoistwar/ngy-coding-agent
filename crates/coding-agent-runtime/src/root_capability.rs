@@ -7,6 +7,8 @@ use std::io;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use sha2::{Digest, Sha256};
+
 use crate::RelativePath;
 use crate::native_fs::{
     child_entry_exists, child_matches_protected_metadata, create_child_directory,
@@ -53,6 +55,83 @@ pub enum DirectoryIdentityError {
     Unavailable,
     #[error("authenticated directory identity does not match")]
     Mismatch,
+}
+
+/// Closed namespaces for durable directory identities.
+///
+/// A directory used as a common Git directory must not compare equal to the
+/// same filesystem object used as a linked-worktree administration directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectoryIdentityDomain {
+    CommonGit,
+    WorktreeAdmin,
+}
+
+impl DirectoryIdentityDomain {
+    const fn tag(self) -> &'static [u8] {
+        match self {
+            Self::CommonGit => b"common-git",
+            Self::WorktreeAdmin => b"worktree-admin",
+        }
+    }
+}
+
+/// Versioned, durable digest of one authenticated directory object.
+///
+/// Unlike [`DirectoryIdentityMarker`], this value is stable across process
+/// restarts and may be persisted as typed internal provenance. Its digest
+/// representation is deliberately not part of the public runtime API.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DurableDirectoryIdentityV1 {
+    digest: [u8; 32],
+    hexadecimal: [u8; 64],
+}
+
+impl DurableDirectoryIdentityV1 {
+    /// Derives provenance from the retained handle without resolving a path.
+    pub(crate) fn derive(
+        capability: &RootCapability,
+        domain: DirectoryIdentityDomain,
+    ) -> Result<Self, DirectoryIdentityError> {
+        let platform = platform_directory_identity(&capability.root)?;
+        let digest = durable_directory_identity_digest(domain, platform);
+        Ok(Self {
+            hexadecimal: encode_lower_hex(digest),
+            digest,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn algorithm(&self) -> &'static str {
+        "directory_identity_v1"
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_hex(&self) -> &str {
+        std::str::from_utf8(&self.hexadecimal)
+            .expect("lower hexadecimal encoding is always valid UTF-8")
+    }
+
+    pub(crate) const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+impl fmt::Debug for DurableDirectoryIdentityV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DurableDirectoryIdentityV1(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PlatformDirectoryIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
 }
 
 /// Retained handles for an application-owned directory path created relative
@@ -120,6 +199,11 @@ impl RootCapability {
         Ok(Self {
             root: reopen_directory(&self.root)?,
         })
+    }
+
+    pub(crate) fn from_authenticated_directory(root: File) -> io::Result<Self> {
+        ensure_plain_directory(&root)?;
+        Ok(Self { root })
     }
 
     pub(crate) fn open_directory(&self, path: &RelativePath) -> io::Result<File> {
@@ -220,13 +304,7 @@ impl RootCapability {
 pub(crate) fn directory_identity_marker(
     directory: &File,
 ) -> Result<DirectoryIdentityMarker, DirectoryIdentityError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = directory
-        .metadata()
-        .map_err(|_| DirectoryIdentityError::Unavailable)?;
-    let device = metadata.dev();
-    let inode = metadata.ino();
+    let PlatformDirectoryIdentity::Unix { device, inode } = platform_directory_identity(directory)?;
     Ok(DirectoryIdentityMarker {
         device,
         inode,
@@ -242,6 +320,40 @@ pub(crate) fn directory_identity_marker(
 pub(crate) fn directory_identity_marker(
     directory: &File,
 ) -> Result<DirectoryIdentityMarker, DirectoryIdentityError> {
+    let PlatformDirectoryIdentity::Windows {
+        volume_serial_number,
+        file_id,
+    } = platform_directory_identity(directory)?;
+    Ok(DirectoryIdentityMarker {
+        volume_serial_number,
+        file_id,
+        opaque_hash: opaque_directory_identity_hash(|hasher| {
+            hasher.write_u8(2);
+            hasher.write_u64(volume_serial_number);
+            hasher.write(&file_id);
+        }),
+    })
+}
+
+#[cfg(unix)]
+fn platform_directory_identity(
+    directory: &File,
+) -> Result<PlatformDirectoryIdentity, DirectoryIdentityError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| DirectoryIdentityError::Unavailable)?;
+    Ok(PlatformDirectoryIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn platform_directory_identity(
+    directory: &File,
+) -> Result<PlatformDirectoryIdentity, DirectoryIdentityError> {
     use std::ffi::c_void;
     use std::mem::{MaybeUninit, size_of};
     use std::os::windows::io::AsRawHandle;
@@ -263,17 +375,62 @@ pub(crate) fn directory_identity_marker(
         return Err(DirectoryIdentityError::Unavailable);
     }
     let information = unsafe { information.assume_init() };
-    let volume_serial_number = information.VolumeSerialNumber;
-    let file_id = information.FileId.Identifier;
-    Ok(DirectoryIdentityMarker {
-        volume_serial_number,
-        file_id,
-        opaque_hash: opaque_directory_identity_hash(|hasher| {
-            hasher.write_u8(2);
-            hasher.write_u64(volume_serial_number);
-            hasher.write(&file_id);
-        }),
+    Ok(PlatformDirectoryIdentity::Windows {
+        volume_serial_number: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
     })
+}
+
+fn durable_directory_identity_digest(
+    domain: DirectoryIdentityDomain,
+    platform: PlatformDirectoryIdentity,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    write_digest_field(
+        &mut hasher,
+        b"schema",
+        b"coding-agent/directory-identity/v1",
+    );
+    write_digest_field(&mut hasher, b"domain", domain.tag());
+    match platform {
+        #[cfg(unix)]
+        PlatformDirectoryIdentity::Unix { device, inode } => {
+            write_digest_field(&mut hasher, b"platform", b"unix");
+            write_digest_field(&mut hasher, b"device", &device.to_be_bytes());
+            write_digest_field(&mut hasher, b"inode", &inode.to_be_bytes());
+        }
+        #[cfg(windows)]
+        PlatformDirectoryIdentity::Windows {
+            volume_serial_number,
+            file_id,
+        } => {
+            write_digest_field(&mut hasher, b"platform", b"windows");
+            write_digest_field(
+                &mut hasher,
+                b"volume-serial-number",
+                &volume_serial_number.to_be_bytes(),
+            );
+            write_digest_field(&mut hasher, b"file-id", &file_id);
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn write_digest_field(hasher: &mut Sha256, tag: &[u8], value: &[u8]) {
+    hasher.update((tag.len() as u32).to_be_bytes());
+    hasher.update(tag);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn encode_lower_hex(digest: [u8; 32]) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = [0u8; 64];
+    for (index, byte) in digest.into_iter().enumerate() {
+        encoded[index * 2] = HEX[usize::from(byte >> 4)];
+        encoded[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+    }
+    encoded
 }
 
 fn opaque_directory_identity_hash(write_identity: impl FnOnce(&mut dyn Hasher)) -> u64 {
@@ -431,6 +588,7 @@ fn metadata_is_reparse_point(_: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+    use std::process::Command;
 
     use super::*;
 
@@ -503,6 +661,111 @@ mod tests {
                 .unwrap()
                 .is_dir()
         );
+    }
+
+    #[test]
+    fn durable_identity_is_stable_domain_separated_and_redacted() {
+        let root_directory = tempfile::tempdir().unwrap();
+        let path = root_directory.path().canonicalize().unwrap();
+        let first = RootCapability::open(&path).unwrap();
+        let reopened = RootCapability::open(&path).unwrap();
+
+        let common =
+            DurableDirectoryIdentityV1::derive(&first, DirectoryIdentityDomain::CommonGit).unwrap();
+        let common_reopened =
+            DurableDirectoryIdentityV1::derive(&reopened, DirectoryIdentityDomain::CommonGit)
+                .unwrap();
+        let admin =
+            DurableDirectoryIdentityV1::derive(&first, DirectoryIdentityDomain::WorktreeAdmin)
+                .unwrap();
+
+        assert_eq!(common, common_reopened);
+        assert_ne!(common, admin);
+        assert_eq!(common.algorithm(), "directory_identity_v1");
+        assert_eq!(common.as_hex().len(), 64);
+        assert!(
+            common
+                .as_hex()
+                .bytes()
+                .all(|byte| { byte.is_ascii_digit() || matches!(byte, b'a'..=b'f') })
+        );
+        assert_eq!(
+            format!("{common:?}"),
+            "DurableDirectoryIdentityV1(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn durable_identity_is_stable_across_processes() {
+        let root_directory = tempfile::tempdir().unwrap();
+        let directory = root_directory.path().join("authenticated-directory");
+        let output_path = root_directory.path().join("child-identity");
+        std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let parent = DurableDirectoryIdentityV1::derive(
+            &RootCapability::open(&directory).unwrap(),
+            DirectoryIdentityDomain::CommonGit,
+        )
+        .unwrap();
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "root_capability::tests::durable_identity_child",
+                "--nocapture",
+            ])
+            .env("CODING_AGENT_DURABLE_IDENTITY_CHILD", "1")
+            .env("CODING_AGENT_DURABLE_IDENTITY_DIRECTORY", &directory)
+            .env("CODING_AGENT_DURABLE_IDENTITY_OUTPUT", &output_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "durable identity child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let child = std::fs::read_to_string(output_path).unwrap();
+        assert_eq!(child, parent.as_hex());
+    }
+
+    #[test]
+    fn durable_identity_child() {
+        if std::env::var_os("CODING_AGENT_DURABLE_IDENTITY_CHILD").is_none() {
+            return;
+        }
+        let directory = std::env::var_os("CODING_AGENT_DURABLE_IDENTITY_DIRECTORY").unwrap();
+        let output_path = std::env::var_os("CODING_AGENT_DURABLE_IDENTITY_OUTPUT").unwrap();
+        let identity = DurableDirectoryIdentityV1::derive(
+            &RootCapability::open(directory).unwrap(),
+            DirectoryIdentityDomain::CommonGit,
+        )
+        .unwrap();
+        std::fs::write(output_path, identity.as_hex()).unwrap();
+    }
+
+    #[test]
+    fn replacing_a_directory_changes_its_durable_identity() {
+        let parent = tempfile::tempdir().unwrap();
+        let live = parent.path().join("live");
+        let displaced = parent.path().join("displaced");
+        std::fs::create_dir(&live).unwrap();
+        let original = DurableDirectoryIdentityV1::derive(
+            &RootCapability::open(live.canonicalize().unwrap()).unwrap(),
+            DirectoryIdentityDomain::CommonGit,
+        )
+        .unwrap();
+
+        std::fs::rename(&live, &displaced).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        let replacement = DurableDirectoryIdentityV1::derive(
+            &RootCapability::open(live.canonicalize().unwrap()).unwrap(),
+            DirectoryIdentityDomain::CommonGit,
+        )
+        .unwrap();
+
+        assert_ne!(original, replacement);
     }
 
     #[cfg(unix)]

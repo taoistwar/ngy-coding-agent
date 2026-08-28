@@ -272,6 +272,14 @@ pub(in crate::store_writer) fn classify_store_failure(
         StoreError::InvariantViolation(message) => {
             return StoreFailureClassification::Invariant(message);
         }
+        StoreError::Delivery(_)
+        | StoreError::TaskNotMergeEligible
+        | StoreError::DeliveryOperationInProgress
+        | StoreError::DeliveryReconciliationRequired => {
+            return StoreFailureClassification::Invariant(
+                "delivery store outcome reached the writer before delivery command integration",
+            );
+        }
         StoreError::Domain(error) => KnownNotAppliedError::Domain(error),
         StoreError::InvalidRepositoryId(error) => {
             KnownNotAppliedError::InvalidRepositoryId(error.to_string())

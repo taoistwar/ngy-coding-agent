@@ -14,6 +14,7 @@ use futures_util::{StreamExt as _, stream};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::delivery_reconciliation::DeliveryArtifactOwnershipRouter;
 use crate::repository_control::{
     RepositoryControlCoordinator, RepositoryControlError, RepositoryControlLease,
     RepositoryControlPoisonReason, RepositoryIdentityResolver,
@@ -504,6 +505,8 @@ pub enum ArtifactReconciliationError {
     MutationUnresolved { identity: AttemptArtifactIdentity },
     #[error("artifact mutation conflicts with durable state")]
     MutationConflict { identity: AttemptArtifactIdentity },
+    #[error("delivery-owned artifact routing is inconsistent")]
+    DeliveryOwnershipInconsistent,
     #[error(transparent)]
     RepositoryControl(#[from] RepositoryControlError),
     #[error(transparent)]
@@ -629,7 +632,38 @@ pub async fn reconcile_startup_artifacts_grouped(
     observer: &dyn AttemptArtifactObserver,
     max_parallel_groups: NonZeroUsize,
 ) -> Result<ArtifactReconciliationSummary, ArtifactReconciliationError> {
+    // Audit the complete delivery ownership graph before the P4-A observer is
+    // allowed to see any Reserved artifact. A valid delivery-owned artifact is
+    // Ready and therefore absent from this list; overlap or identity drift is
+    // a fail-closed startup error, never a fallback to the base observer.
+    let ownership = DeliveryArtifactOwnershipRouter::load(&adapter.store)
+        .await
+        .map_err(|_| ArtifactReconciliationError::DeliveryOwnershipInconsistent)?;
+    reconcile_startup_artifacts_grouped_with_ownership(
+        adapter,
+        coordinator,
+        resolver,
+        observer,
+        max_parallel_groups,
+        &ownership,
+    )
+    .await
+}
+
+pub(crate) async fn reconcile_startup_artifacts_grouped_with_ownership(
+    adapter: &StartupDirectStoreArtifactAdapter,
+    coordinator: &RepositoryControlCoordinator,
+    resolver: &dyn RepositoryIdentityResolver,
+    observer: &dyn AttemptArtifactObserver,
+    max_parallel_groups: NonZeroUsize,
+    ownership: &DeliveryArtifactOwnershipRouter,
+) -> Result<ArtifactReconciliationSummary, ArtifactReconciliationError> {
     let mut artifacts = adapter.list_reserved_attempt_artifacts().await?;
+    for artifact in &artifacts {
+        ownership
+            .require_base_lifecycle(artifact)
+            .map_err(|_| ArtifactReconciliationError::DeliveryOwnershipInconsistent)?;
+    }
     artifacts.sort_unstable_by(|left, right| {
         left.created_at.cmp(&right.created_at).then_with(|| {
             left.identity

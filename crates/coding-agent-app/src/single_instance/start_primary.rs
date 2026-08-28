@@ -23,6 +23,7 @@ use super::{
 };
 
 mod actors;
+mod delivery;
 mod http;
 
 pub(super) async fn start_primary(
@@ -33,7 +34,8 @@ pub(super) async fn start_primary(
 ) -> Result<PrimaryRuntime, StartupError> {
     let configured = ConfiguredPrimary::load(paths, lock, instance_id, dependencies).await?;
     let sentinel = configured.claim_sentinel().await?;
-    let recovered = sentinel.recover_store().await?;
+    let delivery_git = sentinel.probe_delivery_git().await?;
+    let recovered = delivery_git.recover_store().await?;
     let actors = recovered.start_actors().await?;
     http::finish(actors).await
 }
@@ -124,6 +126,42 @@ struct SentinelReady {
 }
 
 impl SentinelReady {
+    async fn probe_delivery_git(self) -> Result<DeliveryGitReady, StartupError> {
+        let probed_runner_inputs = self
+            .context
+            .dependencies
+            .runner_factory
+            .probe_delivery_git_pre_database(
+                &self.context.paths,
+                self.instance_process_scope.clone(),
+            )
+            .await?;
+
+        Ok(DeliveryGitReady {
+            context: self.context,
+            max_queued_tasks: self.max_queued_tasks,
+            validated_inputs: self
+                .validated_inputs
+                .with_probed_runner_inputs(probed_runner_inputs),
+            cleanup: self.cleanup,
+            instance_process_scope: self.instance_process_scope,
+            #[cfg(feature = "test-support")]
+            test_signal_watchers: self.test_signal_watchers,
+        })
+    }
+}
+
+struct DeliveryGitReady {
+    context: StartupContext,
+    max_queued_tasks: NonZeroU32,
+    validated_inputs: ValidatedStartupInputs,
+    cleanup: Arc<PrimaryRuntimeCleanup>,
+    instance_process_scope: ProcessLivenessScope,
+    #[cfg(feature = "test-support")]
+    test_signal_watchers: ProcessTestWatchers,
+}
+
+impl DeliveryGitReady {
     async fn recover_store(self) -> Result<RecoveredStore, StartupError> {
         let store = self
             .context
@@ -221,6 +259,7 @@ struct ActorsReady {
     writer: StoreWriterHandle,
     dispatcher: EventDispatcherHandle,
     task_manager: TaskManagerHandle,
+    delivery_manager: crate::DeliveryManagerHandle,
     runner_selection: StartupRunnerSelection,
     repository_registrar: Option<RepositoryRuntimeRegistrar>,
     repository_discovery: Option<RepositoryDiscovery>,

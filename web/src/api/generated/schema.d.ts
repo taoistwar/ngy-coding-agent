@@ -36,6 +36,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/delivery-operations/{operation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["delivery_operation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/events": {
         parameters: {
             query?: never;
@@ -180,6 +196,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{task_id}/cleanup/branch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["delete_branch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/cleanup/worktree": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["remove_worktree"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/delivery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["task_delivery"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/merge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["accept_merge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/merge/preflight": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["preflight"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -297,7 +393,203 @@ export interface components {
             repository_id: string;
         };
         /** @enum {string} */
+        DeliveryAllowedActionDto: "run_preflight" | "accept_merge" | "remove_worktree" | "delete_branch";
+        DeliveryArtifactDispositionDto: {
+            branch: components["schemas"]["DeliveryBranchDispositionDto"];
+            /** Format: uuid */
+            merged_operation_id: string;
+            source_oid: string;
+            source_ref: string;
+            worktree: components["schemas"]["DeliveryWorktreeDispositionDto"];
+        };
+        DeliveryAvailableTargetDto: {
+            available: boolean;
+            branch: string;
+            head: string;
+        };
+        DeliveryBranchDispositionDto: {
+            failure: null | components["schemas"]["DeliveryOperationFailureDto"];
+            state: components["schemas"]["DeliveryBranchDispositionStateDto"];
+            /** Format: int64 */
+            version: number;
+        };
+        /** @enum {string} */
+        DeliveryBranchDispositionStateDto: "retained" | "deleted" | "reconciliation_required";
+        /** @enum {string} */
+        DeliveryCleanupKindDto: "remove_worktree" | "delete_branch";
+        DeliveryCleanupOperationDto: {
+            cleanup_kind: components["schemas"]["DeliveryCleanupKindDto"];
+            /** Format: int64 */
+            expected_disposition_version: number;
+            /** Format: uuid */
+            expected_merge_operation_id: string;
+            expected_source_oid: string;
+            expected_source_ref: string;
+            failure: null | components["schemas"]["DeliveryOperationFailureDto"];
+            /** Format: uuid */
+            operation_id: string;
+            state: components["schemas"]["DeliveryCleanupStateDto"];
+            target_branch: string | null;
+            target_head: string | null;
+            /** Format: int64 */
+            version: number;
+        };
+        DeliveryCleanupOperationEnvelopeDto: components["schemas"]["DeliveryCleanupOperationDto"] & {
+            kind: components["schemas"]["DeliveryCleanupOperationKindDto"];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "cleanup";
+        };
+        /** @enum {string} */
+        DeliveryCleanupOperationKindDto: "cleanup";
+        /** @enum {string} */
+        DeliveryCleanupStateDto: "unlock_pending" | "unlocked_pending_remove" | "remove_pending" | "delete_pending" | "completed" | "failed" | "reconciliation_required";
+        DeliveryCommandResponse: {
+            operation: components["schemas"]["DeliveryOperationDto"];
+            receipt: components["schemas"]["DeliveryReceiptDispositionDto"];
+        };
+        DeliveryConflictPathDto: {
+            encoding: components["schemas"]["DeliveryConflictPathEncodingDto"];
+            path: string;
+        };
+        /** @enum {string} */
+        DeliveryConflictPathEncodingDto: "utf8" | "base64url";
+        DeliveryConflictSummaryDto: {
+            /** Format: int32 */
+            path_count: number;
+            paths: components["schemas"]["DeliveryConflictPathDto"][];
+            /** Format: int32 */
+            payload_bytes: number;
+            truncated: boolean;
+        };
+        DeliveryDeleteBranchRequest: {
+            /** Format: uuid */
+            client_request_id: string;
+            /** Format: int64 */
+            expected_disposition_version: number;
+            /** Format: uuid */
+            expected_merge_operation_id: string;
+            expected_source_oid: string;
+            expected_source_ref: string;
+            target_branch: string;
+            target_head: string;
+        };
+        /** @enum {string} */
+        DeliveryEligibilityDto: "eligible" | "ineligible" | "unavailable";
+        /** @enum {string} */
+        DeliveryEligibilityReasonDto: "task_not_completed" | "review_not_approved" | "approved_evidence_missing" | "attempt_artifact_missing" | "attempt_artifact_not_ready" | "task_active" | "process_cleanup_unproven" | "target_branch_detached" | "target_branch_mismatch" | "target_head_changed" | "target_worktree_dirty" | "target_ignored_path_collision" | "target_git_operation_in_progress" | "unsafe_git_configuration" | "unsupported_git_attributes" | "source_already_in_target" | "runtime_drift" | "delivery_owned" | "already_merged" | "reconciliation_required" | "repository_busy" | "repository_unavailable" | "store_unavailable" | "runtime_observation_unavailable" | "service_not_ready";
+        DeliveryEvidenceSummaryDto: {
+            /** Format: int64 */
+            review_generation: number;
+            workspace_fingerprint: string;
+        };
+        DeliveryMergeOperationDto: {
+            candidate_source_tree: string | null;
+            conflicts: null | components["schemas"]["DeliveryConflictSummaryDto"];
+            failure: null | components["schemas"]["DeliveryOperationFailureDto"];
+            /** Format: uuid */
+            operation_id: string;
+            preflight_source_commit: string | null;
+            /** Format: int64 */
+            review_generation: number;
+            source_commit: string | null;
+            state: components["schemas"]["DeliveryMergeStateDto"];
+            target_branch: string;
+            target_head: string;
+            /** Format: int64 */
+            version: number;
+            workspace_fingerprint: string;
+        };
+        DeliveryMergeOperationEnvelopeDto: components["schemas"]["DeliveryMergeOperationDto"] & {
+            kind: components["schemas"]["DeliveryMergeOperationKindDto"];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "merge";
+        };
+        /** @enum {string} */
+        DeliveryMergeOperationKindDto: "merge";
+        DeliveryMergeRequest: {
+            /** Format: uuid */
+            client_request_id: string;
+            /** Format: int64 */
+            expected_operation_version: number;
+            /** Format: int64 */
+            expected_review_generation: number;
+            expected_target_head: string;
+            expected_workspace_fingerprint: string;
+            /** Format: uuid */
+            preflight_operation_id: string;
+            target_branch: string;
+        };
+        /** @enum {string} */
+        DeliveryMergeStateDto: "preflight_pending" | "preflight_ready" | "accepted" | "merge_pending" | "merged" | "abort_pending" | "conflict" | "rejected" | "stale" | "superseded" | "failed" | "reconciliation_required";
+        DeliveryOperationDto: components["schemas"]["DeliveryMergeOperationEnvelopeDto"] | components["schemas"]["DeliveryCleanupOperationEnvelopeDto"];
+        DeliveryOperationFailureDto: {
+            code: string;
+        };
+        DeliveryPreflightRequest: {
+            /** Format: uuid */
+            client_request_id: string;
+            expected_target_head: string;
+            target_branch: string;
+        };
+        /** @enum {string} */
         DeliveryReadinessDto: "unreviewed" | "review_approved" | "review_rejected";
+        /** @enum {string} */
+        DeliveryReceiptDispositionDto: "created" | "existing";
+        DeliveryRemoveWorktreeRequest: {
+            /** Format: uuid */
+            client_request_id: string;
+            /** Format: int64 */
+            expected_disposition_version: number;
+            /** Format: uuid */
+            expected_merge_operation_id: string;
+            expected_source_oid: string;
+            expected_source_ref: string;
+        };
+        DeliverySourceDto: {
+            source_oid: string | null;
+            source_ref: string;
+            state: components["schemas"]["DeliverySourceStateDto"];
+            /** Format: int64 */
+            version: number;
+        };
+        /** @enum {string} */
+        DeliverySourceStateDto: "object_pending" | "commit_pending" | "committed" | "reconciliation_required";
+        DeliveryTargetObservationDto: components["schemas"]["DeliveryAvailableTargetDto"] | components["schemas"]["DeliveryUnavailableTargetDto"];
+        /** @enum {string} */
+        DeliveryTargetUnavailableReasonDto: "detached" | "branch_mismatch" | "observation_unavailable" | "repository_busy" | "repository_poisoned" | "service_not_ready";
+        DeliveryTaskDto: {
+            allowed_actions: components["schemas"]["DeliveryAllowedActionDto"][];
+            disposition: null | components["schemas"]["DeliveryArtifactDispositionDto"];
+            eligibility: components["schemas"]["DeliveryEligibilityDto"];
+            evidence: null | components["schemas"]["DeliveryEvidenceSummaryDto"];
+            latest_cleanup: null | components["schemas"]["DeliveryCleanupOperationDto"];
+            latest_merge: null | components["schemas"]["DeliveryMergeOperationDto"];
+            reasons: components["schemas"]["DeliveryEligibilityReasonDto"][];
+            source: null | components["schemas"]["DeliverySourceDto"];
+            target: components["schemas"]["DeliveryTargetObservationDto"];
+            /** Format: uuid */
+            task_id: string;
+        };
+        DeliveryUnavailableTargetDto: {
+            available: boolean;
+            reason: components["schemas"]["DeliveryTargetUnavailableReasonDto"];
+        };
+        DeliveryWorktreeDispositionDto: {
+            failure: null | components["schemas"]["DeliveryOperationFailureDto"];
+            state: components["schemas"]["DeliveryWorktreeDispositionStateDto"];
+            /** Format: int64 */
+            version: number;
+        };
+        /** @enum {string} */
+        DeliveryWorktreeDispositionStateDto: "retained_locked" | "retained_unlocked" | "removed" | "reconciliation_required";
         DiffFileDto: {
             /** Format: int64 */
             additions: number;
@@ -930,6 +1222,76 @@ export interface operations {
                 };
             };
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    delivery_operation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Delivery operation ID */
+                operation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryOperationDto"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1787,6 +2149,532 @@ export interface operations {
                 };
             };
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    delete_branch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task ID */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryDeleteBranchRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    remove_worktree: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task ID */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryRemoveWorktreeRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    task_delivery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task ID */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryTaskDto"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    accept_merge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task ID */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryMergeRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    preflight: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Task ID */
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeliveryPreflightRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeliveryCommandResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            504: {
                 headers: {
                     [name: string]: unknown;
                 };

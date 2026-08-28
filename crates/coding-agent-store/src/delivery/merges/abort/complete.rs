@@ -5,7 +5,6 @@ use crate::delivery::{
 use crate::tasks::current_timestamp;
 use crate::{Store, StoreError};
 
-use super::super::conflicts::{conflict_paths_match, insert_conflict_paths};
 use super::super::merge_invariant;
 use super::super::model::{
     CompleteMergeAbortRequest, MergeTransitionOutcome, MergeTransitionReceipt,
@@ -51,9 +50,7 @@ impl Store {
         }
         let receipt = apply_complete_abort(&mut transaction, &request, target_version).await?;
         let updated = load_merge_operation_exact(&mut transaction, request.operation_id).await?;
-        if !abort_applied_proof_matches(&updated, &request)
-            || !conflict_paths_match(&updated, &request.paths)
-        {
+        if !abort_applied_proof_matches(&updated, &request) {
             return Err(merge_invariant());
         }
         transaction.commit().await?;
@@ -77,10 +74,7 @@ async fn classify_complete_replay(
     )
     .await?
     {
-        TransitionLookup::Exact(receipt)
-            if abort_applied_proof_matches(operation, request)
-                && conflict_paths_match(operation, &request.paths) =>
-        {
+        TransitionLookup::Exact(receipt) if abort_applied_proof_matches(operation, request) => {
             Ok(Some(MergeTransitionOutcome::Existing(receipt)))
         }
         TransitionLookup::Exact(_) | TransitionLookup::Conflict => {
@@ -98,11 +92,11 @@ async fn apply_complete_abort(
     let timestamp: DeliveryTimestamp = current_timestamp()?.to_string().parse()?;
     let updated = sqlx::query(
         "UPDATE task_merge_operations \
-         SET conflict_path_count = ?, state = 'conflict', failure_code = 'MERGE_CONFLICT', \
-             version = ?, updated_at = ? \
-         WHERE operation_id = ? AND task_id = ? AND state = 'abort_pending' AND version = ?",
+         SET state = 'conflict', failure_code = 'MERGE_CONFLICT', \
+              version = ?, updated_at = ? \
+          WHERE operation_id = ? AND task_id = ? AND state = 'abort_pending' AND version = ? \
+            AND conflict_path_count > 0",
     )
-    .bind(i64::try_from(request.paths.len()).map_err(|_| merge_invariant())?)
     .bind(version_i64(target_version)?)
     .bind(timestamp.to_string())
     .bind(request.operation_id.to_string())
@@ -113,7 +107,6 @@ async fn apply_complete_abort(
     if updated.rows_affected() != 1 {
         return Err(merge_invariant());
     }
-    insert_conflict_paths(&mut *connection, request.operation_id, &request.paths).await?;
     require_complete_transition(connection, request, target_version).await
 }
 

@@ -58,6 +58,7 @@ export interface UseAgentStateDependencies {
 
 export interface UseAgentStateResult {
   state: AgentState;
+  expireSession(): void;
   selectTask(taskId: string): void;
   addRepository(path: string): Promise<Repository>;
   pickRepository(): Promise<Repository | null>;
@@ -256,6 +257,7 @@ export function useAgentState(
   const dependenciesRef = useRef(dependencies);
   const streamRef = useRef<AgentStreamAdapter | null>(null);
   const mountedRef = useRef(true);
+  const sessionExpiredRef = useRef(false);
   const projectionRecoveryRef = useRef<{
     active: boolean;
     bufferedEvents: TaskEvent[];
@@ -292,6 +294,8 @@ export function useAgentState(
   }, []);
 
   const expireSession = useCallback(() => {
+    if (sessionExpiredRef.current) return;
+    sessionExpiredRef.current = true;
     const stream = streamRef.current;
     streamRef.current = null;
     projectionRecoveryRef.current = {
@@ -310,6 +314,18 @@ export function useAgentState(
 
   useEffect(() => {
     mountedRef.current = true;
+    if (sessionExpiredRef.current) {
+      if (stateRef.current.connection !== "session_expired") {
+        dispatchStreamAction({ type: "session.expired" });
+      }
+      return () => {
+        mountedRef.current = false;
+        projectionRecoveryRef.current = {
+          active: false,
+          bufferedEvents: [],
+        };
+      };
+    }
     let disposed = false;
     let stream: AgentStreamAdapter | null = null;
     dispatch({ type: "bootstrap.started" });
@@ -672,6 +688,7 @@ export function useAgentState(
 
   return {
     state,
+    expireSession,
     selectTask,
     addRepository,
     pickRepository,

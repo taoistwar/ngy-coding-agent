@@ -2,6 +2,10 @@ use coding_agent_domain::{ClientRequestId, TaskId};
 use serde::{Deserialize, Serialize};
 
 use super::{domain_client_request_id, parse_task_id, validate_request_ids};
+use crate::delivery::mutation::{
+    DeliveryMutationEntity, DeliveryMutationEntityKind, DeliveryMutationKey, DeliveryMutationKind,
+    DeliveryMutationReceiptIdentity, impl_delivery_mutation_request,
+};
 use crate::delivery::receipts::hash;
 use crate::delivery::receipts::model::{
     CanonicalCommandRequest, CommandActionAnchor, CommandRequestKey, DeliveryCommandKind,
@@ -90,6 +94,29 @@ impl AcceptMergeCommandRequest {
         hash::accept_merge(self)
     }
 }
+
+impl_delivery_mutation_request!(AcceptMergeCommandRequest, |request| {
+    let accepted_version = request
+        .expected_operation_version
+        .next()
+        .expect("accept requests validate their next operation version");
+    DeliveryMutationKey::new(
+        DeliveryMutationKind::AcceptMerge,
+        request.task_id,
+        vec![DeliveryMutationEntity::operation(
+            DeliveryMutationEntityKind::MergeOperation,
+            request.preflight_operation_id,
+            request.expected_operation_version,
+        )],
+        Some(DeliveryMutationReceiptIdentity::new(
+            request.client_request_id,
+            DeliveryCommandKind::AcceptMerge,
+            request.canonical_request_hash(),
+            accepted_version,
+            Some(request.preflight_operation_id),
+        )),
+    )
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]

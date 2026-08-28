@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 use http::StatusCode;
 use serde_json::Value;
 
+mod delivery;
+
+pub use delivery::DeliveryApiErrorKind;
+
 pub type ApiResult<T> = Result<T, ApiError>;
 
 #[derive(Debug, thiserror::Error)]

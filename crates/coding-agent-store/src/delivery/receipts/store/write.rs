@@ -63,14 +63,18 @@ pub(crate) async fn insert_receipt(
         .then(|| write.operation_id.to_string());
     let cleanup_operation_id = (operation_kind == DeliveryOperationKind::CleanupOperation)
         .then(|| write.operation_id.to_string());
+    let cleanup_merged_operation_id = match write.key.action_anchor {
+        CommandActionAnchor::CleanupFromMerge(operation_id) => Some(operation_id.to_string()),
+        CommandActionAnchor::NewOperation | CommandActionAnchor::ExistingOperation(_) => None,
+    };
     sqlx::query(
         "INSERT INTO task_delivery_command_receipts ( \
              client_request_id, command_kind, task_id, repository_id, attempt, \
              request_hash_domain, request_hash_version, request_hash_algorithm, \
              canonical_request_hash, operation_kind, operation_id, merge_operation_id, \
-             cleanup_operation_id, accepted_operation_version, accepted_operation_state, \
-             response_discriminator, created_at \
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             cleanup_operation_id, cleanup_merged_operation_id, accepted_operation_version, \
+             accepted_operation_state, response_discriminator, created_at \
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(write.key.client_request_id.to_string())
     .bind(write.key.command_kind.as_str())
@@ -85,6 +89,7 @@ pub(crate) async fn insert_receipt(
     .bind(write.operation_id.to_string())
     .bind(merge_operation_id)
     .bind(cleanup_operation_id)
+    .bind(cleanup_merged_operation_id)
     .bind(i64::try_from(write.accepted_operation_version.get()).map_err(|_| receipt_invariant())?)
     .bind(write.accepted_operation_state.as_str())
     .bind(write.key.command_kind.response_discriminator().as_str())

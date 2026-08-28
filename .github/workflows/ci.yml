@@ -54,6 +54,9 @@ jobs:
       - name: Check generated API client
         run: npm --prefix web run api:check
 
+      - name: Check frontend configuration
+        run: npm --prefix web run config:check
+
       - name: Check API artifacts are unchanged
         run: git diff --exit-code -- web/openapi.json web/src/api/generated/schema.d.ts
 
@@ -73,7 +76,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 
       - name: Test Rust workspace
-        run: cargo test --workspace --all-features --locked --offline
+        run: cargo test --workspace --all-targets --all-features --locked --offline
 
       - name: Build E2E application
         run: cargo build --locked --offline -p coding-agent-app --features e2e
@@ -142,6 +145,9 @@ jobs:
       - name: Check generated API client
         run: npm --prefix web run api:check
 
+      - name: Check frontend configuration
+        run: npm --prefix web run config:check
+
       - name: Check API artifacts are unchanged
         run: git diff --exit-code -- web/openapi.json web/src/api/generated/schema.d.ts
 
@@ -161,7 +167,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 
       - name: Test Rust workspace
-        run: cargo test --workspace --all-features --locked --offline
+        run: cargo test --workspace --all-targets --all-features --locked --offline
 
       - name: Build embedded release application
         run: cargo build --release --locked --offline -p coding-agent-app --features embedded-web

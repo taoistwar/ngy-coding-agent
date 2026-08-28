@@ -106,7 +106,10 @@ fn source_identity_matches(
     operation: &MergeOperationRecord,
 ) -> bool {
     source.provenance == operation.provenance
-        && source.candidate_tree == operation.candidate_tree
+        && operation
+            .preflight_inputs
+            .as_ref()
+            .is_some_and(|inputs| source.candidate_tree == inputs.candidate_tree)
         && source.expected_source_commit.is_some()
 }
 
