@@ -618,7 +618,7 @@ async fn complete_liveness_with_deadline(
     }
 }
 
-async fn complete_liveness_eventually(mut liveness: ProcessLivenessSentinel) {
+pub(super) async fn complete_liveness_eventually(mut liveness: ProcessLivenessSentinel) {
     loop {
         match liveness.try_complete_after_tree_exit() {
             Ok(ProcessCleanupProof::Confirmed) => return,

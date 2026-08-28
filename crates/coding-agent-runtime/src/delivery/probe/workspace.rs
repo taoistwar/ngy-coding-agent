@@ -165,7 +165,7 @@ impl ProbeWorkspace {
     fn initialize_git_sandbox(&mut self) -> Result<(), DeliveryGitProbeError> {
         #[cfg(unix)]
         {
-            return self.create_empty_config();
+            self.create_empty_config()
         }
         #[cfg(windows)]
         Ok(())

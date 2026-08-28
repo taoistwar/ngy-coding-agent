@@ -1027,7 +1027,7 @@ fn worktree_metadata_matches_mode(
         use std::os::unix::fs::MetadataExt as _;
 
         let executable = metadata.mode() & 0o111 != 0;
-        return executable == (expected == ConflictWorktreeMode::Executable);
+        executable == (expected == ConflictWorktreeMode::Executable)
     }
     #[cfg(not(unix))]
     {

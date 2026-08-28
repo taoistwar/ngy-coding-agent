@@ -202,11 +202,14 @@ fn sample_authenticated_directory(directory: &File) -> Result<VolumeSample, Volu
 
 #[cfg(unix)]
 fn unix_available_bytes(statistics: &libc::statvfs) -> Result<u64, VolumeSampleError> {
-    let available_units =
-        u64::try_from(statistics.f_bavail).map_err(|_| VolumeSampleError::Unavailable)?;
-    let fragment_size =
-        u64::try_from(statistics.f_frsize).map_err(|_| VolumeSampleError::Unavailable)?;
+    let available_units = statvfs_value_to_u64(statistics.f_bavail)?;
+    let fragment_size = statvfs_value_to_u64(statistics.f_frsize)?;
     checked_available_bytes(available_units, fragment_size)
+}
+
+#[cfg(unix)]
+fn statvfs_value_to_u64(value: impl TryInto<u64>) -> Result<u64, VolumeSampleError> {
+    value.try_into().map_err(|_| VolumeSampleError::Unavailable)
 }
 
 #[cfg(windows)]

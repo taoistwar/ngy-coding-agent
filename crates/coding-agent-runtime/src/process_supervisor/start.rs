@@ -327,7 +327,7 @@ impl ProcessSupervisor {
             .map_err(ProcessError::CommandPolicy)?;
         #[cfg(unix)]
         let delivery_descriptor_arguments =
-            platform::DeliveryDescriptorArguments::try_new(&command)?;
+            platform::DeliveryDescriptorArguments::try_new(command)?;
         let executable = platform::Executable::new(command.executable().path(), executable_file)
             .map_err(ProcessError::TreeSetupFailed)?;
         let mut process = Command::new(executable.program());

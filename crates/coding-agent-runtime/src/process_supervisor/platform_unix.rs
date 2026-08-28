@@ -126,9 +126,9 @@ fn replace_delivery_argument(
     index: usize,
     replacement: OsString,
 ) -> Result<(), ProcessError> {
-    let argument = arguments
-        .get_mut(index)
-        .ok_or_else(|| ProcessError::CommandPolicy(CommandPolicyError::InvalidGitBinding))?;
+    let argument = arguments.get_mut(index).ok_or(ProcessError::CommandPolicy(
+        CommandPolicyError::InvalidGitBinding,
+    ))?;
     *argument = replacement;
     Ok(())
 }

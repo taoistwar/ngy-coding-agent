@@ -7,6 +7,8 @@ use std::task::{Context, Poll};
 use tempfile::TempDir;
 use tokio::io::ReadBuf;
 
+#[cfg(unix)]
+use super::supervision::complete_liveness_eventually;
 use super::*;
 #[cfg(unix)]
 use crate::command_policy::{
