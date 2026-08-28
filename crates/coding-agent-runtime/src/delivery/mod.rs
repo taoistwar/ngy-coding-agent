@@ -473,7 +473,9 @@ mod tests {
         }
 
         fn private_runtime(&self) -> Arc<ExecutionDirectory> {
-            Arc::new(ExecutionDirectory::open(self._temporary.path()).unwrap())
+            Arc::new(
+                ExecutionDirectory::open(self._temporary.path().canonicalize().unwrap()).unwrap(),
+            )
         }
     }
 }

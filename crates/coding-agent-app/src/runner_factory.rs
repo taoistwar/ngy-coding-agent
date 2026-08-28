@@ -1229,12 +1229,9 @@ mod tests {
         ProcessLivenessScope,
     ) {
         let temporary = tempfile::tempdir().unwrap();
-        let paths = PlatformPaths::new(
-            temporary.path().join("data"),
-            temporary.path().join("runtime"),
-        );
-        std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let paths = PlatformPaths::new(root.join("data"), root.join("runtime"));
+        paths.prepare().unwrap();
         let store = Store::open(&paths.database_path).await.unwrap();
         store.migrate().await.unwrap();
         let runtime_config = load_runtime_config(&paths).unwrap();
@@ -1453,12 +1450,9 @@ mod tests {
     #[tokio::test]
     async fn fixed_factory_dynamic_registrar_converges_existing_rows_without_rebinding() {
         let temporary = tempfile::tempdir().unwrap();
-        let paths = PlatformPaths::new(
-            temporary.path().join("data"),
-            temporary.path().join("runtime"),
-        );
-        std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let paths = PlatformPaths::new(root.join("data"), root.join("runtime"));
+        paths.prepare().unwrap();
         let store = Store::open(&paths.database_path).await.unwrap();
         store.migrate().await.unwrap();
         let dispatcher = EventDispatcherHandle::spawn(store.clone(), 16)
@@ -1661,12 +1655,9 @@ mod tests {
     #[tokio::test]
     async fn production_factory_builds_a_noncontacted_https_runner_with_configured_concurrency() {
         let temporary = tempfile::tempdir().unwrap();
-        let paths = PlatformPaths::new(
-            temporary.path().join("data"),
-            temporary.path().join("runtime"),
-        );
-        std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let paths = PlatformPaths::new(root.join("data"), root.join("runtime"));
+        paths.prepare().unwrap();
         let mut provider = PrivateFile::create_new(paths.data_dir.join("provider.json")).unwrap();
         provider
             .write_all(

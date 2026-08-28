@@ -50,7 +50,7 @@ async fn busy_control_lease_for_fifo_head_does_not_block_another_repository_key(
     let resources =
         test_task_manager_launch_resources_for_repository(2, 1, &first_repository, &first_root);
     let coordinator = resources.repository_control();
-    let second_marker = RootCapability::open(&second_root)
+    let second_marker = RootCapability::open(second_root.canonicalize().unwrap())
         .expect("open second repository capability")
         .identity_marker()
         .expect("read second repository identity");
@@ -187,7 +187,7 @@ async fn missing_fifo_head_storage_scope_does_not_starve_a_ready_repository() {
     let mut resources =
         test_task_manager_launch_resources_for_repository(2, 1, &first_repository, &first_root);
     let coordinator = resources.repository_control();
-    let second_marker = RootCapability::open(&second_root)
+    let second_marker = RootCapability::open(second_root.canonicalize().unwrap())
         .expect("open second repository capability")
         .identity_marker()
         .expect("read second repository identity");

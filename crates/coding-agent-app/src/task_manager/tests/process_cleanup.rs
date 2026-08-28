@@ -5,10 +5,11 @@ use super::*;
 fn terminal_release_confirmation_requires_runner_return_and_the_exact_task_scope() {
     let runtime = tempfile::tempdir().expect("create process-liveness runtime");
     let other_runtime = tempfile::tempdir().expect("create other process-liveness runtime");
-    let directory =
-        ProcessLivenessDirectory::open(runtime.path()).expect("open process-liveness runtime");
-    let other_directory = ProcessLivenessDirectory::open(other_runtime.path())
-        .expect("open other process-liveness runtime");
+    let directory = ProcessLivenessDirectory::open(runtime.path().canonicalize().unwrap())
+        .expect("open process-liveness runtime");
+    let other_directory =
+        ProcessLivenessDirectory::open(other_runtime.path().canonicalize().unwrap())
+            .expect("open other process-liveness runtime");
     let mut instance_id = [0x31; 16];
     instance_id[6] = 0x41;
     instance_id[8] = 0x81;
@@ -46,7 +47,7 @@ fn terminal_release_confirmation_requires_runner_return_and_the_exact_task_scope
     )
     .expect("scope B has a self-consistent clean confirmation");
     let repository = tempfile::tempdir().expect("create repository identity");
-    let marker = RootCapability::open(repository.path())
+    let marker = RootCapability::open(repository.path().canonicalize().unwrap())
         .expect("open repository identity")
         .identity_marker()
         .expect("read repository identity");
@@ -244,8 +245,8 @@ async fn shutdown_process_cleanup_is_immediate_without_spawned_runners() {
 #[tokio::test]
 async fn shutdown_process_cleanup_retires_confirmed_runners_across_many_rounds() {
     let runtime = tempfile::tempdir().expect("create bounded process-cleanup runtime");
-    let directory =
-        ProcessLivenessDirectory::open(runtime.path()).expect("open bounded process runtime");
+    let directory = ProcessLivenessDirectory::open(runtime.path().canonicalize().unwrap())
+        .expect("open bounded process runtime");
     let instance_scope = directory
         .instance_scope(*uuid::Uuid::new_v4().as_bytes())
         .expect("derive bounded process-cleanup instance scope");
@@ -294,8 +295,8 @@ async fn shutdown_process_cleanup_retires_confirmed_runners_across_many_rounds()
 #[test]
 fn shutdown_process_cleanup_mismatch_does_not_retire_outstanding_ownership() {
     let runtime = tempfile::tempdir().expect("create mismatch process-cleanup runtime");
-    let directory =
-        ProcessLivenessDirectory::open(runtime.path()).expect("open mismatch process runtime");
+    let directory = ProcessLivenessDirectory::open(runtime.path().canonicalize().unwrap())
+        .expect("open mismatch process runtime");
     let instance_scope = directory
         .instance_scope(*uuid::Uuid::new_v4().as_bytes())
         .expect("derive mismatch process-cleanup instance scope");
@@ -442,7 +443,7 @@ async fn shutdown_finalization_deadline_covers_response_wait_after_send_succeeds
 #[tokio::test]
 async fn shutdown_process_cleanup_waits_for_the_exact_held_tree() {
     let runtime = tempfile::tempdir().expect("create shutdown process-cleanup runtime");
-    let directory = ProcessLivenessDirectory::open(runtime.path())
+    let directory = ProcessLivenessDirectory::open(runtime.path().canonicalize().unwrap())
         .expect("open shutdown process-cleanup runtime");
     let instance_scope = directory
         .instance_scope(*uuid::Uuid::new_v4().as_bytes())
@@ -474,7 +475,7 @@ async fn shutdown_process_cleanup_waits_for_the_exact_held_tree() {
 #[test]
 fn batch_terminal_preflight_rejects_a_later_corruption_without_consuming_the_first() {
     let runtime = tempfile::tempdir().expect("create batch-preflight runtime");
-    let directory = ProcessLivenessDirectory::open(runtime.path())
+    let directory = ProcessLivenessDirectory::open(runtime.path().canonicalize().unwrap())
         .expect("open batch-preflight process directory");
     let mut instance_id = [0x52; 16];
     instance_id[6] = 0x42;
@@ -495,7 +496,7 @@ fn batch_terminal_preflight_rejects_a_later_corruption_without_consuming_the_fir
         TaskProcessCleanupConfirmation::try_new(RunnerReturnedState::new(&scope_b), &scope_b)
             .expect("second batch-preflight cleanup is clean");
     let repository = tempfile::tempdir().expect("create batch-preflight repository");
-    let marker = RootCapability::open(repository.path())
+    let marker = RootCapability::open(repository.path().canonicalize().unwrap())
         .expect("open batch-preflight repository")
         .identity_marker()
         .expect("read batch-preflight repository identity");

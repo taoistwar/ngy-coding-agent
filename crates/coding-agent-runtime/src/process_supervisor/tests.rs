@@ -474,7 +474,7 @@ async fn attached_cleanup_wait_failure_retains_the_sentinel_until_tree_proof() {
 
 async fn assert_fault_retains_sentinel_until_tree_proof(fault: SupervisionFault, seed: u8) {
     let temp = tempfile::tempdir().unwrap();
-    let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+    let directory = ProcessLivenessDirectory::open(temp.path().canonicalize().unwrap()).unwrap();
     let instance = directory.instance_scope(test_uuid(seed)).unwrap();
     let task = instance
         .task_scope(test_uuid(seed.wrapping_add(32)))
@@ -862,7 +862,7 @@ async fn leader_exit_and_aborted_supervisor_both_kill_the_entire_tree() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scoped_supervisor_keeps_cleanup_unproven_until_the_whole_tree_exits() {
     let temp = tempfile::tempdir().unwrap();
-    let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+    let directory = ProcessLivenessDirectory::open(temp.path().canonicalize().unwrap()).unwrap();
     let instance = directory.instance_scope(test_uuid(31)).unwrap();
     let task = instance.task_scope(test_uuid(32)).unwrap();
     let limits =
@@ -961,7 +961,7 @@ async fn a_new_primary_probes_the_crashed_primary_tree_before_cleanup_is_confirm
     let grandchild_id = wait_for_helper_pid(&pid_file).await;
     assert!(primary.wait().await.unwrap().success());
 
-    let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+    let directory = ProcessLivenessDirectory::open(temp.path().canonicalize().unwrap()).unwrap();
     #[cfg(unix)]
     assert_eq!(
         directory.probe_stale().unwrap(),
@@ -997,7 +997,7 @@ async fn eventual_cleanup_keeps_retry_ownership_across_unknown_probe_state() {
     use std::os::fd::{FromRawFd as _, RawFd};
 
     let temp = tempfile::tempdir().unwrap();
-    let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+    let directory = ProcessLivenessDirectory::open(temp.path().canonicalize().unwrap()).unwrap();
     let instance = directory.instance_scope(test_uuid(41)).unwrap();
     let task = instance.task_scope(test_uuid(42)).unwrap();
     let mut liveness = task.begin_tree().unwrap();
@@ -1421,7 +1421,7 @@ fn supervisor(output_bytes: usize, max_timeout: Duration) -> ProcessSupervisor {
 }
 
 fn fault_supervisor(temp: &TempDir, seed: u8) -> ProcessSupervisor {
-    let directory = ProcessLivenessDirectory::open(temp.path()).unwrap();
+    let directory = ProcessLivenessDirectory::open(temp.path().canonicalize().unwrap()).unwrap();
     let instance = directory.instance_scope(test_uuid(seed)).unwrap();
     let task = instance
         .task_scope(test_uuid(seed.wrapping_add(64)))
@@ -1578,7 +1578,11 @@ fn wait_for_helper_pid_sync() {
 }
 
 async fn wait_for_helper_pid(path: &Path) -> u32 {
-    let deadline = TokioInstant::now() + Duration::from_secs(3);
+    // Starting a helper may include re-hashing this comparatively large test
+    // binary while revalidating its pinned executable. Slow and shared CI
+    // workers must not turn that bounded authentication work into a false
+    // process-start failure.
+    let deadline = TokioInstant::now() + Duration::from_secs(15);
     loop {
         if let Ok(value) = std::fs::read_to_string(path) {
             return value.parse().unwrap();

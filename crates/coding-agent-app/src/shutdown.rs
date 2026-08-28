@@ -1496,7 +1496,8 @@ mod tests {
     #[tokio::test]
     async fn a_late_worker_panic_reuses_the_original_absolute_shutdown_deadline() {
         let directory = tempfile::tempdir().expect("create panic-supervision directory");
-        let paths = PlatformPaths::new(directory.path().join("data"), directory.path().join("run"));
+        let root = directory.path().canonicalize().unwrap();
+        let paths = PlatformPaths::new(root.join("data"), root.join("run"));
         paths.prepare().expect("prepare panic-supervision paths");
         let store = Store::open(&paths.database_path)
             .await

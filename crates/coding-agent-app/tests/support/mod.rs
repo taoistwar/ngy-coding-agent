@@ -64,11 +64,14 @@ pub fn instance_process_scope(runtime_directory: &Path) -> ProcessLivenessScope 
 
 fn private_liveness_runtime(runtime_directory: &Path) -> PathBuf {
     let liveness_runtime = runtime_directory.join(".process-liveness-test-runtime");
-    std::fs::create_dir_all(&liveness_runtime)
+    PlatformPaths::new(&liveness_runtime, &liveness_runtime)
+        .prepare()
         .expect("create private process-liveness test runtime");
     harden_private_liveness_runtime(&liveness_runtime)
         .expect("harden private process-liveness test runtime");
     liveness_runtime
+        .canonicalize()
+        .expect("canonicalize private process-liveness test runtime")
 }
 
 #[cfg(unix)]
@@ -313,7 +316,8 @@ pub struct ShutdownFixture {
 impl StartupFixture {
     pub fn new() -> Self {
         let temp = Arc::new(tempfile::tempdir().expect("create startup fixture"));
-        let paths = PlatformPaths::new(temp.path().join("data"), temp.path().join("runtime"));
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PlatformPaths::new(root.join("data"), root.join("runtime"));
         Self {
             paths,
             calls: Arc::new(StartupCalls::default()),
@@ -544,10 +548,6 @@ impl StartupPaths for FixedStartupPaths {
         Ok(self.paths.clone())
     }
 
-    fn prepare_lock_parent(&self, paths: &PlatformPaths) -> io::Result<()> {
-        std::fs::create_dir_all(&paths.runtime_dir)
-    }
-
     fn prepare(&self, paths: &PlatformPaths) -> io::Result<()> {
         if let Some(kind) = self.prepare_error {
             return Err(io::Error::new(kind, "injected path preparation failure"));
@@ -706,8 +706,9 @@ impl Drop for StoreFixtureRoot {
 impl StoreFixture {
     pub fn instance_process_scope(&self) -> ProcessLivenessScope {
         let runtime_directory = self.root.join("runtime");
-        std::fs::create_dir_all(&runtime_directory)
-            .expect("create store-fixture runtime directory");
+        PlatformPaths::new(self.root.join("data"), &runtime_directory)
+            .prepare()
+            .expect("create store-fixture private runtime directory");
         instance_process_scope(&runtime_directory)
     }
 
@@ -1049,12 +1050,12 @@ pub async fn degraded_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
 
 pub async fn store_fixture() -> StoreFixture {
     let temp_dir = tempfile::tempdir().expect("create app fixture directory");
-    let database_path = temp_dir.path().join("store.sqlite3");
+    let root = temp_dir.path().canonicalize().unwrap();
+    let database_path = root.join("store.sqlite3");
     let store = Store::open(database_path)
         .await
         .expect("open fixture store");
     store.migrate().await.expect("migrate fixture store");
-    let root = temp_dir.path().to_path_buf();
     let repository = match store
         .register_repository(repository_input_at(&root, "seed"))
         .await

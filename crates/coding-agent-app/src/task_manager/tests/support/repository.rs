@@ -1,4 +1,5 @@
 async fn register_repository(store: &Store, root: PathBuf) -> Repository {
+    let root = root.canonicalize().unwrap();
     let input = NewRepository {
         selected_path: canonical(root.join("selected")),
         display_name: "claim pause".to_owned(),
@@ -31,7 +32,7 @@ fn register_repository_control_for_test(
     repository: &Repository,
     root: &Path,
 ) {
-    let marker = RootCapability::open(root)
+    let marker = RootCapability::open(root.canonicalize().unwrap())
         .expect("open task-manager test repository capability")
         .identity_marker()
         .expect("read task-manager test repository identity");

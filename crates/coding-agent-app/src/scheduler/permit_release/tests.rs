@@ -6,7 +6,7 @@ use super::*;
 fn terminal_batch_preflights_every_item_before_releasing_any_capacity() {
     let repository = tempfile::tempdir().expect("create repository identity");
     let key = RepositoryCoordinationKey::from_authenticated_marker(
-        RootCapability::open(repository.path())
+        RootCapability::open(repository.path().canonicalize().unwrap())
             .expect("open repository identity")
             .identity_marker()
             .expect("observe repository identity"),

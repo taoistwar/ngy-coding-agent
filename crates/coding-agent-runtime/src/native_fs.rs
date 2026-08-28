@@ -26,7 +26,24 @@ pub(crate) fn open_child_directory(parent: &File, name: &OsStr) -> io::Result<Fi
         )
     };
     if descriptor < 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOTDIR) {
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            let result = unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0
+                && unsafe { metadata.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK
+            {
+                return Err(io::Error::from_raw_os_error(libc::ELOOP));
+            }
+        }
+        Err(error)
     } else {
         // SAFETY: openat returned a new owned descriptor on success.
         Ok(unsafe { File::from_raw_fd(descriptor) })
@@ -35,11 +52,11 @@ pub(crate) fn open_child_directory(parent: &File, name: &OsStr) -> io::Result<Fi
 
 #[cfg(all(test, unix))]
 mod unix_tests {
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs::File;
     use std::os::unix::fs::PermissionsExt as _;
 
-    use super::create_private_child_file_exclusive;
+    use super::{create_private_child_file_exclusive, open_child_directory, read_directory_names};
 
     #[test]
     fn private_child_file_excludes_group_and_other_access() {
@@ -49,6 +66,40 @@ mod unix_tests {
             .expect("create private child");
 
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+    }
+
+    #[test]
+    fn directory_enumeration_excludes_unix_dot_entries_from_limits_and_results() {
+        let fixture = tempfile::tempdir().expect("create fixture");
+        let mut directory = File::open(fixture.path()).expect("open fixture parent");
+
+        assert!(read_directory_names(&mut directory, 0).unwrap().is_empty());
+
+        std::fs::write(fixture.path().join("child"), b"child").expect("write child");
+        let mut directory = File::open(fixture.path()).expect("reopen fixture parent");
+        assert_eq!(
+            read_directory_names(&mut directory, 1).unwrap(),
+            vec![OsString::from("child")]
+        );
+    }
+
+    #[test]
+    fn directory_open_distinguishes_a_link_from_a_plain_wrong_kind_entry() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().expect("create fixture");
+        let parent = File::open(fixture.path()).expect("open fixture parent");
+        std::fs::write(fixture.path().join("plain-file"), b"plain")
+            .expect("create plain wrong-kind entry");
+        symlink("plain-file", fixture.path().join("linked-entry")).expect("create linked entry");
+
+        let plain_error = open_child_directory(&parent, OsStr::new("plain-file"))
+            .expect_err("a plain file is not a directory");
+        assert_eq!(plain_error.raw_os_error(), Some(libc::ENOTDIR));
+
+        let link_error = open_child_directory(&parent, OsStr::new("linked-entry"))
+            .expect_err("a linked entry is never followed as a directory");
+        assert_eq!(link_error.raw_os_error(), Some(libc::ELOOP));
     }
 }
 
@@ -589,13 +640,17 @@ pub(crate) fn read_directory_names(
 ) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in fs_at::read_dir(directory)? {
+        let name = entry?.name().to_owned();
+        if name == OsStr::new(".") || name == OsStr::new("..") {
+            continue;
+        }
         if names.len() == max_entries {
             return Err(io::Error::new(
                 io::ErrorKind::FileTooLarge,
                 "directory exceeds its entry limit",
             ));
         }
-        names.push(entry?.name().to_owned());
+        names.push(name);
     }
     Ok(names)
 }

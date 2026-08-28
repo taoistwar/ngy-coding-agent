@@ -1113,11 +1113,12 @@ mod tests {
     #[cfg(feature = "test-support")]
     use crate::{
         CommandRunner, FixedStartupRunnerFactory, LegacyV2Seed, PlatformPaths,
-        PreActorStartupRunnerContext, ProcessRunnerMode, ProcessStorageSample, ProcessTestConfig,
-        ProcessTestEnvironment, RepositoryControlError, RunContext, RunnerEventSink, RunnerOutcome,
-        StartupDependencies, StartupRunnerFactory, StoreWriterFaultPoint, StoreWriterFaultSpec,
-        StoreWriterOperationKind, StoreWriterTestController, TaskRunner, VirtualReleaseSignal,
-        VirtualReleaseTarget, load_runtime_config,
+        PreActorStartupRunnerContext, PrivateFile, ProcessRunnerMode, ProcessStorageSample,
+        ProcessTestConfig, ProcessTestEnvironment, RepositoryControlError, RunContext,
+        RunnerEventSink, RunnerOutcome, StartupDependencies, StartupRunnerFactory,
+        StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterOperationKind,
+        StoreWriterTestController, TaskRunner, VirtualReleaseSignal, VirtualReleaseTarget,
+        load_runtime_config,
     };
     use crate::{SecuritySeed, StartupPhaseController, SystemSecurityClock, SystemWallClock};
     #[cfg(feature = "test-support")]
@@ -1380,37 +1381,45 @@ mod tests {
     #[tokio::test]
     async fn forced_shutdown_cancels_create_handler_before_store_writer_handoff() {
         let temporary = tempfile::tempdir().expect("create forced-shutdown fixture");
-        let data_dir = temporary.path().join("data");
-        let runtime_dir = temporary.path().join("runtime");
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonicalize forced-shutdown fixture");
+        let data_dir = root.join("data");
+        let runtime_dir = root.join("runtime");
         let signal_dir = runtime_dir.join("signals");
-        std::fs::create_dir_all(&data_dir).expect("create test data directory");
-        std::fs::create_dir_all(&signal_dir).expect("create test signal directory");
+        PlatformPaths::new(&data_dir, &runtime_dir)
+            .prepare()
+            .expect("prepare private test paths");
+        crate::platform::create_private_directory(&signal_dir)
+            .expect("create private test signal directory");
         let signal_dir = signal_dir
             .canonicalize()
             .expect("canonicalize test signal directory");
         let release_signal = signal_dir.join("create-before-write.release");
         let reached_signal = signal_dir.join("create-before-write.release.reached");
         let scenario = data_dir.join("create-before-write.json");
-        std::fs::write(
-            &scenario,
-            serde_json::to_vec(&ProcessTestConfig {
-                runner_mode: ProcessRunnerMode::ScriptedFake {},
-                runtime_config: None,
-                fake_scenarios: Vec::new(),
-                storage_samples: vec![ProcessStorageSample::Native],
-                store_writer_faults: Vec::new(),
-                actor_pauses: vec![ActorPausePoint::CreateBeforeWrite],
-                virtual_release_signals: vec![VirtualReleaseSignal {
-                    name: "create-before-write".to_owned(),
-                    path: release_signal,
-                    target: VirtualReleaseTarget::ActorCreateBeforeWrite,
-                }],
-                legacy_v2_seed: LegacyV2Seed::None,
-                marker_write_failure: false,
-            })
-            .expect("serialize process-test scenario"),
-        )
-        .expect("write process-test scenario");
+        let encoded_scenario = serde_json::to_vec(&ProcessTestConfig {
+            runner_mode: ProcessRunnerMode::ScriptedFake {},
+            runtime_config: None,
+            fake_scenarios: Vec::new(),
+            storage_samples: vec![ProcessStorageSample::Native],
+            store_writer_faults: Vec::new(),
+            actor_pauses: vec![ActorPausePoint::CreateBeforeWrite],
+            virtual_release_signals: vec![VirtualReleaseSignal {
+                name: "create-before-write".to_owned(),
+                path: release_signal,
+                target: VirtualReleaseTarget::ActorCreateBeforeWrite,
+            }],
+            legacy_v2_seed: LegacyV2Seed::None,
+            marker_write_failure: false,
+        })
+        .expect("serialize process-test scenario");
+        let mut scenario_file =
+            PrivateFile::create_new(&scenario).expect("create private process-test scenario");
+        std::io::Write::write_all(&mut scenario_file, &encoded_scenario)
+            .expect("write process-test scenario");
+        drop(scenario_file);
         let environment = ProcessTestEnvironment::load(&data_dir, &runtime_dir, &scenario)
             .expect("load process-test environment");
         let dependencies = environment
@@ -1542,13 +1551,10 @@ mod tests {
     #[tokio::test]
     async fn repository_registration_deadline_starts_before_discovery() {
         let temporary = tempfile::tempdir().expect("create deadline fixture");
-        let paths = PlatformPaths::new(
-            temporary.path().join("data"),
-            temporary.path().join("runtime"),
-        );
-        std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
-        let repository_root = temporary.path().join("repository");
+        let root = temporary.path().canonicalize().unwrap();
+        let paths = PlatformPaths::new(root.join("data"), root.join("runtime"));
+        paths.prepare().unwrap();
+        let repository_root = root.join("repository");
         std::fs::create_dir_all(repository_root.join(".git")).unwrap();
         std::fs::write(repository_root.join("Cargo.toml"), b"[workspace]\n").unwrap();
         let repository_root = repository_root.canonicalize().unwrap();
@@ -1623,13 +1629,10 @@ mod tests {
     #[tokio::test]
     async fn commit_before_reply_does_not_guess_runtime_attachment_and_existing_retry_converges() {
         let temporary = tempfile::tempdir().expect("create registration fixture");
-        let paths = PlatformPaths::new(
-            temporary.path().join("data"),
-            temporary.path().join("runtime"),
-        );
-        std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
-        let repository_root = temporary.path().join("repository");
+        let root = temporary.path().canonicalize().unwrap();
+        let paths = PlatformPaths::new(root.join("data"), root.join("runtime"));
+        paths.prepare().unwrap();
+        let repository_root = root.join("repository");
         std::fs::create_dir_all(repository_root.join(".git")).unwrap();
         std::fs::write(repository_root.join("Cargo.toml"), b"[workspace]\n").unwrap();
         let repository_root = repository_root.canonicalize().unwrap();

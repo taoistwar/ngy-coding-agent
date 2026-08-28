@@ -31,7 +31,7 @@ fn timestamp(second: u8) -> UtcTimestamp {
 
 fn marker_key(directory: &tempfile::TempDir) -> RepositoryCoordinationKey {
     RepositoryCoordinationKey::from_authenticated_marker(
-        RootCapability::open(directory.path())
+        RootCapability::open(directory.path().canonicalize().unwrap())
             .expect("open authenticated directory")
             .identity_marker()
             .expect("observe directory identity"),

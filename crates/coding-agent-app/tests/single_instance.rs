@@ -11,8 +11,8 @@ use axum::Router;
 #[cfg(feature = "test-support")]
 use coding_agent_app::{
     ActorPausePoint, FakeRunnerConfig, FakeScenario, FixedStartupRunnerFactory, LegacyV2Seed,
-    ProcessRunnerMode, ProcessStorageSample, ProcessTestConfig, ProcessTestEnvironment,
-    ScriptedFakeRunner, VirtualReleaseSignal, VirtualReleaseTarget,
+    PrivateFile, ProcessRunnerMode, ProcessStorageSample, ProcessTestConfig,
+    ProcessTestEnvironment, ScriptedFakeRunner, VirtualReleaseSignal, VirtualReleaseTarget,
 };
 use coding_agent_app::{
     InstanceLock, PreActorStartupRunnerContext, ProductionStartupRunnerFactory, RuntimeDescriptor,
@@ -878,9 +878,9 @@ async fn process_test_legacy_v2_seed_migrates_before_primary_store_projection() 
     std::fs::create_dir_all(repository_path.join(".git"))
         .expect("create authenticated legacy repository identity");
     let scenario = fixture.paths.data_dir.join("legacy-v2-scenario.json");
-    std::fs::write(
+    write_private_process_scenario(
         &scenario,
-        serde_json::to_vec(&ProcessTestConfig {
+        &ProcessTestConfig {
             runner_mode: ProcessRunnerMode::ScriptedFake {},
             runtime_config: None,
             fake_scenarios: Vec::new(),
@@ -893,10 +893,8 @@ async fn process_test_legacy_v2_seed_migrates_before_primary_store_projection() 
                 task_prompt: "Inspect migrated legacy Completed task".to_owned(),
             },
             marker_write_failure: false,
-        })
-        .expect("serialize legacy v2 scenario"),
-    )
-    .expect("write legacy v2 scenario");
+        },
+    );
     let environment = ProcessTestEnvironment::load(
         &fixture.paths.data_dir,
         &fixture.paths.runtime_dir,
@@ -1200,9 +1198,9 @@ fn descriptor_pause_dependencies(
         .paths
         .data_dir
         .join(format!("{scenario_name}-scenario.json"));
-    std::fs::write(
+    write_private_process_scenario(
         &scenario,
-        serde_json::to_vec(&ProcessTestConfig {
+        &ProcessTestConfig {
             runner_mode: ProcessRunnerMode::ScriptedFake {},
             runtime_config: None,
             fake_scenarios,
@@ -1216,10 +1214,8 @@ fn descriptor_pause_dependencies(
             }],
             legacy_v2_seed: LegacyV2Seed::None,
             marker_write_failure: false,
-        })
-        .expect("serialize process-test scenario"),
-    )
-    .expect("write process-test scenario");
+        },
+    );
     let environment = ProcessTestEnvironment::load(
         &fixture.paths.data_dir,
         &fixture.paths.runtime_dir,
@@ -1230,6 +1226,13 @@ fn descriptor_pause_dependencies(
         .apply(fixture.dependencies(Default::default()))
         .expect("apply descriptor pause");
     (dependencies, reached)
+}
+
+#[cfg(feature = "test-support")]
+fn write_private_process_scenario(path: &std::path::Path, scenario: &ProcessTestConfig) {
+    let encoded = serde_json::to_vec(scenario).expect("serialize process-test scenario");
+    let mut file = PrivateFile::create_new(path).expect("create private process-test scenario");
+    std::io::Write::write_all(&mut file, &encoded).expect("write process-test scenario");
 }
 
 fn fragment_token(url: &str) -> &str {

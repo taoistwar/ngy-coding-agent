@@ -2,6 +2,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+#[path = "platform/windows_private_creation.rs"]
+mod windows_private_creation;
+#[cfg(all(test, windows))]
+use windows_private_creation::encode_windows_path;
+#[cfg(windows)]
+use windows_private_creation::{ensure_private_directory_exists, open_private_file_exclusive};
+
 pub trait WallClock: Send + Sync + 'static {
     fn now_utc(&self) -> time::OffsetDateTime;
 }
@@ -88,23 +96,13 @@ impl PrivateFile {
         after_open: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<Self> {
         let path = path.as_ref();
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-
-            options.access_mode(windows_private_file_access_mode());
-        }
-        let file = options.open(path)?;
-        if let Err(error) = after_open().and_then(|()| make_private_file(&file)) {
+        let file = open_private_file_exclusive(path)?;
+        if let Err(error) = after_open().and_then(|()| make_private_new_file(&file)) {
             drop(file);
-            let _ = std::fs::remove_file(path);
+            // The path may have been replaced after the exclusive open. Never
+            // unlink by name here: that could delete an attacker's replacement.
+            // Retaining the exact opened object is the fail-closed outcome for
+            // namespace integrity; callers must not consume it after this error.
             return Err(error);
         }
         Ok(Self(file))
@@ -139,6 +137,15 @@ impl Seek for PrivateFile {
     fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
         self.0.seek(position)
     }
+}
+
+#[cfg(unix)]
+fn open_private_file_exclusive(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true).mode(0o600);
+    options.open(path)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -221,6 +228,11 @@ fn validate_private_file_with(
     file: &File,
     validate_permissions: fn(&File) -> io::Result<()>,
 ) -> io::Result<()> {
+    validate_private_file_kind(file)?;
+    validate_permissions(file)
+}
+
+fn validate_private_file_kind(file: &File) -> io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -239,10 +251,13 @@ fn validate_private_file_with(
             ));
         }
     }
-    validate_permissions(file)
+    Ok(())
 }
 
 pub(crate) fn harden_private_file(file: &File) -> io::Result<()> {
+    validate_private_file_kind(file)?;
+    #[cfg(windows)]
+    validate_windows_current_user_owner(file)?;
     make_private_file(file)?;
     validate_private_file(file)
 }
@@ -316,6 +331,7 @@ fn prepare_private_directory(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
+#[cfg(unix)]
 fn ensure_private_directory_exists(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata_is_link_or_reparse_point(&metadata) => {
@@ -494,6 +510,13 @@ fn make_private_file(file: &File) -> io::Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
+#[cfg(unix)]
+fn make_private_new_file(file: &File) -> io::Result<()> {
+    validate_private_file_kind(file)?;
+    make_private_file(file)?;
+    validate_private_file(file)
+}
+
 #[cfg(target_os = "macos")]
 fn make_private_file(file: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -565,6 +588,11 @@ fn make_private_file(file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+fn make_private_new_file(file: &File) -> io::Result<()> {
+    validate_private_file(file)
+}
+
+#[cfg(windows)]
 fn make_private_windows_handle(file: &File, directory: bool) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use std::ptr::{null, null_mut};
@@ -574,16 +602,23 @@ fn make_private_windows_handle(file: &File, directory: bool) -> io::Result<()> {
         DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    with_windows_user_acl(directory, |acl| unsafe {
-        SetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            acl,
-            null(),
-        )
+    with_windows_user_acl(directory, |acl, _user_sid| {
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null(),
+            )
+        };
+        if status == windows_sys::Win32::Foundation::ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
     })
 }
 
@@ -594,7 +629,7 @@ fn validate_windows_current_user_owner(file: &File) -> io::Result<()> {
 
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{EqualSid, OWNER_SECURITY_INFORMATION};
+    use windows_sys::Win32::Security::{EqualSid, OWNER_SECURITY_INFORMATION, TOKEN_USER};
 
     let mut owner = null_mut();
     let mut descriptor = null_mut();
@@ -619,11 +654,7 @@ fn validate_windows_current_user_owner(file: &File) -> io::Result<()> {
             return Err(invalid_private_permissions());
         }
         let user_buffer = current_user_token_buffer()?;
-        let user = unsafe {
-            &*user_buffer
-                .as_ptr()
-                .cast::<windows_sys::Win32::Security::TOKEN_USER>()
-        };
+        let user = unsafe { &*user_buffer.as_ptr().cast::<TOKEN_USER>() };
         if unsafe { EqualSid(owner, user.User.Sid) } == 0 {
             return Err(invalid_private_permissions());
         }
@@ -735,10 +766,13 @@ fn invalid_private_permissions() -> io::Error {
 }
 
 #[cfg(windows)]
-fn with_windows_user_acl(
+fn with_windows_user_acl<T>(
     directory: bool,
-    apply: impl FnOnce(*mut windows_sys::Win32::Security::ACL) -> u32,
-) -> io::Result<()> {
+    apply: impl FnOnce(
+        *mut windows_sys::Win32::Security::ACL,
+        windows_sys::Win32::Security::PSID,
+    ) -> io::Result<T>,
+) -> io::Result<T> {
     use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
@@ -771,13 +805,9 @@ fn with_windows_user_acl(
         return Err(io::Error::from_raw_os_error(acl_status as i32));
     }
 
-    let status = apply(acl);
+    let result = apply(acl, user.User.Sid);
     unsafe { LocalFree(acl.cast()) };
-    if status == ERROR_SUCCESS {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(status as i32))
-    }
+    result
 }
 
 #[cfg(windows)]
@@ -892,6 +922,8 @@ mod tests {
         private
             .write_all(b"opened file contents")
             .expect("write through the original opened handle");
+        validate_private_file(private.as_file())
+            .expect("the opened private file has an owner-only ACL");
         drop(private);
         assert_eq!(
             std::fs::read(&opened_path).unwrap(),
@@ -947,14 +979,15 @@ mod tests {
     #[test]
     fn retained_runtime_authority_requires_the_expected_namespace_identity() {
         let temporary = tempfile::tempdir().expect("create retained runtime fixture");
-        let paths = PlatformPaths::new(
-            temporary.path().join("data"),
-            temporary.path().join("runtime"),
-        );
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonicalize retained runtime fixture");
+        let paths = PlatformPaths::new(root.join("data"), root.join("runtime"));
         let retained = paths
             .retain_private_runtime_directory()
             .expect("prepare and retain private runtime directory");
-        let replacement = temporary.path().join("replacement-runtime");
+        let replacement = root.join("replacement-runtime");
         std::fs::create_dir(&replacement).expect("create replacement runtime directory");
 
         assert!(matches!(
@@ -970,10 +1003,11 @@ mod tests {
     #[test]
     fn retained_runtime_authority_rejects_a_namespace_replacement() {
         let temporary = tempfile::tempdir().expect("create retained runtime fixture");
-        let paths = PlatformPaths::new(
-            temporary.path().join("data"),
-            temporary.path().join("runtime"),
-        );
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonicalize retained runtime fixture");
+        let paths = PlatformPaths::new(root.join("data"), root.join("runtime"));
         let retained = paths
             .retain_private_runtime_directory()
             .expect("prepare and retain private runtime directory");
@@ -1102,7 +1136,29 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_private_handles_harden_the_acl_without_owner_mutation() {
+    fn windows_private_path_encoding_rejects_embedded_nul() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(OsString::from_wide(&[
+            b'p' as u16,
+            b'r' as u16,
+            b'e' as u16,
+            0,
+            b'f' as u16,
+            b'i' as u16,
+            b'x' as u16,
+        ]));
+
+        assert_eq!(
+            encode_windows_path(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_paths_never_request_owner_mutation_after_open() {
         use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
 
         assert_eq!(
@@ -1113,13 +1169,51 @@ mod tests {
         assert_eq!(
             windows_private_file_access_mode() & WRITE_OWNER,
             0,
-            "private file hardening must not take ownership of another principal's file"
+            "existing private files must reject foreign ownership rather than replace it"
         );
         assert_eq!(
             windows_private_directory_access_mode() & WRITE_OWNER,
             0,
             "private directory hardening must reject foreign ownership rather than replace it"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_private_file_never_takes_over_a_foreign_default_owner() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let temp = tempfile::tempdir().expect("create existing-owner fixture");
+        let path = temp.path().join("existing-private-file");
+        std::fs::write(&path, b"existing").expect("create file with the token's default owner");
+        let observed = File::open(&path).expect("open existing owner for observation");
+        let owner_is_current = validate_windows_current_user_owner(&observed).is_ok();
+
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .access_mode(windows_private_file_access_mode());
+        match options.open(&path) {
+            Ok(file) if owner_is_current => {
+                harden_private_file(&file).expect("harden a current-user-owned existing file");
+            }
+            Ok(file) => {
+                assert_eq!(
+                    harden_private_file(&file).unwrap_err().kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+                assert!(
+                    validate_windows_current_user_owner(&observed).is_err(),
+                    "hardening must not replace a foreign default owner"
+                );
+            }
+            Err(error) if !owner_is_current => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(validate_windows_current_user_owner(&observed).is_err());
+            }
+            Err(error) => panic!("open current-user-owned existing file: {error}"),
+        }
     }
 
     #[cfg(windows)]

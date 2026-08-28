@@ -322,7 +322,7 @@ struct TestVolume {
 
 fn test_volume(token: u64) -> TestVolume {
     let directory = tempfile::tempdir().unwrap();
-    let root = Arc::new(RootCapability::open(directory.path()).unwrap());
+    let root = Arc::new(RootCapability::open(directory.path().canonicalize().unwrap()).unwrap());
     let root_identity = root.identity_marker().unwrap();
     let identity = volume(token);
     TestVolume {
@@ -642,7 +642,7 @@ async fn retained_root_capability_remains_the_probe_authority_after_namespace_re
     let original_path = parent.path().join("original-root");
     let renamed_path = parent.path().join("renamed-root");
     std::fs::create_dir(&original_path).unwrap();
-    let root = Arc::new(RootCapability::open(&original_path).unwrap());
+    let root = Arc::new(RootCapability::open(original_path.canonicalize().unwrap()).unwrap());
     let native_sampler = NativeVolumeSampler::new();
     let initial_sample = native_sampler.sample(&root).unwrap();
     let target = StorageProbeTarget::new(initial_sample.identity(), root);

@@ -277,7 +277,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         std::fs::write(temporary.path().join("ignored-file"), b"keep").unwrap();
         std::fs::create_dir(temporary.path().join("ignored-directory")).unwrap();
-        let root = RootCapability::open(temporary.path()).unwrap();
+        let root = RootCapability::open(temporary.path().canonicalize().unwrap()).unwrap();
 
         let ignored_file = parse_target_path_listing(b"ignored-file\0", 128, true).unwrap();
         let file_write = parse_target_path_listing(b"ignored-file\0", 128, false).unwrap();
@@ -310,7 +310,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         std::fs::write(temporary.path().join("target"), b"outside").unwrap();
         symlink("target", temporary.path().join("ignored-link")).unwrap();
-        let root = RootCapability::open(temporary.path()).unwrap();
+        let root = RootCapability::open(temporary.path().canonicalize().unwrap()).unwrap();
         let ignored = parse_target_path_listing(b"ignored-link\0", 128, true).unwrap();
         let write_set = parse_target_path_listing(b"ignored-link\0", 128, false).unwrap();
 

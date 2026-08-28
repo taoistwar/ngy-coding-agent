@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn delivery_snapshot_rejects_combined_present_and_deleted_paths_over_limit() {
         let directory = tempfile::tempdir().unwrap();
-        let work_tree = ExecutionDirectory::open(directory.path()).unwrap();
+        let work_tree = ExecutionDirectory::open(directory.path().canonicalize().unwrap()).unwrap();
         let limits = FingerprintLimits::try_new(Duration::from_secs(1), 1, 1024, 1024).unwrap();
 
         assert!(matches!(
@@ -500,7 +500,7 @@ mod tests {
     fn delivery_snapshot_keeps_visible_readd_instead_of_replaying_base_deletion() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("present.txt"), b"captured bytes").unwrap();
-        let work_tree = ExecutionDirectory::open(directory.path()).unwrap();
+        let work_tree = ExecutionDirectory::open(directory.path().canonicalize().unwrap()).unwrap();
         let limits = FingerprintLimits::try_new(Duration::from_secs(1), 2, 1024, 1024).unwrap();
 
         let mut snapshot = WorkspaceFingerprinter::capture_delivery_snapshot(

@@ -144,23 +144,7 @@ impl InstanceLock {
             Err(error) => return Err(error),
         }
 
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-            options
-                .access_mode(crate::platform::windows_private_file_access_mode())
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        let file = options.open(path)?;
+        let file = open_instance_lock(path)?;
 
         match file.try_lock() {
             Ok(()) => {
@@ -180,6 +164,48 @@ impl InstanceLock {
     fn keepalive(&self) -> Arc<LockLease> {
         self.lease.clone()
     }
+}
+
+#[cfg(unix)]
+fn open_instance_lock(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn open_instance_lock(path: &Path) -> io::Result<File> {
+    // CREATE_NEW is the ownership boundary: a new lock receives the private
+    // owner/DACL atomically, while a pre-existing path is reopened without
+    // WRITE_OWNER and must pass strict owner validation before ACL changes.
+    match PrivateFile::create_new(path) {
+        Ok(file) => Ok(file.into_file()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_existing_instance_lock(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn open_existing_instance_lock(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .access_mode(crate::platform::windows_private_file_access_mode())
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(path)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -547,7 +573,9 @@ impl Default for StartupPhaseController {
 
 pub trait StartupPaths: Send + Sync + 'static {
     fn discover(&self) -> io::Result<PlatformPaths>;
-    fn prepare_lock_parent(&self, paths: &PlatformPaths) -> io::Result<()>;
+    fn prepare_lock_parent(&self, paths: &PlatformPaths) -> io::Result<()> {
+        paths.prepare_runtime_directory()
+    }
     fn prepare(&self, paths: &PlatformPaths) -> io::Result<()>;
 }
 
@@ -1615,12 +1643,13 @@ mod tests {
     #[test]
     fn completed_cleanup_drop_preserves_a_replacement_descriptor() {
         let temp = tempfile::tempdir().expect("create cleanup fixture");
-        let lock_path = temp.path().join("instance.lock");
-        let descriptor_path = temp.path().join("runtime.json");
+        let root = temp.path().canonicalize().unwrap();
+        let lock_path = root.join("instance.lock");
+        let descriptor_path = root.join("runtime.json");
         let lock = InstanceLock::try_acquire(&lock_path)
             .expect("acquire cleanup fixture lock")
             .expect("cleanup fixture lock is available");
-        let process_scope = ProcessLivenessDirectory::open(temp.path())
+        let process_scope = ProcessLivenessDirectory::open(&root)
             .expect("open cleanup fixture process-liveness directory")
             .instance_scope(*Uuid::new_v4().as_bytes())
             .expect("create cleanup fixture process-liveness scope");
@@ -1655,11 +1684,12 @@ mod tests {
     #[tokio::test]
     async fn aborting_startup_cleanup_worker_keeps_the_lock_fail_closed() {
         let temp = tempfile::tempdir().expect("create fail-closed cleanup fixture");
-        let lock_path = temp.path().join("instance.lock");
+        let root = temp.path().canonicalize().unwrap();
+        let lock_path = root.join("instance.lock");
         let lock = InstanceLock::try_acquire(&lock_path)
             .expect("acquire fail-closed cleanup lock")
             .expect("fail-closed cleanup lock is available");
-        let instance = ProcessLivenessDirectory::open(temp.path())
+        let instance = ProcessLivenessDirectory::open(root)
             .expect("open fail-closed process-liveness directory")
             .instance_scope(*Uuid::new_v4().as_bytes())
             .expect("create fail-closed process-liveness scope");
@@ -1696,15 +1726,16 @@ mod tests {
     #[test]
     fn abandoning_cleanup_after_runtime_actors_exist_retains_the_lock_fail_closed() {
         let temp = tempfile::tempdir().expect("create actor-stage cleanup fixture");
-        let lock_path = temp.path().join("instance.lock");
+        let root = temp.path().canonicalize().unwrap();
+        let lock_path = root.join("instance.lock");
         let lock = InstanceLock::try_acquire(&lock_path)
             .expect("acquire actor-stage cleanup lock")
             .expect("actor-stage cleanup lock is available");
-        let instance = ProcessLivenessDirectory::open(temp.path())
+        let instance = ProcessLivenessDirectory::open(&root)
             .expect("open actor-stage process-liveness directory")
             .instance_scope(*Uuid::new_v4().as_bytes())
             .expect("create actor-stage process-liveness scope");
-        let cleanup = PrimaryRuntimeCleanup::new(lock, temp.path().join("runtime.json"), instance);
+        let cleanup = PrimaryRuntimeCleanup::new(lock, root.join("runtime.json"), instance);
         cleanup.mark_runtime_actors_installed();
 
         drop(cleanup);

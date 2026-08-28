@@ -434,8 +434,9 @@ pub(crate) fn test_process_scope() -> ProcessLivenessScope {
         .get_or_init(|| {
             let temporary =
                 tempfile::tempdir().expect("create private process-liveness unit-test directory");
-            let directory = ProcessLivenessDirectory::open(temporary.path())
-                .expect("open process-liveness unit-test directory");
+            let directory =
+                ProcessLivenessDirectory::open(temporary.path().canonicalize().unwrap())
+                    .expect("open process-liveness unit-test directory");
             let mut instance_id = [0x15; 16];
             instance_id[6] = 0x45;
             instance_id[8] = 0x95;
@@ -1180,8 +1181,8 @@ mod tests {
     #[test]
     fn sealed_cleanup_scope_binds_only_the_exact_worker_scope() {
         let runtime = tempfile::tempdir().expect("create process-liveness runtime");
-        let directory =
-            ProcessLivenessDirectory::open(runtime.path()).expect("open process-liveness runtime");
+        let directory = ProcessLivenessDirectory::open(runtime.path().canonicalize().unwrap())
+            .expect("open process-liveness runtime");
         let mut instance_id = [0x21; 16];
         instance_id[6] = 0x41;
         instance_id[8] = 0x81;
@@ -1221,8 +1222,8 @@ mod tests {
     #[test]
     fn task_scope_seal_linearizes_after_in_flight_registration_and_rejects_late_begins() {
         let runtime = tempfile::tempdir().expect("create process-liveness runtime");
-        let directory =
-            ProcessLivenessDirectory::open(runtime.path()).expect("open process-liveness runtime");
+        let directory = ProcessLivenessDirectory::open(runtime.path().canonicalize().unwrap())
+            .expect("open process-liveness runtime");
         let mut instance_id = [0x31; 16];
         instance_id[6] = 0x41;
         instance_id[8] = 0x81;
@@ -1311,10 +1312,11 @@ mod tests {
     #[test]
     fn instance_scope_seal_linearizes_after_in_flight_registration_and_rejects_all_late_begins() {
         let runtime = tempfile::tempdir().expect("create process-liveness runtime");
+        let runtime_path = runtime.path().canonicalize().unwrap();
         let directory =
-            ProcessLivenessDirectory::open(runtime.path()).expect("open process-liveness runtime");
-        let reopened = ProcessLivenessDirectory::open(runtime.path())
-            .expect("reopen process-liveness runtime");
+            ProcessLivenessDirectory::open(&runtime_path).expect("open process-liveness runtime");
+        let reopened =
+            ProcessLivenessDirectory::open(runtime_path).expect("reopen process-liveness runtime");
         let mut instance_id = [0x71; 16];
         instance_id[6] = 0x41;
         instance_id[8] = 0x81;
@@ -1420,9 +1422,10 @@ mod tests {
     #[test]
     fn repeated_instance_scope_for_the_same_directory_shares_registration_and_seal_state() {
         let runtime = tempfile::tempdir().expect("create shared-instance runtime");
+        let runtime_path = runtime.path().canonicalize().unwrap();
         let directory =
-            ProcessLivenessDirectory::open(runtime.path()).expect("open process-liveness runtime");
-        let reopened = ProcessLivenessDirectory::open(runtime.path())
+            ProcessLivenessDirectory::open(&runtime_path).expect("open process-liveness runtime");
+        let reopened = ProcessLivenessDirectory::open(runtime_path)
             .expect("reopen the same process-liveness runtime");
         let mut instance_id = [0x51; 16];
         instance_id[6] = 0x41;
@@ -1483,8 +1486,8 @@ mod tests {
     #[test]
     fn sealed_instance_scope_aggregates_instance_and_multiple_task_trees() {
         let runtime = tempfile::tempdir().expect("create aggregate instance fixture");
-        let directory =
-            ProcessLivenessDirectory::open(runtime.path()).expect("open process-liveness runtime");
+        let directory = ProcessLivenessDirectory::open(runtime.path().canonicalize().unwrap())
+            .expect("open process-liveness runtime");
         let instance = directory
             .instance_scope({
                 let mut id = [0xa1; 16];

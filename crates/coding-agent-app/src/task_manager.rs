@@ -569,7 +569,11 @@ pub(crate) fn test_task_manager_launch_resources(
     )> = std::sync::OnceLock::new();
     let (_, directory) = PROCESS_LIVENESS.get_or_init(|| {
         let runtime = tempfile::tempdir().expect("create task-manager test runtime");
-        let directory = coding_agent_runtime::ProcessLivenessDirectory::open(runtime.path())
+        let runtime_path = runtime
+            .path()
+            .canonicalize()
+            .expect("canonicalize task-manager test runtime");
+        let directory = coding_agent_runtime::ProcessLivenessDirectory::open(runtime_path)
             .expect("open task-manager test process-liveness directory");
         (runtime, directory)
     });

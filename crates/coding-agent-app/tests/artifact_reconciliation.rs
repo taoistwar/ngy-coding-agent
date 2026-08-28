@@ -475,11 +475,11 @@ async fn grouped_startup_identity_drift_is_durable_inconsistent_and_keeps_poison
     let stable_directory = tempfile::tempdir().unwrap();
     let drifted_directory = tempfile::tempdir().unwrap();
     let resolver = DriftingIdentityResolver {
-        stable: RootCapability::open(stable_directory.path())
+        stable: RootCapability::open(stable_directory.path().canonicalize().unwrap())
             .unwrap()
             .identity_marker()
             .unwrap(),
-        drifted: RootCapability::open(drifted_directory.path())
+        drifted: RootCapability::open(drifted_directory.path().canonicalize().unwrap())
             .unwrap()
             .identity_marker()
             .unwrap(),

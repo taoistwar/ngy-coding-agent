@@ -342,7 +342,8 @@ mod integration_tests {
             .expect("migrate storage activity integration store");
         let repository = register_activity_repository(&store, temp.path().to_path_buf()).await;
         let root = Arc::new(
-            RootCapability::open(temp.path()).expect("open storage activity root capability"),
+            RootCapability::open(temp.path().canonicalize().unwrap())
+                .expect("open storage activity root capability"),
         );
         let marker = root
             .identity_marker()

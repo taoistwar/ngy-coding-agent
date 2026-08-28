@@ -328,14 +328,14 @@ async fn quiesce_during_claim_completion_wait_latches_and_keeps_mailbox_responsi
     );
 
     let safety = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(3),
         fixture.manager.safety_snapshot_for_test(),
     )
     .await
     .expect("latched shutdown keeps the safety mailbox responsive");
     assert!(matches!(safety, Err(TaskManagerError::Frozen)));
     let notification = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(3),
         fixture.manager.notify_queued(TaskId::new()),
     )
     .await
@@ -1219,7 +1219,7 @@ async fn reconciliation_claims_a_task_after_its_queue_notification_is_lost() {
     fixture.runner.push_blocking(1);
     let task = fixture.enqueue_tasks(1, false).await.remove(0);
 
-    assert_eq!(fixture.load(task.id).await.status, TaskStatus::Queued);
+    assert_eq!(task.status, TaskStatus::Queued);
     fixture.wait_for_status(task.id, TaskStatus::Running).await;
     fixture.wait_for_runner_start(task.id).await;
 

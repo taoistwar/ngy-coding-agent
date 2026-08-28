@@ -22,8 +22,8 @@ fn logical_scope_aliases_on_the_same_volume_deduplicate() {
     fs::create_dir(&data_path).unwrap();
     fs::create_dir(&runtime_path).unwrap();
 
-    let data = RootCapability::open(&data_path).unwrap();
-    let runtime = RootCapability::open(&runtime_path).unwrap();
+    let data = RootCapability::open(data_path.canonicalize().unwrap()).unwrap();
+    let runtime = RootCapability::open(runtime_path.canonicalize().unwrap()).unwrap();
     assert_ne!(
         data.identity_marker().unwrap(),
         runtime.identity_marker().unwrap(),
@@ -61,7 +61,7 @@ fn retained_capability_remains_sampleable_after_its_namespace_name_moves() {
     let moved_path = temporary.path().join("after");
     fs::create_dir(&original_path).unwrap();
 
-    let root = RootCapability::open(&original_path).unwrap();
+    let root = RootCapability::open(original_path.canonicalize().unwrap()).unwrap();
     let sampler = NativeVolumeSampler::new();
     let before = sampler.sample(&root).unwrap();
 
@@ -75,7 +75,7 @@ fn retained_capability_remains_sampleable_after_its_namespace_name_moves() {
 #[test]
 fn identity_and_sample_debug_output_are_opaque() {
     let temporary = tempdir().unwrap();
-    let root = RootCapability::open(temporary.path()).unwrap();
+    let root = RootCapability::open(temporary.path().canonicalize().unwrap()).unwrap();
     let sample = NativeVolumeSampler::new().sample(&root).unwrap();
     let identity = sample.identity();
 
@@ -110,8 +110,8 @@ fn explicitly_configured_second_volume_has_an_independent_identity() {
         .tempdir_in(second_volume_root)
         .unwrap();
     let sampler = NativeVolumeSampler::new();
-    let primary_root = RootCapability::open(primary.path()).unwrap();
-    let secondary_root = RootCapability::open(secondary.path()).unwrap();
+    let primary_root = RootCapability::open(primary.path().canonicalize().unwrap()).unwrap();
+    let secondary_root = RootCapability::open(secondary.path().canonicalize().unwrap()).unwrap();
 
     assert_ne!(
         sampler.sample(&primary_root).unwrap().identity(),

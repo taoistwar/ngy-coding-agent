@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use coding_agent_app::{
     CodingAgentAttemptFactory, CodingAgentPreparationControl, CodingAgentRunner,
-    CodingAgentRunnerConfig, EventDispatcherHandle, EventWake, Project2RuntimeSessionFactory,
-    ProvisionedAgentRuntimeFactory, QuiesceResult, RepositoryControlCoordinator,
-    RepositoryControlState, SchedulerConcurrencyLimits, ServiceState, ServiceStateController,
-    StoreWriterHandle, SystemWallClock, TaskManagerHandle, TaskManagerLaunchResources,
-    WorktreeCodingAgentAttemptFactory,
+    CodingAgentRunnerConfig, EventDispatcherHandle, EventWake, PlatformPaths,
+    Project2RuntimeSessionFactory, ProvisionedAgentRuntimeFactory, QuiesceResult,
+    RepositoryControlCoordinator, RepositoryControlState, SchedulerConcurrencyLimits, ServiceState,
+    ServiceStateController, StoreWriterHandle, SystemWallClock, TaskManagerHandle,
+    TaskManagerLaunchResources, WorktreeCodingAgentAttemptFactory,
 };
 use coding_agent_domain::{NewRepository, Repository, Task, TaskId, TaskStatus};
 use coding_agent_runtime::{ProcessLivenessScope, ToolchainPaths};
@@ -118,7 +118,9 @@ impl ConcurrentE2eFixture {
             .expect("canonical concurrent E2E root");
         let runtime_directory = root.join("runtime");
         let artifact_root = root.join("artifacts");
-        std::fs::create_dir_all(&runtime_directory).expect("create E2E runtime directory");
+        PlatformPaths::new(root.join("data"), &runtime_directory)
+            .prepare()
+            .expect("create private E2E runtime directory");
         std::fs::create_dir_all(&artifact_root).expect("create E2E artifact directory");
 
         let mut repository_paths = Vec::with_capacity(repository_count);

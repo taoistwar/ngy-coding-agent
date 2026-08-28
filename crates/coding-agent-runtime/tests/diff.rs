@@ -504,8 +504,8 @@ async fn collector_for_with_process_limits(
     .unwrap();
     DiffCollector::from_trusted_capabilities(
         &toolchain,
-        Arc::new(ExecutionDirectory::open(git_directory).unwrap()),
-        Arc::new(ExecutionDirectory::open(work_tree).unwrap()),
+        Arc::new(ExecutionDirectory::open(git_directory.canonicalize().unwrap()).unwrap()),
+        Arc::new(ExecutionDirectory::open(work_tree.canonicalize().unwrap()).unwrap()),
         runtime_directory,
         support::task_process_scope(runtime_directory),
         process_limits,

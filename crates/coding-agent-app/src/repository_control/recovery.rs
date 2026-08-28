@@ -192,7 +192,7 @@ mod tests {
         crate::RepositoryCoordinationKey,
     ) {
         let directory = tempfile::tempdir().expect("create recovery witness identity");
-        let marker = RootCapability::open(directory.path())
+        let marker = RootCapability::open(directory.path().canonicalize().unwrap())
             .expect("open recovery witness identity")
             .identity_marker()
             .expect("observe recovery witness identity");

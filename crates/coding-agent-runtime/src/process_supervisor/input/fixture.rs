@@ -274,7 +274,12 @@ fn create_fixture_directory() -> (PathBuf, [u8; 16]) {
             encode_hex(&identity)
         ));
         match std::fs::create_dir(&root) {
-            Ok(()) => return (root, identity),
+            Ok(()) => {
+                let root = root
+                    .canonicalize()
+                    .expect("canonicalize process-stdin fixture directory");
+                return (root, identity);
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => panic!("create process-stdin fixture directory: {error}"),
         }

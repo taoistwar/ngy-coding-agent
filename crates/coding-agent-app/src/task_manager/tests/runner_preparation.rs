@@ -118,7 +118,7 @@ fn fake_run_context_with_preparation(
     let timestamp = UtcTimestamp::parse_rfc3339("2026-07-15T00:00:00Z")
         .expect("construct fake runner timestamp");
     let repository_root = tempfile::tempdir().expect("create fake runner repository");
-    let root = repository_root.path().to_path_buf();
+    let root = repository_root.path().canonicalize().unwrap();
     let task = Task::try_from_stored(Task {
         id: TaskId::new(),
         client_request_id: ClientRequestId::new(),
@@ -146,7 +146,7 @@ fn fake_run_context_with_preparation(
     };
     let resources = test_task_manager_launch_resources(1, 1);
     let coordinator = resources.repository_control();
-    let marker = RootCapability::open(repository_root.path())
+    let marker = RootCapability::open(&root)
         .expect("open fake runner repository capability")
         .identity_marker()
         .expect("read fake runner repository identity");

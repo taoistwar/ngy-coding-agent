@@ -30,7 +30,7 @@ fn task_id(suffix: u32) -> TaskId {
 }
 
 fn marker(directory: &tempfile::TempDir) -> DirectoryIdentityMarker {
-    RootCapability::open(directory.path())
+    RootCapability::open(directory.path().canonicalize().unwrap())
         .expect("open authenticated identity fixture")
         .identity_marker()
         .expect("observe fixture identity")

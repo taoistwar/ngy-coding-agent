@@ -203,7 +203,7 @@ fn register(
     seed: &str,
     identity: &tempfile::TempDir,
 ) -> coding_agent_app::RepositoryCoordinationKey {
-    let marker = RootCapability::open(identity.path())
+    let marker = RootCapability::open(identity.path().canonicalize().unwrap())
         .expect("open authenticated common identity")
         .identity_marker()
         .expect("observe authenticated common identity");

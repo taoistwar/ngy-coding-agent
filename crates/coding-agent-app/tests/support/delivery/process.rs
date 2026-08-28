@@ -5,10 +5,11 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use coding_agent_app::{
-    LegacyV2Seed, ProcessDeliveryProcessFault, ProcessDeliveryProviderScenario, ProcessRunnerMode,
-    ProcessStorageSample, ProcessTestConfig, RuntimeDescriptor, StoreWriterFaultPoint,
-    StoreWriterFaultSpec, StoreWriterOperationKind, TEST_APP_DATA_ENV, TEST_RUNTIME_ENV,
-    TEST_SCENARIO_ENV, VirtualReleaseSignal, VirtualReleaseTarget,
+    LegacyV2Seed, PlatformPaths, PrivateFile, ProcessDeliveryProcessFault,
+    ProcessDeliveryProviderScenario, ProcessRunnerMode, ProcessStorageSample, ProcessTestConfig,
+    RuntimeDescriptor, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterOperationKind,
+    TEST_APP_DATA_ENV, TEST_RUNTIME_ENV, TEST_SCENARIO_ENV, VirtualReleaseSignal,
+    VirtualReleaseTarget,
 };
 use coding_agent_store::Store;
 use http::header::{ACCEPT, CONTENT_TYPE, HOST, SET_COOKIE};
@@ -258,12 +259,13 @@ impl ProcessDeliveryFixture {
         process_fault: ProcessDeliveryProcessFault,
     ) -> Self {
         let temporary = tempfile::tempdir().expect("create process delivery root");
-        let root = temporary.path().to_path_buf();
+        let root = temporary.path().canonicalize().unwrap();
         let data_dir = root.join("data");
         let runtime_dir = root.join("runtime");
         let repository_path = root.join("repository");
-        std::fs::create_dir(&data_dir).expect("create process delivery data root");
-        std::fs::create_dir(&runtime_dir).expect("create process delivery runtime root");
+        PlatformPaths::new(&data_dir, &runtime_dir)
+            .prepare()
+            .expect("prepare private process delivery roots");
         seed_process_repository(&repository_path);
         let repository_path = repository_path
             .canonicalize()
@@ -1268,11 +1270,13 @@ impl ProcessDeliveryFixture {
         let scenario_path = self
             .data_dir
             .join(format!("scenario-{}.json", self.generation));
-        std::fs::write(
-            &scenario_path,
-            serde_json::to_vec(&scenario).expect("encode strict process delivery scenario"),
-        )
-        .expect("write strict process delivery scenario");
+        let encoded =
+            serde_json::to_vec(&scenario).expect("encode strict process delivery scenario");
+        let mut scenario_file = PrivateFile::create_new(&scenario_path)
+            .expect("create private process delivery scenario");
+        std::io::Write::write_all(&mut scenario_file, &encoded)
+            .expect("write strict process delivery scenario");
+        drop(scenario_file);
         let child_log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

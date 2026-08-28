@@ -1509,7 +1509,7 @@ mod tests {
     };
 
     fn directory_marker(path: &Path) -> DirectoryIdentityMarker {
-        RootCapability::open(path)
+        RootCapability::open(path.canonicalize().unwrap())
             .unwrap()
             .identity_marker()
             .unwrap()
@@ -1558,7 +1558,7 @@ mod tests {
         let namespace_marker = directory_marker(&namespace);
         let admin_marker = directory_marker(&admin);
         fs::rename(&namespace, fixture.path().join("worktrees-renamed")).unwrap();
-        let common_git = RootCapability::open(fixture.path()).unwrap();
+        let common_git = RootCapability::open(fixture.path().canonicalize().unwrap()).unwrap();
 
         assert_eq!(
             reject_renamed_admin_aliases(&common_git, namespace_marker, admin_marker),
@@ -1576,7 +1576,7 @@ mod tests {
         let admin_marker = directory_marker(&admin);
         fs::rename(&admin, fixture.path().join("admin-renamed")).unwrap();
         fs::remove_dir(&namespace).unwrap();
-        let common_git = RootCapability::open(fixture.path()).unwrap();
+        let common_git = RootCapability::open(fixture.path().canonicalize().unwrap()).unwrap();
 
         assert_eq!(
             reject_renamed_admin_aliases(&common_git, namespace_marker, admin_marker),
@@ -1592,11 +1592,18 @@ mod tests {
         fs::create_dir_all(&admin).unwrap();
         let namespace_marker = directory_marker(&namespace);
         let admin_marker = directory_marker(&admin);
+        // Unix may recycle the inode of an unlinked directory immediately.
+        // Retain the captured objects while creating unrelated siblings so
+        // this fixture tests alias detection rather than inode reuse.
+        #[cfg(unix)]
+        let _namespace_lease = fs::File::open(&namespace).unwrap();
+        #[cfg(unix)]
+        let _admin_lease = fs::File::open(&admin).unwrap();
         fs::remove_dir(&admin).unwrap();
         fs::remove_dir(&namespace).unwrap();
         fs::create_dir(fixture.path().join("objects")).unwrap();
         fs::write(fixture.path().join("HEAD"), b"ref: refs/heads/main\n").unwrap();
-        let common_git = RootCapability::open(fixture.path()).unwrap();
+        let common_git = RootCapability::open(fixture.path().canonicalize().unwrap()).unwrap();
 
         assert_eq!(
             reject_renamed_admin_aliases(&common_git, namespace_marker, admin_marker),

@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use coding_agent_app::{
     ActorPausePoint, FakeScenario, FakeTaskRunner, FixedStartupRunnerFactory, LegacyV2Seed,
-    PreActorStartupRunnerContext, ProcessRunnerMode, ProcessRuntimeConfig,
-    ProcessRuntimeStorageConfig, ProcessStorageSample, ProcessTestConfig, ProcessTestEnvironment,
-    RunContext, ShutdownOutcome, StartupDependencies, StartupOutcome, StartupRunnerContext,
-    StartupRunnerFactory, StartupRunnerFactoryError, StartupRunnerSelection, StoreWriterFaultPoint,
-    StoreWriterOperationKind, TEST_PICKER_PROBE_FILE, VirtualReleaseTarget, launch,
-    load_runtime_config_for_test,
+    PlatformPaths, PreActorStartupRunnerContext, PrivateFile, ProcessRunnerMode,
+    ProcessRuntimeConfig, ProcessRuntimeStorageConfig, ProcessStorageSample, ProcessTestConfig,
+    ProcessTestEnvironment, RunContext, ShutdownOutcome, StartupDependencies, StartupOutcome,
+    StartupRunnerContext, StartupRunnerFactory, StartupRunnerFactoryError, StartupRunnerSelection,
+    StoreWriterFaultPoint, StoreWriterOperationKind, TEST_PICKER_PROBE_FILE, VirtualReleaseTarget,
+    launch, load_runtime_config_for_test,
 };
 use coding_agent_runtime::ProcessLivenessScope;
 
@@ -283,8 +283,7 @@ async fn production_offline_runner_starts_loopback_and_seeds_the_real_repository
     let data_dir = fixture.path().join("data");
     let runtime_dir = fixture.path().join("runtime");
     let repository = fixture.path().join("repository");
-    fs::create_dir(&data_dir).expect("create isolated data root");
-    fs::create_dir(&runtime_dir).expect("create isolated runtime root");
+    prepare_isolated_roots(&data_dir, &runtime_dir);
     fs::create_dir_all(repository.join(".git")).expect("create git metadata directory");
     fs::create_dir_all(repository.join("src")).expect("create source directory");
     fs::write(
@@ -347,8 +346,7 @@ fn process_environment_writes_a_private_typed_runtime_config_before_launch() {
     let fixture = tempfile::tempdir().expect("create runtime-config process fixture");
     let data_dir = fixture.path().join("data");
     let runtime_dir = fixture.path().join("runtime");
-    fs::create_dir(&data_dir).expect("create isolated data root");
-    fs::create_dir(&runtime_dir).expect("create isolated runtime root");
+    prepare_isolated_roots(&data_dir, &runtime_dir);
     let scenario_path = data_dir.join("scenario.json");
     let signal_path = runtime_dir.join("signals").join("claim-permit.release");
     write_scenario(&scenario_path, &signal_path, "");
@@ -601,8 +599,7 @@ async fn isolated_roots_are_applied_before_startup_and_disable_native_side_effec
     let fixture = tempfile::tempdir().expect("create process-support fixture");
     let data_dir = fixture.path().join("data");
     let runtime_dir = fixture.path().join("runtime");
-    fs::create_dir(&data_dir).expect("create isolated data root");
-    fs::create_dir(&runtime_dir).expect("create isolated runtime root");
+    prepare_isolated_roots(&data_dir, &runtime_dir);
     let scenario_path = runtime_dir.join("scenario.json");
     let signal_path = runtime_dir.join("signals").join("runner-0.release");
     write_scenario(&scenario_path, &signal_path, "");
@@ -656,8 +653,7 @@ async fn primary_uuid_and_instance_process_scope_are_created_once_after_lock_acq
     let fixture = tempfile::tempdir().expect("create process-liveness startup fixture");
     let data_dir = fixture.path().join("data");
     let runtime_dir = fixture.path().join("runtime");
-    fs::create_dir(&data_dir).expect("create isolated data root");
-    fs::create_dir(&runtime_dir).expect("create isolated runtime root");
+    prepare_isolated_roots(&data_dir, &runtime_dir);
     let scenario_path = runtime_dir.join("scenario.json");
     let signal_path = runtime_dir.join("signals").join("runner-0.release");
     write_scenario(&scenario_path, &signal_path, "");
@@ -718,8 +714,7 @@ fn scenario_outside_isolated_roots_is_rejected_before_consumption() {
     let fixture = tempfile::tempdir().expect("create process-support fixture");
     let data_dir = fixture.path().join("data");
     let runtime_dir = fixture.path().join("runtime");
-    fs::create_dir(&data_dir).expect("create isolated data root");
-    fs::create_dir(&runtime_dir).expect("create isolated runtime root");
+    prepare_isolated_roots(&data_dir, &runtime_dir);
     let scenario_path = fixture.path().join("outside.json");
     write_scenario(&scenario_path, &runtime_dir.join("runner-0.release"), "");
 
@@ -756,8 +751,7 @@ fn release_signals_cannot_alias_product_runtime_files() {
         let fixture = tempfile::tempdir().expect("create reserved-signal fixture");
         let data_dir = fixture.path().join("data");
         let runtime_dir = fixture.path().join("runtime");
-        fs::create_dir(&data_dir).expect("create isolated data root");
-        fs::create_dir(&runtime_dir).expect("create isolated runtime root");
+        prepare_isolated_roots(&data_dir, &runtime_dir);
         let scenario_path = data_dir.join("scenario.json");
         write_scenario(&scenario_path, &runtime_dir.join(reserved_name), "");
 
@@ -787,5 +781,12 @@ fn write_scenario(path: &Path, signal_path: &Path, extra_field: &str) {
   "marker_write_failure": true{extra_field}
 }}"#
     );
-    fs::write(path, bytes).expect("write process scenario");
+    let mut file = PrivateFile::create_new(path).expect("create private process scenario");
+    std::io::Write::write_all(&mut file, bytes.as_bytes()).expect("write process scenario");
+}
+
+fn prepare_isolated_roots(data_dir: &Path, runtime_dir: &Path) {
+    PlatformPaths::new(data_dir, runtime_dir)
+        .prepare()
+        .expect("prepare private isolated process roots");
 }
