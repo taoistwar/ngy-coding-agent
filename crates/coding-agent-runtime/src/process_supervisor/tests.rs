@@ -1,4 +1,6 @@
 use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd as _;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -246,9 +248,20 @@ fn macos_uses_the_validated_executable_path_instead_of_dev_fd() {
     assert!(!executable.program().starts_with("/dev/fd"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_dev_fd_directory_entry_is_not_a_child_namespace() {
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::write(temporary.path().join("child"), b"contents").unwrap();
+    let directory = File::open(temporary.path()).unwrap();
+    let descriptor_path = Path::new("/dev/fd").join(directory.as_raw_fd().to_string());
+
+    assert!(File::open(descriptor_path.join("child")).is_err());
+}
+
 #[cfg(unix)]
 #[test]
-fn delivery_directory_and_config_slots_materialize_only_to_inherited_descriptors() {
+fn delivery_directory_and_config_slots_use_supported_spawn_paths() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().canonicalize().unwrap();
     let git_path = root.join("git-directory");
@@ -293,7 +306,22 @@ fn delivery_directory_and_config_slots_materialize_only_to_inherited_descriptors
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
-    for forbidden in [&git_path, &work_tree_path, &common_git_path, &sandbox_path] {
+    for forbidden in [&work_tree_path, &sandbox_path] {
+        let forbidden = forbidden.to_string_lossy();
+        assert!(
+            arguments
+                .iter()
+                .all(|argument| !argument.contains(forbidden.as_ref()))
+        );
+        assert!(
+            materialized
+                .environment()
+                .iter()
+                .all(|(_, value)| !value.to_string_lossy().contains(forbidden.as_ref()))
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    for forbidden in [&git_path, &common_git_path] {
         let forbidden = forbidden.to_string_lossy();
         assert!(
             arguments
@@ -308,6 +336,9 @@ fn delivery_directory_and_config_slots_materialize_only_to_inherited_descriptors
         );
     }
     assert!(arguments[5].starts_with("--git-dir="));
+    #[cfg(target_os = "macos")]
+    assert_eq!(arguments[5], format!("--git-dir={}", git_path.display()));
+    #[cfg(not(target_os = "macos"))]
     assert!(arguments[5].contains("/fd/"));
     assert_eq!(arguments[6], "--work-tree=.");
     assert!(
@@ -317,6 +348,9 @@ fn delivery_directory_and_config_slots_materialize_only_to_inherited_descriptors
     );
     assert_eq!(materialized.environment().len(), 3);
     assert_eq!(materialized.environment()[0].0, "GIT_COMMON_DIR");
+    #[cfg(target_os = "macos")]
+    assert_eq!(materialized.environment()[0].1, common_git_path.as_os_str());
+    #[cfg(not(target_os = "macos"))]
     assert!(
         materialized.environment()[0]
             .1
@@ -336,6 +370,9 @@ fn delivery_directory_and_config_slots_materialize_only_to_inherited_descriptors
                 .contains(&sandbox_path.to_string_lossy()[..])
         );
     }
+    #[cfg(target_os = "macos")]
+    assert_eq!(materialized.inherited_resource_count(), 1);
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(materialized.inherited_resource_count(), 3);
     assert!(!config_path.exists());
     let descriptor_config = materialized
@@ -366,8 +403,12 @@ fn delivery_directory_and_config_slots_materialize_only_to_inherited_descriptors
         .find_map(|(key, value)| (key == "GIT_INDEX_FILE").then_some(value))
         .unwrap();
     let descriptor_index = std::path::PathBuf::from(descriptor_index);
+    #[cfg(target_os = "macos")]
+    assert_eq!(descriptor_index, temporary_index_path.join("index"));
+    #[cfg(not(target_os = "macos"))]
     assert!(descriptor_index.to_string_lossy().contains("/fd/"));
     assert!(descriptor_index.ends_with("index"));
+    #[cfg(not(target_os = "macos"))]
     assert!(
         !descriptor_index
             .to_string_lossy()
@@ -387,7 +428,24 @@ fn delivery_directory_and_config_slots_materialize_only_to_inherited_descriptors
         std::fs::read(temporary_index_path.join("index.lock")).unwrap(),
         b"lock"
     );
+    #[cfg(target_os = "macos")]
+    assert_eq!(temporary_index_materialized.inherited_resource_count(), 1);
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(temporary_index_materialized.inherited_resource_count(), 4);
+
+    #[cfg(target_os = "macos")]
+    {
+        let held_git_path = root.join("held-git-directory");
+        std::fs::rename(&git_path, &held_git_path).unwrap();
+        std::fs::create_dir(&git_path).unwrap();
+        let Err(error) = platform::DeliveryDescriptorArguments::try_new(&command) else {
+            panic!("a replaced macOS delivery namespace must fail closed");
+        };
+        assert!(matches!(
+            error,
+            ProcessError::CommandPolicy(CommandPolicyError::IdentityChanged)
+        ));
+    }
 }
 
 #[cfg(target_os = "macos")]

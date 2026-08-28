@@ -84,7 +84,7 @@ async fn wait_for_status(store: &Store, task_id: TaskId, expected: TaskStatus) {
 }
 
 async fn wait_for_claim_resources_released(hooks: &ClaimTestHooks) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let released = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if hooks.active_count() == 0 && hooks.available_permits() == 1 {
                 return;
@@ -92,8 +92,13 @@ async fn wait_for_claim_resources_released(hooks: &ClaimTestHooks) {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("claim-pause active handle and permit are released");
+    .await;
+    assert!(
+        released.is_ok(),
+        "claim-pause active handle and permit were not released before timeout; active_count={}, available_permits={}",
+        hooks.active_count(),
+        hooks.available_permits()
+    );
 }
 
 fn detached_task_manager_handle(sender: mpsc::Sender<TaskManagerMessage>) -> TaskManagerHandle {

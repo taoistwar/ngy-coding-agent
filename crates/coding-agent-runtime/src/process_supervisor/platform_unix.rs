@@ -47,37 +47,57 @@ impl DeliveryDescriptorArguments {
                 )?;
             }
             role => {
+                #[cfg(target_os = "macos")]
+                let directory_path = {
+                    let _ = descriptor_root;
+                    // Darwin's /dev/fd entries can reopen one descriptor, but
+                    // an entry for a directory is not a traversable namespace:
+                    // /dev/fd/<dirfd>/child cannot be resolved. Revalidate the
+                    // admitted namespace immediately before spawn and use it
+                    // while prepare() retains the matching dependent-directory
+                    // handle through exec, mirroring the macOS executable-path
+                    // compatibility boundary above.
+                    binding
+                        .directory()
+                        .revalidate()
+                        .map_err(ProcessError::CommandPolicy)?;
+                    binding.directory().path().to_owned()
+                };
+                #[cfg(not(target_os = "macos"))]
                 let directory = binding
                     .directory()
                     .cloned_directory()
                     .map_err(ProcessError::CommandPolicy)?;
+                #[cfg(not(target_os = "macos"))]
                 let directory =
                     normalize_inherited_file(directory).map_err(ProcessError::TreeSetupFailed)?;
-                let descriptor_path = descriptor_root.join(directory.as_raw_fd().to_string());
+                #[cfg(not(target_os = "macos"))]
+                let directory_path = descriptor_root.join(directory.as_raw_fd().to_string());
                 match role {
                     UnixDeliveryDirectoryRole::GitDirectory { argument_index } => {
                         replace_delivery_argument(
                             &mut self.arguments,
                             argument_index,
-                            prefixed_descriptor_argument("--git-dir=", &descriptor_path),
+                            prefixed_path_argument("--git-dir=", &directory_path),
                         )?;
                     }
                     UnixDeliveryDirectoryRole::CommonGitEnvironment => {
                         self.environment.push((
                             OsString::from("GIT_COMMON_DIR"),
-                            descriptor_path.into_os_string(),
+                            directory_path.into_os_string(),
                         ));
                     }
                     UnixDeliveryDirectoryRole::TemporaryIndexEnvironment => {
                         self.environment.push((
                             OsString::from("GIT_INDEX_FILE"),
-                            descriptor_path.join("index").into_os_string(),
+                            directory_path.join("index").into_os_string(),
                         ));
                     }
                     UnixDeliveryDirectoryRole::WorkTree { .. } => unreachable!(
                         "the working tree is materialized from the retained cwd capability"
                     ),
                 }
+                #[cfg(not(target_os = "macos"))]
                 self.inherited_resources.push(directory);
             }
         }
@@ -133,7 +153,7 @@ fn replace_delivery_argument(
     Ok(())
 }
 
-fn prefixed_descriptor_argument(prefix: &str, path: &std::path::Path) -> OsString {
+fn prefixed_path_argument(prefix: &str, path: &std::path::Path) -> OsString {
     let mut argument = OsString::from(prefix);
     argument.push(path);
     argument
