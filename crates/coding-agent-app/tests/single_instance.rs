@@ -1186,7 +1186,6 @@ fn descriptor_pause_dependencies(
     scenario_name: &str,
 ) -> (StartupDependencies, std::path::PathBuf) {
     let signals = fixture.paths.runtime_dir.join("signals");
-    std::fs::create_dir(&signals).expect("create actor signal directory");
     let release = signals.join("descriptor-before-browser.release");
     let mut reached_name = release
         .file_name()
