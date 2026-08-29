@@ -392,13 +392,20 @@ async fn primary_preserves_queued_tasks_before_publishing_ready_descriptor() {
     let fixture = support::StartupFixture::new();
     fixture.prepare();
     let queued = seed_queued_task(&fixture, "recover this task").await;
+    let (dependencies, reached, release) = recovery_pause_dependencies(&fixture);
+    let launch_task = tokio::spawn(launch(dependencies));
 
-    let outcome = launch(fixture.dependencies(support::StartupBehavior::default()))
-        .await
-        .expect("start recovered primary");
-    let StartupOutcome::Primary(primary) = outcome else {
-        panic!("seed database must start as primary");
-    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !reached.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup recovery reaches the pre-descriptor pause");
+    assert!(!launch_task.is_finished());
+    assert_eq!(fixture.calls.listener_binds(), 0);
+    assert!(!fixture.paths.instance_descriptor.exists());
+
     let observer = Store::open(&fixture.paths.database_path)
         .await
         .expect("open recovery observer");
@@ -415,8 +422,18 @@ async fn primary_preserves_queued_tasks_before_publishing_ready_descriptor() {
         detail.timeline.last().map(|event| event.kind),
         Some(TaskEventKind::TaskQueued)
     );
+
+    std::fs::write(&release, b"").expect("release pre-descriptor recovery pause");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), launch_task)
+        .await
+        .expect("released startup completes")
+        .expect("join recovered primary launch")
+        .expect("start recovered primary");
+    let StartupOutcome::Primary(primary) = outcome else {
+        panic!("seed database must start as primary");
+    };
     assert!(fixture.paths.instance_descriptor.exists());
-    drop(primary);
+    let _ = primary.shutdown().await;
 }
 
 #[tokio::test]
@@ -1185,8 +1202,40 @@ fn descriptor_pause_dependencies(
     fake_scenarios: Vec<FakeScenario>,
     scenario_name: &str,
 ) -> (StartupDependencies, std::path::PathBuf) {
+    let (dependencies, reached, _) = startup_pause_dependencies(
+        fixture,
+        fake_scenarios,
+        scenario_name,
+        "descriptor-before-browser",
+        ActorPausePoint::DescriptorBeforeBrowser,
+        VirtualReleaseTarget::ActorDescriptorBeforeBrowser,
+    );
+    (dependencies, reached)
+}
+
+fn recovery_pause_dependencies(
+    fixture: &support::StartupFixture,
+) -> (StartupDependencies, std::path::PathBuf, std::path::PathBuf) {
+    startup_pause_dependencies(
+        fixture,
+        Vec::new(),
+        "queued-recovery",
+        "recovery-before-descriptor",
+        ActorPausePoint::RecoveryBeforeDescriptor,
+        VirtualReleaseTarget::ActorRecoveryBeforeDescriptor,
+    )
+}
+
+fn startup_pause_dependencies(
+    fixture: &support::StartupFixture,
+    fake_scenarios: Vec<FakeScenario>,
+    scenario_name: &str,
+    signal_name: &str,
+    pause: ActorPausePoint,
+    target: VirtualReleaseTarget,
+) -> (StartupDependencies, std::path::PathBuf, std::path::PathBuf) {
     let signals = fixture.paths.runtime_dir.join("signals");
-    let release = signals.join("descriptor-before-browser.release");
+    let release = signals.join(format!("{signal_name}.release"));
     let mut reached_name = release
         .file_name()
         .expect("release has a file name")
@@ -1205,11 +1254,11 @@ fn descriptor_pause_dependencies(
             fake_scenarios,
             storage_samples: vec![ProcessStorageSample::Native],
             store_writer_faults: Vec::new(),
-            actor_pauses: vec![ActorPausePoint::DescriptorBeforeBrowser],
+            actor_pauses: vec![pause],
             virtual_release_signals: vec![VirtualReleaseSignal {
-                name: "descriptor-before-browser".to_owned(),
-                path: release,
-                target: VirtualReleaseTarget::ActorDescriptorBeforeBrowser,
+                name: signal_name.to_owned(),
+                path: release.clone(),
+                target,
             }],
             legacy_v2_seed: LegacyV2Seed::None,
             marker_write_failure: false,
@@ -1223,8 +1272,8 @@ fn descriptor_pause_dependencies(
     .expect("load process-test environment");
     let dependencies = environment
         .apply(fixture.dependencies(Default::default()))
-        .expect("apply descriptor pause");
-    (dependencies, reached)
+        .expect("apply startup pause");
+    (dependencies, reached, release)
 }
 
 #[cfg(feature = "test-support")]
