@@ -1450,7 +1450,12 @@ pub async fn shutdown_fixture(
         StartupOutcome::Secondary(_) => panic!("shutdown fixture must own the primary lock"),
     };
     let handles = primary.test_handles();
-    let repository_input = repository_input_at(startup._temp.path(), "shutdown");
+    let repository_root = startup
+        ._temp
+        .path()
+        .canonicalize()
+        .expect("canonicalize shutdown fixture repository root");
+    let repository_input = repository_input_at(&repository_root, "shutdown");
     std::fs::create_dir_all(repository_input.git_root.as_path().join(".git"))
         .expect("create authenticated shutdown repository identity");
     let registration_deadline = deadline();
