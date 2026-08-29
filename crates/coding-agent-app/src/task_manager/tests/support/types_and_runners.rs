@@ -90,11 +90,31 @@ struct DelayedCancellationRunner {
 #[cfg(feature = "test-support")]
 #[derive(Default)]
 struct StagedReviewStopRunner {
+    starts: AtomicUsize,
     started: tokio::sync::Notify,
     review_release: tokio::sync::Notify,
     review_applied: tokio::sync::Notify,
     finish_release: tokio::sync::Notify,
     review_result: std::sync::Mutex<Option<Result<EventId, RunnerEventError>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl StagedReviewStopRunner {
+    async fn wait_for_starts(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let started = self.started.notified();
+                tokio::pin!(started);
+                started.as_mut().enable();
+                if self.starts.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                started.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("staged review runner did not observe {expected} starts"));
+    }
 }
 
 #[cfg(feature = "test-support")]

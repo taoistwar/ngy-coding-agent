@@ -27,6 +27,7 @@ impl TaskRunner for StagedReviewStopRunner {
                 retryable: false,
             });
         }
+        self.starts.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         self.review_release.notified().await;
         let review = sink.record_review(staged_review_evidence()).await;

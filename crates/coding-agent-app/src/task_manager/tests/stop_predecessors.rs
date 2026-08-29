@@ -360,6 +360,7 @@ async fn mixed_critical_batch_submits_the_unblocked_peer_without_manufacturing_g
     for task in &tasks {
         wait_for_status(&store, task.id, TaskStatus::Running).await;
     }
+    runner.wait_for_starts(2).await;
 
     runner.review_release.notify_one();
     for expected_pause in 1..=2 {
