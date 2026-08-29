@@ -510,9 +510,18 @@ async fn source_commit_rejects_a_candidate_tree_when_reopened_evidence_changes()
         fixture.current_fingerprint(&source).await,
         source.approved_fingerprint
     );
+    let original_filemode = git_line(
+        &fixture.repository,
+        &["config", "--local", "--bool", "--get", "core.filemode"],
+    );
+    let changed_filemode = match original_filemode.as_str() {
+        "true" => "false",
+        "false" => "true",
+        value => panic!("unexpected core.filemode value: {value}"),
+    };
     git_ok(
         &fixture.repository,
-        &["config", "--local", "core.filemode", "true"],
+        &["config", "--local", "core.filemode", changed_filemode],
     );
     let digest_changed = provisioner
         .open_delivery_source(
@@ -522,6 +531,11 @@ async fn source_commit_rejects_a_candidate_tree_when_reopened_evidence_changes()
         )
         .await
         .unwrap();
+    assert_ne!(
+        digest_changed.config_attributes_digest(),
+        original.config_attributes_digest(),
+        "the reopened source must carry different config/attributes evidence"
+    );
     let external_digest_state = source.snapshot(&fixture.repository);
     let error = provisioner
         .build_source_commit(
