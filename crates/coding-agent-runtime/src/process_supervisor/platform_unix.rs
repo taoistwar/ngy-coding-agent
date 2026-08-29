@@ -448,7 +448,7 @@ pub(super) fn liveness_pipe_has_no_writers(read: &OwnedFd) -> io::Result<bool> {
     }
 }
 
-fn exit_is_waitable(process_id: libc::id_t) -> io::Result<bool> {
+pub(super) fn exit_is_waitable(process_id: libc::id_t) -> io::Result<bool> {
     loop {
         let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         let result = unsafe {

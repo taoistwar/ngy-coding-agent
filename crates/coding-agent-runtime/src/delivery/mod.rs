@@ -459,9 +459,10 @@ mod tests {
     impl ExecutableCopies {
         fn new() -> Self {
             let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().canonicalize().unwrap();
             let extension = if cfg!(windows) { ".exe" } else { "" };
-            let git_a = temporary.path().join(format!("git-a{extension}"));
-            let git_b = temporary.path().join(format!("git-b{extension}"));
+            let git_a = root.join(format!("git-a{extension}"));
+            let git_b = root.join(format!("git-b{extension}"));
             let current = std::env::current_exe().unwrap();
             std::fs::copy(&current, &git_a).unwrap();
             std::fs::copy(current, &git_b).unwrap();

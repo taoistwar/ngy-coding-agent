@@ -1718,7 +1718,21 @@ fn process_is_running(process_id: u32) -> bool {
         .is_some_and(|state| state != 'Z')
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn process_is_running(process_id: u32) -> bool {
+    // `kill(pid, 0)` still reports an unreaped child zombie as present on
+    // macOS. Observe waitability without reaping so supervision remains the
+    // only owner that consumes the leader exit.
+    if matches!(
+        super::platform::exit_is_waitable(process_id as libc::id_t),
+        Ok(true)
+    ) {
+        return false;
+    }
+    process_exists(process_id)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn process_is_running(process_id: u32) -> bool {
     process_exists(process_id)
 }
