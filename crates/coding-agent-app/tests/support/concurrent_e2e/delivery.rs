@@ -16,17 +16,13 @@ use coding_agent_runtime::{
     probe_delivery_git,
 };
 use coding_agent_store::{
-    AcceptMergeCommandRequest, CleanupOperationRecord, CleanupOperationState, DeliveryOperationId,
-    DeliveryOperationSnapshot, DeliveryOwnershipSnapshot, GitBranchRef, GitCommitOid,
-    MergeOperationRecord, MergeOperationState, PreflightCommandRequest,
-    RemoveWorktreeCommandRequest, Store,
+    AcceptMergeCommandRequest, DeliveryOperationId, DeliveryOperationSnapshot,
+    DeliveryOwnershipSnapshot, GitBranchRef, GitCommitOid, MergeOperationRecord,
+    PreflightCommandRequest, RemoveWorktreeCommandRequest, Store,
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    E2E_POLL_INTERVAL, PROCESS_CLEANUP_TIMEOUT, PROCESS_COMMAND_TIMEOUT,
-    PRODUCTION_DELIVERY_STAGE_TIMEOUT, repository,
-};
+use super::{PROCESS_CLEANUP_TIMEOUT, PROCESS_COMMAND_TIMEOUT, repository};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliverySideEffectSnapshot {
@@ -306,67 +302,6 @@ pub(super) async fn receipt_counts(store: &Store, task_id: TaskId) -> (i64, i64)
     .expect("count concurrent delivery receipts")
 }
 
-pub(super) async fn wait_for_merge(
-    store: &Store,
-    operation_id: DeliveryOperationId,
-) -> MergeOperationRecord {
-    tokio::time::timeout(PRODUCTION_DELIVERY_STAGE_TIMEOUT, async {
-        loop {
-            let operation = merge_operation(store, operation_id).await;
-            if operation.state == MergeOperationState::Merged {
-                return operation;
-            }
-            if matches!(
-                operation.state,
-                MergeOperationState::Conflict
-                    | MergeOperationState::Rejected
-                    | MergeOperationState::Stale
-                    | MergeOperationState::Superseded
-                    | MergeOperationState::Failed
-                    | MergeOperationState::ReconciliationRequired
-            ) {
-                panic!(
-                    "concurrent delivery merge terminated in {:?}: {operation:?}",
-                    operation.state
-                );
-            }
-            tokio::time::sleep(E2E_POLL_INTERVAL).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("concurrent delivery merge {operation_id} exceeded its stage budget")
-    })
-}
-
-pub(super) async fn wait_for_cleanup(
-    store: &Store,
-    operation_id: DeliveryOperationId,
-) -> CleanupOperationRecord {
-    tokio::time::timeout(PRODUCTION_DELIVERY_STAGE_TIMEOUT, async {
-        loop {
-            let operation = cleanup_operation(store, operation_id).await;
-            if operation.state == CleanupOperationState::Completed {
-                return operation;
-            }
-            if matches!(
-                operation.state,
-                CleanupOperationState::Failed | CleanupOperationState::ReconciliationRequired
-            ) {
-                panic!(
-                    "concurrent delivery cleanup terminated in {:?}: {operation:?}",
-                    operation.state
-                );
-            }
-            tokio::time::sleep(E2E_POLL_INTERVAL).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("concurrent delivery cleanup {operation_id} exceeded its stage budget")
-    })
-}
-
 async fn merge_operation(store: &Store, operation_id: DeliveryOperationId) -> MergeOperationRecord {
     match store
         .delivery_operation_snapshot(operation_id)
@@ -376,21 +311,6 @@ async fn merge_operation(store: &Store, operation_id: DeliveryOperationId) -> Me
     {
         DeliveryOperationSnapshot::Merge(operation) => *operation,
         DeliveryOperationSnapshot::Cleanup(_) => panic!("expected concurrent merge operation"),
-    }
-}
-
-async fn cleanup_operation(
-    store: &Store,
-    operation_id: DeliveryOperationId,
-) -> CleanupOperationRecord {
-    match store
-        .delivery_operation_snapshot(operation_id)
-        .await
-        .expect("load concurrent delivery cleanup operation")
-        .expect("concurrent delivery cleanup operation exists")
-    {
-        DeliveryOperationSnapshot::Cleanup(operation) => *operation,
-        DeliveryOperationSnapshot::Merge(_) => panic!("expected concurrent cleanup operation"),
     }
 }
 

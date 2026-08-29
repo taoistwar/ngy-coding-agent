@@ -333,7 +333,8 @@ async fn mixed_critical_batch_submits_the_unblocked_peer_without_manufacturing_g
         dispatcher,
         service_state.clone(),
         runner.clone(),
-        test_task_manager_launch_resources_for_repository(2, 2, &repository, temp_dir.path()),
+        test_task_manager_launch_resources_for_repository(2, 2, &repository, temp_dir.path())
+            .with_critical_stop_persistence_budget_for_test(Duration::from_secs(30)),
         16,
     );
     let mut tasks = Vec::new();

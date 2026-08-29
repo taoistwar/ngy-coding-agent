@@ -30,6 +30,7 @@ use repository::{
 };
 
 mod delivery;
+pub(crate) mod delivery_observation;
 mod observation;
 mod provider;
 mod repository;
@@ -64,6 +65,15 @@ const STORE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const FIXTURE_CLOSE_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const E2E_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PRODUCTION_DELIVERY_STAGE_TIMEOUT: Duration = Duration::from_secs(11 * 60);
+// One pipeline iteration can enter two sequential production runtime envelopes
+// before its bounded routing, store, and orchestration work publishes durable
+// progress. Three runtime envelopes cover that full iteration without copying
+// every internal timeout into this E2E observer.
+const DELIVERY_NO_PROGRESS_TIMEOUT: Duration =
+    Duration::from_secs(3 * PRODUCTION_DELIVERY_STAGE_TIMEOUT.as_secs());
+// Ownership observation validates the complete task-owned delivery graph. A
+// 100 ms cadence avoids turning a slow E2E into sustained audit-query pressure.
+const DELIVERY_OBSERVATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct TrackedDispatcherWake {
     dispatcher: EventDispatcherHandle,
@@ -351,7 +361,7 @@ impl ConcurrentE2eFixture {
         &self,
         operation_id: DeliveryOperationId,
     ) -> MergeOperationRecord {
-        delivery::wait_for_merge(&self.store, operation_id).await
+        delivery_observation::wait_for_merge(&self.store, operation_id).await
     }
 
     pub async fn delivery_remove_request(&self, task_id: TaskId) -> RemoveWorktreeCommandRequest {
@@ -369,7 +379,7 @@ impl ConcurrentE2eFixture {
         &self,
         operation_id: DeliveryOperationId,
     ) -> CleanupOperationRecord {
-        delivery::wait_for_cleanup(&self.store, operation_id).await
+        delivery_observation::wait_for_cleanup(&self.store, operation_id).await
     }
 
     pub async fn delivery_side_effect_snapshot(

@@ -331,3 +331,117 @@ async fn third_same_repository_waits_while_another_repository_skips_ahead() {
     fixture.assert_no_live_process_trees();
     fixture.finish().await;
 }
+
+mod delivery_observation_tests {
+    use std::collections::VecDeque;
+    use std::future::ready;
+    use std::time::Duration;
+
+    use super::support::concurrent_e2e::delivery_observation::{
+        DeliveryProgress, DeliveryProgressError, wait_for_delivery_progress,
+    };
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Observation {
+        Pending(u8),
+        Complete,
+        Terminal,
+    }
+
+    fn classify(observation: &Observation) -> DeliveryProgress<u8> {
+        match observation {
+            Observation::Pending(progress) => DeliveryProgress::Pending(*progress),
+            Observation::Complete => DeliveryProgress::Complete,
+            Observation::Terminal => DeliveryProgress::Terminal,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_observation_returns_immediately_with_its_payload() {
+        let started = tokio::time::Instant::now();
+
+        let result = wait_for_delivery_progress(
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            3,
+            || ready(Observation::Terminal),
+            classify,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(DeliveryProgressError::Terminal(Observation::Terminal))
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_progress_renews_the_stage_observation_budget() {
+        let started = tokio::time::Instant::now();
+        let mut observations = VecDeque::from([
+            Observation::Pending(1),
+            Observation::Pending(2),
+            Observation::Complete,
+        ]);
+
+        let result = wait_for_delivery_progress(
+            Duration::from_millis(15),
+            Duration::from_millis(10),
+            3,
+            || ready(observations.pop_front().expect("scripted observation")),
+            classify,
+        )
+        .await;
+
+        assert_eq!(result, Ok(Observation::Complete));
+        assert_eq!(started.elapsed(), Duration::from_millis(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_progress_reports_the_last_durable_observation() {
+        let started = tokio::time::Instant::now();
+
+        let result = wait_for_delivery_progress(
+            Duration::from_millis(15),
+            Duration::from_millis(10),
+            3,
+            || ready(Observation::Pending(7)),
+            classify,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(DeliveryProgressError::NoProgress {
+                last: Some(Observation::Pending(7)),
+            })
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_state_cap_rejects_an_unbounded_transition_loop() {
+        let mut observations = VecDeque::from([
+            Observation::Pending(1),
+            Observation::Pending(2),
+            Observation::Pending(3),
+        ]);
+
+        let result = wait_for_delivery_progress(
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            2,
+            || ready(observations.pop_front().expect("scripted observation")),
+            classify,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(DeliveryProgressError::ProgressStateLimit {
+                observed_states: 3,
+                last: Observation::Pending(3),
+            })
+        );
+    }
+}
