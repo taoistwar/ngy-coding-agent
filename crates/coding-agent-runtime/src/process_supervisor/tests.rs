@@ -1002,13 +1002,14 @@ async fn scoped_supervisor_keeps_cleanup_unproven_until_the_whole_tree_exits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_primary_probes_the_crashed_primary_tree_before_cleanup_is_confirmed() {
     let temp = tempfile::tempdir().unwrap();
-    let pid_file = temp.path().join("crash-grandchild-pid");
-    let release_file = temp.path().join("release-crash-grandchild");
+    let runtime_directory = temp.path().canonicalize().unwrap();
+    let pid_file = runtime_directory.join("crash-grandchild-pid");
+    let release_file = runtime_directory.join("release-crash-grandchild");
     let mut primary = tokio::process::Command::new(std::env::current_exe().unwrap());
     primary
         .args(["--exact", HELPER_TEST, "--nocapture"])
         .env(HELPER_ENV, "primary-crash")
-        .env(HELPER_RUNTIME_DIRECTORY, temp.path())
+        .env(HELPER_RUNTIME_DIRECTORY, &runtime_directory)
         .env(HELPER_PID_FILE, &pid_file)
         .env(HELPER_RELEASE_FILE, &release_file)
         .stdin(Stdio::null())
@@ -1019,7 +1020,7 @@ async fn a_new_primary_probes_the_crashed_primary_tree_before_cleanup_is_confirm
     let grandchild_id = wait_for_helper_pid(&pid_file).await;
     assert!(primary.wait().await.unwrap().success());
 
-    let directory = ProcessLivenessDirectory::open(temp.path().canonicalize().unwrap()).unwrap();
+    let directory = ProcessLivenessDirectory::open(runtime_directory).unwrap();
     #[cfg(unix)]
     assert_eq!(
         directory.probe_stale().unwrap(),
