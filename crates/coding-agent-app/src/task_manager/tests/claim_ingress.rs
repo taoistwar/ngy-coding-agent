@@ -252,8 +252,27 @@ async fn full_claim_ingress_reconciles_same_identity_before_rescan_and_later_sta
         controller.release(StoreWriterFaultPoint::PauseBeforeExecute),
         1
     );
-    let _ = blocked.completion().await;
-    let _ = buffered.completion().await;
+    let filler_tasks = [blocked.completion().await, buffered.completion().await].map(
+        |completion| match completion.disposition {
+            DurableDisposition::Confirmed(
+                coding_agent_store::QueueLimitedCreateTaskOutcome::Created { task, .. },
+            ) => task,
+            disposition => {
+                panic!("full-claim ingress filler did not create its queued task: {disposition:?}")
+            }
+        },
+    );
+    for filler_task in filler_tasks {
+        let receipt = writer
+            .cancel_task(filler_task.id, TaskStatus::Queued, background_deadline())
+            .await
+            .expect("cancel full-claim ingress filler");
+        assert!(matches!(
+            receipt.value,
+            TransitionOutcome::Applied { task: cancelled, .. }
+                if cancelled.id == filler_task.id && cancelled.status == TaskStatus::Cancelled
+        ));
+    }
     hooks.resume();
     wait_for_status(&store, task.id, TaskStatus::Running).await;
     runner.wait_for_starts(1).await;
