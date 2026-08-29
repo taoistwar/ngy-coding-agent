@@ -669,6 +669,9 @@ async fn abort_pending_restart_reuses_the_one_durable_abort_child() {
         .abort_child_receipt_id
         .expect("abort pending persists one exact child receipt");
 
+    fixture
+        .wait_repository_state(RepositoryControlState::Available)
+        .await;
     fixture.restart_manager().await;
     assert_eq!(
         fixture
@@ -824,6 +827,9 @@ async fn unlock_remove_and_delete_pending_states_restart_to_completion() {
         fixture
             .wait_operation_state(accepted.operation_id(), pending)
             .await;
+        fixture
+            .wait_repository_state(RepositoryControlState::Available)
+            .await;
         fixture.restart_manager().await;
         assert_eq!(
             fixture
@@ -845,11 +851,17 @@ async fn unlock_remove_and_delete_pending_states_restart_to_completion() {
         .wait_operation_state(worktree.operation_id(), CleanupOperationState::Completed)
         .await;
     fixture
+        .wait_repository_state(RepositoryControlState::Available)
+        .await;
+    fixture
         .runtime
         .fail_once(CleanupStage::Delete, CleanupFault::Unavailable);
     let branch = fixture.delete().await;
     fixture
         .wait_operation_state(branch.operation_id(), CleanupOperationState::DeletePending)
+        .await;
+    fixture
+        .wait_repository_state(RepositoryControlState::Available)
         .await;
     fixture.restart_manager().await;
     assert_eq!(
@@ -976,6 +988,9 @@ async fn every_cleanup_phase_store_reply_loss_converges_without_repeating_side_e
     let worktree = fixture.remove().await;
     fixture
         .wait_operation_state(worktree.operation_id(), CleanupOperationState::Completed)
+        .await;
+    fixture
+        .wait_repository_state(RepositoryControlState::Available)
         .await;
     let branch = fixture.delete().await;
     fixture
