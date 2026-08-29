@@ -571,6 +571,25 @@ impl StorageMonitorHandle {
             .map_err(|_| StorageMonitorError::Unavailable)?
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn probe_is_in_flight_for_test(
+        &self,
+        volume: VolumeIdentity,
+    ) -> Result<bool, StorageMonitorError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.command_sender
+            .send(StorageMonitorCommand::InspectProbeFlightForTest {
+                volume,
+                response: response_sender,
+            })
+            .await
+            .map_err(|_| StorageMonitorError::Unavailable)?;
+        response_receiver
+            .await
+            .map_err(|_| StorageMonitorError::Unavailable)?
+    }
+
     pub fn current_snapshot(&self) -> StorageMonitorSnapshot {
         self.snapshot
             .lock()
@@ -615,6 +634,11 @@ enum StorageMonitorCommand {
     ProbeExited {
         volume: VolumeIdentity,
         probe_id: u64,
+    },
+    #[cfg(feature = "test-support")]
+    InspectProbeFlightForTest {
+        volume: VolumeIdentity,
+        response: oneshot::Sender<Result<bool, StorageMonitorError>>,
     },
 }
 
@@ -839,6 +863,15 @@ impl StorageMonitorActor {
             }
             StorageMonitorCommand::ProbeExited { volume, probe_id } => {
                 self.handle_probe_exited(volume, probe_id);
+            }
+            #[cfg(feature = "test-support")]
+            StorageMonitorCommand::InspectProbeFlightForTest { volume, response } => {
+                let result = self
+                    .volumes
+                    .get(&volume)
+                    .map(|runtime| runtime.in_flight.is_some())
+                    .ok_or(StorageMonitorError::Unavailable);
+                let _ = response.send(result);
             }
         }
     }

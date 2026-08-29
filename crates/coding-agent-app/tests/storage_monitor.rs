@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coding_agent_app::{
     MonitoredStorageScope, MonitoredStorageScopeBinding, RepositoryCoordinationKey,
@@ -146,6 +146,7 @@ impl Drop for ReleaseOnDrop {
 struct ScriptedSampler {
     steps: Mutex<VecDeque<ProbeStep>>,
     calls: Mutex<Vec<DirectoryIdentityMarker>>,
+    calls_changed: Condvar,
 }
 
 impl ScriptedSampler {
@@ -153,6 +154,7 @@ impl ScriptedSampler {
         Self {
             steps: Mutex::new(steps.into_iter().collect()),
             calls: Mutex::new(Vec::new()),
+            calls_changed: Condvar::new(),
         }
     }
 
@@ -169,6 +171,20 @@ impl ScriptedSampler {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    fn wait_for_exact_call_count(&self, expected: usize) {
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (calls, _) = self
+            .calls_changed
+            .wait_timeout_while(calls, Duration::from_secs(30), |calls| {
+                calls.len() < expected
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(calls.len(), expected);
+    }
 }
 
 impl VolumeSampler for ScriptedSampler {
@@ -176,10 +192,14 @@ impl VolumeSampler for ScriptedSampler {
         let root_identity = root
             .identity_marker()
             .map_err(|_| VolumeSampleError::Unavailable)?;
-        self.calls
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(root_identity);
+        {
+            let mut calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            calls.push(root_identity);
+            self.calls_changed.notify_all();
+        }
         let mut steps = self
             .steps
             .lock()
@@ -436,18 +456,43 @@ async fn advance_both(clock: &FakeClock, duration: Duration) {
     tokio::task::yield_now().await;
 }
 
-async fn wait_for_call_count(sampler: &ScriptedSampler, expected: usize) {
-    for _ in 0..1_000 {
-        if sampler.call_count() == expected {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(sampler.call_count(), expected);
+async fn wait_for_call_count(sampler: &Arc<ScriptedSampler>, expected: usize) {
+    let sampler = Arc::clone(sampler);
+    tokio::task::spawn_blocking(move || sampler.wait_for_exact_call_count(expected))
+        .await
+        .expect("join storage sampler call-count waiter");
 }
 
-async fn yield_repeatedly() {
-    for _ in 0..1_000 {
+async fn wait_for_data_state(monitor: &StorageMonitorHandle, expected: StorageState) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let actual = monitor.current_snapshot().data_state();
+        if actual == Some(expected) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            assert_eq!(actual, Some(expected));
+        }
+        std::thread::yield_now();
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_probe_exit(monitor: &StorageMonitorHandle, volume: VolumeIdentity) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if !monitor
+            .probe_is_in_flight_for_test(volume)
+            .await
+            .expect("inspect storage probe flight")
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "storage probe did not exit before the real-time deadline"
+        );
+        std::thread::yield_now();
         tokio::task::yield_now().await;
     }
 }
@@ -698,7 +743,7 @@ async fn admission_rechecks_every_required_volume_after_waiting_for_a_slow_probe
         async move { monitor.refresh_for_admission(0).await.unwrap() }
     });
     wait_for_call_count(&sampler, 2).await;
-    yield_repeatedly().await;
+    wait_for_data_state(&monitor, StorageState::Normal).await;
     assert_eq!(
         monitor.current_snapshot().data_state(),
         Some(StorageState::Normal),
@@ -708,8 +753,15 @@ async fn admission_rechecks_every_required_volume_after_waiting_for_a_slow_probe
     let initial = initial_refresh.await.unwrap();
     assert_eq!(initial.data_state(), Some(StorageState::Normal));
     assert_eq!(initial.runtime_state(), Some(StorageState::Unavailable));
+    assert!(
+        monitor
+            .probe_is_in_flight_for_test(runtime.identity)
+            .await
+            .unwrap(),
+        "a timed-out blocking probe remains owned until its worker exits"
+    );
     initial_runtime_gate.release();
-    yield_repeatedly().await;
+    wait_for_probe_exit(&monitor, runtime.identity).await;
 
     advance_both(&clock, Duration::from_millis(4_900)).await;
     let refresh = tokio::spawn({
@@ -719,7 +771,6 @@ async fn admission_rechecks_every_required_volume_after_waiting_for_a_slow_probe
     wait_for_call_count(&sampler, 3).await;
     advance_both(&clock, Duration::from_millis(200)).await;
     second_data_gate.release();
-    yield_repeatedly().await;
 
     let _ = refresh.await.unwrap();
     assert_eq!(
@@ -770,7 +821,7 @@ async fn repository_admission_does_not_probe_or_wait_for_an_unrelated_repository
                 .unwrap()
         }
     });
-    yield_repeatedly().await;
+    wait_for_call_count(&sampler, 3).await;
     assert_eq!(sampler.call_count(), 3);
     assert_eq!(
         sampler.called_roots().into_iter().collect::<HashSet<_>>(),
