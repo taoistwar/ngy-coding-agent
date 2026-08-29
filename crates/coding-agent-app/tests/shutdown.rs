@@ -404,6 +404,9 @@ async fn unknown_process_tree_past_total_budget_stops_http_but_retains_lock_and_
         !marker_path.exists() && !fixture.startup.paths.unclean_shutdown.exists(),
         "degraded markers are forbidden before all process trees are proven clean"
     );
+    // A fresh SQLx SQLite pool waits on a worker thread, so paused Tokio time
+    // could auto-advance to the acquire timeout before that thread replies.
+    tokio::time::resume();
     assert_eq!(
         fixture.reopen_task(task.id).await.status,
         TaskStatus::Running,
@@ -412,7 +415,6 @@ async fn unknown_process_tree_past_total_budget_stops_http_but_retains_lock_and_
     assert!(fixture.startup.calls.messages().is_empty());
 
     drop(held_tree);
-    tokio::time::resume();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), shutdown)
             .await
