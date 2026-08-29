@@ -888,6 +888,9 @@ async fn cleanup_completion_reply_loss_does_not_repeat_remove_or_delete() {
     fixture
         .wait_operation_state(worktree.operation_id(), CleanupOperationState::Completed)
         .await;
+    fixture
+        .wait_repository_state(RepositoryControlState::Available)
+        .await;
     let branch = fixture.delete().await;
     fixture
         .wait_operation_state(branch.operation_id(), CleanupOperationState::Completed)
