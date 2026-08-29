@@ -152,7 +152,15 @@ async fn persistent_reviewed_terminal_ambiguity_freezes_and_retains_runner_and_p
 #[tokio::test]
 async fn cleanup_unproven_runner_blocks_multi_active_degraded_recovery_and_retains_all_permits() {
     let _test_guard = support::degraded_test_guard().await;
-    let fixture = support::degraded_fixture_with_concurrency(2).await;
+    let (fixture, writer_faults) = support::degraded_fixture_with_writer_faults(
+        2,
+        [StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::BusyBeforeExecute,
+            operation: Some(StoreWriterOperationKind::AppendRunningEvent),
+            count: 6,
+        }],
+    )
+    .await;
     let (cleanup_task, cleanup_gate) = fixture.start_cleanup_unproven_task().await;
     let (event_task, event_gate) = fixture
         .start_event_task(RunnerEvent::PlanUpdated(PlanSnapshot::legacy(
@@ -161,7 +169,6 @@ async fn cleanup_unproven_runner_blocks_multi_active_degraded_recovery_and_retai
         )))
         .await;
 
-    fixture.fail_all_background_writes().await;
     event_gate.release.notify_one();
     fixture.wait_for_state(ServiceState::StoreDegraded).await;
     assert_eq!(
@@ -184,7 +191,6 @@ async fn cleanup_unproven_runner_blocks_multi_active_degraded_recovery_and_retai
     .await
     .expect("cleanup-unproven result keeps the coordinator blocked");
 
-    fixture.restore_writes().await;
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
@@ -195,6 +201,14 @@ async fn cleanup_unproven_runner_blocks_multi_active_degraded_recovery_and_retai
     assert!(!snapshot.degraded_recovery_running);
     assert_eq!(fixture.state.current().state, ServiceState::StoreDegraded);
     assert!(fixture.runner.cleanup_tree_is_held(cleanup_task));
+    assert_eq!(
+        writer_faults.hit_count(
+            StoreWriterFaultPoint::BusyBeforeExecute,
+            StoreWriterOperationKind::AppendRunningEvent,
+        ),
+        6,
+        "the event write exhausts the real bounded StoreWriter retry path"
+    );
 
     assert!(fixture.runner.release_cleanup_tree(cleanup_task));
     assert!(!fixture.runner.cleanup_tree_is_held(cleanup_task));

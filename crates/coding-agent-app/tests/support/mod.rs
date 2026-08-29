@@ -2145,6 +2145,7 @@ impl DegradedFixture {
             .await
             .expect("notify cleanup-unproven task");
         self.wait_for_status(task.id, TaskStatus::Running).await;
+        self.wait_for_runner_start(task.id).await;
         (task.id, gate)
     }
 
@@ -2186,6 +2187,7 @@ impl DegradedFixture {
             .await
             .expect("notify degraded fixture event task");
         self.wait_for_status(task.id, TaskStatus::Running).await;
+        self.wait_for_runner_start(task.id).await;
         (task.id, gate)
     }
 
@@ -2197,6 +2199,7 @@ impl DegradedFixture {
             .await
             .expect("notify degraded fixture review task");
         self.wait_for_status(task.id, TaskStatus::Running).await;
+        self.wait_for_runner_start(task.id).await;
         (task.id, gate)
     }
 
@@ -2379,6 +2382,16 @@ impl DegradedFixture {
         })
         .await
         .unwrap_or_else(|_| panic!("task {task_id} did not reach {expected:?}"));
+    }
+
+    async fn wait_for_runner_start(&self, task_id: TaskId) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.runner.started_count(task_id) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("runner did not start task {task_id}"));
     }
 }
 
