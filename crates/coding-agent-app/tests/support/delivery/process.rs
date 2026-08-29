@@ -297,11 +297,13 @@ impl ProcessDeliveryFixture {
     pub async fn start_ready(&mut self, pause: Option<StoreWriterOperationKind>) -> ProcessSession {
         self.spawn(pause);
         let descriptor = self.wait_for_descriptor().await;
-        ProcessSession::exchange(
+        let session = ProcessSession::exchange(
             &descriptor,
             tokio::time::Instant::from_std(self.generation_hard_deadline()),
         )
-        .await
+        .await;
+        self.wait_for_service_ready(&session).await;
+        session
     }
 
     pub async fn start_until_store_pause(&mut self, operation: StoreWriterOperationKind) {
@@ -1320,6 +1322,41 @@ impl ProcessDeliveryFixture {
             assert!(
                 Instant::now() < deadline,
                 "process delivery child did not publish its descriptor; child_log={}",
+                self.child_log()
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    async fn wait_for_service_ready(&mut self, session: &ProcessSession) {
+        let deadline = Instant::now() + STARTUP_OR_SHUTDOWN_TIMEOUT;
+        loop {
+            self.assert_child_running("open service admission after publishing its descriptor");
+            let bootstrap = session
+                .get_json("/api/bootstrap")
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "load process bootstrap while waiting for Ready: {error}; child_log={}",
+                        self.child_log()
+                    )
+                });
+            match bootstrap["service_state"].as_str() {
+                Some("ready") => return,
+                Some("store_degraded") => {}
+                Some("quiescing") => panic!(
+                    "process entered Quiescing before opening service admission; bootstrap={bootstrap}; child_log={}",
+                    self.child_log()
+                ),
+                state => panic!(
+                    "process bootstrap returned an unknown service state {state:?}; bootstrap={bootstrap}; child_log={}",
+                    self.child_log()
+                ),
+            }
+            self.assert_child_running("open service admission after publishing its descriptor");
+            assert!(
+                Instant::now() < deadline,
+                "process did not open service admission after publishing its descriptor; bootstrap={bootstrap}; child_log={}",
                 self.child_log()
             );
             tokio::time::sleep(POLL_INTERVAL).await;
