@@ -150,6 +150,8 @@ const DELIVERY_GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_ATTACHMENT_PREPARE_CONCURRENCY: usize = 4;
 const REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS: u64 = 1_000;
 const REPOSITORY_DISCOVERY_CLEANUP_TIMEOUT_MILLIS: u64 = 500;
+#[cfg(any(test, feature = "test-support"))]
+const PROCESS_TEST_REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS: u64 = 4_000;
 const REPOSITORY_POST_DISCOVERY_RESERVE_MILLIS: u64 = 2_000;
 // Two fixed discovery commands and one worst-case tree cleanup must leave a
 // positive, explicit budget for the durable write and runtime attachments.
@@ -158,6 +160,12 @@ const _: () = assert!(
         > (2 * REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS)
             + REPOSITORY_DISCOVERY_CLEANUP_TIMEOUT_MILLIS
             + REPOSITORY_POST_DISCOVERY_RESERVE_MILLIS
+);
+#[cfg(any(test, feature = "test-support"))]
+const _: () = assert!(
+    DEFAULT_APPLICATION_WRITE_BUDGET_MILLIS
+        > PROCESS_TEST_REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS
+            + REPOSITORY_DISCOVERY_CLEANUP_TIMEOUT_MILLIS
 );
 
 fn build_storage_monitor(
@@ -367,7 +375,7 @@ enum FixedSchedulerLimitsMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FixedRepositoryDiscoveryMode {
     Disabled,
-    Supervised,
+    Supervised(ProcessLimits),
 }
 
 /// Production composition root. It is intentionally inert until the locked
@@ -1025,15 +1033,38 @@ fn repository_discovery_process_limits() -> ProcessLimits {
     .expect("constant repository discovery process limits are valid")
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn process_test_repository_discovery_process_limits() -> ProcessLimits {
+    ProcessLimits::try_new(
+        16 * 1024,
+        16 * 1024,
+        Duration::from_millis(PROCESS_TEST_REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS),
+        Duration::from_millis(REPOSITORY_DISCOVERY_CLEANUP_TIMEOUT_MILLIS),
+    )
+    .expect("constant process-test repository discovery limits are valid")
+}
+
 fn supervised_repository_discovery(
     toolchain: &ToolchainPaths,
     context: &PreActorStartupRunnerContext,
+) -> Result<RepositoryDiscovery, StartupRunnerFactoryError> {
+    supervised_repository_discovery_with_limits(
+        toolchain,
+        context,
+        repository_discovery_process_limits(),
+    )
+}
+
+fn supervised_repository_discovery_with_limits(
+    toolchain: &ToolchainPaths,
+    context: &PreActorStartupRunnerContext,
+    process_limits: ProcessLimits,
 ) -> Result<RepositoryDiscovery, StartupRunnerFactoryError> {
     RepositoryDiscoveryCommands::from_trusted_toolchain(
         toolchain,
         context.paths().runtime_dir.as_path(),
         context.process_liveness_scope().clone(),
-        repository_discovery_process_limits(),
+        process_limits,
     )
     .map(RepositoryDiscovery::from_supervised_commands)
     .map_err(|_| StartupRunnerFactoryError::new("REPOSITORY_DISCOVERY_UNAVAILABLE"))
@@ -1066,7 +1097,14 @@ impl FixedStartupRunnerFactory {
             runner,
             scheduler_limits: FixedSchedulerLimitsMode::RuntimeConfig,
             sampler,
-            repository_discovery: FixedRepositoryDiscoveryMode::Supervised,
+            // Process-backed fixtures run beside other spawn-heavy tests. Give
+            // them test-only command latency allowance while retaining the
+            // caller's five-second end-to-end deadline and cleanup reserve.
+            // Unlike production, these fixtures do not promise the separate
+            // two-second post-discovery reserve.
+            repository_discovery: FixedRepositoryDiscoveryMode::Supervised(
+                process_test_repository_discovery_process_limits(),
+            ),
         }
     }
 }
@@ -1119,7 +1157,7 @@ impl StartupRunnerFactory for FixedStartupRunnerFactory {
                     context.paths().runtime_dir.clone(),
                 )
             }
-            FixedRepositoryDiscoveryMode::Supervised => {
+            FixedRepositoryDiscoveryMode::Supervised(process_limits) => {
                 let toolchain = discover_toolchain(
                     context.paths().runtime_dir.as_path(),
                     context.process_liveness_scope().clone(),
@@ -1128,7 +1166,7 @@ impl StartupRunnerFactory for FixedStartupRunnerFactory {
                 )
                 .await
                 .map_err(|error| StartupRunnerFactoryError::new(error.code()))?;
-                supervised_repository_discovery(&toolchain, context)?
+                supervised_repository_discovery_with_limits(&toolchain, context, process_limits)?
             }
         };
         Ok(Arc::new(PreparedFixedRunner {
