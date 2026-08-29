@@ -1642,8 +1642,10 @@ async fn wait_for_helper_pid(path: &Path) -> u32 {
     // process-start failure.
     let deadline = TokioInstant::now() + Duration::from_secs(15);
     loop {
-        if let Ok(value) = std::fs::read_to_string(path) {
-            return value.parse().unwrap();
+        if let Ok(value) = std::fs::read_to_string(path)
+            && let Ok(process_id) = value.parse::<std::num::NonZeroU32>()
+        {
+            return process_id.get();
         }
         assert!(
             TokioInstant::now() < deadline,
@@ -1651,6 +1653,24 @@ async fn wait_for_helper_pid(path: &Path) -> u32 {
         );
         time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+#[tokio::test]
+async fn helper_pid_waits_for_complete_contents_after_file_creation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("helper-pid");
+    std::fs::File::create(&path).unwrap();
+    let expected = std::process::id();
+    let writer = tokio::spawn({
+        let path = path.clone();
+        async move {
+            time::sleep(Duration::from_millis(20)).await;
+            std::fs::write(path, expected.to_string()).unwrap();
+        }
+    });
+
+    assert_eq!(wait_for_helper_pid(&path).await, expected);
+    writer.await.unwrap();
 }
 
 async fn wait_until_process_gone(process_id: u32) {
