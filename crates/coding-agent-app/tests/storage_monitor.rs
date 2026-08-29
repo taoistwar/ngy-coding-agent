@@ -534,6 +534,15 @@ async fn periodic_sampling_runs_for_queued_or_active_work_and_stops_while_idle()
     assert_eq!(sampler.call_count(), 0);
     advance_both(&clock, Duration::from_nanos(1)).await;
     wait_for_call_count(&sampler, 1).await;
+    // A sampler call precedes the actor's ProbeCompleted handling. Join that
+    // in-flight sample before advancing to the next periodic deadline.
+    let first_periodic_sample = monitor.refresh_for_admission(0).await.unwrap();
+    assert_eq!(first_periodic_sample.state(), Some(StorageState::Normal));
+    assert_eq!(
+        sampler.call_count(),
+        1,
+        "the admission barrier must reuse the in-flight or fresh periodic sample"
+    );
 
     monitor
         .set_activity(StorageActivity::new(0, 1))
