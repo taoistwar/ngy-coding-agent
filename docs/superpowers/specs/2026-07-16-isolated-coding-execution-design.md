@@ -1,8 +1,9 @@
 # Project 2：隔离式 Coding 执行设计
 
 > 日期：2026-07-16
-> 状态：初稿，等待书面规格复核
+> 状态：历史规格；Project 2 已完成并验收
 > 前置条件：Project 1 已完成并验收
+> 2026-08-29 范围修订：本文保留的“清理和配额属于 Project 4”按能力拆分为 P4-B 的显式 Git 现场清理与未来 P4-C 的历史/构件保留期和长期配额；已批准的 Project 4 仅为 P4-A + P4-B。此注释不改写 Project 2 的历史 TDD 事实。
 
 ## 1. 目标
 
@@ -108,7 +109,7 @@ Git 调用使用应用固定的可信 work-tree/git-dir，不采用模型可改�
 
 ### 5.3 保留
 
-Project 2 对 Completed、Failed、Cancelled、Interrupted 的 worktree 和分支一律保留，供用户检查。清理和配额属于 Project 4。应用重启不自动继续旧进程；Project 1 的恢复规则仍把运行中任务标记为 Interrupted。
+Project 2 对 Completed、Failed、Cancelled、Interrupted 的 worktree 和分支一律保留，供用户检查。清理和配额在当时路线图中统称 Project 4；按 2026-08-29 范围修订，显式 Git 现场清理归 P4-B，历史/构件保留期和长期配额归未来 P4-C。应用重启不自动继续旧进程；Project 1 的恢复规则仍把运行中任务标记为 Interrupted。
 
 ## 6. Repository runtime ports
 

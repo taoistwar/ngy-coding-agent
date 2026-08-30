@@ -1,8 +1,9 @@
 # NGY Coding Agent 产品路线图设计
 
 > 日期：2026-07-14
-> 状态：对话设计已确认；等待书面规格复核
+> 状态：历史路线图；Project 1–4 已按后续各项目批准范围完成并通过验收
 > 本文用途：固定产品边界、跨项目架构和实施顺序。每个项目开始实现前，仍需单独完成规格与实现计划。
+> 2026-08-29 范围修订：已批准的 Project 4 仅由 P4-A + P4-B 组成；原草案中的历史/构件生命周期归未来 P4-C，发行包装、全链路脱敏与真实 provider 加固归未来 P4-D。本文正文已按该后续批准边界归一化；修订前的原始路线图记录由 Git 历史保留。
 
 ## 1. 产品目标
 
@@ -28,7 +29,7 @@
 - 命令接口使用 REST，实时事件使用 SSE。
 - SQLite 是任务、仓库与事件的权威状态源。
 - OpenAPI 是前后端 DTO 的契约源，TypeScript 类型由它生成。
-- 应用核心是各目标平台上的单个本地可执行文件，内嵌 React 生产资源；安装器、macOS app bundle、Linux desktop entry 与签名等平台包装属于 Project 4。
+- 应用核心是各目标平台上的单个本地可执行文件，内嵌 React 生产资源；安装器、macOS app bundle、Linux desktop entry 与签名等平台包装属于未来 P4-D，不属于 Project 4。
 - 支持 Windows、macOS 与 Linux。
 
 React 官方把 Vite 列为从零搭建 React 应用的可选构建工具；Vite 的生产构建输出适合被后端作为静态资源发布。相关依据见 [React: Build a React app from Scratch](https://react.dev/learn/build-a-react-app-from-scratch)、[Vite: Building for Production](https://vite.dev/guide/build) 与 [Vite: Static Asset Handling](https://vite.dev/guide/assets.html)。Axum 的路由、提取器、响应与 SSE 能力以其 [官方 crate 文档](https://docs.rs/axum/latest/axum/) 为准。
@@ -78,7 +79,7 @@ flowchart LR
 
 ### Project 1：本地 Web 平台
 
-交付可直接启动、全程通过 Web UI 交互的本地 React/Axum 核心应用，先用确定性的 `FakeTaskRunner` 验证平台能力；三平台的双击 launcher/安装包装在 Project 4 完成：
+交付可直接启动、全程通过 Web UI 交互的本地 React/Axum 核心应用，先用确定性的 `FakeTaskRunner` 验证平台能力；三平台的双击 launcher/安装包装留给未来 P4-D：
 
 - React 三栏工作台；
 - 仓库登记与本地目录选择；
@@ -105,7 +106,7 @@ Project 1 不调用模型、不修改仓库、不创建 worktree。它建立后�
 - 原子修改语义明确为“单文件安全替换”，不承诺跨文件崩溃事务；
 - 使用本地 mock HTTP provider 的离线端到端测试。
 
-本项目结束时，一个任务能在 worktree 中完成“读取—修改—测试”，但还不声称具备 Planner/Reviewer 质量闭环。Project 2 的真实 runner 暂时限制为全局单任务执行；P1 的四路并发只用于 Fake runner。真实任务并发、同仓库协调和资源配额在 Project 4 验收前不得打开。
+本项目结束时，一个任务能在 worktree 中完成“读取—修改—测试”，但还不声称具备 Planner/Reviewer 质量闭环。Project 2 的真实 runner 暂时限制为全局单任务执行；P1 的四路并发只用于 Fake runner。真实任务并发、同仓库协调和应用管理范围内的资源准入由后续 P4-A 批准后打开；这不等于 OS 或宿主磁盘硬配额。
 
 ### Project 3：多角色质量闭环
 
@@ -123,18 +124,17 @@ Project 1 不调用模型、不修改仓库、不创建 worktree。它建立后�
 
 角色使用同一 provider 配置是允许的，但不得共享隐式对话历史。Reviewer 运行的命令仍只作用于任务 worktree。
 
-### Project 4：并发交付与产品加固
+### Project 4：受控并发与本地交付（P4-A + P4-B）
 
-把前三个项目提升为可持续使用的 v1：
+已批准的 Project 4 只包含两段：
 
-- 对真实任务启用受控并发与资源配额；
-- 同仓库多 worktree 的锁、分支命名、冲突与清理策略；
-- Web UI 中的合并前检查、合并、失败恢复和保留/清理操作；
-- 既有任务历史的分页/搜索，以及真实制品的保留、清理和磁盘配额；
-- provider 与命令全链路脱敏；
-- Windows、macOS、Linux 的打包、签名准备与兼容性测试；
-- 崩溃恢复、长时间运行、背压与大输出压力测试；
-- 完整真实 provider 冒烟测试，同时保持默认测试套件离线可重复。
+- P4-A：对真实任务启用受控并发、同仓库准入、repository control、队列背压、存储压力准入和进程/重启恢复；这些是应用管理范围内的准入机制，不是 OS 或宿主磁盘硬配额。
+- P4-B：在 Web UI 中提供显式的合并前检查、exact no-ff 本地合并、失败/崩溃恢复，以及合并后两个独立的 worktree/branch 清理动作；默认仍不 merge、不 cleanup。
+
+以下原草案候选项不属于 Project 4，需以后续独立规格重新批准：
+
+- P4-C：既有任务历史分页/搜索、真实构件大小、保留期、长期配额和批量/自动删除生命周期。
+- P4-D：provider/命令全链路脱敏重构、动态设置、Windows/macOS/Linux 发行包装、签名/公证、自动更新和真实 provider 冒烟。
 
 ## 5. 项目依赖和验收门
 
@@ -142,7 +142,7 @@ Project 1 不调用模型、不修改仓库、不创建 worktree。它建立后�
 flowchart LR
     P1["P1 Local Web platform"] --> P2["P2 Isolated coding execution"]
     P2 --> P3["P3 Multi-role quality loop"]
-    P3 --> P4["P4 Concurrent delivery and hardening"]
+    P3 --> P4["P4 Controlled concurrency and local delivery"]
 ```
 
 每个项目都必须经过以下门禁，才进入下一项目：
@@ -157,9 +157,9 @@ flowchart LR
 
 前一项目的接口可以在后一项目规格中扩展，但不能静默改变已验收行为。需要破坏性变更时，先更新对应规格并说明迁移。
 
-## 6. 最终 v1 验收场景
+## 6. Project 1–4 已批准范围验收场景
 
-当四个项目全部完成后，至少通过以下跨项目场景：
+Project 1–4（其中 Project 4 = P4-A + P4-B）已经全部完成，并通过以下已批准范围内的跨项目场景：
 
 1. 双击应用后，仅在 `127.0.0.1` 随机端口打开受保护的 Web UI。
 2. 添加两个真实 Rust Git 仓库，并在同一仓库创建两个并发任务。
@@ -170,8 +170,8 @@ flowchart LR
 7. 应用被强制终止后重启，未完成任务变为 `Interrupted`，worktree、日志与历史仍在。
 8. 用户从 Web UI 重新运行中断任务；旧尝试保持只读可查看。
 9. Reviewer 通过后不自动合并；用户执行合并，冲突时得到明确且可恢复的结果。P4 合并入口只接受显式 `ReviewApproved` 且证据绑定最终 generation 的任务，历史 `Completed` 任务默认不可合并。
-10. 正常离线测试不访问外部模型服务；真实 provider 只用于显式的冒烟测试。
+10. 正常离线测试不访问外部模型服务；Project 4 不包含真实 provider 冒烟，相关能力留给未来 P4-D。
 
-## 7. 当前执行范围
+## 7. 已封存范围
 
-当前只为 Project 1 编写规格与实现计划。Project 2、3、4 的内容是方向与依赖约束，不是已授权立即实现的范围。
+2026-08-30 封存：本节原文只描述 2026-07-14 当时的授权边界，现由各项目后续批准并完成验收的规格与计划取代。Project 4 的已验收范围固定为 P4-A + P4-B；P4-C/P4-D 仍是未来独立项目，不能作为 Project 4 的未完成项或验收欠账。

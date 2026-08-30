@@ -1,9 +1,10 @@
 # Project 1：本地 Web 平台设计
 
 > 日期：2026-07-14
-> 状态：对话设计已确认；等待书面规格复核
+> 状态：历史规格；Project 1 已完成并验收
 > 上位文档：`2026-07-14-coding-agent-product-roadmap-design.md`
 > 本文范围：只交付本地 Web 平台和确定性的假任务执行器，不实现真实模型、代码修改或 Git worktree。
+> 2026-08-29 范围修订：本文保留的“发行包装留给 Project 4”等旧里程碑措辞按未来 P4-D 解释；P4-A + P4-B 才是后续批准的 Project 4。此注释不改写 Project 1 的历史 TDD 事实。
 
 ## 1. 摘要
 
@@ -742,7 +743,7 @@ runner 若在第 2 步事务之前已经成功提交 `Completed`/`Failed`，保�
 
 Vite 只转译 TypeScript而不执行完整类型检查，因此 `typecheck` 是独立门禁，依据见 [Vite Features: TypeScript](https://vite.dev/guide/features#typescript)。生产资源构建和路径行为以 [Vite Building for Production](https://vite.dev/guide/build) 与 [Static Asset Handling](https://vite.dev/guide/assets.html) 为准。
 
-运行时核心不包含 Node.js、npm、源码目录或独立静态资源目录。SQLite、日志和 runtime descriptor 是用户数据，不内嵌也不写到可执行文件旁边。Project 1 在 Windows、macOS、Linux 分别构建带内嵌前端的核心可执行文件并做基础启动 smoke；它不交付安装器、macOS app bundle、Linux desktop entry、签名或自动更新，这些平台发行包装在 Project 4 完成。
+运行时核心不包含 Node.js、npm、源码目录或独立静态资源目录。SQLite、日志和 runtime descriptor 是用户数据，不内嵌也不写到可执行文件旁边。Project 1 在 Windows、macOS、Linux 分别构建带内嵌前端的核心可执行文件并做基础启动 smoke；它不交付安装器、macOS app bundle、Linux desktop entry、签名或自动更新。这些平台发行包装在当时路线图中记为 Project 4；按 2026-08-29 范围修订归未来 P4-D。
 
 ## 14. 错误与恢复策略
 
@@ -869,7 +870,7 @@ Project 1 只有在以下结果同时成立时才完成：
 8. retry 产生新 attempt，旧 attempt 的状态、事件与错误不被覆盖。
 9. 错误 runner 和 panic 被隔离，其他任务继续。
 10. 未认证、错误 Host/Origin/CSRF 的本地请求不能读取路径、打开 picker 或修改状态。
-11. 应用核心是内嵌 React 资源的单个 Rust 可执行文件，运行时不要求 Node.js；Project 1 验证三平台可构建和基础启动，安装器、app bundle、desktop entry、签名与发行体验留给 Project 4。
+11. 应用核心是内嵌 React 资源的单个 Rust 可执行文件，运行时不要求 Node.js；Project 1 验证三平台可构建和基础启动。安装器、app bundle、desktop entry、签名与发行体验在当时路线图中留给 Project 4；按 2026-08-29 范围修订归未来 P4-D。
 12. 依赖已经安装后，默认测试执行与应用运行不访问模型服务或其他外部网络；包管理器下载依赖不属于运行时测试流量。
 13. OpenAPI 与生成 TypeScript DTO 保持同步。
 14. Windows、macOS、Linux 的平台 smoke test 都通过。
@@ -883,7 +884,7 @@ Project 1 结束时只承诺以下接缝，避免提前实现 Project 2：
 - UI 与 API 不依赖 `FakeTaskRunner` 专有字段。
 - TaskEvent envelope 支持以后增加新的 versioned event kind。
 - Repository 已保存 Git root 与 Cargo workspace root，但尚未创建 worktree。
-- Project 2 接入真实 runner 时把全局并发上限设为 1；在 Project 4 完成 worktree 协调、同仓库锁和资源配额前，不复用 Fake runner 的四路并发配置。
+- Project 2 接入真实 runner 时把全局并发上限设为 1；在后续 P4-A 完成 worktree 协调、同仓库锁和应用管理范围内的资源准入前，不复用 Fake runner 的四路并发配置；这不承诺 OS 或宿主磁盘硬配额。
 - Project 2 可以增加代码工具、模型配置与 worktree 元数据；任何破坏现有 Task/API 行为的改动必须先修订规格。
 
 Project 1 不以“预留未来”为理由加入未使用的 provider、工具调用或角色抽象。

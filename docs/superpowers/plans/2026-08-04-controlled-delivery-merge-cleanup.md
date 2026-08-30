@@ -1,9 +1,11 @@
 # Project 4B：受控本地交付、合并与 Git 现场清理实施计划
 
 > 日期：2026-08-04
-> 状态：规格与本计划已于 2026-08-04 获用户书面批准；P4-B 实施进行中
+> 状态：P4-B 已完成实现、独立审查与完整验收；Project 4（P4-A + P4-B）已完成
+> 验收日期：2026-08-30
 > 基线：`29b81d9 project 4 P4-A：受控并发与资源准入`
 > 执行规则：按任务顺序手工执行 TDD；每个任务先 RED、再 GREEN、最后 REFACTOR 与回归验证
+> 项目边界：已批准的 Project 4 = P4-A + P4-B；P4-C（历史/构件生命周期）与 P4-D（发行/provider 加固）是未来项目
 
 **目标：** 在不扩展六态 `TaskStatus`、不改变 `DeliveryReadiness`、attempt artifact 和 11 种持久 task event 语义的前提下，为 `Completed + ReviewApproved` 任务增加用户显式触发、可恢复且 fail-closed 的本地 source commit、固定 `--no-ff` merge、冲突恢复，以及分两步确认的 worktree/source-branch 清理。
 
@@ -1018,15 +1020,15 @@ node scripts/check-placeholders.mjs
 git diff --check
 ```
 
-- [ ] 在承载最终候选commit的现有CI上，`quality-e2e`（Ubuntu）与`release-smoke`矩阵的`ubuntu-latest`、`windows-2022`、`macos-latest`全部成功；核对的workflow必须仍执行P4-B相关workspace/Web/E2E或明确的等价门禁。
-- [ ] 上述PowerShell命令只算Windows本地证据；CI未运行、被跳过或任一平台失败时，状态只能报告“本地部分验证”，不得报告P4-B完成。
+- [x] 在承载最终代码候选commit的现有CI上，7个必需job全部成功：1个`quality-e2e`、3个Linux `runtime-tests` shard，以及`release-smoke`矩阵的`ubuntu-latest`、`windows-2022`、`macos-latest`；核对的workflow仍执行P4-B相关workspace/Web/E2E门禁。不可变run/job证据见下方最终验收记录。
+- [x] 上述PowerShell命令只算Windows本地证据；本次最终代码候选的7个必需job均为`success`，没有必需job被跳过、取消或失败，最终结论不以单平台本地结果替代CI。
 
 ## 完成定义
 
 只有以下条件全部满足，P4-B 才可报告完成：
 
 - 任务1–29均有先失败、后通过的聚焦测试证据，任务30完整门禁使用最终代码全绿。
-- 最终候选commit的现有`quality-e2e`与Linux/Windows/macOS三平台`release-smoke`全绿；不能用单平台本地结果替代。
+- 最终候选commit的7个必需CI job全绿：1个`quality-e2e`、3个Linux `runtime-tests` shard和Linux/Windows/macOS三个`release-smoke`平台；不能用单平台本地结果替代，任一必需job失败都不通过。
 - 独立审查Blocker/High为0，最终diff与已批准规格/计划逐条一致。
 - 未点击不创建source commit/merge/cleanup；显式merge产生exact no-ff commit，冲突不改目标。
 - source/merge/abort/cleanup每个crash/reply-lost/unknown路径均收敛到可证明状态或reconciliation+poison。
@@ -1034,6 +1036,28 @@ git diff --check
 - 六态Task、readiness/evidence、artifact事实、11种persisted event、SSE cursor和P4-A startup/Scheduler不变量保持。
 - 没有真实provider/remote Git尝试，没有rebase/push/PR/自动cleanup，没有开始P4-C/P4-D。
 
-## 当前门禁
+## 实施完成与最终验收记录
 
-本计划已获用户书面批准，P4-B 实施授权生效。必须按任务 1–30 顺序推进；未完成任务 30 的独立审查、跨平台 CI 与完整门禁前，不得报告 P4-B 或 Project 4 完成。
+本计划已获用户书面批准；P4-B 实现、独立审查和任务 30 全部门禁均已完成。2026-08-30，已批准的 Project 4（P4-A + P4-B）完成最终验收。
+
+| 验收项 | 不可变证据 |
+| --- | --- |
+| 最终代码候选 | `8da9d760f281527cc6d6806f226ab6e09f6015e0`（`test: canonicalize release smoke root`） |
+| CI run | [run 33305748048](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048)，attempt 1，event=`push`，branch=`codex/project-4`，head SHA=`8da9d760f281527cc6d6806f226ab6e09f6015e0`，结论=`success` |
+| Windows 本地门禁 | `cargo fmt --all -- --check`、`git diff --check`、workspace all-target/all-feature Clippy、`release_smoke` 非 ignored 测试 5/5，以及构建后 exact ignored release smoke 1/1 均通过 |
+| 独立代码审查 | 精确范围 `29b81d9..8da9d760f281527cc6d6806f226ab6e09f6015e0`；Blocker/High/Medium/Low=`0/0/0/0`；Scope gate 与 Structure gate 均为 PASS |
+| 范围核对 | 保持六态 Task、11 种 persisted task event、既有 router 兼容和 fail-closed ownership；未加入 provider/remote Git、P4-C 或 P4-D 能力 |
+
+| 必需门禁 | Job ID | 结论 |
+| --- | ---: | --- |
+| [Linux quality and E2E](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934287) | `99241934287` | `success` |
+| [Linux runtime tests (shard 1)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934284) | `99241934284` | `success` |
+| [Linux runtime tests (shard 2)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934297) | `99241934297` | `success` |
+| [Linux runtime tests (shard 3)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934281) | `99241934281` | `success` |
+| [Release smoke (ubuntu-latest)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934295) | `99241934295` | `success` |
+| [Release smoke (windows-2022)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934229) | `99241934229` | `success` |
+| [Release smoke (macos-latest)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934250) | `99241934250` | `success` |
+
+`Linux quality and E2E` 覆盖 workspace、OpenAPI/生成客户端漂移、Web typecheck/unit/build、浏览器 E2E 和 placeholder 门禁；三个 runtime shard 的 manifest validator 精确覆盖全部 runtime integration target；三平台 release job 均执行 native source/abort/atomic-cleanup 证明、embedded release build 和真实启动 smoke。
+
+本记录由只修改 `README.md` 与九份规格/计划文档的封存提交承载；该后继提交不能把本节的代码候选 run 冒充为自身 CI。封存提交自身的 7 个必需 CI 结论在最终项目交付记录中报告，避免在不可变提交内容中形成自引用。

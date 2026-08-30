@@ -1,6 +1,6 @@
 # ngy 编码代理
 
-本仓库包含本地浏览器编码代理的 Project 4（P4-A + P4-B）实现。该应用程序是一个 Rust 进程，
+本仓库包含本地浏览器编码代理已完成并通过验收的 Project 4（P4-A + P4-B）实现。该应用程序是一个 Rust 进程，
 负责运行 Axum、SQLite、任务编排、原生对话框、隔离的 Git 工作树运行时，以及
 兼容 OpenAI 的提供方客户端；React UI 则通过随机的 `127.0.0.1` 端口提供服务。
 
@@ -34,8 +34,15 @@ generation、digest、完整 diff coverage 和全部必需检查一致时才生�
 Reviewer approval、页面刷新、后台调度或启动恢复而自动 merge。保留的 Git 工作树和
 分支仍是供用户独立检查的权威构件。
 
-Project 4 不提供自动 merge/cleanup、远程 push、PR、rebase、squash、自动冲突解决、
-构件历史/配额生命周期、动态运行时设置、安装程序、代码签名、公证或自动更新。
+Project 4 的批准范围固定为 P4-A + P4-B。它不提供自动 merge/cleanup、远程 push、PR、
+rebase、squash 或自动冲突解决。构件历史/保留期/长期配额生命周期属于未来 P4-C；
+动态运行时设置、安装程序、代码签名、公证、自动更新和真实 provider 冒烟属于未来 P4-D。
+P4-C/P4-D 不是 Project 4 的未完成部分。
+
+最终代码候选 `8da9d760f281527cc6d6806f226ab6e09f6015e0` 已在
+[GitHub Actions run 33305748048](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048)
+完成 7 个必需作业并全部成功；逐作业证据和验收边界见
+[P4-B 实施计划的最终验收记录](docs/superpowers/plans/2026-08-04-controlled-delivery-merge-cleanup.md#实施完成与最终验收记录)。
 
 ## 受控本地交付
 
