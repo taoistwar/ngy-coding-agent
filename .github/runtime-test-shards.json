@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "shards": [
+    {
+      "id": "1",
+      "includeLib": true,
+      "targets": [
+        "delivery_abort",
+        "delivery_cleanup_recovery",
+        "delivery_mutation_faults",
+        "delivery_target",
+        "delivery_preflight",
+        "delivery_recovery",
+        "delivery_probe",
+        "storage",
+        "path_security"
+      ]
+    },
+    {
+      "id": "2",
+      "includeLib": false,
+      "targets": [
+        "delivery_branch_cleanup",
+        "delivery_merge",
+        "delivery_process_faults",
+        "delivery_security",
+        "delivery_persisted_recovery",
+        "delivery_task18_regression",
+        "delivery_task18_security_regression",
+        "process_liveness",
+        "process_stdin",
+        "atomic_replace",
+        "windows_protected_metadata",
+        "role_runtime",
+        "review_diff"
+      ]
+    },
+    {
+      "id": "3",
+      "includeLib": false,
+      "targets": [
+        "delivery_cleanup",
+        "delivery_source_commit",
+        "worktree",
+        "delivery_source",
+        "diff",
+        "file_tools",
+        "fingerprint",
+        "git_tools",
+        "cargo_tools",
+        "quality_runtime"
+      ]
+    }
+  ]
+}

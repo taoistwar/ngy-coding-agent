@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality-e2e:
     name: Linux quality and E2E
@@ -75,11 +79,8 @@ jobs:
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 
-      - name: Test cleanup refresh recovery in isolation
-        run: cargo test --locked --offline -p coding-agent-runtime --test delivery_cleanup_recovery --all-features recovered_branch_refresh_revokes_every_old_delete_capability -- --exact --test-threads=1 --nocapture
-
-      - name: Test Rust workspace
-        run: cargo test --workspace --all-targets --all-features --locked --offline -- --skip recovered_branch_refresh_revokes_every_old_delete_capability
+      - name: Test non-runtime Rust workspace
+        run: cargo test --workspace --exclude coding-agent-runtime --all-targets --all-features --locked --offline
 
       - name: Build E2E application
         run: cargo build --locked --offline -p coding-agent-app --features e2e
@@ -91,11 +92,51 @@ jobs:
       - name: Run browser E2E tests
         run: npm --prefix web run e2e
 
-      - name: Build embedded release application
-        run: cargo build --release --locked --offline -p coding-agent-app --features embedded-web
-
       - name: Reject placeholder markers
         run: node scripts/check-placeholders.mjs
+
+  runtime-tests:
+    name: Linux runtime tests (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Set neutral Rust default
+        shell: bash
+        run: |
+          toolchain="$(rustup show active-toolchain)"
+          rustup default "${toolchain%% *}"
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Enable offline runtime gates
+        shell: bash
+        run: echo "CARGO_NET_OFFLINE=true" >> "$GITHUB_ENV"
+
+      - name: Validate runtime shard coverage
+        run: node scripts/runtime-test-shards.mjs --check --expected-shards 3
+
+      - name: Test runtime shard
+        run: node scripts/runtime-test-shards.mjs --run --shard "${{ matrix.shard }}" --expected-shards 3
 
   release-smoke:
     name: Release smoke (${{ matrix.os }})
@@ -142,38 +183,29 @@ jobs:
           echo "CARGO_NET_OFFLINE=true" >> "$GITHUB_ENV"
           echo "npm_config_offline=true" >> "$GITHUB_ENV"
 
-      - name: Export OpenAPI schema
-        run: cargo run --locked --offline -p coding-agent-api --bin export_openapi -- web/openapi.json
-
-      - name: Check generated API client
-        run: npm --prefix web run api:check
-
-      - name: Check frontend configuration
-        run: npm --prefix web run config:check
-
-      - name: Check API artifacts are unchanged
-        run: git diff --exit-code -- web/openapi.json web/src/api/generated/schema.d.ts
-
-      - name: Type-check frontend
-        run: npm --prefix web run typecheck
-
-      - name: Test frontend
-        run: npm --prefix web run test:run
-
       - name: Build frontend
         run: npm --prefix web run build
-
-      - name: Check Rust formatting
-        run: cargo fmt --all --check
 
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 
-      - name: Test cleanup refresh recovery in isolation
-        run: cargo test --locked --offline -p coding-agent-runtime --test delivery_cleanup_recovery --all-features recovered_branch_refresh_revokes_every_old_delete_capability -- --exact --test-threads=1 --nocapture
+      - name: Test native library and binary contracts
+        run: cargo test --locked --offline -p coding-agent-runtime -p coding-agent-app --lib --bins --all-features
 
-      - name: Test Rust workspace
-        run: cargo test --workspace --all-targets --all-features --locked --offline -- --skip recovered_branch_refresh_revokes_every_old_delete_capability
+      - name: Test native runtime contracts
+        run: cargo test --locked --offline -p coding-agent-runtime --all-features --test atomic_replace --test path_security --test storage --test process_liveness --test process_stdin --test windows_protected_metadata --test delivery_probe --test delivery_security --test delivery_source_commit --test delivery_task18_regression --test delivery_task18_security_regression --test worktree
+
+      - name: Test native application contracts
+        run: cargo test --locked --offline -p coding-agent-app --all-features --test platform --test repository_service --test runtime_config --test single_instance --test process_liveness_startup_e2e
+
+      - name: Test cross-platform source proof
+        run: cargo test --locked --offline -p coding-agent-runtime --all-features --test delivery_source_commit source_commit_rejects_a_candidate_tree_when_reopened_evidence_changes -- --exact --test-threads=1
+
+      - name: Test cross-platform abort proof
+        run: cargo test --locked --offline -p coding-agent-runtime --all-features --test delivery_abort real_git_conflict_has_the_exact_clean_abort_postcondition -- --exact --test-threads=1
+
+      - name: Test cross-platform atomic cleanup proof
+        run: cargo test --locked --offline -p coding-agent-runtime --all-features --test delivery_branch_cleanup exact_source_and_target_retry_one_atomic_delete_transaction -- --exact --test-threads=1
 
       - name: Build embedded release application
         run: cargo build --release --locked --offline -p coding-agent-app --features embedded-web
