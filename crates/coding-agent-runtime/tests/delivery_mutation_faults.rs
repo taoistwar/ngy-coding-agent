@@ -393,40 +393,6 @@ impl PreparedAbort {
         );
         std::fs::remove_file(&self.attributes).unwrap();
     }
-
-    fn clear_proven_stale_index_lock_for_fixture(
-        &self,
-        fault: ProcessFault,
-        outcome: &DeliveryAbortOutcome,
-    ) {
-        if !matches!(
-            fault,
-            ProcessFault::AfterSpawnUnknown
-                | ProcessFault::Deadline
-                | ProcessFault::WaitUnknown
-                | ProcessFault::KillFailure
-                | ProcessFault::CleanupFailure
-        ) {
-            return;
-        }
-
-        let index_lock = self.fixture.repository.join(".git/index.lock");
-        let metadata = match std::fs::symlink_metadata(&index_lock) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => panic!("{fault:?}: inspect fixture index lock after zero-live: {error}"),
-        };
-        assert!(
-            metadata.file_type().is_file(),
-            "{fault:?}: fixture index lock must be a plain file"
-        );
-        assert!(
-            matches!(outcome, DeliveryAbortOutcome::ReconciliationRequired),
-            "{fault:?}: a stale index lock must prevent a definitive abort outcome"
-        );
-        std::fs::remove_file(index_lock)
-            .unwrap_or_else(|error| panic!("{fault:?}: remove proven stale fixture lock: {error}"));
-    }
 }
 
 struct AcceptAbortProof;
@@ -853,6 +819,11 @@ async fn assert_actual_merge_fault(name: &str, task_id: &str, fault: ProcessFaul
         fault,
     );
     assert_actual_merge_fault_truth(&prepared, fault, &outcome);
+    clear_proven_stale_fixture_index_lock(
+        &prepared.fixture.repository,
+        fault,
+        matches!(outcome, DeliveryMergeOutcome::ReconciliationRequired),
+    );
 
     prepared.reset_target();
     assert_eq!(
@@ -1014,7 +985,11 @@ async fn assert_abort_fault(name: &str, task_id: &str, fault: ProcessFault) {
     assert_closing_observation_policy(ABORT_CHILD_ORDINAL, observed_children, fault);
     assert_fault_event_order(&controller, ABORT_CHILD_ORDINAL, observed_children, fault);
     assert_abort_fault_truth(&prepared, fault, &outcome);
-    prepared.clear_proven_stale_index_lock_for_fixture(fault, &outcome);
+    clear_proven_stale_fixture_index_lock(
+        &prepared.fixture.repository,
+        fault,
+        matches!(outcome, DeliveryAbortOutcome::ReconciliationRequired),
+    );
 
     prepared.recreate_conflict(task_id);
     assert_eq!(
@@ -1474,6 +1449,76 @@ fn assert_delete_fault_truth(
             ),
         },
     }
+}
+
+fn clear_proven_stale_fixture_index_lock(
+    repository: &Path,
+    fault: ProcessFault,
+    reconciliation_required: bool,
+) {
+    if !matches!(
+        fault,
+        ProcessFault::AfterSpawnUnknown
+            | ProcessFault::Deadline
+            | ProcessFault::WaitUnknown
+            | ProcessFault::KillFailure
+            | ProcessFault::CleanupFailure
+    ) {
+        return;
+    }
+
+    let index_lock = repository.join(".git/index.lock");
+    let metadata = match std::fs::symlink_metadata(&index_lock) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("{fault:?}: inspect fixture index lock after zero-live: {error}"),
+    };
+    assert!(
+        metadata.file_type().is_file(),
+        "{fault:?}: fixture index lock must be a plain file"
+    );
+    assert!(
+        reconciliation_required,
+        "{fault:?}: a stale fixture index lock requires reconciliation"
+    );
+    std::fs::remove_file(index_lock)
+        .unwrap_or_else(|error| panic!("{fault:?}: remove proven stale fixture lock: {error}"));
+}
+
+#[test]
+fn proven_stale_fixture_index_lock_is_removed_only_for_after_spawn_faults() {
+    let temp = tempfile::tempdir().unwrap();
+    let git_directory = temp.path().join(".git");
+    std::fs::create_dir(&git_directory).unwrap();
+    let index_lock = git_directory.join("index.lock");
+    std::fs::write(&index_lock, b"fixture lock").unwrap();
+
+    clear_proven_stale_fixture_index_lock(temp.path(), ProcessFault::BeforeSpawn, true);
+    assert!(index_lock.is_file());
+
+    clear_proven_stale_fixture_index_lock(temp.path(), ProcessFault::Deadline, true);
+    assert!(!index_lock.exists());
+}
+
+#[test]
+#[should_panic(expected = "a stale fixture index lock requires reconciliation")]
+fn stale_fixture_index_lock_rejects_a_definitive_outcome() {
+    let temp = tempfile::tempdir().unwrap();
+    let git_directory = temp.path().join(".git");
+    std::fs::create_dir(&git_directory).unwrap();
+    std::fs::write(git_directory.join("index.lock"), b"fixture lock").unwrap();
+
+    clear_proven_stale_fixture_index_lock(temp.path(), ProcessFault::Deadline, false);
+}
+
+#[test]
+#[should_panic(expected = "fixture index lock must be a plain file")]
+fn stale_fixture_index_lock_rejects_a_non_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let index_lock = temp.path().join(".git/index.lock");
+    std::fs::create_dir_all(&index_lock).unwrap();
+
+    clear_proven_stale_fixture_index_lock(temp.path(), ProcessFault::Deadline, true);
 }
 
 async fn assert_controlled_child_was_reaped(
