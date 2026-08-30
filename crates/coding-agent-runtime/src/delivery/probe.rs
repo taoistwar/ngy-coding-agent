@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::future::Future;
 #[cfg(feature = "test-support")]
 use std::path::Path;
 #[cfg(windows)]
@@ -271,26 +272,32 @@ async fn create_probe_graph(
     runner: &ProbeCommandRunner<'_>,
     oid_length: usize,
 ) -> Result<ProbeGraph, DeliveryGitProbeError> {
-    let empty_tree = parse_object_id(&runner.run(commands.empty_tree()?).await?, oid_length)?;
-    let blob = parse_object_id(&runner.run(commands.probe_blob()?).await?, oid_length)?;
-    let source_tree =
-        parse_object_id(&runner.run(commands.source_tree(&blob)?).await?, oid_length)?;
-    let base = parse_object_id(
-        &runner.run(commands.base_commit(&empty_tree)?).await?,
-        oid_length,
-    )?;
-    let target = parse_object_id(
-        &runner
-            .run(commands.target_commit(&empty_tree, &base)?)
-            .await?,
-        oid_length,
-    )?;
-    let source = parse_object_id(
-        &runner
-            .run(commands.source_commit(&source_tree, &base)?)
-            .await?,
-        oid_length,
-    )?;
+    // These three waves only populate the private repository's immutable,
+    // content-addressed object database. Ref, index, HEAD, and worktree
+    // operations remain serialized below the graph construction boundary.
+    let empty_tree_command = commands.empty_tree()?;
+    let probe_blob_command = commands.probe_blob()?;
+    let (empty_tree, blob) = runner
+        .run_pair_to_completion(empty_tree_command, probe_blob_command)
+        .await?;
+    let empty_tree = parse_object_id(&empty_tree, oid_length)?;
+    let blob = parse_object_id(&blob, oid_length)?;
+
+    let source_tree_command = commands.source_tree(&blob)?;
+    let base_commit_command = commands.base_commit(&empty_tree)?;
+    let (source_tree, base) = runner
+        .run_pair_to_completion(source_tree_command, base_commit_command)
+        .await?;
+    let source_tree = parse_object_id(&source_tree, oid_length)?;
+    let base = parse_object_id(&base, oid_length)?;
+
+    let target_commit_command = commands.target_commit(&empty_tree, &base)?;
+    let source_commit_command = commands.source_commit(&source_tree, &base)?;
+    let (target, source) = runner
+        .run_pair_to_completion(target_commit_command, source_commit_command)
+        .await?;
+    let target = parse_object_id(&target, oid_length)?;
+    let source = parse_object_id(&source, oid_length)?;
     Ok(ProbeGraph {
         source_tree,
         target,
@@ -355,6 +362,14 @@ impl<'a> ProbeCommandRunner<'a> {
         self.run_expecting(command, &[0]).await
     }
 
+    async fn run_pair_to_completion(
+        &self,
+        left: ValidatedCommand,
+        right: ValidatedCommand,
+    ) -> Result<(Vec<u8>, Vec<u8>), DeliveryGitProbeError> {
+        complete_probe_pair(self.run(left), self.run(right)).await
+    }
+
     async fn run_expecting(
         &self,
         command: ValidatedCommand,
@@ -366,6 +381,32 @@ impl<'a> ProbeCommandRunner<'a> {
             .await
             .map_err(map_process_error)?;
         checked_stdout(result, expected_exit_codes)
+    }
+}
+
+async fn complete_probe_pair<L, R, T, U>(left: L, right: R) -> Result<(T, U), DeliveryGitProbeError>
+where
+    L: Future<Output = Result<T, DeliveryGitProbeError>>,
+    R: Future<Output = Result<U, DeliveryGitProbeError>>,
+{
+    // A short-circuiting join could drop a still-supervised child and hide its
+    // CleanupUnproven result. Drain both sides before applying error priority.
+    let (left, right) = tokio::join!(biased; left, right);
+    combine_probe_pair_results(left, right)
+}
+
+fn combine_probe_pair_results<T, U>(
+    left: Result<T, DeliveryGitProbeError>,
+    right: Result<U, DeliveryGitProbeError>,
+) -> Result<(T, U), DeliveryGitProbeError> {
+    match (left, right) {
+        (Err(DeliveryGitProbeError::CleanupUnproven), _)
+        | (_, Err(DeliveryGitProbeError::CleanupUnproven)) => {
+            Err(DeliveryGitProbeError::CleanupUnproven)
+        }
+        (Err(error), _) => Err(error),
+        (_, Err(error)) => Err(error),
+        (Ok(left), Ok(right)) => Ok((left, right)),
     }
 }
 
@@ -534,6 +575,9 @@ fn probe_environment(
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::Barrier;
 
     use super::*;
 
@@ -587,6 +631,64 @@ mod tests {
             CommandPolicyError::IdentityChanged,
         ));
         assert_eq!(error, DeliveryGitProbeError::ExecutableChanged);
+    }
+
+    #[tokio::test]
+    async fn probe_pairs_enter_both_futures_before_either_completes() {
+        let barrier = Arc::new(Barrier::new(2));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let left_barrier = Arc::clone(&barrier);
+        let left_entered = Arc::clone(&entered);
+        let right_barrier = Arc::clone(&barrier);
+        let right_entered = Arc::clone(&entered);
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            complete_probe_pair(
+                async move {
+                    left_entered.fetch_add(1, Ordering::SeqCst);
+                    left_barrier.wait().await;
+                    Ok::<_, DeliveryGitProbeError>(b"left".to_vec())
+                },
+                async move {
+                    right_entered.fetch_add(1, Ordering::SeqCst);
+                    right_barrier.wait().await;
+                    Ok::<_, DeliveryGitProbeError>(b"right".to_vec())
+                },
+            ),
+        )
+        .await
+        .expect("both paired probe futures must be polled")
+        .expect("paired probe futures succeed");
+
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
+        assert_eq!(completed, (b"left".to_vec(), b"right".to_vec()));
+    }
+
+    #[test]
+    fn probe_pair_results_prioritize_cleanup_and_preserve_left_error_order() {
+        assert_eq!(
+            combine_probe_pair_results::<u8, u8>(
+                Err(DeliveryGitProbeError::CapabilityUnavailable),
+                Err(DeliveryGitProbeError::CleanupUnproven),
+            ),
+            Err(DeliveryGitProbeError::CleanupUnproven)
+        );
+        assert_eq!(
+            combine_probe_pair_results::<u8, u8>(
+                Err(DeliveryGitProbeError::CleanupUnproven),
+                Err(DeliveryGitProbeError::Cancelled),
+            ),
+            Err(DeliveryGitProbeError::CleanupUnproven)
+        );
+        assert_eq!(
+            combine_probe_pair_results::<u8, u8>(
+                Err(DeliveryGitProbeError::Cancelled),
+                Err(DeliveryGitProbeError::ExecutableChanged),
+            ),
+            Err(DeliveryGitProbeError::Cancelled)
+        );
+        assert_eq!(combine_probe_pair_results(Ok(1_u8), Ok(2_u8)), Ok((1, 2)));
     }
 
     #[test]

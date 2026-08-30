@@ -8,11 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[cfg(feature = "test-support")]
-use coding_agent_runtime::probe_delivery_git_with_after_initialize_hook_for_test;
 use coding_agent_runtime::{
     DeliveryGitObjectFormat, ExecutionDirectory, PinnedExecutable, ProbedDeliveryGit,
     ProcessLimits, probe_delivery_git,
+};
+#[cfg(feature = "test-support")]
+use coding_agent_runtime::{
+    ProcessFault, ProcessFaultController, probe_delivery_git_with_after_initialize_hook_for_test,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -57,6 +59,29 @@ async fn cancellation_before_spawn_fails_closed_and_cleans_the_private_directory
 
     let error = fixture.probe(cancellation).await.unwrap_err();
     assert_eq!(error.code(), "DELIVERY_GIT_PROBE_CANCELLED");
+    fixture.assert_probe_root_empty();
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_failed_parallel_graph_child_waits_for_its_sibling_and_cleans_up() {
+    let fixture = ProbeFixture::new();
+    let controller =
+        ProcessFaultController::for_child(4, ProcessFault::BeforeSpawn).expect("valid fault");
+
+    let error = controller
+        .scope(fixture.probe(CancellationToken::new()))
+        .await
+        .expect_err("the first graph child fails before spawn");
+    assert_eq!(error.code(), "DELIVERY_GIT_CAPABILITY_UNAVAILABLE");
+    let proof = controller
+        .prove_zero_live(Duration::from_secs(5))
+        .await
+        .expect("all paired probe children are reaped");
+    assert!(
+        proof.observed_children() >= 5,
+        "the sibling graph child must still be admitted after the left child fails"
+    );
     fixture.assert_probe_root_empty();
 }
 
