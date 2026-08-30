@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { Repository, Task } from "../api/types";
+import { shouldRefreshDeliveryAfterSchedulerChange } from "../state/deliveryModel";
 import type { UseAgentStateResult } from "../state/useAgentState";
 import { ConnectionBanner } from "./ConnectionBanner";
 import type { DeliveryPanelBinding } from "./DeliveryPanel";
@@ -18,6 +19,11 @@ export interface AppShellProps {
 interface QuitFailure {
   message: string;
   requestId: string | null;
+}
+
+interface DeliverySchedulerRefresh {
+  taskId: string;
+  generation: number | null;
 }
 
 function orderedValues<T>(order: string[], values: Record<string, T>): T[] {
@@ -77,6 +83,7 @@ export function AppShell({ agent, delivery = null }: AppShellProps) {
   const deliveryLifecycleRef = useRef<
     Pick<Task, "id" | "status" | "delivery_readiness"> | null
   >(null);
+  const deliverySchedulerRefreshRef = useRef<DeliverySchedulerRefresh | null>(null);
   const shuttingDown = quitting || agent.state.serviceState === "quiescing";
 
   useEffect(() => {
@@ -135,6 +142,9 @@ export function AppShell({ agent, delivery = null }: AppShellProps) {
           (stopping) => stopping.task_id === task.id,
         ) ?? null);
   const refreshDelivery = delivery?.controller.refresh;
+  const deliveryPhase = delivery?.controller.state.phase ?? "idle";
+  const deliveryProjection = delivery?.controller.state.projection ?? null;
+  const schedulerGeneration = agent.state.scheduler.snapshot?.generation ?? null;
 
   useEffect(() => {
     const current =
@@ -147,22 +157,54 @@ export function AppShell({ agent, delivery = null }: AppShellProps) {
           };
     const previous = deliveryLifecycleRef.current;
     deliveryLifecycleRef.current = current;
-    if (
-      current === null ||
-      previous === null ||
-      previous.id !== current.id ||
-      refreshDelivery === undefined
-    ) {
+    if (current === null) {
+      deliverySchedulerRefreshRef.current = null;
       return;
     }
-    if (
+    if (previous === null || previous.id !== current.id) {
+      deliverySchedulerRefreshRef.current = {
+        taskId: current.id,
+        generation: schedulerGeneration,
+      };
+      return;
+    }
+    if (refreshDelivery === undefined) return;
+    const lifecycleChanged =
       previous.status !== current.status ||
-      previous.delivery_readiness !== current.delivery_readiness
-    ) {
+      previous.delivery_readiness !== current.delivery_readiness;
+    if (lifecycleChanged) {
+      deliverySchedulerRefreshRef.current = {
+        taskId: current.id,
+        generation: schedulerGeneration,
+      };
+      refreshDelivery();
+      return;
+    }
+    const lastSchedulerRefresh = deliverySchedulerRefreshRef.current;
+    // Terminal task events are published before scheduler-owned repository
+    // state is released. Refresh once per later scheduler generation, but only
+    // after the preceding delivery query has settled.
+    const schedulerProjectionNeedsRefresh =
+      current.status === "completed" &&
+      current.delivery_readiness === "review_approved" &&
+      deliveryPhase === "ready" &&
+      schedulerGeneration !== null &&
+      deliveryProjection?.task_id === current.id &&
+      shouldRefreshDeliveryAfterSchedulerChange(deliveryProjection) &&
+      (lastSchedulerRefresh?.taskId !== current.id ||
+        lastSchedulerRefresh.generation !== schedulerGeneration);
+    if (schedulerProjectionNeedsRefresh) {
+      deliverySchedulerRefreshRef.current = {
+        taskId: current.id,
+        generation: schedulerGeneration,
+      };
       refreshDelivery();
     }
   }, [
+    deliveryPhase,
+    deliveryProjection,
     refreshDelivery,
+    schedulerGeneration,
     selectedStateTask?.delivery_readiness,
     selectedStateTask?.id,
     selectedStateTask?.status,

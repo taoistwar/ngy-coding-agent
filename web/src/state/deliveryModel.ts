@@ -6,6 +6,10 @@ import type {
 export const DELIVERY_INITIAL_POLL_DELAY_MS = 500;
 export const DELIVERY_MAX_POLL_DELAY_MS = 2_000;
 
+const SCHEDULER_OWNED_ELIGIBILITY_REASONS = new Set<
+  DeliveryTask["reasons"][number]
+>(["task_active", "repository_busy"]);
+
 export type DeliveryPhase =
   | "idle"
   | "loading"
@@ -80,6 +84,13 @@ export function shouldPollDeliveryOperation(operation: DeliveryOperation): boole
     operation.state === "unlocked_pending_remove" ||
     operation.state === "remove_pending" ||
     operation.state === "delete_pending"
+  );
+}
+
+export function shouldRefreshDeliveryAfterSchedulerChange(task: DeliveryTask): boolean {
+  return (
+    task.eligibility !== "eligible" &&
+    task.reasons.some((reason) => SCHEDULER_OWNED_ELIGIBILITY_REASONS.has(reason))
   );
 }
 

@@ -5,6 +5,10 @@ const TEST_HARNESS_STAGE_ALLOWANCE = 1;
 // for the child plus one minute for the runtime to prove process-tree cleanup.
 export const PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS = 11 * MILLISECONDS_PER_MINUTE;
 
+// Once the task is terminal, repository ownership and its scheduler projection
+// should converge without consuming another production runtime-stage budget.
+export const DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS = 3 * MILLISECONDS_PER_MINUTE;
+
 export type ProductionDeliveryScenarioStage =
   | "approval"
   | "preflight"

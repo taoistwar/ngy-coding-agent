@@ -4,6 +4,7 @@ import path from "node:path";
 import { expect, test } from "./fixtures";
 
 import {
+  DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
   DeliveryBrowserDriver,
   fetchDelivery,
   PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
@@ -28,22 +29,54 @@ test("explicitly preflights and exact-no-ff merges real approved bytes, then cle
     "worktree_cleanup",
     "branch_cleanup",
   ));
+  let terminalReleasePath = "";
   await withLocalApp(
     testInfo,
-    (roots): ProcessScenario =>
-      productionDeliveryScenario(roots, {
+    (roots): ProcessScenario => {
+      terminalReleasePath = roots.releaseSignalPath("delivery-terminal-release");
+      return productionDeliveryScenario(roots, {
         providerScenario: "approve",
         pauseAfterCommit: {
           name: "delivery-preflight-pending",
           operation: "create_merge_preflight",
         },
-      }),
+        pauseAfterTerminalDispatch: { name: "delivery-terminal-release" },
+      });
+    },
     async (app) => {
       const driver = await DeliveryBrowserDriver.open(page, app);
       await driver.registerFixtureRepository();
-      const task = await driver.createApprovedTask(
+      const creation = driver.createApprovedTask(
         "Approve exact local delivery bytes without publishing or deploying",
       );
+      if (terminalReleasePath.length === 0) {
+        throw new Error("terminal actor release path was not initialized");
+      }
+      const terminalReached = await Promise.race([
+        waitForReachedSignal(
+          app.runtimeDir,
+          terminalReleasePath,
+          PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+        ),
+        creation.then(() => {
+          throw new Error("task creation crossed the configured terminal actor pause");
+        }),
+      ]);
+      try {
+        await expect(page.getByText("Execution status: completed", { exact: true })).toBeVisible({
+          timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+        });
+        await expect(
+          page.getByText("Delivery readiness: review approved", { exact: true }),
+        ).toBeVisible({ timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS });
+        await expect(driver.panel()).toContainText("The task is still active.", {
+          timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+        });
+        await expect(driver.panel()).not.toContainText("Eligible for local delivery");
+      } finally {
+        await publishReleaseSignal(terminalReached);
+      }
+      const task = await creation;
       const targetBefore = await driver.git.snapshotTarget();
       const sourceRefsBefore = await driver.git.sourceRefs();
       const beforeClick = await fetchDelivery(page, task.id);

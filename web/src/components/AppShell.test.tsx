@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { CreateTaskCommand } from "../api/client";
 import type {
+  DeliveryTask,
   Repository,
   SchedulerQueueReason,
   SchedulerState,
@@ -93,12 +94,13 @@ function detail(value: Task): TaskDetail {
 function schedulerProjection(
   queued: Array<{ task_id: string; reason: SchedulerQueueReason }>,
   freshness: SchedulerProjectionState["freshness"] = "fresh",
+  generation = 1,
 ): SchedulerProjectionState {
   const snapshot: SchedulerState = {
     schema_version: 1,
     server_instance_id: "123e4567-e89b-42d3-a456-426614174000",
     server_started_at: LATER,
-    generation: 1,
+    generation,
     as_of_event_id: 1,
     service_state_generation: 0,
     admission_state: "running",
@@ -199,6 +201,40 @@ function deliveryBinding(taskId: string): DeliveryPanelBinding {
       openModal: vi.fn(),
       clearModal: vi.fn(),
     },
+  };
+}
+
+function deliveryProjection(
+  taskId: string,
+  eligibility: "eligible" | "unavailable",
+  unavailableReasons: DeliveryTask["reasons"] = [
+    "repository_busy",
+    "reconciliation_required",
+    "task_active",
+  ],
+): DeliveryTask {
+  const eligible = eligibility === "eligible";
+  const reasons = eligible ? [] : unavailableReasons;
+  return {
+    task_id: taskId,
+    eligibility,
+    reasons,
+    evidence: eligible
+      ? { review_generation: 1, workspace_fingerprint: "a".repeat(64) }
+      : null,
+    target: eligible
+      ? { available: true, branch: "refs/heads/main", head: "1".repeat(40) }
+      : {
+          available: false,
+          reason: reasons.includes("repository_busy")
+            ? "repository_busy"
+            : "repository_poisoned",
+        },
+    source: null,
+    latest_merge: null,
+    latest_cleanup: null,
+    disposition: null,
+    allowed_actions: eligible ? ["run_preflight"] : [],
   };
 }
 
@@ -704,8 +740,8 @@ describe("ConnectionBanner", () => {
 });
 
 describe("AppShell", () => {
-  it("refreshes delivery once when the selected task lifecycle advances", async () => {
-    const fixture = agentFixture();
+  it("refreshes delivery on lifecycle advance and terminal scheduler release", async () => {
+    const fixture = agentFixture({ scheduler: schedulerProjection([], "fresh", 1) });
     const taskId = fixture.result.state.selectedTaskId ?? "missing";
     const binding = deliveryBinding(taskId);
     const refresh = vi.mocked(binding.controller.refresh);
@@ -714,6 +750,86 @@ describe("AppShell", () => {
     );
     expect(refresh).not.toHaveBeenCalled();
 
+    const previous = fixture.result.state.tasksById[taskId]!;
+    const schedulerAdvancedAgent: UseAgentStateResult = {
+      ...fixture.result,
+      state: {
+        ...fixture.result.state,
+        scheduler: schedulerProjection([], "fresh", 2),
+      },
+    };
+    rerender(<AppShell agent={schedulerAdvancedAgent} delivery={binding} />);
+    expect(refresh).not.toHaveBeenCalled();
+
+    const approved: Task = {
+      ...previous,
+      status: "completed",
+      delivery_readiness: "review_approved",
+      last_event_id: previous.last_event_id + 1,
+    };
+    const approvedAgent: UseAgentStateResult = {
+      ...schedulerAdvancedAgent,
+      state: {
+        ...schedulerAdvancedAgent.state,
+        tasksById: { ...schedulerAdvancedAgent.state.tasksById, [taskId]: approved },
+        selectedDetail: detail(approved),
+      },
+    };
+    rerender(<AppShell agent={approvedAgent} delivery={binding} />);
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+
+    const releasedAgent: UseAgentStateResult = {
+      ...approvedAgent,
+      state: {
+        ...approvedAgent.state,
+        scheduler: schedulerProjection([], "fresh", 3),
+      },
+    };
+    rerender(<AppShell agent={releasedAgent} delivery={binding} />);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    binding.controller.state = {
+      ...binding.controller.state,
+      phase: "ready",
+      projection: deliveryProjection(taskId, "unavailable"),
+    };
+    rerender(<AppShell agent={releasedAgent} delivery={binding} />);
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+
+    binding.controller.state = {
+      ...binding.controller.state,
+      projection: deliveryProjection(taskId, "eligible"),
+    };
+    const laterSchedulerAgent: UseAgentStateResult = {
+      ...releasedAgent,
+      state: {
+        ...releasedAgent.state,
+        scheduler: schedulerProjection([], "fresh", 4),
+      },
+    };
+    rerender(<AppShell agent={laterSchedulerAgent} delivery={binding} />);
+    expect(refresh).toHaveBeenCalledTimes(2);
+
+    const newerEvidence = { ...approved, last_event_id: approved.last_event_id + 1 };
+    rerender(
+      <AppShell
+        agent={{
+          ...laterSchedulerAgent,
+          state: {
+            ...laterSchedulerAgent.state,
+            tasksById: { ...laterSchedulerAgent.state.tasksById, [taskId]: newerEvidence },
+            selectedDetail: detail(newerEvidence),
+          },
+        }}
+        delivery={binding}
+      />,
+    );
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not refresh terminal delivery while polling or refreshing", () => {
+    const fixture = agentFixture({ scheduler: schedulerProjection([], "fresh", 1) });
+    const taskId = fixture.result.state.selectedTaskId ?? "missing";
     const previous = fixture.result.state.tasksById[taskId]!;
     const approved: Task = {
       ...previous,
@@ -729,24 +845,82 @@ describe("AppShell", () => {
         selectedDetail: detail(approved),
       },
     };
-    rerender(<AppShell agent={approvedAgent} delivery={binding} />);
-    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
-
-    const newerEvidence = { ...approved, last_event_id: approved.last_event_id + 1 };
-    rerender(
-      <AppShell
-        agent={{
-          ...approvedAgent,
-          state: {
-            ...approvedAgent.state,
-            tasksById: { ...approvedAgent.state.tasksById, [taskId]: newerEvidence },
-            selectedDetail: detail(newerEvidence),
-          },
-        }}
-        delivery={binding}
-      />,
+    const binding = deliveryBinding(taskId);
+    binding.controller.state = {
+      ...binding.controller.state,
+      phase: "polling",
+      projection: deliveryProjection(taskId, "unavailable"),
+    };
+    const refresh = vi.mocked(binding.controller.refresh);
+    const { rerender } = render(
+      <AppShell agent={approvedAgent} delivery={binding} />,
     );
-    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+
+    const pollingGeneration: UseAgentStateResult = {
+      ...approvedAgent,
+      state: {
+        ...approvedAgent.state,
+        scheduler: schedulerProjection([], "fresh", 2),
+      },
+    };
+    rerender(<AppShell agent={pollingGeneration} delivery={binding} />);
+    expect(refresh).not.toHaveBeenCalled();
+
+    binding.controller.state = {
+      ...binding.controller.state,
+      phase: "refreshing",
+    };
+    const refreshingGeneration: UseAgentStateResult = {
+      ...pollingGeneration,
+      state: {
+        ...pollingGeneration.state,
+        scheduler: schedulerProjection([], "fresh", 3),
+      },
+    };
+    rerender(<AppShell agent={refreshingGeneration} delivery={binding} />);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh terminal delivery for stable unavailable reasons", () => {
+    const fixture = agentFixture({ scheduler: schedulerProjection([], "fresh", 1) });
+    const taskId = fixture.result.state.selectedTaskId ?? "missing";
+    const previous = fixture.result.state.tasksById[taskId]!;
+    const approved: Task = {
+      ...previous,
+      status: "completed",
+      delivery_readiness: "review_approved",
+      last_event_id: previous.last_event_id + 1,
+    };
+    const approvedAgent: UseAgentStateResult = {
+      ...fixture.result,
+      state: {
+        ...fixture.result.state,
+        tasksById: { ...fixture.result.state.tasksById, [taskId]: approved },
+        selectedDetail: detail(approved),
+      },
+    };
+    const binding = deliveryBinding(taskId);
+    binding.controller.state = {
+      ...binding.controller.state,
+      phase: "ready",
+      projection: deliveryProjection(taskId, "unavailable", [
+        "reconciliation_required",
+      ]),
+    };
+    const refresh = vi.mocked(binding.controller.refresh);
+    const { rerender } = render(
+      <AppShell agent={approvedAgent} delivery={binding} />,
+    );
+
+    const schedulerAdvancedAgent: UseAgentStateResult = {
+      ...approvedAgent,
+      state: {
+        ...approvedAgent.state,
+        scheduler: schedulerProjection([], "fresh", 2),
+      },
+    };
+    rerender(<AppShell agent={schedulerAdvancedAgent} delivery={binding} />);
+    expect(refresh).not.toHaveBeenCalled();
   });
 
   it("passes the independent delivery binding into the selected task workspace", () => {

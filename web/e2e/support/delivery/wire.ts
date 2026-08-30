@@ -2,6 +2,7 @@ import type { Page } from "@playwright/test";
 
 const POLL_TIMEOUT_MS = 180_000;
 const POLL_INTERVAL_MS = 250;
+const BROWSER_REQUEST_TIMEOUT_MARKER = "DELIVERY_E2E_BROWSER_REQUEST_TIMEOUT";
 const MERGE_STATES = [
   "preflight_pending",
   "preflight_ready",
@@ -84,9 +85,17 @@ export interface TaskDeliverySummary {
   readonly failureCode: string | null;
 }
 
-export async function fetchDelivery(page: Page, taskId: string): Promise<DeliveryTask> {
+export async function fetchDelivery(
+  page: Page,
+  taskId: string,
+  timeoutMs?: number,
+): Promise<DeliveryTask> {
   return parseDelivery(
-    await browserJson(page, `/api/tasks/${encodeURIComponent(taskId)}/delivery`),
+    await browserJson(
+      page,
+      `/api/tasks/${encodeURIComponent(taskId)}/delivery`,
+      timeoutMs,
+    ),
   );
 }
 
@@ -128,10 +137,17 @@ export async function waitForDelivery(
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
   let last: DeliveryTask | null = null;
-  while (Date.now() < deadline) {
-    last = await fetchDelivery(page, taskId);
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    try {
+      last = await fetchDelivery(page, taskId, remainingMs);
+    } catch (error) {
+      if (isBrowserRequestTimeout(error)) break;
+      throw error;
+    }
     if (predicate(last)) return last;
-    await delay(POLL_INTERVAL_MS);
+    await delayUntilNextPoll(deadline);
   }
   const elapsedMs = Date.now() - startedAt;
   throw new Error(
@@ -145,36 +161,72 @@ export async function waitForTaskDeliveryReadiness(
   expected: "review_approved" | "review_rejected" | "unreviewed",
   timeoutMs = 180_000,
 ): Promise<TaskDeliverySummary> {
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
   let last: TaskDeliverySummary | null = null;
-  while (Date.now() < deadline) {
-    last = parseTaskSummary(
-      await browserJson(page, `/api/tasks/${encodeURIComponent(taskId)}`),
-    );
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    try {
+      last = parseTaskSummary(
+        await browserJson(
+          page,
+          `/api/tasks/${encodeURIComponent(taskId)}`,
+          remainingMs,
+        ),
+      );
+    } catch (error) {
+      if (isBrowserRequestTimeout(error)) break;
+      throw error;
+    }
     if (last.status === "completed" && last.deliveryReadiness === expected) return last;
     if (["failed", "cancelled", "interrupted"].includes(last.status)) {
       throw new Error(
         `task became ${last.status} before ${expected}; failure=${last.failureCode ?? "none"}`,
       );
     }
-    await delay(POLL_INTERVAL_MS);
+    await delayUntilNextPoll(deadline);
   }
+  const elapsedMs = Date.now() - startedAt;
   throw new Error(
-    `timed out waiting for completed + ${expected}; last=${last === null ? "none" : JSON.stringify(last)}`,
+    `timed out after ${String(elapsedMs)} ms (budget ${String(timeoutMs)} ms) waiting for completed + ${expected}; last=${last === null ? "none" : JSON.stringify(last)}`,
   );
 }
 
-export async function browserJson(page: Page, requestPath: string): Promise<unknown> {
-  return page.evaluate(async (path_) => {
-    const response = await fetch(path_, {
-      credentials: "same-origin",
-      headers: { accept: "application/json" },
-    });
-    if (!response.ok) {
-      throw new Error(`GET ${path_} failed with HTTP ${String(response.status)}`);
+export async function browserJson(
+  page: Page,
+  requestPath: string,
+  timeoutMs?: number,
+): Promise<unknown> {
+  const requestTimeoutMs = timeoutMs === undefined ? null : Math.max(1, Math.floor(timeoutMs));
+  return page.evaluate(async ({ path_, timeoutMs_, timeoutMarker_ }) => {
+    const controller = timeoutMs_ === null ? null : new AbortController();
+    const timer = controller === null || timeoutMs_ === null
+      ? null
+      : window.setTimeout(() => controller.abort(), timeoutMs_);
+    try {
+      const response = await fetch(path_, {
+        credentials: "same-origin",
+        headers: { accept: "application/json" },
+        signal: controller?.signal ?? null,
+      });
+      if (!response.ok) {
+        throw new Error(`GET ${path_} failed with HTTP ${String(response.status)}`);
+      }
+      return response.json() as Promise<unknown>;
+    } catch (error) {
+      if (controller?.signal.aborted === true) {
+        throw new Error(`${timeoutMarker_}:${String(timeoutMs_)}`);
+      }
+      throw error;
+    } finally {
+      if (timer !== null) window.clearTimeout(timer);
     }
-    return response.json() as Promise<unknown>;
-  }, requestPath);
+  }, {
+    path_: requestPath,
+    timeoutMs_: requestTimeoutMs,
+    timeoutMarker_: BROWSER_REQUEST_TIMEOUT_MARKER,
+  });
 }
 
 function parseTaskSummary(value: unknown): TaskDeliverySummary {
@@ -351,4 +403,15 @@ function requireExactKeys(value: Record<string, unknown>, expected: readonly str
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function delayUntilNextPoll(deadline: number): Promise<void> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs > 0) await delay(Math.min(POLL_INTERVAL_MS, remainingMs));
+}
+
+function isBrowserRequestTimeout(error: unknown): boolean {
+  return (
+    error instanceof Error && error.message.includes(BROWSER_REQUEST_TIMEOUT_MARKER)
+  );
 }

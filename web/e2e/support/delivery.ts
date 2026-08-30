@@ -4,7 +4,10 @@ import type { LocalApp } from "./localApp";
 import { DeliveryGit, type DeliveryTargetSnapshot, type ExactNoFfMerge } from "./delivery/git";
 import { ExactAppOriginTrafficGuard } from "./delivery/network";
 import { loseNextHttpReply } from "./delivery/recovery";
-import { PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS } from "./delivery/timeouts";
+import {
+  DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+  PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+} from "./delivery/timeouts";
 import {
   fetchDelivery,
   type DeliveryMergeState,
@@ -82,9 +85,18 @@ export class DeliveryBrowserDriver {
       "review_approved",
       PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
     );
+    await waitForDelivery(
+      this.page,
+      task.id,
+      (delivery) => delivery.eligibility === "eligible",
+      "eligible delivery projection after task finalization",
+      DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+    );
     await this.selectTask(task.prompt);
     await expect(this.panel()).toBeVisible();
-    await expect(this.panel()).toContainText("Eligible for local delivery");
+    await expect(this.panel()).toContainText("Eligible for local delivery", {
+      timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+    });
     return task;
   }
 
@@ -409,6 +421,7 @@ export { DeliveryGit } from "./delivery/git";
 export type { DeliveryTargetSnapshot, ExactNoFfMerge } from "./delivery/git";
 export { loseNextHttpReply, productionDeliveryScenario } from "./delivery/recovery";
 export {
+  DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
   PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
   productionDeliveryTestTimeout,
 } from "./delivery/timeouts";

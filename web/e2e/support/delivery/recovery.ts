@@ -24,6 +24,9 @@ export interface ProductionDeliveryScenarioOptions {
   readonly pauseBeforeDescriptor?: {
     readonly name: string;
   };
+  readonly pauseAfterTerminalDispatch?: {
+    readonly name: string;
+  };
 }
 
 export function productionDeliveryScenario(
@@ -32,6 +35,7 @@ export function productionDeliveryScenario(
 ): ProcessScenario {
   const storePause = options.pauseAfterCommit;
   const recoveryPause = options.pauseBeforeDescriptor;
+  const terminalPause = options.pauseAfterTerminalDispatch;
   return {
     runner_mode: {
       kind: "production_offline_delivery",
@@ -52,8 +56,12 @@ export function productionDeliveryScenario(
               count: 1,
             },
           ],
-    actor_pauses:
-      recoveryPause === undefined ? [] : ["recovery_before_descriptor"],
+    actor_pauses: [
+      ...(recoveryPause === undefined ? [] : ["recovery_before_descriptor" as const]),
+      ...(terminalPause === undefined
+        ? []
+        : ["terminal_after_dispatch_before_scheduler_publish" as const]),
+    ],
     virtual_release_signals: [
       ...(storePause === undefined
         ? []
@@ -71,6 +79,15 @@ export function productionDeliveryScenario(
               name: recoveryPause.name,
               path: roots.releaseSignalPath(recoveryPause.name),
               target: "actor_recovery_before_descriptor" as const,
+            },
+          ]),
+      ...(terminalPause === undefined
+        ? []
+        : [
+            {
+              name: terminalPause.name,
+              path: roots.releaseSignalPath(terminalPause.name),
+              target: "actor_terminal_after_dispatch_before_scheduler_publish" as const,
             },
           ]),
     ],
