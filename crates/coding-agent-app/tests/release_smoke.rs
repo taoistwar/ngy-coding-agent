@@ -15,6 +15,7 @@ use tempfile::TempDir;
 
 const RELEASE_BINARY_ENV: &str = "CODING_AGENT_RELEASE_BINARY";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const STARTUP_DIAGNOSTIC_GRACE_TIMEOUT: Duration = Duration::from_secs(6);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -398,11 +399,46 @@ impl ReleaseApplication {
                 );
             }
             if Instant::now() >= deadline {
-                let database_exists = safe_presence(self.database_path.try_exists());
-                let delivery_probe_workspace_exists =
-                    safe_presence(delivery_probe_workspace_exists(&self.runtime_dir));
+                self.fail_after_startup_deadline(deadline);
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn fail_after_startup_deadline(&mut self, startup_deadline: Instant) -> ! {
+        // The startup contract is already failed. Never accept a descriptor in
+        // this grace period; retain the child only long enough to classify it.
+        let database_exists = safe_presence(self.database_path.try_exists());
+        let delivery_probe_workspace_exists =
+            safe_presence(delivery_probe_workspace_exists(&self.runtime_dir));
+        let diagnostic_deadline = startup_deadline + STARTUP_DIAGNOSTIC_GRACE_TIMEOUT;
+
+        loop {
+            if let Some(code) = self.startup_diagnostics.poll() {
                 panic!(
-                    "the release child did not publish its private descriptor before the deadline (database_exists={database_exists}, delivery_probe_workspace_exists={delivery_probe_workspace_exists})"
+                    "the release child reported a startup failure after missing the descriptor deadline (code={code})"
+                );
+            }
+            if let Some(status) = self
+                .child
+                .as_mut()
+                .expect("release child remains owned during startup diagnostics")
+                .try_wait()
+                .expect("poll the release child during startup diagnostics")
+            {
+                if let Some(code) = self.startup_diagnostics.poll() {
+                    panic!(
+                        "the release child reported a startup failure after missing the descriptor deadline (code={code})"
+                    );
+                }
+                panic!(
+                    "the release child exited after missing the descriptor deadline (success={}, database_exists={database_exists}, delivery_probe_workspace_exists={delivery_probe_workspace_exists})",
+                    status.success()
+                );
+            }
+            if Instant::now() >= diagnostic_deadline {
+                panic!(
+                    "the release child did not publish its private descriptor before the deadline and no startup error code arrived during the bounded diagnostic grace period (database_exists={database_exists}, delivery_probe_workspace_exists={delivery_probe_workspace_exists})"
                 );
             }
             thread::sleep(POLL_INTERVAL);
