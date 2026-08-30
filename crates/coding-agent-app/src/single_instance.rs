@@ -725,7 +725,29 @@ pub enum StartupError {
     Timestamp,
 }
 
+const STARTUP_ERROR_CODE_PREFIX: &str = "CODING_AGENT_STARTUP_ERROR_CODE=";
+
 impl StartupError {
+    fn diagnostic_code(&self) -> &str {
+        match self {
+            Self::Paths(_) => "STARTUP_PATHS_UNAVAILABLE",
+            Self::Lock(_) => "STARTUP_LOCK_UNAVAILABLE",
+            Self::ProcessLiveness(_) => "STARTUP_PROCESS_LIVENESS_UNAVAILABLE",
+            Self::ProcessCleanupUnproven => "STARTUP_PROCESS_CLEANUP_UNPROVEN",
+            Self::Descriptor(_) => "STARTUP_DESCRIPTOR_UNAVAILABLE",
+            Self::Store(_) => "STARTUP_STORE_UNAVAILABLE",
+            Self::RuntimeConfig(error) => error.code(),
+            Self::Security(_) => "STARTUP_SECURITY_FAILED",
+            Self::Dispatcher(_) => "STARTUP_DISPATCHER_FAILED",
+            Self::Runner(error) => error.code(),
+            Self::Listener(_) => "STARTUP_LISTENER_FAILED",
+            Self::InvalidListener => "STARTUP_LISTENER_INVALID",
+            Self::SelfProbe => "STARTUP_SELF_PROBE_FAILED",
+            Self::PrimaryUnverified => "STARTUP_PRIMARY_UNVERIFIED",
+            Self::Timestamp => "STARTUP_TIMESTAMP_INVALID",
+        }
+    }
+
     fn native_title(&self) -> &'static str {
         match self {
             Self::PrimaryUnverified => "Coding Agent is already running",
@@ -759,6 +781,21 @@ impl StartupError {
     }
 }
 
+fn write_startup_error_code(writer: &mut impl Write, error: &StartupError) -> io::Result<()> {
+    // Establish a record boundary even if another stderr writer left a partial line.
+    writeln!(
+        writer,
+        "\n{STARTUP_ERROR_CODE_PREFIX}{}",
+        error.diagnostic_code()
+    )?;
+    writer.flush()
+}
+
+fn emit_startup_error_code(error: &StartupError) {
+    let mut stderr = io::stderr().lock();
+    let _ = write_startup_error_code(&mut stderr, error);
+}
+
 pub enum StartupOutcome {
     Primary(Box<PrimaryRuntime>),
     Secondary(SecondaryRuntime),
@@ -768,6 +805,7 @@ pub async fn launch(dependencies: StartupDependencies) -> Result<StartupOutcome,
     let messages = dependencies.messages.clone();
     let result = launch_inner(dependencies).await;
     if let Err(error) = &result {
+        emit_startup_error_code(error);
         messages.show_error(error.native_title(), error.native_body());
     }
     result
@@ -1639,6 +1677,51 @@ impl NativeMessageSink for SystemNativeMessageSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_error_diagnostic_contains_only_a_stable_secret_safe_code() {
+        let error = StartupError::Paths(io::Error::other(
+            "provider-secret at /Users/example/private/runtime.json",
+        ));
+        let mut diagnostic = Vec::new();
+
+        write_startup_error_code(&mut diagnostic, &error).expect("write startup diagnostic");
+
+        assert_eq!(
+            diagnostic,
+            b"\nCODING_AGENT_STARTUP_ERROR_CODE=STARTUP_PATHS_UNAVAILABLE\n"
+        );
+    }
+
+    #[test]
+    fn runner_startup_diagnostic_reuses_the_validated_runner_code() {
+        let error = StartupError::Runner(crate::StartupRunnerFactoryError::new(
+            "DELIVERY_GIT_PROBE_FAILED",
+        ));
+        let mut diagnostic = Vec::new();
+
+        write_startup_error_code(&mut diagnostic, &error).expect("write runner diagnostic");
+
+        assert_eq!(
+            diagnostic,
+            b"\nCODING_AGENT_STARTUP_ERROR_CODE=DELIVERY_GIT_PROBE_FAILED\n"
+        );
+    }
+
+    #[test]
+    fn runner_startup_diagnostic_cannot_forward_an_invalid_code() {
+        let error = StartupError::Runner(crate::StartupRunnerFactoryError::new(
+            "provider-secret:/Users/example/private/runtime.json",
+        ));
+        let mut diagnostic = Vec::new();
+
+        write_startup_error_code(&mut diagnostic, &error).expect("write runner diagnostic");
+
+        assert_eq!(
+            diagnostic,
+            b"\nCODING_AGENT_STARTUP_ERROR_CODE=RUNNER_STARTUP_FAILED\n"
+        );
+    }
 
     #[test]
     fn completed_cleanup_drop_preserves_a_replacement_descriptor() {

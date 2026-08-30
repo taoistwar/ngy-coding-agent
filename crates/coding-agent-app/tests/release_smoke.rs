@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -19,6 +19,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const STARTUP_ERROR_CODE_PREFIX: &[u8] = b"CODING_AGENT_STARTUP_ERROR_CODE=";
+const MAX_STARTUP_ERROR_CODE_BYTES: usize = 96;
+const MAX_STARTUP_DIAGNOSTIC_LINE_BYTES: usize =
+    STARTUP_ERROR_CODE_PREFIX.len() + MAX_STARTUP_ERROR_CODE_BYTES + 1;
+const STARTUP_DIAGNOSTIC_READ_CHUNK_BYTES: usize = 4 * 1024;
+const MAX_STARTUP_DIAGNOSTIC_BYTES_PER_POLL: usize = 64 * 1024;
+const MAX_RUNTIME_DIAGNOSTIC_ENTRIES: usize = 256;
+const DELIVERY_PROBE_WORKSPACE_PREFIX: &str = ".coding-agent-delivery-probe-";
 
 #[test]
 #[ignore = "requires CODING_AGENT_RELEASE_BINARY to name an embedded production artifact"]
@@ -277,7 +285,9 @@ struct ReleaseApplication {
     temporary: Option<TempDir>,
     temporary_root: PathBuf,
     database_path: PathBuf,
+    runtime_dir: PathBuf,
     descriptor_path: PathBuf,
+    startup_diagnostics: StartupDiagnosticCapture,
     child: Option<Child>,
 }
 
@@ -311,12 +321,17 @@ impl ReleaseApplication {
         let environment = IsolatedChildEnvironment::new(&temporary_root);
         assert_node_cannot_spawn(&environment, &launch_dir);
 
+        let startup_diagnostics_path = temporary_root.join("startup-diagnostics.log");
+        let startup_diagnostics_writer = PrivateFile::create_new(&startup_diagnostics_path)
+            .expect("create the private startup-diagnostics capture");
+        let startup_diagnostics = StartupDiagnosticCapture::new(startup_diagnostics_path);
+
         let mut command = Command::new(&copied_binary);
         command
             .current_dir(&launch_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(startup_diagnostics_writer.into_file()));
         environment.apply(&mut command);
         let child = command
             .spawn()
@@ -326,7 +341,9 @@ impl ReleaseApplication {
             temporary: Some(temporary),
             temporary_root,
             database_path: environment.data_dir.join("coding-agent.sqlite3"),
+            runtime_dir: environment.runtime_dir.clone(),
             descriptor_path: environment.runtime_dir.join("instance.json"),
+            startup_diagnostics,
             child: Some(child),
         }
     }
@@ -358,6 +375,11 @@ impl ReleaseApplication {
                 }
                 return descriptor;
             }
+            if let Some(code) = self.startup_diagnostics.poll() {
+                panic!(
+                    "the release child reported a startup failure before publishing its private descriptor (code={code})"
+                );
+            }
             if let Some(status) = self
                 .child
                 .as_mut()
@@ -365,15 +387,24 @@ impl ReleaseApplication {
                 .try_wait()
                 .expect("poll the release child during startup")
             {
+                if let Some(code) = self.startup_diagnostics.poll() {
+                    panic!(
+                        "the release child reported a startup failure before publishing its private descriptor (code={code})"
+                    );
+                }
                 panic!(
                     "the release child exited before publishing its private descriptor (success={})",
                     status.success()
                 );
             }
-            assert!(
-                Instant::now() < deadline,
-                "the release child did not publish its private descriptor before the deadline"
-            );
+            if Instant::now() >= deadline {
+                let database_exists = safe_presence(self.database_path.try_exists());
+                let delivery_probe_workspace_exists =
+                    safe_presence(delivery_probe_workspace_exists(&self.runtime_dir));
+                panic!(
+                    "the release child did not publish its private descriptor before the deadline (database_exists={database_exists}, delivery_probe_workspace_exists={delivery_probe_workspace_exists})"
+                );
+            }
             thread::sleep(POLL_INTERVAL);
         }
     }
@@ -430,6 +461,203 @@ impl ReleaseApplication {
         });
         self.temporary_root.clone()
     }
+}
+
+struct StartupDiagnosticCapture {
+    path: PathBuf,
+    offset: u64,
+    scanner: StartupDiagnosticScanner,
+}
+
+impl StartupDiagnosticCapture {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            scanner: StartupDiagnosticScanner::default(),
+        }
+    }
+
+    fn poll(&mut self) -> Option<String> {
+        if let Some(code) = self.scanner.code() {
+            return Some(code.to_owned());
+        }
+
+        let mut file = fs::File::open(&self.path).ok()?;
+        file.seek(SeekFrom::Start(self.offset)).ok()?;
+
+        let mut buffer = [0u8; STARTUP_DIAGNOSTIC_READ_CHUNK_BYTES];
+        let mut remaining = MAX_STARTUP_DIAGNOSTIC_BYTES_PER_POLL;
+        while remaining > 0 {
+            let requested = remaining.min(buffer.len());
+            let read = match file.read(&mut buffer[..requested]) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            self.offset = self.offset.saturating_add(read as u64);
+            remaining -= read;
+            self.scanner.ingest(&buffer[..read]);
+            if let Some(code) = self.scanner.code() {
+                return Some(code.to_owned());
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Default)]
+struct StartupDiagnosticScanner {
+    line: Vec<u8>,
+    discarding_line: bool,
+    code: Option<String>,
+}
+
+impl StartupDiagnosticScanner {
+    fn ingest(&mut self, bytes: &[u8]) {
+        for byte in bytes.iter().copied() {
+            if self.code.is_some() {
+                return;
+            }
+            if byte == b'\n' {
+                if !self.discarding_line
+                    && let Some(code) = parse_startup_error_code(&self.line)
+                {
+                    self.code = Some(code.to_owned());
+                }
+                self.line.clear();
+                self.discarding_line = false;
+            } else if !self.discarding_line {
+                if self.line.len() < MAX_STARTUP_DIAGNOSTIC_LINE_BYTES {
+                    self.line.push(byte);
+                } else {
+                    self.line.clear();
+                    self.discarding_line = true;
+                }
+            }
+        }
+    }
+
+    fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+}
+
+fn parse_startup_error_code(line: &[u8]) -> Option<&str> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let code = line.strip_prefix(STARTUP_ERROR_CODE_PREFIX)?;
+    if code.is_empty()
+        || code.len() > MAX_STARTUP_ERROR_CODE_BYTES
+        || !code
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return None;
+    }
+    std::str::from_utf8(code).ok()
+}
+
+fn safe_presence(result: io::Result<bool>) -> &'static str {
+    match result {
+        Ok(true) => "yes",
+        Ok(false) => "no",
+        Err(_) => "unknown",
+    }
+}
+
+fn delivery_probe_workspace_exists(runtime_dir: &Path) -> io::Result<bool> {
+    let mut entries = fs::read_dir(runtime_dir)?;
+    for _ in 0..MAX_RUNTIME_DIAGNOSTIC_ENTRIES {
+        let Some(entry) = entries.next() else {
+            return Ok(false);
+        };
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(suffix) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(DELIVERY_PROBE_WORKSPACE_PREFIX))
+        else {
+            continue;
+        };
+        let has_canonical_name = suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+        if has_canonical_name && entry.file_type()?.is_dir() {
+            return Ok(true);
+        }
+    }
+    match entries.next().transpose()? {
+        Some(_) => Err(io::Error::other("runtime diagnostic entry budget exceeded")),
+        None => Ok(false),
+    }
+}
+
+#[test]
+fn startup_error_code_parser_accepts_only_the_bounded_canonical_shape() {
+    assert_eq!(
+        parse_startup_error_code(b"CODING_AGENT_STARTUP_ERROR_CODE=RUNNER_UNAVAILABLE"),
+        Some("RUNNER_UNAVAILABLE")
+    );
+    assert_eq!(
+        parse_startup_error_code(b"CODING_AGENT_STARTUP_ERROR_CODE=RUNTIME_CONFIG_INVALID\r"),
+        Some("RUNTIME_CONFIG_INVALID")
+    );
+
+    for rejected in [
+        b"CODING_AGENT_STARTUP_ERROR_CODE=".as_slice(),
+        b"CODING_AGENT_STARTUP_ERROR_CODE=runner_unavailable".as_slice(),
+        b"CODING_AGENT_STARTUP_ERROR_CODE=RUNNER-UNAVAILABLE".as_slice(),
+        b"prefix CODING_AGENT_STARTUP_ERROR_CODE=RUNNER_UNAVAILABLE".as_slice(),
+        b"CODING_AGENT_STARTUP_ERROR_CODE=RUNNER_UNAVAILABLE suffix".as_slice(),
+    ] {
+        assert_eq!(parse_startup_error_code(rejected), None);
+    }
+
+    let overlong = format!(
+        "CODING_AGENT_STARTUP_ERROR_CODE={}",
+        "A".repeat(MAX_STARTUP_ERROR_CODE_BYTES + 1)
+    );
+    assert_eq!(parse_startup_error_code(overlong.as_bytes()), None);
+}
+
+#[test]
+fn startup_diagnostic_scanner_ignores_arbitrary_and_incomplete_output() {
+    let mut scanner = StartupDiagnosticScanner::default();
+    scanner.ingest(b"arbitrary stderr that must never be surfaced\n");
+    scanner.ingest(b"CODING_AGENT_STARTUP_ERROR_");
+    assert_eq!(scanner.code(), None, "an incomplete record is not accepted");
+    scanner.ingest(b"CODE=DELIVERY_GIT_UNAVAILABLE\r\n");
+    assert_eq!(scanner.code(), Some("DELIVERY_GIT_UNAVAILABLE"));
+
+    let mut recovered = StartupDiagnosticScanner::default();
+    recovered.ingest(&[b'X'; MAX_STARTUP_DIAGNOSTIC_LINE_BYTES + 1]);
+    recovered.ingest(b"\nCODING_AGENT_STARTUP_ERROR_CODE=STORE_UNAVAILABLE\n");
+    assert_eq!(recovered.code(), Some("STORE_UNAVAILABLE"));
+}
+
+#[test]
+fn startup_diagnostic_capture_reads_a_framed_record_while_the_writer_is_open() {
+    let temporary = tempfile::tempdir().expect("create startup diagnostic fixture");
+    let path = temporary.path().join("startup-diagnostics.log");
+    let mut writer = PrivateFile::create_new(&path)
+        .expect("create private startup diagnostic fixture")
+        .into_file();
+    let mut capture = StartupDiagnosticCapture::new(path);
+
+    writer
+        .write_all(b"arbitrary stderr without a line ending")
+        .expect("write arbitrary startup stderr");
+    writer.flush().expect("flush arbitrary startup stderr");
+    assert_eq!(capture.poll(), None);
+
+    writer
+        .write_all(b"\nCODING_AGENT_STARTUP_ERROR_CODE=STARTUP_STORE_UNAVAILABLE\n")
+        .expect("write framed startup diagnostic");
+    writer.flush().expect("flush framed startup diagnostic");
+    assert_eq!(capture.poll().as_deref(), Some("STARTUP_STORE_UNAVAILABLE"));
 }
 
 impl Drop for ReleaseApplication {
