@@ -393,6 +393,40 @@ impl PreparedAbort {
         );
         std::fs::remove_file(&self.attributes).unwrap();
     }
+
+    fn clear_proven_stale_index_lock_for_fixture(
+        &self,
+        fault: ProcessFault,
+        outcome: &DeliveryAbortOutcome,
+    ) {
+        if !matches!(
+            fault,
+            ProcessFault::AfterSpawnUnknown
+                | ProcessFault::Deadline
+                | ProcessFault::WaitUnknown
+                | ProcessFault::KillFailure
+                | ProcessFault::CleanupFailure
+        ) {
+            return;
+        }
+
+        let index_lock = self.fixture.repository.join(".git/index.lock");
+        let metadata = match std::fs::symlink_metadata(&index_lock) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("{fault:?}: inspect fixture index lock after zero-live: {error}"),
+        };
+        assert!(
+            metadata.file_type().is_file(),
+            "{fault:?}: fixture index lock must be a plain file"
+        );
+        assert!(
+            matches!(outcome, DeliveryAbortOutcome::ReconciliationRequired),
+            "{fault:?}: a stale index lock must prevent a definitive abort outcome"
+        );
+        std::fs::remove_file(index_lock)
+            .unwrap_or_else(|error| panic!("{fault:?}: remove proven stale fixture lock: {error}"));
+    }
 }
 
 struct AcceptAbortProof;
@@ -980,6 +1014,7 @@ async fn assert_abort_fault(name: &str, task_id: &str, fault: ProcessFault) {
     assert_closing_observation_policy(ABORT_CHILD_ORDINAL, observed_children, fault);
     assert_fault_event_order(&controller, ABORT_CHILD_ORDINAL, observed_children, fault);
     assert_abort_fault_truth(&prepared, fault, &outcome);
+    prepared.clear_proven_stale_index_lock_for_fixture(fault, &outcome);
 
     prepared.recreate_conflict(task_id);
     assert_eq!(
