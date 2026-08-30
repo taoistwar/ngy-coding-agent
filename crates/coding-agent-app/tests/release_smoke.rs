@@ -488,6 +488,12 @@ impl IsolatedChildEnvironment {
         let retained_paths = env::split_paths(&original_path)
             .filter(|entry| !path_entry_provides_node(entry))
             .collect::<Vec<_>>();
+        #[cfg(unix)]
+        let retained_paths = {
+            let mut retained_paths = retained_paths;
+            retained_paths.insert(0, preserve_bootstrap_git_without_node(root, &original_path));
+            retained_paths
+        };
         assert!(
             !retained_paths.is_empty(),
             "filtering Node entries must preserve operating-system PATH entries"
@@ -685,6 +691,38 @@ fn path_entry_provides_node(entry: &Path) -> bool {
     ["node", "node.exe"]
         .iter()
         .any(|executable| entry.join(executable).is_file())
+}
+
+#[cfg(unix)]
+fn preserve_bootstrap_git_without_node(root: &Path, original_path: &OsString) -> PathBuf {
+    // Hosted Unix images may install the supported Git and Node executables in
+    // the same PATH directory. Dropping that entire entry proves Node is absent
+    // but can silently substitute a different system Git for the production
+    // startup capability probe. Publish only the already-selected Git object
+    // through a private PATH entry; tool discovery canonicalizes and pins it.
+    let git = env::split_paths(original_path)
+        .map(|entry| entry.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("the release smoke requires Git on the host PATH")
+        .canonicalize()
+        .expect("canonicalize the host Git executable");
+    let bootstrap_bin = root.join("bootstrap-bin");
+    fs::create_dir(&bootstrap_bin).expect("create the Node-free bootstrap directory");
+    let bootstrap_git = bootstrap_bin.join("git");
+    std::os::unix::fs::symlink(&git, &bootstrap_git)
+        .expect("publish only Git in the Node-free bootstrap directory");
+    assert_eq!(
+        bootstrap_git
+            .canonicalize()
+            .expect("canonicalize the isolated Git bootstrap link"),
+        git,
+        "the isolated bootstrap entry must retain the host-selected Git object"
+    );
+    assert!(
+        !bootstrap_bin.join("node").exists(),
+        "the isolated bootstrap directory must not expose Node"
+    );
+    bootstrap_bin
 }
 
 fn assert_node_cannot_spawn(environment: &IsolatedChildEnvironment, current_dir: &Path) {
