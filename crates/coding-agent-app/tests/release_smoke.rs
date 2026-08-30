@@ -13,6 +13,11 @@ use coding_agent_app::{PlatformPaths, PrivateFile, RuntimeDescriptor, StartupPha
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+#[path = "release_smoke/startup_evidence.rs"]
+mod startup_evidence;
+
+use startup_evidence::{StartupEvidence, format_startup_evidence, read_descriptor_before_deadline};
+
 const RELEASE_BINARY_ENV: &str = "CODING_AGENT_RELEASE_BINARY";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_DIAGNOSTIC_GRACE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -26,8 +31,6 @@ const MAX_STARTUP_DIAGNOSTIC_LINE_BYTES: usize =
     STARTUP_ERROR_CODE_PREFIX.len() + MAX_STARTUP_ERROR_CODE_BYTES + 1;
 const STARTUP_DIAGNOSTIC_READ_CHUNK_BYTES: usize = 4 * 1024;
 const MAX_STARTUP_DIAGNOSTIC_BYTES_PER_POLL: usize = 64 * 1024;
-const MAX_RUNTIME_DIAGNOSTIC_ENTRIES: usize = 256;
-const DELIVERY_PROBE_WORKSPACE_PREFIX: &str = ".coding-agent-delivery-probe-";
 
 #[test]
 #[ignore = "requires CODING_AGENT_RELEASE_BINARY to name an embedded production artifact"]
@@ -355,8 +358,11 @@ impl ReleaseApplication {
 
     fn wait_for_descriptor(&mut self) -> RuntimeDescriptor {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let mut evidence = StartupEvidence::default();
         loop {
-            if let Ok(descriptor) = RuntimeDescriptor::read(&self.descriptor_path) {
+            if let Some(descriptor) =
+                read_descriptor_before_deadline(&self.descriptor_path, deadline)
+            {
                 assert!(
                     self.database_path.is_file(),
                     "the release database must be inside the isolated application-data tree"
@@ -376,6 +382,19 @@ impl ReleaseApplication {
                 }
                 return descriptor;
             }
+            if Instant::now() >= deadline {
+                self.fail_after_startup_deadline(deadline, evidence);
+            }
+            let mut observed_evidence = evidence;
+            observed_evidence.observe_milestones_at(
+                &self.runtime_dir,
+                &self.database_path,
+                Instant::now(),
+            );
+            if Instant::now() >= deadline {
+                self.fail_after_startup_deadline(deadline, evidence);
+            }
+            evidence = observed_evidence;
             if let Some(code) = self.startup_diagnostics.poll() {
                 panic!(
                     "the release child reported a startup failure before publishing its private descriptor (code={code})"
@@ -399,24 +418,33 @@ impl ReleaseApplication {
                 );
             }
             if Instant::now() >= deadline {
-                self.fail_after_startup_deadline(deadline);
+                self.fail_after_startup_deadline(deadline, evidence);
             }
             thread::sleep(POLL_INTERVAL);
         }
     }
 
-    fn fail_after_startup_deadline(&mut self, startup_deadline: Instant) -> ! {
+    fn fail_after_startup_deadline(
+        &mut self,
+        startup_deadline: Instant,
+        before_deadline: StartupEvidence,
+    ) -> ! {
         // The startup contract is already failed. Never accept a descriptor in
         // this grace period; retain the child only long enough to classify it.
-        let database_exists = safe_presence(self.database_path.try_exists());
-        let delivery_probe_workspace_exists =
-            safe_presence(delivery_probe_workspace_exists(&self.runtime_dir));
         let diagnostic_deadline = startup_deadline + STARTUP_DIAGNOSTIC_GRACE_TIMEOUT;
+        let mut during_grace = StartupEvidence::default();
 
         loop {
+            during_grace.observe_milestones_at(
+                &self.runtime_dir,
+                &self.database_path,
+                Instant::now(),
+            );
+            during_grace.observe_descriptor(&self.descriptor_path, self.process_id());
             if let Some(code) = self.startup_diagnostics.poll() {
+                let evidence = format_startup_evidence(&before_deadline, &during_grace);
                 panic!(
-                    "the release child reported a startup failure after missing the descriptor deadline (code={code})"
+                    "the release child reported a startup failure after missing the descriptor deadline (code={code}, {evidence})"
                 );
             }
             if let Some(status) = self
@@ -427,18 +455,21 @@ impl ReleaseApplication {
                 .expect("poll the release child during startup diagnostics")
             {
                 if let Some(code) = self.startup_diagnostics.poll() {
+                    let evidence = format_startup_evidence(&before_deadline, &during_grace);
                     panic!(
-                        "the release child reported a startup failure after missing the descriptor deadline (code={code})"
+                        "the release child reported a startup failure after missing the descriptor deadline (code={code}, {evidence})"
                     );
                 }
+                let evidence = format_startup_evidence(&before_deadline, &during_grace);
                 panic!(
-                    "the release child exited after missing the descriptor deadline (success={}, database_exists={database_exists}, delivery_probe_workspace_exists={delivery_probe_workspace_exists})",
+                    "the release child exited after missing the descriptor deadline (success={}, {evidence})",
                     status.success()
                 );
             }
             if Instant::now() >= diagnostic_deadline {
+                let evidence = format_startup_evidence(&before_deadline, &during_grace);
                 panic!(
-                    "the release child did not publish its private descriptor before the deadline and no startup error code arrived during the bounded diagnostic grace period (database_exists={database_exists}, delivery_probe_workspace_exists={delivery_probe_workspace_exists})"
+                    "the release child did not publish its private descriptor before the deadline and no startup error code arrived during the bounded diagnostic grace period ({evidence})"
                 );
             }
             thread::sleep(POLL_INTERVAL);
@@ -593,42 +624,6 @@ fn parse_startup_error_code(line: &[u8]) -> Option<&str> {
         return None;
     }
     std::str::from_utf8(code).ok()
-}
-
-fn safe_presence(result: io::Result<bool>) -> &'static str {
-    match result {
-        Ok(true) => "yes",
-        Ok(false) => "no",
-        Err(_) => "unknown",
-    }
-}
-
-fn delivery_probe_workspace_exists(runtime_dir: &Path) -> io::Result<bool> {
-    let mut entries = fs::read_dir(runtime_dir)?;
-    for _ in 0..MAX_RUNTIME_DIAGNOSTIC_ENTRIES {
-        let Some(entry) = entries.next() else {
-            return Ok(false);
-        };
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(suffix) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(DELIVERY_PROBE_WORKSPACE_PREFIX))
-        else {
-            continue;
-        };
-        let has_canonical_name = suffix.len() == 32
-            && suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
-        if has_canonical_name && entry.file_type()?.is_dir() {
-            return Ok(true);
-        }
-    }
-    match entries.next().transpose()? {
-        Some(_) => Err(io::Error::other("runtime diagnostic entry budget exceeded")),
-        None => Ok(false),
-    }
 }
 
 #[test]
