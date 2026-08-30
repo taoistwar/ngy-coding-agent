@@ -301,7 +301,15 @@ impl ReleaseApplication {
             .prefix("coding-agent-release-smoke-")
             .tempdir()
             .expect("create the release-smoke temporary tree");
-        let temporary_root = temporary.path().to_path_buf();
+        // macOS commonly exposes temporary directories through `/var`, whose
+        // canonical object lives below `/private/var`. The release process
+        // opens its runtime directory as a root capability, so derive every
+        // isolated child path from the canonical root and satisfy the same
+        // capability-root invariant as production runtime paths.
+        let temporary_root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonicalize the release-smoke temporary tree");
         let launch_dir = temporary_root.join("clean-launch");
         fs::create_dir(&launch_dir).expect("create the clean launch directory");
         let copied_binary = launch_dir.join(format!("coding-agent-app{}", env::consts::EXE_SUFFIX));
