@@ -709,6 +709,40 @@ async fn recovered_branch_refresh_revokes_every_old_delete_capability() {
         "123e4567-e89b-12d3-a456-426614174426",
     )
     .await;
+
+    // Materialize every object directory needed by the legal target forward
+    // before deleting the worktree admin directory. On inode-based Unix
+    // filesystems, creating a new object fanout after removal may reuse the
+    // deleted admin inode. The persisted recovery binding must conservatively
+    // classify that alias as reconciliation, so the fixture must not create
+    // unrelated repository directories after the deletion boundary.
+    std::fs::write(
+        prepared.fixture.repository.join("forward.txt"),
+        b"legal target forward\n",
+    )
+    .unwrap();
+    git_ok(&prepared.fixture.repository, &["add", "--", "forward.txt"]);
+    git_ok(
+        &prepared.fixture.repository,
+        &[
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "-m",
+            "legal target forward",
+        ],
+    );
+    let fresh_target = git_line(&prepared.fixture.repository, &["rev-parse", "HEAD"]);
+    assert_ne!(fresh_target, prepared.target_head);
+    git_ok(
+        &prepared.fixture.repository,
+        &["reset", "--hard", "--quiet", &prepared.target_head],
+    );
+    assert_eq!(
+        git_line(&prepared.fixture.repository, &["rev-parse", "HEAD"]),
+        prepared.target_head
+    );
+
     prepared.raw_unlock();
     prepared.raw_remove();
     let branch_outcome = prepared.bind_branch().await;
@@ -729,24 +763,14 @@ async fn recovered_branch_refresh_revokes_every_old_delete_capability() {
     let first_old = delete_capability(&intent).await;
     let second_old = delete_capability(&intent).await;
 
-    std::fs::write(
-        prepared.fixture.repository.join("forward.txt"),
-        b"legal target forward\n",
-    )
-    .unwrap();
-    git_ok(&prepared.fixture.repository, &["add", "--", "forward.txt"]);
     git_ok(
         &prepared.fixture.repository,
-        &[
-            "commit",
-            "--quiet",
-            "--no-gpg-sign",
-            "-m",
-            "legal target forward",
-        ],
+        &["reset", "--hard", "--quiet", &fresh_target],
     );
-    let fresh_target = git_line(&prepared.fixture.repository, &["rev-parse", "HEAD"]);
-    assert_ne!(fresh_target, prepared.target_head);
+    assert_eq!(
+        git_line(&prepared.fixture.repository, &["rev-parse", "HEAD"]),
+        fresh_target
+    );
     assert_eq!(prepared.source_oid(), prepared.source_commit);
     assert!(!prepared.source.worktree_path().exists());
     git_ok(
