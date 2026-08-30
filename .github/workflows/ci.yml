@@ -75,8 +75,11 @@ jobs:
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 
+      - name: Test cleanup refresh recovery in isolation
+        run: cargo test --locked --offline -p coding-agent-runtime --test delivery_cleanup_recovery --all-features recovered_branch_refresh_revokes_every_old_delete_capability -- --exact --test-threads=1 --nocapture
+
       - name: Test Rust workspace
-        run: cargo test --workspace --all-targets --all-features --locked --offline
+        run: cargo test --workspace --all-targets --all-features --locked --offline -- --skip recovered_branch_refresh_revokes_every_old_delete_capability
 
       - name: Build E2E application
         run: cargo build --locked --offline -p coding-agent-app --features e2e
@@ -166,8 +169,11 @@ jobs:
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 
+      - name: Test cleanup refresh recovery in isolation
+        run: cargo test --locked --offline -p coding-agent-runtime --test delivery_cleanup_recovery --all-features recovered_branch_refresh_revokes_every_old_delete_capability -- --exact --test-threads=1 --nocapture
+
       - name: Test Rust workspace
-        run: cargo test --workspace --all-targets --all-features --locked --offline
+        run: cargo test --workspace --all-targets --all-features --locked --offline -- --skip recovered_branch_refresh_revokes_every_old_delete_capability
 
       - name: Build embedded release application
         run: cargo build --release --locked --offline -p coding-agent-app --features embedded-web

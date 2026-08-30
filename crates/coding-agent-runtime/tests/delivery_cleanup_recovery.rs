@@ -746,6 +746,27 @@ async fn recovered_branch_refresh_revokes_every_old_delete_capability() {
         ],
     );
     let fresh_target = git_line(&prepared.fixture.repository, &["rev-parse", "HEAD"]);
+    assert_ne!(fresh_target, prepared.target_head);
+    assert_eq!(prepared.source_oid(), prepared.source_commit);
+    assert!(!prepared.source.worktree_path().exists());
+    git_ok(
+        &prepared.fixture.repository,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &prepared.source_commit,
+            &fresh_target,
+        ],
+    );
+    git_ok(
+        &prepared.fixture.repository,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &prepared.target_head,
+            &fresh_target,
+        ],
+    );
     let refresh = match prepared
         .cleanup
         .classify_delivery_delete_pending(
@@ -757,7 +778,9 @@ async fn recovered_branch_refresh_revokes_every_old_delete_capability() {
         .unwrap()
     {
         DeliveryDeletePendingDisposition::RefreshExpectedTarget(refresh) => refresh,
-        _ => panic!("legal target forward must require a persisted refresh"),
+        other => {
+            panic!("legal target forward must require a persisted refresh; got {other:?}")
+        }
     };
     assert_eq!(refresh.fresh_target_head(), fresh_target);
     let refreshed = refresh
