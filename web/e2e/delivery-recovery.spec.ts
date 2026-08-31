@@ -4,6 +4,7 @@ import path from "node:path";
 import { expect, test } from "./fixtures";
 
 import {
+  DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
   DeliveryBrowserDriver,
   fetchDelivery,
   PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
@@ -258,7 +259,9 @@ test("hard-kill recovery finishes an exact conflict abort without changing targe
       await driver.selectTask(task.prompt);
       await driver.waitForMergeState(task.id, "conflict");
       await driver.git.assertTargetUnchanged(targetBefore);
-      await expect(driver.panel()).toContainText("Preflight found conflicts");
+      await expect(driver.panel()).toContainText("Preflight found conflicts", {
+        timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+      });
       await driver.assertDeliveryPanelRedactsAbsolutePaths();
       await driver.quit();
     },

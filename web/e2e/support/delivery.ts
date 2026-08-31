@@ -162,10 +162,7 @@ export class DeliveryBrowserDriver {
     if (operation?.preflight_source_commit === null || operation?.preflight_source_commit === undefined) {
       throw new Error("ready preflight omitted its exact source commit");
     }
-    const panel = this.panel();
-    await panel.getByRole("button", { name: "Review and confirm local merge" }).click();
-    const dialog = this.page.getByRole("dialog", { name: "Confirm exact local merge" });
-    await expect(dialog).toBeVisible();
+    const dialog = await this.openMergeDialog();
     await expectExactField(dialog, "Operation ID", operation.operation_id);
     await expectExactField(dialog, "Confirmed operation version", String(operation.version));
     await expectExactField(dialog, "Target HEAD", before.head);
@@ -213,6 +210,13 @@ export class DeliveryBrowserDriver {
     );
   }
 
+  async openMergeDialog(): Promise<Locator> {
+    await this.clickPanelAction("Review and confirm local merge");
+    const dialog = this.page.getByRole("dialog", { name: "Confirm exact local merge" });
+    await expect(dialog).toBeVisible();
+    return dialog;
+  }
+
   async startPreflightWithoutWaiting(
     taskId: string,
     before: DeliveryTargetSnapshot,
@@ -223,21 +227,20 @@ export class DeliveryBrowserDriver {
   }
 
   async startMergeWithoutWaiting(): Promise<void> {
-    await this.panel().getByRole("button", { name: "Review and confirm local merge" }).click();
-    const dialog = this.page.getByRole("dialog", { name: "Confirm exact local merge" });
+    const dialog = await this.openMergeDialog();
     await dialog.getByRole("button", { name: "Merge locally", exact: true }).click();
     await expect(dialog.getByRole("button", { name: "Accepting merge…" })).toBeDisabled();
   }
 
   async startRemoveWorktreeWithoutWaiting(): Promise<void> {
-    await this.panel().getByRole("button", { name: "Remove worktree", exact: true }).click();
+    await this.clickPanelAction("Remove worktree");
     const dialog = this.page.getByRole("dialog", { name: "Remove local worktree?" });
     await dialog.getByRole("button", { name: "Remove exact local worktree" }).click();
     await expect(dialog.getByRole("button", { name: "Removing worktree…" })).toBeDisabled();
   }
 
   async startDeleteBranchWithoutWaiting(): Promise<void> {
-    await this.panel().getByRole("button", { name: "Delete source branch", exact: true }).click();
+    await this.clickPanelAction("Delete source branch");
     const dialog = this.page.getByRole("dialog", { name: "Delete local source branch?" });
     await dialog.getByRole("button", { name: "Delete exact local branch" }).click();
     await expect(
@@ -246,8 +249,7 @@ export class DeliveryBrowserDriver {
   }
 
   async removeWorktree(taskId: string): Promise<DeliveryTask> {
-    const panel = this.panel();
-    await panel.getByRole("button", { name: "Remove worktree", exact: true }).click();
+    await this.clickPanelAction("Remove worktree");
     const dialog = this.page.getByRole("dialog", { name: "Remove local worktree?" });
     await expect(dialog).toContainText("The source branch is retained");
     const responsePromise = this.deliveryResponse(
@@ -274,8 +276,7 @@ export class DeliveryBrowserDriver {
   }
 
   async removeWorktreeAfterLostReply(taskId: string): Promise<DeliveryTask> {
-    const panel = this.panel();
-    await panel.getByRole("button", { name: "Remove worktree", exact: true }).click();
+    await this.clickPanelAction("Remove worktree");
     const dialog = this.page.getByRole("dialog", { name: "Remove local worktree?" });
     const requestBodies: unknown[] = [];
     const url = `${this.app.origin}/api/tasks/${taskId}/cleanup/worktree`;
@@ -339,8 +340,7 @@ export class DeliveryBrowserDriver {
   }
 
   async deleteSourceBranch(taskId: string): Promise<DeliveryTask> {
-    const panel = this.panel();
-    await panel.getByRole("button", { name: "Delete source branch", exact: true }).click();
+    await this.clickPanelAction("Delete source branch");
     const dialog = this.page.getByRole("dialog", { name: "Delete local source branch?" });
     await expect(dialog).toContainText("never deletes a remote branch");
     const responsePromise = this.deliveryResponse(
@@ -403,6 +403,17 @@ export class DeliveryBrowserDriver {
     );
   }
 
+  private async clickPanelAction(name: string | RegExp): Promise<void> {
+    // Direct wire polling can observe a durable state before a reloaded or
+    // restarted React session finishes its independent delivery projection.
+    const button = typeof name === "string"
+      ? this.panel().getByRole("button", { name, exact: true })
+      : this.panel().getByRole("button", { name });
+    await button.click({
+      timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+    });
+  }
+
   private async openPreflightDialog(
     taskId: string,
     before: DeliveryTargetSnapshot,
@@ -411,7 +422,7 @@ export class DeliveryBrowserDriver {
     if (projection.target.available !== true || !("branch" in projection.target)) {
       throw new Error("delivery target is unavailable before preflight");
     }
-    await this.panel().getByRole("button", { name: "Run delivery preflight" }).click();
+    await this.clickPanelAction(/^Run delivery preflight(?: again)?$/u);
     const dialog = this.page.getByRole("dialog", { name: "Confirm local merge preflight" });
     await expect(dialog).toBeVisible();
     await expectExactField(dialog, "Target branch", projection.target.branch);

@@ -95,7 +95,9 @@ test("explicitly preflights and exact-no-ff merges real approved bytes, then cle
       );
       try {
         await driver.waitForMergeState(task.id, "preflight_pending");
-        await expect(driver.panel()).toContainText("Running preflight");
+        await expect(driver.panel()).toContainText("Running preflight", {
+          timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+        });
       } finally {
         await publishReleaseSignal(reached);
       }
@@ -106,7 +108,9 @@ test("explicitly preflights and exact-no-ff merges real approved bytes, then cle
       await page.reload();
       await expect(page.locator(".connection-banner")).toContainText("Connected");
       await driver.selectTask(task.prompt);
-      await expect(driver.panel()).toContainText("Preflight ready");
+      await expect(driver.panel()).toContainText("Preflight ready", {
+        timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+      });
       const exactMerge = await driver.acceptMerge(task.id, targetBefore);
 
       const merged = await fetchDelivery(page, task.id);
@@ -177,7 +181,9 @@ test("keeps conflicting and stale preflights byte-exact until a fresh explicit m
       const conflict = await driver.runPreflight(task.id, conflictingTarget);
       expect(conflict.latest_merge?.state).toBe("conflict");
       await driver.git.assertTargetUnchanged(conflictingTarget);
-      await expect(driver.panel()).toContainText("Preflight found conflicts");
+      await expect(driver.panel()).toContainText("Preflight found conflicts", {
+        timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+      });
       await expect(driver.panel()).toContainText("src/lib.rs");
       await driver.assertDeliveryPanelRedactsAbsolutePaths();
 
@@ -193,12 +199,7 @@ test("keeps conflicting and stale preflights byte-exact until a fresh explicit m
       const ready = await driver.runPreflight(task.id, resolvedTarget);
       expect(ready.latest_merge?.state).toBe("preflight_ready");
 
-      await driver
-        .panel()
-        .getByRole("button", { name: "Review and confirm local merge" })
-        .click();
-      const staleDialog = page.getByRole("dialog", { name: "Confirm exact local merge" });
-      await expect(staleDialog).toBeVisible();
+      const staleDialog = await driver.openMergeDialog();
       await driver.git.writeFixtureFile(
         "target-only-note.txt",
         "independent target advance after the reviewed preflight\n",
@@ -227,7 +228,9 @@ test("keeps conflicting and stale preflights byte-exact until a fresh explicit m
       ).toBeVisible();
       await driver.git.assertTargetUnchanged(advancedTarget);
       await driver.waitForMergeState(task.id, "stale");
-      await expect(driver.panel()).toContainText("Preflight stale");
+      await expect(driver.panel()).toContainText("Preflight stale", {
+        timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+      });
       await expect(
         driver
           .panel()
@@ -241,7 +244,7 @@ test("keeps conflicting and stale preflights byte-exact until a fresh explicit m
       await staleDialog.getByRole("button", { name: "Cancel" }).click();
       await expect(
         driver.panel().getByRole("button", { name: "Run delivery preflight" }),
-      ).toBeVisible();
+      ).toBeEnabled({ timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS });
 
       const freshReady = await driver.runPreflight(task.id, advancedTarget);
       expect(freshReady.latest_merge?.state).toBe("preflight_ready");
@@ -279,7 +282,9 @@ test("rejects an ignored target collision without overwriting its bytes", async 
       expect(rejected.latest_merge?.state).toBe("rejected");
       await driver.git.assertTargetUnchanged(targetBefore);
       expect(await driver.git.readFixtureFile("collision.txt")).toEqual(sentinel);
-      await expect(driver.panel()).toContainText("TARGET_IGNORED_PATH_COLLISION");
+      await expect(driver.panel()).toContainText("TARGET_IGNORED_PATH_COLLISION", {
+        timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+      });
       await driver.assertDeliveryPanelRedactsAbsolutePaths();
       await driver.quit();
     },
@@ -322,7 +327,9 @@ test("rejects malicious local Git configuration without executing or exposing it
       const rejected = await driver.delivery(task.id);
       expect(rejected.eligibility).not.toBe("eligible");
       expect(rejected.reasons).toContain("unsafe_git_configuration");
-      await expect(driver.panel()).toContainText("repository Git configuration is unsafe");
+      await expect(driver.panel()).toContainText("repository Git configuration is unsafe", {
+        timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
+      });
       await expect(driver.panel()).not.toContainText("delivery-probe");
       await driver.assertDeliveryPanelRedactsAbsolutePaths();
       expect(await pathExists(sentinel)).toBe(false);
