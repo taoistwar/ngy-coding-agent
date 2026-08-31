@@ -46,22 +46,17 @@ test("explicitly preflights and exact-no-ff merges real approved bytes, then cle
     async (app) => {
       const driver = await DeliveryBrowserDriver.open(page, app);
       await driver.registerFixtureRepository();
-      const creation = driver.createApprovedTask(
+      const task = await driver.createReviewApprovedTask(
         "Approve exact local delivery bytes without publishing or deploying",
       );
       if (terminalReleasePath.length === 0) {
         throw new Error("terminal actor release path was not initialized");
       }
-      const terminalReached = await Promise.race([
-        waitForReachedSignal(
-          app.runtimeDir,
-          terminalReleasePath,
-          PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
-        ),
-        creation.then(() => {
-          throw new Error("task creation crossed the configured terminal actor pause");
-        }),
-      ]);
+      const terminalReached = await waitForReachedSignal(
+        app.runtimeDir,
+        terminalReleasePath,
+        PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+      );
       try {
         await expect(page.getByText("Execution status: completed", { exact: true })).toBeVisible({
           timeout: DELIVERY_PROJECTION_CONVERGENCE_TIMEOUT_MS,
@@ -76,7 +71,7 @@ test("explicitly preflights and exact-no-ff merges real approved bytes, then cle
       } finally {
         await publishReleaseSignal(terminalReached);
       }
-      const task = await creation;
+      await driver.waitForEligibleDelivery(task);
       const targetBefore = await driver.git.snapshotTarget();
       const sourceRefsBefore = await driver.git.sourceRefs();
       const beforeClick = await fetchDelivery(page, task.id);

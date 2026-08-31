@@ -67,6 +67,11 @@ export class DeliveryBrowserDriver {
   }
 
   async createApprovedTask(prompt: string): Promise<CreatedDeliveryTask> {
+    const task = await this.createReviewApprovedTask(prompt);
+    return this.waitForEligibleDelivery(task);
+  }
+
+  async createReviewApprovedTask(prompt: string): Promise<CreatedDeliveryTask> {
     await this.page.getByLabel("Task description").fill(prompt);
     const responsePromise = this.page.waitForResponse(
       (response) =>
@@ -85,6 +90,10 @@ export class DeliveryBrowserDriver {
       "review_approved",
       PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
     );
+    return task;
+  }
+
+  async waitForEligibleDelivery(task: CreatedDeliveryTask): Promise<CreatedDeliveryTask> {
     await waitForDelivery(
       this.page,
       task.id,
