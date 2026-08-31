@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use super::tree_control::ExitedTreeKill;
 use super::*;
 
 /// Single-use owner for a sentinel whose child spawn has committed.
@@ -153,23 +155,6 @@ pub(super) fn should_use_exited_tree_kill(observed: &ObservedTermination) -> boo
     matches!(observed, ObservedTermination::Exited(_))
 }
 
-#[cfg(target_os = "macos")]
-pub(super) fn reconcile_exited_tree_kill(
-    kill_result: io::Result<()>,
-    liveness_probe: impl FnOnce() -> io::Result<bool>,
-) -> io::Result<()> {
-    match kill_result {
-        Err(kill_error) if kill_error.raw_os_error() == Some(libc::EPERM) => {
-            match liveness_probe() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(kill_error),
-                Err(probe_error) => Err(probe_error),
-            }
-        }
-        result => result,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn supervise_child(
     mut child: Child,
@@ -317,13 +302,22 @@ async fn prove_tree_cleanup(
         (supervision_fault == Some(SupervisionFault::KillNow))
             .then(|| injected_supervision_error(SupervisionFault::KillNow))
     });
+    #[cfg(target_os = "macos")]
+    let mut deferred_exited_eperm = None;
     let kill_error = if let Some(error) = injected_kill_error {
         tree.inject_kill_failure_for_test(error).err()
     } else {
         #[cfg(target_os = "macos")]
         {
             if should_use_exited_tree_kill(observed) {
-                tree.kill_now_after_observed_exit(&leader_exit).err()
+                match tree.kill_now_after_observed_exit(&leader_exit) {
+                    Ok(ExitedTreeKill::Settled) => None,
+                    Ok(ExitedTreeKill::AwaitingEof(error)) => {
+                        deferred_exited_eperm = Some(error);
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
             } else {
                 tree.kill_now().err()
             }
@@ -358,16 +352,27 @@ async fn prove_tree_cleanup(
         )));
     }
     match time::timeout_at(cleanup_deadline, leader_exit.wait_tree_before_reap()).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            #[cfg(target_os = "macos")]
+            tree.confirm_exited_eperm_after_eof();
+        }
         Ok(Err(error)) => {
+            #[cfg(target_os = "macos")]
+            let error = deferred_exited_eperm.unwrap_or(error);
             abort_and_join_child_io(input_writer, stdout_task, stderr_task).await;
             handoff_tree_reap(tasks, child, tree.clone(), leader_exit, liveness);
             return Err(ProcessError::TreeCleanupFailed(error));
         }
         Err(_) => {
+            #[cfg(target_os = "macos")]
+            let error = deferred_exited_eperm
+                .map(ProcessError::TreeCleanupFailed)
+                .unwrap_or(ProcessError::CleanupTimedOut);
+            #[cfg(not(target_os = "macos"))]
+            let error = ProcessError::CleanupTimedOut;
             abort_and_join_child_io(input_writer, stdout_task, stderr_task).await;
             handoff_tree_reap(tasks, child, tree.clone(), leader_exit, liveness);
-            return Err(ProcessError::CleanupTimedOut);
+            return Err(error);
         }
     }
     let status = match observed {
@@ -540,6 +545,8 @@ pub(super) fn handoff_tree_reap(
         while leader_exit.wait_tree_before_reap().await.is_err() {
             time::sleep(Duration::from_millis(2)).await;
         }
+        #[cfg(target_os = "macos")]
+        _guard.0.confirm_exited_eperm_after_eof();
         loop {
             let _ = child.start_kill();
             if child.wait().await.is_ok() {

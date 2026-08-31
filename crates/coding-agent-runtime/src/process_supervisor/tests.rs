@@ -1,6 +1,8 @@
 use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd as _;
+#[cfg(target_os = "macos")]
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +13,7 @@ use tokio::io::ReadBuf;
 
 #[cfg(unix)]
 use super::supervision::complete_liveness_eventually;
+use super::tree_control::{EXITED_EPERM_RAW_OS_ERROR, ExitedTreeKill, reconcile_exited_tree_kill};
 use super::*;
 #[cfg(unix)]
 use crate::command_policy::{
@@ -27,6 +30,9 @@ const HELPER_LEADER_PID_FILE: &str = "CODING_AGENT_PROCESS_HELPER_LEADER_PID_FIL
 const HELPER_RELEASE_FILE: &str = "CODING_AGENT_PROCESS_HELPER_RELEASE_FILE";
 const HELPER_RUNTIME_DIRECTORY: &str = "CODING_AGENT_PROCESS_HELPER_RUNTIME_DIRECTORY";
 const HELPER_TEST: &str = "process_supervisor::tests::process_helper_entrypoint";
+
+#[cfg(target_os = "macos")]
+mod macos_exited_eperm;
 
 #[test]
 fn child_start_truth_table_distinguishes_only_proven_pre_spawn_failures() {
@@ -127,6 +133,20 @@ fn process_helper_entrypoint() {
             if mode == "leader-sleep" {
                 std::thread::sleep(Duration::from_secs(60));
             }
+            std::process::exit(0);
+        }
+        #[cfg(target_os = "macos")]
+        "leader-detached-release" => {
+            write_optional_helper_pid(HELPER_LEADER_PID_FILE);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", HELPER_TEST, "--nocapture"])
+                .env(HELPER_ENV, "grandchild-release")
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            child.spawn().unwrap();
+            wait_for_helper_pid_sync();
             std::process::exit(0);
         }
         "grandchild" | "grandchild-release" => {
@@ -463,37 +483,48 @@ fn macos_only_uses_the_exited_tree_kill_path_after_observed_leader_exit() {
     ));
 }
 
-#[cfg(target_os = "macos")]
 #[test]
-fn macos_only_accepts_eof_after_an_exited_tree_kill_returns_eperm() {
-    assert!(
-        reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(libc::EPERM)), || Ok(true))
-            .is_ok()
+fn exited_tree_kill_reconciliation_only_settles_eperm_after_eof() {
+    assert!(matches!(
+        reconcile_exited_tree_kill(
+            Err(io::Error::from_raw_os_error(EXITED_EPERM_RAW_OS_ERROR)),
+            || Ok(true)
+        ),
+        Ok(ExitedTreeKill::Settled)
+    ));
+
+    let writers_remain = reconcile_exited_tree_kill(
+        Err(io::Error::from_raw_os_error(EXITED_EPERM_RAW_OS_ERROR)),
+        || Ok(false),
+    )
+    .unwrap();
+    let ExitedTreeKill::AwaitingEof(writers_remain) = writers_remain else {
+        panic!("EPERM with live writers must remain pending")
+    };
+    assert_eq!(
+        writers_remain.raw_os_error(),
+        Some(EXITED_EPERM_RAW_OS_ERROR)
     );
 
-    let writers_remain =
-        reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(libc::EPERM)), || Ok(false))
-            .unwrap_err();
-    assert_eq!(writers_remain.raw_os_error(), Some(libc::EPERM));
+    let probe_failed = reconcile_exited_tree_kill(
+        Err(io::Error::from_raw_os_error(EXITED_EPERM_RAW_OS_ERROR)),
+        || Err(io::Error::other("probe failed")),
+    )
+    .unwrap_err();
+    assert_eq!(probe_failed.kind(), io::ErrorKind::Other);
 
-    let probe_failed =
-        reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(libc::EPERM)), || {
-            Err(io::Error::from_raw_os_error(libc::EIO))
-        })
-        .unwrap_err();
-    assert_eq!(probe_failed.raw_os_error(), Some(libc::EIO));
-
-    let non_eperm =
-        reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(libc::EINVAL)), || {
-            panic!("non-EPERM failures must not probe liveness")
-        })
-        .unwrap_err();
-    assert_eq!(non_eperm.raw_os_error(), Some(libc::EINVAL));
-
-    reconcile_exited_tree_kill(Ok(()), || {
-        panic!("successful kills must not probe liveness")
+    let non_eperm = reconcile_exited_tree_kill(Err(io::Error::from_raw_os_error(2)), || {
+        panic!("non-EPERM failures must not probe liveness")
     })
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(non_eperm.raw_os_error(), Some(2));
+
+    assert!(matches!(
+        reconcile_exited_tree_kill(Ok(()), || {
+            panic!("successful kills must not probe liveness")
+        }),
+        Ok(ExitedTreeKill::Settled)
+    ));
 }
 
 #[cfg(target_os = "macos")]

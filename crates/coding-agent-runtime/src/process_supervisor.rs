@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -32,8 +32,6 @@ mod tree_control;
 #[cfg(test)]
 use output::HeadTailCapture;
 use output::{drain_stream, join_captured};
-#[cfg(target_os = "macos")]
-use supervision::reconcile_exited_tree_kill;
 #[cfg(all(test, target_os = "macos"))]
 use supervision::should_use_exited_tree_kill;
 #[cfg(test)]
