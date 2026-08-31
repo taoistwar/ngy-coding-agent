@@ -128,6 +128,9 @@ function createPollingSession({
   let tracked: DeliveryOperation | null = null;
   let lastSeen: DeliveryOperation | null = null;
   let nextDelayMs = DELIVERY_INITIAL_POLL_DELAY_MS;
+  // An aborted HTTP request can leave its backend query running, so keep the
+  // active same-task request and coalesce freshness demand into one trailing load.
+  let trailingRefreshRequested = false;
 
   const clearTimer = () => {
     if (timer !== null) {
@@ -151,10 +154,29 @@ function createPollingSession({
     }, delayMs);
   };
 
+  const runTrailingRefresh = (): boolean => {
+    if (
+      !trailingRefreshRequested ||
+      disposed ||
+      taskId === null ||
+      controller !== null ||
+      timer !== null
+    ) {
+      return false;
+    }
+    trailingRefreshRequested = false;
+    void loadDelivery();
+    return true;
+  };
+
   const loadDelivery = async () => {
     if (disposed || taskId === null) return;
+    if (controller !== null || timer !== null) {
+      trailingRefreshRequested = true;
+      return;
+    }
+    trailingRefreshRequested = false;
     clearTimer();
-    abortRequest();
     const request = new AbortController();
     controller = request;
     dispatch({ type: "delivery.started", taskId, generation });
@@ -169,9 +191,10 @@ function createPollingSession({
       if (latest !== null && shouldPollDeliveryOperation(latest)) {
         tracked = latest;
         nextDelayMs = DELIVERY_INITIAL_POLL_DELAY_MS;
-        schedule(latest.operation_id, nextDelayMs);
+        if (!runTrailingRefresh()) schedule(latest.operation_id, nextDelayMs);
       } else {
         tracked = null;
+        runTrailingRefresh();
       }
     } catch (error) {
       if (!active(request)) return;
@@ -182,6 +205,7 @@ function createPollingSession({
         generation,
         error: deliveryError(error),
       });
+      runTrailingRefresh();
     }
   };
 
@@ -201,13 +225,16 @@ function createPollingSession({
       const operation = await api.deliveryOperation(operationId, request.signal);
       if (!active(request) || tracked?.operation_id !== operationId) return;
       controller = null;
-      if (operation.operation_id !== operationId) return;
+      if (operation.operation_id !== operationId) {
+        runTrailingRefresh();
+        return;
+      }
       if (
         lastSeen !== null &&
         lastSeen.operation_id === operationId &&
         operation.version < lastSeen.version
       ) {
-        schedule(operationId, nextDelayMs);
+        if (!runTrailingRefresh()) schedule(operationId, nextDelayMs);
         return;
       }
       const progressed =
@@ -226,7 +253,7 @@ function createPollingSession({
         operation,
       });
       if (shouldPollDeliveryOperation(operation)) {
-        schedule(operationId, nextDelayMs);
+        if (!runTrailingRefresh()) schedule(operationId, nextDelayMs);
       } else {
         tracked = null;
         void loadDelivery();
@@ -246,13 +273,21 @@ function createPollingSession({
         nextDelayMs,
         willRetry,
       });
-      if (willRetry) schedule(operationId, nextDelayMs);
+      if (willRetry) {
+        if (!runTrailingRefresh()) schedule(operationId, nextDelayMs);
+      } else {
+        runTrailingRefresh();
+      }
     }
   };
 
   return {
     refresh(expectedTaskId) {
       if (expectedTaskId !== taskId) return;
+      if (controller !== null || timer !== null) {
+        trailingRefreshRequested = true;
+        return;
+      }
       void loadDelivery();
     },
     track(expectedTaskId, operation) {
@@ -266,6 +301,7 @@ function createPollingSession({
       }
       clearTimer();
       abortRequest();
+      trailingRefreshRequested = false;
       lastSeen = operation;
       tracked = operation;
       nextDelayMs = DELIVERY_INITIAL_POLL_DELAY_MS;
@@ -286,6 +322,7 @@ function createPollingSession({
       disposed = true;
       clearTimer();
       abortRequest();
+      trailingRefreshRequested = false;
       tracked = null;
       lastSeen = null;
     },

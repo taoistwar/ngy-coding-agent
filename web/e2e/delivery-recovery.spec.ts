@@ -17,8 +17,20 @@ import {
   withLocalApp,
   type LocalApp,
   type ProcessDeliveryProviderScenario,
+  type ReachedSignal,
   type StoreWriterOperation,
 } from "./support/localApp";
+
+// The test-only pre-actor pause splits startup into two serial waits: reaching
+// the pause consumes harness budget, and delivery recovery runs after release.
+const RECOVERY_STARTUP_TIMEOUT_MS = 2 * PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS;
+// The merge click reaches the durable abort receipt through accept
+// authentication, source construction, and the conflict-producing merge.
+const CONFLICT_ABORT_REACHED_TIMEOUT_MS = 3 * PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS;
+const CONFLICT_ABORT_TEST_TIMEOUT_MS =
+  productionDeliveryTestTimeout("approval", "preflight", "merge") +
+  CONFLICT_ABORT_REACHED_TIMEOUT_MS -
+  PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS;
 
 test("hard-kill source recovery completes the merge before Ready, then recovers both cleanup receipts", async (
   { page },
@@ -54,7 +66,11 @@ test("hard-kill source recovery completes the merge before Ready, then recovers 
 
       await driver.startMergeWithoutWaiting();
       await crashAtReachedStorePause(app, sourcePause, async () => {
-        const pending = await fetchDelivery(page, task.id);
+        const pending = await fetchDelivery(
+          page,
+          task.id,
+          PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+        );
         expect(pending.latest_merge?.state).toBe("accepted");
         expect(pending.source?.state).toBe("object_pending");
       });
@@ -83,7 +99,11 @@ test("hard-kill source recovery completes the merge before Ready, then recovers 
       );
       await driver.startRemoveWorktreeWithoutWaiting();
       await crashAtReachedStorePause(app, removePause, async () => {
-        const pending = await fetchDelivery(page, task.id);
+        const pending = await fetchDelivery(
+          page,
+          task.id,
+          PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+        );
         expect(pending.latest_cleanup?.state).toBe("unlock_pending");
       });
       await restartAtRecoveryBoundary(app, "worktree-recovery-before-ready");
@@ -109,7 +129,11 @@ test("hard-kill source recovery completes the merge before Ready, then recovers 
       );
       await driver.startDeleteBranchWithoutWaiting();
       await crashAtReachedStorePause(app, deletePause, async () => {
-        const pending = await fetchDelivery(page, task.id);
+        const pending = await fetchDelivery(
+          page,
+          task.id,
+          PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+        );
         expect(pending.latest_cleanup?.state).toBe("delete_pending");
       });
       await restartAtRecoveryBoundary(app, "branch-recovery-before-ready");
@@ -157,7 +181,11 @@ test("hard-kill merge-pending recovery reaches one exact no-ff merge before Read
 
       await driver.startMergeWithoutWaiting();
       await crashAtReachedStorePause(app, mergePause, async () => {
-        const pending = await fetchDelivery(page, task.id);
+        const pending = await fetchDelivery(
+          page,
+          task.id,
+          PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+        );
         expect(pending.latest_merge?.state).toBe("merge_pending");
       });
       await restartAtRecoveryBoundary(app, "merge-recovery-before-ready");
@@ -184,7 +212,7 @@ test("hard-kill recovery finishes an exact conflict abort without changing targe
   { page },
   testInfo,
 ) => {
-  test.setTimeout(productionDeliveryTestTimeout("approval", "preflight", "merge"));
+  test.setTimeout(CONFLICT_ABORT_TEST_TIMEOUT_MS);
   const abortPause = "delivery-abort-pending";
   await withLocalApp(
     testInfo,
@@ -212,10 +240,19 @@ test("hard-kill recovery finishes an exact conflict abort without changing targe
       const ready = await driver.runPreflight(task.id, targetBefore);
       expect(ready.latest_merge?.state).toBe("preflight_ready");
       await driver.startMergeWithoutWaiting();
-      await crashAtReachedStorePause(app, abortPause, async () => {
-        const pending = await fetchDelivery(page, task.id);
-        expect(pending.latest_merge?.state).toBe("abort_pending");
-      });
+      await crashAtReachedStorePause(
+        app,
+        abortPause,
+        async () => {
+          const pending = await fetchDelivery(
+            page,
+            task.id,
+            PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+          );
+          expect(pending.latest_merge?.state).toBe("abort_pending");
+        },
+        CONFLICT_ABORT_REACHED_TIMEOUT_MS,
+      );
       await restartAtRecoveryBoundary(app, "abort-recovery-before-ready", "runtime_conflict");
       await driver.reopen();
       await driver.selectTask(task.prompt);
@@ -236,11 +273,13 @@ async function restartWithStorePause(
   operation: StoreWriterOperation,
 ): Promise<void> {
   await app.hardKillPrimaryPreservingRoot();
-  await app.restart((roots) =>
-    productionDeliveryScenario(roots, {
-      providerScenario: "approve",
-      pauseAfterCommit: { name: signalName, operation },
-    }),
+  await app.restart(
+    (roots) =>
+      productionDeliveryScenario(roots, {
+        providerScenario: "approve",
+        pauseAfterCommit: { name: signalName, operation },
+      }),
+    { startupTimeoutMs: PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS },
   );
   await driver.reopen();
   await driver.selectTask(prompt);
@@ -250,15 +289,32 @@ async function crashAtReachedStorePause(
   app: LocalApp,
   signalName: string,
   assertPersistedPending: () => Promise<void>,
+  reachedTimeoutMs = PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
 ): Promise<void> {
   const releasePath = path.join(app.runtimeDir, "signals", `${signalName}.release`);
   await waitForReachedSignal(
     app.runtimeDir,
     releasePath,
-    PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+    reachedTimeoutMs,
   );
-  await assertPersistedPending();
-  await app.hardKillPrimaryPreservingRoot();
+  const failures: unknown[] = [];
+  try {
+    await assertPersistedPending();
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    await app.hardKillPrimaryPreservingRoot();
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(
+      failures,
+      "persisted pending assertion and hard-kill both failed",
+    );
+  }
 }
 
 async function restartAtRecoveryBoundary(
@@ -273,25 +329,35 @@ async function restartAtRecoveryBoundary(
         providerScenario,
         pauseBeforeDescriptor: { name: signalName },
       }),
-    { startupTimeoutMs: PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS },
+    { startupTimeoutMs: RECOVERY_STARTUP_TIMEOUT_MS },
   );
   void restart.catch(() => undefined);
-  const reached = await waitForReachedSignal(
-    app.runtimeDir,
-    releasePath,
-    PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
-  );
-  let boundaryFailure: unknown = null;
+  let reached: ReachedSignal | null = null;
+  let markerFailure: unknown = null;
   try {
-    await expectPathAbsent(app.descriptorPath);
+    reached = await waitForReachedSignal(
+      app.runtimeDir,
+      releasePath,
+      PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
+    );
   } catch (error) {
-    boundaryFailure = error;
+    markerFailure = error;
+  }
+  let boundaryFailure: unknown = null;
+  if (reached !== null) {
+    try {
+      await expectPathAbsent(app.descriptorPath);
+    } catch (error) {
+      boundaryFailure = error;
+    }
   }
   let releaseFailure: unknown = null;
-  try {
-    await publishReleaseSignal(reached);
-  } catch (error) {
-    releaseFailure = error;
+  if (reached !== null) {
+    try {
+      await publishReleaseSignal(reached);
+    } catch (error) {
+      releaseFailure = error;
+    }
   }
   let restartFailure: unknown = null;
   try {
@@ -299,7 +365,7 @@ async function restartAtRecoveryBoundary(
   } catch (error) {
     restartFailure = error;
   }
-  const failures = [boundaryFailure, releaseFailure, restartFailure].filter(
+  const failures = [markerFailure, boundaryFailure, releaseFailure, restartFailure].filter(
     (error) => error !== null,
   );
   if (failures.length === 1) throw failures[0];

@@ -148,6 +148,11 @@ describe("useDeliveryPolling", () => {
     );
     await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(1));
     const staleTrackOperation = result.current.trackOperation;
+    act(() => {
+      result.current.refresh();
+      result.current.refresh();
+    });
+    expect(taskDelivery).toHaveBeenCalledTimes(1);
 
     rerender({ taskId: TASK_B });
     await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(2));
@@ -162,7 +167,123 @@ describe("useDeliveryPolling", () => {
     expect(result.current.state.operation).toBeNull();
     act(() => staleTrackOperation(operation(1)));
     expect(result.current.state.operation).toBeNull();
+    expect(taskDelivery).toHaveBeenCalledTimes(2);
     expect(clock.delays).toEqual([]);
+  });
+
+  it("coalesces same-task refreshes into one trailing delivery load", async () => {
+    const first = deferred<DeliveryTask>();
+    const second = deferred<DeliveryTask>();
+    const refreshed = projection(TASK_A);
+    refreshed.target = {
+      available: true,
+      branch: "refs/heads/main",
+      head: OID_B,
+    };
+    const signals: AbortSignal[] = [];
+    const taskDelivery = vi.fn(
+      async (_taskId: string, signal?: AbortSignal): Promise<DeliveryTask> => {
+        if (signal !== undefined) signals.push(signal);
+        return taskDelivery.mock.calls.length === 1 ? first.promise : second.promise;
+      },
+    );
+    const api: DeliveryPollingApi = {
+      taskDelivery,
+      deliveryOperation: vi.fn<
+        (operationId: string, signal?: AbortSignal) => Promise<DeliveryOperation>
+      >(),
+    };
+    const { result } = renderHook(() => useDeliveryPolling({ api, taskId: TASK_A }));
+    await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      result.current.refresh();
+      result.current.refresh();
+      result.current.refresh();
+    });
+    expect(taskDelivery).toHaveBeenCalledTimes(1);
+    expect(signals[0]?.aborted).toBe(false);
+
+    await act(async () => {
+      first.resolve(projection(TASK_A));
+      await first.promise;
+    });
+    await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(2));
+    expect(signals[0]?.aborted).toBe(false);
+    expect(signals[1]?.aborted).toBe(false);
+
+    await act(async () => {
+      second.resolve(refreshed);
+      await second.promise;
+    });
+    await waitFor(() => expect(result.current.state.phase).toBe("ready"));
+    expect(result.current.state.projection).toEqual(refreshed);
+    expect(taskDelivery).toHaveBeenCalledTimes(2);
+  });
+
+  it("runs one queued refresh after a delivery load fails", async () => {
+    const first = deferred<DeliveryTask>();
+    const refreshed = projection(TASK_A);
+    refreshed.target = {
+      available: true,
+      branch: "refs/heads/main",
+      head: OID_B,
+    };
+    const taskDelivery = vi
+      .fn<(taskId: string, signal?: AbortSignal) => Promise<DeliveryTask>>()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce(refreshed);
+    const api: DeliveryPollingApi = {
+      taskDelivery,
+      deliveryOperation: vi.fn<
+        (operationId: string, signal?: AbortSignal) => Promise<DeliveryOperation>
+      >(),
+    };
+    const { result } = renderHook(() => useDeliveryPolling({ api, taskId: TASK_A }));
+    await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(1));
+    act(() => {
+      result.current.refresh();
+      result.current.refresh();
+    });
+
+    await act(async () => {
+      first.reject({
+        code: "DELIVERY_REQUEST_FAILED",
+        message: "delivery request failed",
+        retryable: true,
+      });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.phase).toBe("ready"));
+    expect(result.current.state.projection).toEqual(refreshed);
+    expect(taskDelivery).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears a queued same-task refresh when its polling session is disposed", async () => {
+    const pending = deferred<DeliveryTask>();
+    let signal: AbortSignal | undefined;
+    const taskDelivery = vi.fn(async (_taskId: string, nextSignal?: AbortSignal) => {
+      signal = nextSignal;
+      return pending.promise;
+    });
+    const api: DeliveryPollingApi = {
+      taskDelivery,
+      deliveryOperation: vi.fn<
+        (operationId: string, signal?: AbortSignal) => Promise<DeliveryOperation>
+      >(),
+    };
+    const { result, unmount } = renderHook(() =>
+      useDeliveryPolling({ api, taskId: TASK_A }),
+    );
+    await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(1));
+    act(() => result.current.refresh());
+
+    unmount();
+    expect(signal?.aborted).toBe(true);
+    pending.resolve(projection(TASK_A));
+    await pending.promise;
+    expect(taskDelivery).toHaveBeenCalledTimes(1);
   });
 
   it("backs off 500ms to 2s, resets on version progress, then stops and refreshes", async () => {
@@ -297,5 +418,174 @@ describe("useDeliveryPolling", () => {
     unmount();
     expect(operationSignal?.aborted).toBe(true);
     pending.resolve(operation(2, "merge_pending"));
+  });
+
+  it("queues refresh behind an operation poll without aborting it", async () => {
+    const clock = new ManualClock();
+    const pendingOperation = deferred<DeliveryOperation>();
+    const refreshed = projection(TASK_A, operation(3, "merged"));
+    const taskDelivery = vi
+      .fn<(taskId: string, signal?: AbortSignal) => Promise<DeliveryTask>>()
+      .mockResolvedValueOnce(projection(TASK_A, operation(1)))
+      .mockResolvedValueOnce(refreshed);
+    let operationSignal: AbortSignal | undefined;
+    const deliveryOperation = vi.fn(async (_operationId: string, signal?: AbortSignal) => {
+      operationSignal = signal;
+      return pendingOperation.promise;
+    });
+    const api: DeliveryPollingApi = { taskDelivery, deliveryOperation };
+    const { result } = renderHook(() =>
+      useDeliveryPolling({ api, taskId: TASK_A, clock }),
+    );
+    await waitFor(() => expect(clock.delays).toEqual([500]));
+    act(() => result.current.refresh());
+    expect(taskDelivery).toHaveBeenCalledTimes(1);
+    expect(clock.delays).toEqual([500]);
+
+    await act(async () => {
+      clock.fireNext();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(operationSignal).toBeDefined());
+    act(() => {
+      result.current.refresh();
+      result.current.refresh();
+    });
+    expect(operationSignal?.aborted).toBe(false);
+    expect(taskDelivery).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingOperation.resolve(operation(2, "merge_pending"));
+      await pendingOperation.promise;
+    });
+    await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.phase).toBe("ready"));
+    expect(result.current.state.projection).toEqual(refreshed);
+    expect(taskDelivery).toHaveBeenCalledTimes(2);
+    expect(clock.delays).toEqual([]);
+  });
+
+  it.each<{
+    name: string;
+    initial: DeliveryMergeOperationEnvelope;
+    outcome:
+      | { kind: "resolve"; value: DeliveryOperation }
+      | { kind: "reject"; retryable: boolean };
+  }>([
+    {
+      name: "a stale operation response",
+      initial: operation(2, "merge_pending"),
+      outcome: { kind: "resolve", value: operation(1) },
+    },
+    {
+      name: "a mismatched operation response",
+      initial: operation(1),
+      outcome: {
+        kind: "resolve",
+        value: { ...operation(2), operation_id: CLEANUP_ID },
+      },
+    },
+    {
+      name: "a retryable operation error",
+      initial: operation(1),
+      outcome: { kind: "reject", retryable: true },
+    },
+    {
+      name: "a non-retryable operation error",
+      initial: operation(1),
+      outcome: { kind: "reject", retryable: false },
+    },
+  ])("runs one queued refresh after $name", async ({ initial, outcome }) => {
+    const clock = new ManualClock();
+    const pendingOperation = deferred<DeliveryOperation>();
+    const refreshed = projection(TASK_A, operation(3, "merged"));
+    const taskDelivery = vi
+      .fn<(taskId: string, signal?: AbortSignal) => Promise<DeliveryTask>>()
+      .mockResolvedValueOnce(projection(TASK_A, initial))
+      .mockResolvedValueOnce(refreshed);
+    let operationSignal: AbortSignal | undefined;
+    const deliveryOperation = vi.fn(async (_operationId: string, signal?: AbortSignal) => {
+      operationSignal = signal;
+      return pendingOperation.promise;
+    });
+    const api: DeliveryPollingApi = { taskDelivery, deliveryOperation };
+    const { result } = renderHook(() =>
+      useDeliveryPolling({ api, taskId: TASK_A, clock }),
+    );
+    await waitFor(() => expect(clock.delays).toEqual([500]));
+    await act(async () => {
+      clock.fireNext();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(operationSignal).toBeDefined());
+    act(() => {
+      result.current.refresh();
+      result.current.refresh();
+    });
+    expect(operationSignal?.aborted).toBe(false);
+
+    await act(async () => {
+      if (outcome.kind === "resolve") {
+        pendingOperation.resolve(outcome.value);
+      } else {
+        pendingOperation.reject({
+          code: "DELIVERY_OPERATION_FAILED",
+          message: "operation request failed",
+          retryable: outcome.retryable,
+        });
+      }
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(taskDelivery).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.phase).toBe("ready"));
+    expect(operationSignal?.aborted).toBe(false);
+    expect(result.current.state.projection).toEqual(refreshed);
+    expect(taskDelivery).toHaveBeenCalledTimes(2);
+    expect(clock.delays).toEqual([]);
+  });
+
+  it("clears a queued refresh when a newer operation is tracked", async () => {
+    const clock = new ManualClock();
+    const firstPoll = deferred<DeliveryOperation>();
+    const secondPoll = deferred<DeliveryOperation>();
+    const taskDelivery = vi.fn(async () => projection(TASK_A, operation(1)));
+    const operationSignals: AbortSignal[] = [];
+    const deliveryOperation = vi.fn(
+      async (_operationId: string, signal?: AbortSignal) => {
+        if (signal !== undefined) operationSignals.push(signal);
+        return deliveryOperation.mock.calls.length === 1
+          ? firstPoll.promise
+          : secondPoll.promise;
+      },
+    );
+    const api: DeliveryPollingApi = { taskDelivery, deliveryOperation };
+    const { result } = renderHook(() =>
+      useDeliveryPolling({ api, taskId: TASK_A, clock }),
+    );
+    await waitFor(() => expect(clock.delays).toEqual([500]));
+    await act(async () => {
+      clock.fireNext();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(deliveryOperation).toHaveBeenCalledTimes(1));
+    act(() => result.current.refresh());
+    act(() => result.current.trackOperation(operation(2, "merge_pending")));
+    expect(operationSignals[0]?.aborted).toBe(true);
+    expect(clock.delays).toEqual([500]);
+
+    firstPoll.resolve(operation(3, "merge_pending"));
+    await firstPoll.promise;
+    await act(async () => {
+      clock.fireNext();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(deliveryOperation).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      secondPoll.resolve(operation(3, "merge_pending"));
+      await secondPoll.promise;
+    });
+    await waitFor(() => expect(clock.delays).toEqual([500]));
+    expect(taskDelivery).toHaveBeenCalledTimes(1);
+    expect(result.current.state.operation?.version).toBe(3);
   });
 });

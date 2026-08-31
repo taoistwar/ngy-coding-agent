@@ -93,9 +93,12 @@ test("explicitly preflights and exact-no-ff merges real approved bytes, then cle
         preflightRelease,
         PRODUCTION_DELIVERY_STAGE_TIMEOUT_MS,
       );
-      await driver.waitForMergeState(task.id, "preflight_pending");
-      await expect(driver.panel()).toContainText("Running preflight");
-      await publishReleaseSignal(reached);
+      try {
+        await driver.waitForMergeState(task.id, "preflight_pending");
+        await expect(driver.panel()).toContainText("Running preflight");
+      } finally {
+        await publishReleaseSignal(reached);
+      }
       const ready = await driver.waitForMergeState(task.id, "preflight_ready");
       expect(ready.latest_merge?.state).toBe("preflight_ready");
       await driver.git.assertTargetUnchanged(targetBefore);
