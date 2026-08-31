@@ -152,6 +152,12 @@ const REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS: u64 = 1_000;
 const REPOSITORY_DISCOVERY_CLEANUP_TIMEOUT_MILLIS: u64 = 500;
 #[cfg(any(test, feature = "test-support"))]
 const PROCESS_TEST_REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS: u64 = 4_000;
+// This wiring proof runs beside spawn-heavy parallel library tests. Its total
+// budget is intentionally separate from the five-second HTTP registration
+// contract so process scheduling and spawn coordination do not share that
+// tight service deadline.
+#[cfg(test)]
+const PROCESS_TEST_REPOSITORY_DISCOVERY_PROOF_TIMEOUT_MILLIS: u64 = 15_000;
 const REPOSITORY_POST_DISCOVERY_RESERVE_MILLIS: u64 = 2_000;
 // Two fixed discovery commands and one worst-case tree cleanup must leave a
 // positive, explicit budget for the durable write and runtime attachments.
@@ -166,6 +172,12 @@ const _: () = assert!(
     DEFAULT_APPLICATION_WRITE_BUDGET_MILLIS
         > PROCESS_TEST_REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS
             + REPOSITORY_DISCOVERY_CLEANUP_TIMEOUT_MILLIS
+);
+#[cfg(test)]
+const _: () = assert!(
+    PROCESS_TEST_REPOSITORY_DISCOVERY_PROOF_TIMEOUT_MILLIS
+        > 2 * (PROCESS_TEST_REPOSITORY_DISCOVERY_COMMAND_TIMEOUT_MILLIS
+            + REPOSITORY_DISCOVERY_CLEANUP_TIMEOUT_MILLIS)
 );
 
 fn build_storage_monitor(
@@ -1302,16 +1314,27 @@ mod tests {
         workspace.canonicalize().unwrap()
     }
 
+    fn initialize_discovery_git_repository(repository: &Path) {
+        let mut command = Command::new("git");
+        command.args(["init", "--quiet"]).arg(repository);
+        let mut child = {
+            let _spawn_guard = coding_agent_runtime::acquire_process_spawn_lock();
+            command
+                .spawn()
+                .expect("spawn offline discovery fixture initialization")
+        };
+        assert!(
+            child
+                .wait()
+                .expect("wait for offline discovery fixture initialization")
+                .success(),
+            "initialize the offline discovery fixture"
+        );
+    }
+
     fn create_discovery_repository(root: &Path) -> PathBuf {
         let repository = create_discovery_workspace(root);
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(&repository)
-                .status()
-                .unwrap()
-                .success()
-        );
+        initialize_discovery_git_repository(&repository);
         repository
     }
 
@@ -1346,20 +1369,28 @@ mod tests {
         let (temporary, prepared, process_liveness_scope) = prepare_fixed_factory(&factory).await;
         let repository = create_discovery_repository(temporary.path());
 
-        let discovered = prepared
+        let discovery = prepared
             .repository_discovery
             .discover(
                 &repository,
-                Instant::now() + crate::repository_service::DEFAULT_APPLICATION_WRITE_BUDGET,
+                Instant::now()
+                    + Duration::from_millis(
+                        super::PROCESS_TEST_REPOSITORY_DISCOVERY_PROOF_TIMEOUT_MILLIS,
+                    ),
             )
-            .await
-            .expect("process tests use pinned and supervised Git/Cargo discovery");
+            .await;
+        assert_eq!(
+            process_liveness_scope.active_tree_count(),
+            0,
+            "repository discovery releases every supervised process tree"
+        );
+        let discovered =
+            discovery.expect("process tests use pinned and supervised Git/Cargo discovery");
 
         assert_eq!(discovered.git_root, repository);
         assert_eq!(discovered.cargo_workspace_root, repository);
         assert_eq!(prepared.scheduler_limits.global().get(), 2);
         assert_eq!(prepared.scheduler_limits.per_repository().get(), 2);
-        assert_eq!(process_liveness_scope.active_tree_count(), 0);
     }
 
     struct BlockingVolumeSampler {
@@ -1750,15 +1781,7 @@ mod tests {
             b"[workspace]\nmembers = []\n",
         )
         .unwrap();
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .arg(&supervised_root)
-                .status()
-                .unwrap()
-                .success(),
-            "initialize the offline discovery fixture"
-        );
+        initialize_discovery_git_repository(&supervised_root);
         let supervised_root = supervised_root.canonicalize().unwrap();
         let discovered = selection
             .repository_discovery()
