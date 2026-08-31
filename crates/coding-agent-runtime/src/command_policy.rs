@@ -402,6 +402,7 @@ impl ValidatedCommand {
     ///
     /// The executable, cwd and payload are still capability bound; callers
     /// cannot choose the child argv or turn this into a generic process API.
+    #[cfg(feature = "test-support")]
     pub(crate) fn process_stdin_fixture_for_test(
         executable: Arc<PinnedExecutable>,
         working_directory: Arc<ExecutionDirectory>,

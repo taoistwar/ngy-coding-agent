@@ -51,6 +51,7 @@ pub use faults::{
 };
 
 pub(crate) use input::ExactChildInput;
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use input::{
     MAX_EXACT_CHILD_INPUT_BYTES_FOR_TEST, ProcessStdinTestObservation, ProcessStdinTestOutcome,

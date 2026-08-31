@@ -111,6 +111,7 @@ pub use process_supervisor::{
     CapturedStream, CommandResult, ProcessError, ProcessLimits, ProcessLimitsError,
     ProcessSpawnGuard, acquire_process_spawn_lock,
 };
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use process_supervisor::{
     MAX_EXACT_CHILD_INPUT_BYTES_FOR_TEST, ProcessStdinTestObservation, ProcessStdinTestOutcome,

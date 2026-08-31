@@ -30,4 +30,5 @@ windows-sys.workspace = true
 find-msvc-tools = "0.1.9"
 
 [dev-dependencies]
+coding-agent-runtime = { path = ".", features = ["test-support"] }
 tempfile.workspace = true

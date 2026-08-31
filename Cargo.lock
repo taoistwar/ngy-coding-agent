@@ -426,6 +426,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "coding-agent-core",
+ "coding-agent-runtime",
  "find-msvc-tools",
  "fs_at",
  "getrandom 0.4.3",

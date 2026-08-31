@@ -1,7 +1,9 @@
+#[cfg(feature = "test-support")]
 mod fixture;
 mod model;
 mod writer;
 
+#[cfg(feature = "test-support")]
 pub use fixture::{
     MAX_EXACT_CHILD_INPUT_BYTES_FOR_TEST, ProcessStdinTestObservation, ProcessStdinTestOutcome,
     ProcessStdinTestScenario, exercise_process_stdin_for_test,
