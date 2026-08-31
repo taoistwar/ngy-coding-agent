@@ -39,9 +39,9 @@ rebase、squash 或自动冲突解决。构件历史/保留期/长期配额生�
 动态运行时设置、安装程序、代码签名、公证、自动更新和真实 provider 冒烟属于未来 P4-D。
 P4-C/P4-D 不是 Project 4 的未完成部分。
 
-最终代码候选 `8da9d760f281527cc6d6806f226ab6e09f6015e0` 已在
-[GitHub Actions run 33305748048](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048)
-完成 7 个必需作业并全部成功；逐作业证据和验收边界见
+最终代码候选 `f47054da853d72f03faca0e3e91247736593b702` 已在
+[GitHub Actions run 33407404320](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320)
+完成 7 个必需作业并全部成功；逐作业证据、代码候选与文档封存提交的边界见
 [P4-B 实施计划的最终验收记录](docs/superpowers/plans/2026-08-04-controlled-delivery-merge-cleanup.md#实施完成与最终验收记录)。
 
 ## 受控本地交付

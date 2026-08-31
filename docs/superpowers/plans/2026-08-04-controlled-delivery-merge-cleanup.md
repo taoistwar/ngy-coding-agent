@@ -2,7 +2,7 @@
 
 > 日期：2026-08-04
 > 状态：P4-B 已完成实现、独立审查与完整验收；Project 4（P4-A + P4-B）已完成
-> 验收日期：2026-08-30
+> 验收日期：2026-09-01
 > 基线：`29b81d9 project 4 P4-A：受控并发与资源准入`
 > 执行规则：按任务顺序手工执行 TDD；每个任务先 RED、再 GREEN、最后 REFACTOR 与回归验证
 > 项目边界：已批准的 Project 4 = P4-A + P4-B；P4-C（历史/构件生命周期）与 P4-D（发行/provider 加固）是未来项目
@@ -1038,26 +1038,26 @@ git diff --check
 
 ## 实施完成与最终验收记录
 
-本计划已获用户书面批准；P4-B 实现、独立审查和任务 30 全部门禁均已完成。2026-08-30，已批准的 Project 4（P4-A + P4-B）完成最终验收。
+本计划已获用户书面批准；P4-B 实现、独立审查和任务 30 全部门禁均已完成。2026-09-01，已批准的 Project 4（P4-A + P4-B）完成最终验收。
 
 | 验收项 | 不可变证据 |
 | --- | --- |
-| 最终代码候选 | `8da9d760f281527cc6d6806f226ab6e09f6015e0`（`test: canonicalize release smoke root`） |
-| CI run | [run 33305748048](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048)，attempt 1，event=`push`，branch=`codex/project-4`，head SHA=`8da9d760f281527cc6d6806f226ab6e09f6015e0`，结论=`success` |
-| Windows 本地门禁 | `cargo fmt --all -- --check`、`git diff --check`、workspace all-target/all-feature Clippy、`release_smoke` 非 ignored 测试 5/5，以及构建后 exact ignored release smoke 1/1 均通过 |
-| 独立代码审查 | 精确范围 `29b81d9..8da9d760f281527cc6d6806f226ab6e09f6015e0`；Blocker/High/Medium/Low=`0/0/0/0`；Scope gate 与 Structure gate 均为 PASS |
+| 最终代码候选 | `f47054da853d72f03faca0e3e91247736593b702`（`test: await delivery UI projection convergence`） |
+| CI run | [run 33407404320](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320)，attempt 1，event=`push`，branch=`codex/project-4`，head SHA=`f47054da853d72f03faca0e3e91247736593b702`，结论=`success` |
+| Windows 本地门禁 | 最终代码候选上的 `cargo fmt --all -- --check`、`git diff --check`、workspace all-target/all-feature Clippy、Web `config:check`、`api:check`、typecheck、Vitest 340/340、production build、当前应用二进制真实启动 smoke，以及完整 Playwright 回归 49/49 均通过 |
+| 独立代码审查 | 精确范围 `29b81d9..f47054da853d72f03faca0e3e91247736593b702`；Blocker/High/Medium/Low=`0/0/0/0`；Scope gate 与 Structure gate 均为 PASS |
 | 范围核对 | 保持六态 Task、11 种 persisted task event、既有 router 兼容和 fail-closed ownership；未加入 provider/remote Git、P4-C 或 P4-D 能力 |
 
 | 必需门禁 | Job ID | 结论 |
 | --- | ---: | --- |
-| [Linux quality and E2E](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934287) | `99241934287` | `success` |
-| [Linux runtime tests (shard 1)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934284) | `99241934284` | `success` |
-| [Linux runtime tests (shard 2)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934297) | `99241934297` | `success` |
-| [Linux runtime tests (shard 3)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934281) | `99241934281` | `success` |
-| [Release smoke (ubuntu-latest)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934295) | `99241934295` | `success` |
-| [Release smoke (windows-2022)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934229) | `99241934229` | `success` |
-| [Release smoke (macos-latest)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33305748048/job/99241934250) | `99241934250` | `success` |
+| [Linux quality and E2E](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320/job/99538269324) | `99538269324` | `success` |
+| [Linux runtime tests (shard 1)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320/job/99538269834) | `99538269834` | `success` |
+| [Linux runtime tests (shard 2)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320/job/99538269553) | `99538269553` | `success` |
+| [Linux runtime tests (shard 3)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320/job/99538269973) | `99538269973` | `success` |
+| [Release smoke (ubuntu-latest)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320/job/99538269630) | `99538269630` | `success` |
+| [Release smoke (windows-2022)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320/job/99538269721) | `99538269721` | `success` |
+| [Release smoke (macos-latest)](https://github.com/taoistwar/ngy-coding-agent/actions/runs/33407404320/job/99538269544) | `99538269544` | `success` |
 
-`Linux quality and E2E` 覆盖 workspace、OpenAPI/生成客户端漂移、Web typecheck/unit/build、浏览器 E2E 和 placeholder 门禁；三个 runtime shard 的 manifest validator 精确覆盖全部 runtime integration target；三平台 release job 均执行 native source/abort/atomic-cleanup 证明、embedded release build 和真实启动 smoke。
+`Linux quality and E2E` 执行 OpenAPI/生成客户端漂移、Web config/typecheck/unit/build、Rust fmt、全 workspace Clippy、非 runtime Rust workspace 测试、完整浏览器 E2E 和 placeholder 门禁；三个 runtime shard 的 manifest validator 精确覆盖 runtime library 与全部 integration target；三平台 release job 均执行 native source/abort/atomic-cleanup 证明、embedded release build 和真实启动 smoke。
 
-本记录由只修改 `README.md` 与九份规格/计划文档的封存提交承载；该后继提交不能把本节的代码候选 run 冒充为自身 CI。封存提交自身的 7 个必需 CI 结论在最终项目交付记录中报告，避免在不可变提交内容中形成自引用。
+本记录由只修改 `README.md`、本计划与对应设计规格的三文档封存提交承载。上表只记录该封存提交父级代码候选 `f47054da853d72f03faca0e3e91247736593b702` 的不可变 CI 证据，不宣称 run `33407404320` 验证了封存提交本身；封存提交自身的 7 个必需 CI 结果只能在该提交产生并完成运行后于仓库外的最终交付记录中报告，不能回写本节而再制造一个尚未验证的新 HEAD。
