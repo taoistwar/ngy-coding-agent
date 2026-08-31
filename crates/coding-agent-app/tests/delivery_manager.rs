@@ -10,20 +10,21 @@ use std::sync::{Arc, Mutex};
 use coding_agent_app::{
     DeliveryAllowedAction, DeliveryEligibility, DeliveryManagerHandle,
     DeliveryManagerLiveDependencies, DeliveryOperationProjection, DeliveryOperationQuery,
-    DeliveryOperationQueryOutcome, DeliveryOperationQueryTestSeam, DeliveryPreflightDurability,
-    DeliveryPreflightOperation, DeliveryPreflightOutcome, DeliveryPreflightRequest,
-    DeliveryPreflightState, DeliveryPreflightUnavailableReason, DeliveryPreparedPreflight,
-    DeliveryProcessProof, DeliveryProcessProofError, DeliveryProcessProofProvider,
-    DeliveryProcessProofProviderTestSeam, DeliveryQueryUnavailableReason,
-    DeliveryRuntimeAuthentication, DeliveryRuntimeAuthenticationOutcome, DeliveryRuntimeFailure,
-    DeliveryRuntimeObservation, DeliveryRuntimeObservationUnavailableReason,
-    DeliveryRuntimeRegistry, DeliveryRuntimeRegistryTestSeam, DeliveryRuntimeSession,
-    DeliveryRuntimeSessionTestSeam, DeliveryTargetObservation, DeliveryTargetUnavailableReason,
-    DeliveryTaskProjection, DeliveryTaskQueryOutcome, EventDispatcherHandle,
-    RepositoryControlCoordinator, RepositoryControlState, RepositoryCoordinationKey,
-    SchedulerConcurrencyLimits, ServiceState, ServiceStateController, StoreWriterFaultPoint,
-    StoreWriterFaultSpec, StoreWriterHandle, StoreWriterOperationKind, StoreWriterTestController,
-    TaskManagerHandle, TaskManagerLaunchResources,
+    DeliveryOperationQueryOutcome, DeliveryOperationQueryTestSeam, DeliveryPreflightBusyReason,
+    DeliveryPreflightDurability, DeliveryPreflightOperation, DeliveryPreflightOutcome,
+    DeliveryPreflightRequest, DeliveryPreflightState, DeliveryPreflightUnavailableReason,
+    DeliveryPreparedPreflight, DeliveryProcessProof, DeliveryProcessProofError,
+    DeliveryProcessProofProvider, DeliveryProcessProofProviderTestSeam,
+    DeliveryQueryUnavailableReason, DeliveryRuntimeAuthentication,
+    DeliveryRuntimeAuthenticationOutcome, DeliveryRuntimeFailure, DeliveryRuntimeObservation,
+    DeliveryRuntimeObservationUnavailableReason, DeliveryRuntimeRegistry,
+    DeliveryRuntimeRegistryTestSeam, DeliveryRuntimeSession, DeliveryRuntimeSessionTestSeam,
+    DeliveryTargetObservation, DeliveryTargetUnavailableReason, DeliveryTaskProjection,
+    DeliveryTaskQueryOutcome, EventDispatcherHandle, RepositoryControlCoordinator,
+    RepositoryControlState, RepositoryCoordinationKey, SchedulerConcurrencyLimits, ServiceState,
+    ServiceStateController, StoreWriterFaultPoint, StoreWriterFaultSpec, StoreWriterHandle,
+    StoreWriterOperationKind, StoreWriterTestController, TaskManagerHandle,
+    TaskManagerLaunchResources,
 };
 use coding_agent_domain::{
     CanonicalPath, ClientRequestId, NewRepository, Repository, Task, TaskEventPayload, TaskId,
@@ -32,11 +33,12 @@ use coding_agent_domain::{
 use coding_agent_store::{
     AttemptArtifactIdentity, DeliveryAcceptedOperationState, DeliveryCommand, DeliveryCommandKind,
     DeliveryCommandLookup, DeliveryIdentity, DeliveryOperationId, DeliveryResponseDiscriminator,
-    DeliveryVersion, FinalizeReviewedTaskOutcome, GitBranchRef, GitCommitOid, GitObjectAlgorithm,
-    GitTreeOid, MergeConflictPaths, MergeOperationState, MergePreflightResult,
-    MergeReconciliationReason, PreflightCommandRequest, PreflightStaleReason,
+    DeliveryVersion, FailUnboundMergePreflightRequest, FinalizeReviewedTaskOutcome, GitBranchRef,
+    GitCommitOid, GitObjectAlgorithm, GitTreeOid, MergeConflictPaths, MergeOperationState,
+    MergePreflightResult, MergeReconciliationReason, PreflightCommandRequest,
+    PreflightRejectedReason, PreflightStaleReason, RecordMergePreflightResultRequest,
     RegisterRepositoryOutcome, ReserveAttemptArtifact, Sha256Digest, TaskTransition,
-    TransitionOutcome,
+    TransitionOutcome, UnboundMergePreflightFailure,
 };
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::{Duration, sleep, timeout};
@@ -149,13 +151,21 @@ impl RuntimeControl {
 
 impl DeliveryRuntimeRegistryTestSeam for RuntimeControl {}
 
+struct RuntimeTimeResumeGuard;
+
+impl Drop for RuntimeTimeResumeGuard {
+    fn drop(&mut self) {
+        tokio::time::resume();
+    }
+}
+
 async fn elapse_isolated_runtime_stage(delay: Duration) {
     // Keep virtual time scoped to the controlled runtime stage. Pausing the
     // whole preflight also advances Store read/write deadlines while SQLite
     // work is waiting on real I/O, which makes this test race parallel cases.
     tokio::time::pause();
+    let _resume = RuntimeTimeResumeGuard;
     sleep(delay).await;
-    tokio::time::resume();
 }
 
 #[async_trait::async_trait]
@@ -235,6 +245,7 @@ struct ControlledRuntimeSession {
     authentication_gate: Mutex<Option<Arc<ObservationGate>>>,
     authentication_delay: Mutex<Option<Duration>>,
     prepare_failures: Mutex<VecDeque<DeliveryRuntimeFailure>>,
+    prepare_gate: Mutex<Option<Arc<ObservationGate>>>,
     prepare_delay: Mutex<Option<Duration>>,
     preflight_results: Mutex<VecDeque<Result<MergePreflightResult, DeliveryRuntimeFailure>>>,
     run_gate: Mutex<Option<Arc<RunGate>>>,
@@ -279,6 +290,12 @@ impl ControlledRuntimeSession {
             .authentication_delay
             .lock()
             .expect("lock controlled authentication delay") = Some(delay);
+    }
+
+    fn install_prepare_gate(&self) -> Arc<ObservationGate> {
+        let gate = Arc::new(ObservationGate::default());
+        *self.prepare_gate.lock().expect("lock preparation gate") = Some(gate.clone());
+        gate
     }
 
     fn delay_next_run(&self, delay: Duration) {
@@ -404,6 +421,16 @@ impl DeliveryRuntimeSession for ContextualRuntimeSession {
             .take();
         if let Some(delay) = delay {
             elapse_isolated_runtime_stage(delay).await;
+        }
+        let prepare_gate = self
+            .control
+            .prepare_gate
+            .lock()
+            .expect("lock preparation gate")
+            .clone();
+        if let Some(gate) = prepare_gate {
+            gate.reached.add_permits(1);
+            gate.release.notified().await;
         }
         if let Some(failure) = self
             .control
@@ -1132,6 +1159,245 @@ async fn runtime_open_auth_prepare_and_merge_stages_may_exceed_orchestration_bud
         DeliveryPreflightDurability::Created | DeliveryPreflightDurability::Existing
     ));
     assert_eq!(state, DeliveryPreflightState::PreflightReady);
+}
+
+#[tokio::test]
+async fn outer_runtime_timeout_during_childless_open_releases_worker_ownership() {
+    let runtime = RuntimeControl::ready();
+    runtime.delay_next_open(Duration::from_secs(11 * 60 + 1));
+    let fixture = live_fixture(runtime, None).await;
+    let task = approved_task(&fixture.base).await;
+
+    assert_eq!(
+        fixture
+            .manager
+            .preflight(preflight_request(task.id))
+            .await
+            .expect("childless runtime-open timeout remains typed"),
+        DeliveryPreflightOutcome::Unavailable(
+            DeliveryPreflightUnavailableReason::RuntimeUnavailable
+        )
+    );
+    assert_preflight_control_and_workers(
+        &fixture,
+        task.repository_id,
+        RepositoryControlState::Poisoned,
+        0,
+        "childless runtime-open timeout",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn outer_runtime_timeout_during_preflight_run_retains_repository_ownership() {
+    let runtime = RuntimeControl::ready();
+    let gate = runtime.session.install_run_gate(Ok(ready_result()));
+    let fixture = live_fixture(runtime, None).await;
+    let task = approved_task(&fixture.base).await;
+    let caller = tokio::spawn({
+        let manager = fixture.manager.clone();
+        async move { manager.preflight(preflight_request(task.id)).await }
+    });
+
+    gate.wait_until_reached().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11 * 60 + 1)).await;
+    tokio::time::resume();
+
+    let outcome = caller
+        .await
+        .expect("join outer-timeout preflight caller")
+        .expect("preflight manager remains open");
+    let (durability, state) = durable_state(outcome);
+    assert!(matches!(
+        durability,
+        DeliveryPreflightDurability::Created | DeliveryPreflightDurability::Existing
+    ));
+    assert_eq!(state, DeliveryPreflightState::ReconciliationRequired);
+    assert_eq!(
+        fixture
+            .manager
+            .preflight(preflight_request(task.id))
+            .await
+            .expect("same-repository request is rejected while cleanup is unproven"),
+        DeliveryPreflightOutcome::Busy(DeliveryPreflightBusyReason::RepositoryBusy)
+    );
+    assert_preflight_control_and_workers(
+        &fixture,
+        task.repository_id,
+        RepositoryControlState::Busy,
+        1,
+        "outer preflight runtime timeout",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn prepared_runtime_timeout_keeps_retention_after_persist_invariant_conflict() {
+    let runtime = RuntimeControl::ready();
+    let gate = runtime.session.install_run_gate(Ok(ready_result()));
+    let controller = Arc::new(
+        StoreWriterTestController::try_new([StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseBeforeExecute,
+            operation: Some(StoreWriterOperationKind::RecordMergePreflightResult),
+            count: 1,
+        }])
+        .expect("valid prepared-timeout persistence pause"),
+    );
+    let fixture = live_fixture(runtime, Some(controller.clone())).await;
+    let task = approved_task(&fixture.base).await;
+    let task_id = task.id;
+    let repository_id = task.repository_id;
+    let caller = tokio::spawn({
+        let manager = fixture.manager.clone();
+        async move { manager.preflight(preflight_request(task_id)).await }
+    });
+
+    gate.wait_until_reached().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11 * 60 + 1)).await;
+    tokio::time::resume();
+    controller
+        .wait_until_reached(StoreWriterFaultPoint::PauseBeforeExecute, 1)
+        .await;
+
+    let snapshot = fixture
+        .base
+        .store
+        .delivery_eligibility_snapshot(task_id)
+        .await
+        .expect("load prepared timeout snapshot")
+        .expect("prepared timeout task exists");
+    let operation = snapshot
+        .ownership
+        .merge_operations
+        .first()
+        .expect("prepared timeout operation exists");
+    assert_eq!(operation.state, MergeOperationState::PreflightPending);
+    assert_eq!(operation.version.get(), 2);
+    assert!(matches!(
+        fixture
+            .base
+            .store
+            .record_merge_preflight_result(
+                RecordMergePreflightResultRequest::try_new(
+                    task_id,
+                    operation.operation_id,
+                    operation.version,
+                    ready_result(),
+                )
+                .expect("valid competing prepared result"),
+            )
+            .await
+            .expect("write competing prepared result"),
+        coding_agent_store::MergeTransitionOutcome::Applied(_)
+    ));
+    assert_eq!(
+        controller.release(StoreWriterFaultPoint::PauseBeforeExecute),
+        1
+    );
+    assert_eq!(
+        caller
+            .await
+            .expect("join prepared-timeout caller")
+            .expect("prepared-timeout manager remains open"),
+        DeliveryPreflightOutcome::Unavailable(
+            DeliveryPreflightUnavailableReason::RepositoryControlUnavailable
+        )
+    );
+    assert_preflight_control_and_workers(
+        &fixture,
+        repository_id,
+        RepositoryControlState::Busy,
+        1,
+        "prepared timeout persistence invariant conflict",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unbound_runtime_timeout_keeps_retention_after_persist_invariant_conflict() {
+    let runtime = RuntimeControl::ready();
+    let gate = runtime.session.install_prepare_gate();
+    let controller = Arc::new(
+        StoreWriterTestController::try_new([StoreWriterFaultSpec {
+            point: StoreWriterFaultPoint::PauseBeforeExecute,
+            operation: Some(StoreWriterOperationKind::FailUnboundMergePreflight),
+            count: 1,
+        }])
+        .expect("valid unbound-timeout persistence pause"),
+    );
+    let fixture = live_fixture(runtime, Some(controller.clone())).await;
+    let task = approved_task(&fixture.base).await;
+    let task_id = task.id;
+    let repository_id = task.repository_id;
+    let caller = tokio::spawn({
+        let manager = fixture.manager.clone();
+        async move { manager.preflight(preflight_request(task_id)).await }
+    });
+
+    gate.wait_until_reached().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11 * 60 + 1)).await;
+    tokio::time::resume();
+    controller
+        .wait_until_reached(StoreWriterFaultPoint::PauseBeforeExecute, 1)
+        .await;
+
+    let snapshot = fixture
+        .base
+        .store
+        .delivery_eligibility_snapshot(task_id)
+        .await
+        .expect("load unbound timeout snapshot")
+        .expect("unbound timeout task exists");
+    let operation = snapshot
+        .ownership
+        .merge_operations
+        .first()
+        .expect("unbound timeout operation exists");
+    assert_eq!(operation.state, MergeOperationState::PreflightPending);
+    assert_eq!(operation.version, DeliveryVersion::initial());
+    assert!(matches!(
+        fixture
+            .base
+            .store
+            .fail_unbound_merge_preflight(
+                FailUnboundMergePreflightRequest::try_new(
+                    task_id,
+                    operation.operation_id,
+                    operation.version,
+                    UnboundMergePreflightFailure::Rejected(
+                        PreflightRejectedReason::TargetWorktreeDirty,
+                    ),
+                )
+                .expect("valid competing unbound failure"),
+            )
+            .await
+            .expect("write competing unbound failure"),
+        coding_agent_store::MergeTransitionOutcome::Applied(_)
+    ));
+    assert_eq!(
+        controller.release(StoreWriterFaultPoint::PauseBeforeExecute),
+        1
+    );
+    assert_eq!(
+        caller
+            .await
+            .expect("join unbound-timeout caller")
+            .expect("unbound-timeout manager remains open"),
+        DeliveryPreflightOutcome::Unavailable(
+            DeliveryPreflightUnavailableReason::RepositoryControlUnavailable
+        )
+    );
+    assert_preflight_control_and_workers(
+        &fixture,
+        repository_id,
+        RepositoryControlState::Busy,
+        1,
+        "unbound timeout persistence invariant conflict",
+    )
+    .await;
 }
 
 #[tokio::test]

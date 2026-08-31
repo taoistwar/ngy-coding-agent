@@ -1,5 +1,9 @@
 use std::str::FromStr;
 
+use crate::{
+    DeliverySourceWriteCommand, DeliverySourceWriteOutcome, DeliveryWriteCommand,
+    DeliveryWriteOutcome,
+};
 use coding_agent_domain::ClientRequestId;
 use coding_agent_store::{
     AcceptMergeCommandRequest, AdvanceDeliverySourceObjectRequest, CommitDeliverySourceRequest,
@@ -7,12 +11,6 @@ use coding_agent_store::{
     DeliverySourceReconciliationReason, DeliverySourceState, DeliverySourceTransitionOutcome,
     ReconcileDeliverySourceOutcome, ReconcileDeliverySourceRequest,
     RecordDeliverySourceRetryRequest,
-};
-use tokio::time::timeout;
-
-use crate::{
-    DeliverySourceWriteCommand, DeliverySourceWriteOutcome, DeliveryWriteCommand,
-    DeliveryWriteOutcome,
 };
 
 use super::DeliveryManagerLiveDependencies;
@@ -23,6 +21,7 @@ use super::recovery::{
     DeliveryRecoveryContext, ExactDeliveryWriteResult, LIVE_RUNTIME_STAGE_TIMEOUT,
     LiveStageOutcome, execute_exact_delivery_write,
 };
+use super::runtime_stage::{ProcessStageCompletion, run_process_stage};
 
 pub(super) async fn drive_source_stage(
     dependencies: &DeliveryManagerLiveDependencies,
@@ -34,18 +33,22 @@ pub(super) async fn drive_source_stage(
     };
     match source.state {
         DeliverySourceState::ObjectPending => {
-            let proof = match timeout(
+            let proof = match run_process_stage(
                 LIVE_RUNTIME_STAGE_TIMEOUT,
                 session.build_source_object(source),
             )
             .await
             {
-                Ok(Ok(proof)) => proof,
-                Ok(Err(DeliveryLiveRuntimeError::ReconciliationRequired(reason))) => {
+                ProcessStageCompletion::Completed(Ok(proof)) => proof,
+                ProcessStageCompletion::Completed(Err(
+                    DeliveryLiveRuntimeError::ReconciliationRequired(reason),
+                )) => {
                     return reconcile_source(dependencies, context, reason).await;
                 }
-                Ok(Err(error)) => return runtime_error(error),
-                Err(_) => return LiveStageOutcome::Release,
+                ProcessStageCompletion::Completed(Err(error)) => return runtime_error(error),
+                ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                    return LiveStageOutcome::Retain;
+                }
             };
             let proof = match proof.into_store_proof() {
                 Ok(proof) => proof,
@@ -81,18 +84,22 @@ pub(super) async fn drive_source_stage(
             }
         }
         DeliverySourceState::CommitPending => {
-            let result = match timeout(
+            let result = match run_process_stage(
                 LIVE_RUNTIME_STAGE_TIMEOUT,
                 session.apply_source_commit(source),
             )
             .await
             {
-                Ok(Ok(result)) => result,
-                Ok(Err(DeliveryLiveRuntimeError::ReconciliationRequired(reason))) => {
+                ProcessStageCompletion::Completed(Ok(result)) => result,
+                ProcessStageCompletion::Completed(Err(
+                    DeliveryLiveRuntimeError::ReconciliationRequired(reason),
+                )) => {
                     return reconcile_source(dependencies, context, reason).await;
                 }
-                Ok(Err(error)) => return runtime_error(error),
-                Err(_) => return LiveStageOutcome::Release,
+                ProcessStageCompletion::Completed(Err(error)) => return runtime_error(error),
+                ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                    return LiveStageOutcome::Retain;
+                }
             };
             match result.disposition() {
                 DeliveryLiveSourceDisposition::Applied => {

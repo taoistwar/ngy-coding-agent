@@ -7,6 +7,7 @@ use coding_agent_store::{
 use tokio::time::timeout;
 
 use crate::delivery_api_projection::DeliveryPreflightDurability;
+use crate::delivery_manager::runtime_stage::{ProcessStageCompletion, run_process_stage};
 use crate::delivery_manager::{
     DeliveryManagerLiveDependencies, DeliveryPreparedPreflight, DeliveryRuntimeAuthentication,
     DeliveryRuntimeFailure, DeliveryRuntimeSession,
@@ -20,7 +21,8 @@ use super::admission::{
 use super::eligibility::EligiblePreflight;
 use super::persist::{
     ExactWriteResult, execute_exact_write, persist_prepared_failure, persist_prepared_result,
-    persist_unbound_failure, retry_pending,
+    persist_prepared_runtime_timeout, persist_unbound_failure, persist_unbound_runtime_timeout,
+    retry_pending,
 };
 use super::routing::{PendingShape, pending_shape};
 
@@ -61,14 +63,14 @@ pub(super) async fn authenticate(
             ));
         }
     };
-    let authentication_outcome = match timeout(
+    let authentication_outcome = match run_process_stage(
         PRE_RUNTIME_STAGE_TIMEOUT,
         session.authenticate_preflight(&eligible.routed.command),
     )
     .await
     {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(DeliveryRuntimeFailure::ProcessCleanupUnproven)) => {
+        ProcessStageCompletion::Completed(Ok(outcome)) => outcome,
+        ProcessStageCompletion::Completed(Err(DeliveryRuntimeFailure::ProcessCleanupUnproven)) => {
             return Err(retain_and_fail_closed(
                 eligible.routed.lease,
                 crate::DeliveryPreflightOutcome::Unavailable(
@@ -76,8 +78,16 @@ pub(super) async fn authenticate(
                 ),
             ));
         }
-        Ok(Err(_)) | Err(_) => {
+        ProcessStageCompletion::Completed(Err(_)) => {
             return Err(poison_and_release(
+                eligible.routed.lease,
+                crate::DeliveryPreflightOutcome::Unavailable(
+                    crate::DeliveryPreflightUnavailableReason::RuntimeUnavailable,
+                ),
+            ));
+        }
+        ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+            return Err(retain_and_fail_closed(
                 eligible.routed.lease,
                 crate::DeliveryPreflightOutcome::Unavailable(
                     crate::DeliveryPreflightUnavailableReason::RuntimeUnavailable,
@@ -162,9 +172,11 @@ pub(super) async fn resume_pending_preflight(
                 .await;
             }
             let prepared =
-                match timeout(PRE_RUNTIME_STAGE_TIMEOUT, session.prepare_preflight()).await {
-                    Ok(Ok(prepared)) => prepared,
-                    Ok(Err(failure)) => {
+                match run_process_stage(PRE_RUNTIME_STAGE_TIMEOUT, session.prepare_preflight())
+                    .await
+                {
+                    ProcessStageCompletion::Completed(Ok(prepared)) => prepared,
+                    ProcessStageCompletion::Completed(Err(failure)) => {
                         return persist_prepared_failure(
                             dependencies,
                             command.task_id(),
@@ -175,13 +187,12 @@ pub(super) async fn resume_pending_preflight(
                         )
                         .await;
                     }
-                    Err(_) => {
-                        return persist_prepared_failure(
+                    ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                        return persist_prepared_runtime_timeout(
                             dependencies,
                             command.task_id(),
                             receipt.operation_id,
                             DeliveryPreflightDurability::Existing,
-                            DeliveryRuntimeFailure::Unavailable,
                             lease,
                         )
                         .await;
@@ -244,31 +255,31 @@ pub(super) async fn continue_unbound_preflight(
         )
         .await;
     }
-    let prepared = match timeout(PRE_RUNTIME_STAGE_TIMEOUT, session.prepare_preflight()).await {
-        Ok(Ok(prepared)) => prepared,
-        Ok(Err(failure)) => {
-            return persist_unbound_failure(
-                dependencies,
-                command.task_id(),
-                receipt.operation_id,
-                durability,
-                failure,
-                lease,
-            )
-            .await;
-        }
-        Err(_) => {
-            return persist_unbound_failure(
-                dependencies,
-                command.task_id(),
-                receipt.operation_id,
-                durability,
-                DeliveryRuntimeFailure::Unavailable,
-                lease,
-            )
-            .await;
-        }
-    };
+    let prepared =
+        match run_process_stage(PRE_RUNTIME_STAGE_TIMEOUT, session.prepare_preflight()).await {
+            ProcessStageCompletion::Completed(Ok(prepared)) => prepared,
+            ProcessStageCompletion::Completed(Err(failure)) => {
+                return persist_unbound_failure(
+                    dependencies,
+                    command.task_id(),
+                    receipt.operation_id,
+                    durability,
+                    failure,
+                    lease,
+                )
+                .await;
+            }
+            ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                return persist_unbound_runtime_timeout(
+                    dependencies,
+                    command.task_id(),
+                    receipt.operation_id,
+                    durability,
+                    lease,
+                )
+                .await;
+            }
+        };
     if !authentication.authorizes_prepared(&prepared) {
         return persist_unbound_failure(
             dependencies,
@@ -337,18 +348,21 @@ async fn run_prepared_preflight(
     prepared: DeliveryPreparedPreflight,
     lease: RepositoryControlLease,
 ) -> PreflightAttemptResult {
-    let (result, retained_process_cleanup) =
-        match timeout(PRE_RUNTIME_STAGE_TIMEOUT, session.run_preflight(&prepared)).await {
-            Ok(Ok(result)) => (result, false),
-            Ok(Err(failure)) => (
-                failure.prepared_failure(),
-                failure.requires_retained_repository_ownership(),
-            ),
-            Err(_) => (
-                DeliveryRuntimeFailure::Unavailable.prepared_failure(),
-                false,
-            ),
-        };
+    let (result, retained_process_cleanup) = match run_process_stage(
+        PRE_RUNTIME_STAGE_TIMEOUT,
+        session.run_preflight(&prepared),
+    )
+    .await
+    {
+        ProcessStageCompletion::Completed(Ok(result)) => (result, false),
+        ProcessStageCompletion::Completed(Err(failure)) => (
+            failure.prepared_failure(),
+            failure.requires_retained_repository_ownership(),
+        ),
+        ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+            (DeliveryRuntimeFailure::Unavailable.prepared_failure(), true)
+        }
+    };
     persist_prepared_result(
         dependencies,
         task_id,

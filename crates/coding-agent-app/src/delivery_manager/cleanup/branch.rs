@@ -1,5 +1,6 @@
 use super::transitions::*;
 use super::*;
+use crate::delivery_manager::runtime_stage::{ProcessStageCompletion, run_process_stage};
 
 pub(super) async fn drive_branch_stage(
     dependencies: &DeliveryManagerLiveDependencies,
@@ -10,7 +11,7 @@ pub(super) async fn drive_branch_stage(
     if operation.state != CleanupOperationState::DeletePending {
         return recovery_stage_for_state(operation.state);
     }
-    let intent = match timeout(
+    let intent = match run_process_stage(
         LIVE_RUNTIME_STAGE_TIMEOUT,
         session.bind_branch_cleanup(
             &context.snapshot,
@@ -19,9 +20,13 @@ pub(super) async fn drive_branch_stage(
     )
     .await
     {
-        Ok(Ok(intent)) => intent,
-        Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
-        Err(_) => return LiveStageOutcome::Release,
+        ProcessStageCompletion::Completed(Ok(intent)) => intent,
+        ProcessStageCompletion::Completed(Err(error)) => {
+            return runtime_error(dependencies, context, error).await;
+        }
+        ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+            return LiveStageOutcome::Retain;
+        }
     };
     drive_authorized_branch_stage(dependencies, session, context, intent, 0).await
 }
@@ -46,15 +51,19 @@ async fn drive_authorized_branch_stage(
         Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
         Err(_) => return LiveStageOutcome::Release,
     };
-    let disposition = match timeout(
+    let disposition = match run_process_stage(
         LIVE_RUNTIME_STAGE_TIMEOUT,
         session.drive_delete_pending(capability),
     )
     .await
     {
-        Ok(Ok(disposition)) => disposition,
-        Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
-        Err(_) => return LiveStageOutcome::Release,
+        ProcessStageCompletion::Completed(Ok(disposition)) => disposition,
+        ProcessStageCompletion::Completed(Err(error)) => {
+            return runtime_error(dependencies, context, error).await;
+        }
+        ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+            return LiveStageOutcome::Retain;
+        }
     };
     match disposition {
         DeliveryLiveDeletePendingDisposition::RetryExactDelete => LiveStageOutcome::Retry,

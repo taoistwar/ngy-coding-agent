@@ -13,6 +13,7 @@ mod query;
 mod recovery;
 mod request;
 mod runtime;
+mod runtime_stage;
 mod shutdown;
 mod source;
 

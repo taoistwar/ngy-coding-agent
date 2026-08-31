@@ -35,6 +35,7 @@ use super::recovery::{
     LIVE_RETRY_DELAY, LIVE_RUNTIME_STAGE_TIMEOUT, LiveStageOutcome, MAX_LIVE_ATTEMPTS,
     RecoveryLoadError, STORE_READ_TIMEOUT, execute_exact_delivery_write, load_operation_context,
 };
+use super::runtime_stage::{ProcessStageCompletion, run_process_stage};
 use super::source::{drive_source_stage, reconcile_source};
 use super::{
     DeliveryAcceptRequest, DeliveryIntakeGate, DeliveryManagerBackend,
@@ -447,21 +448,28 @@ async fn drive_merge_stage(
     }
     match operation.state {
         MergeOperationState::Accepted => {
-            let proof = match timeout(
+            let proof = match run_process_stage(
                 LIVE_RUNTIME_STAGE_TIMEOUT,
                 session.build_expected_merge(operation, source),
             )
             .await
             {
-                Ok(Ok(proof)) => proof,
-                Ok(Err(DeliveryLiveRuntimeError::ProcessCleanupUnproven)) => {
+                ProcessStageCompletion::Completed(Ok(proof)) => proof,
+                ProcessStageCompletion::Completed(Err(
+                    DeliveryLiveRuntimeError::ProcessCleanupUnproven,
+                )) => {
                     return LiveStageOutcome::Retain;
                 }
-                Ok(Err(DeliveryLiveRuntimeError::ReconciliationRequired(reason))) => {
+                ProcessStageCompletion::Completed(Err(
+                    DeliveryLiveRuntimeError::ReconciliationRequired(reason),
+                )) => {
                     return reconcile_operation(dependencies, operation, reason).await;
                 }
-                Ok(Err(DeliveryLiveRuntimeError::Unavailable)) | Err(_) => {
+                ProcessStageCompletion::Completed(Err(DeliveryLiveRuntimeError::Unavailable)) => {
                     return LiveStageOutcome::Release;
+                }
+                ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                    return LiveStageOutcome::Retain;
                 }
             };
             let proof = match proof.into_store_proof() {
@@ -503,21 +511,28 @@ async fn drive_merge_stage(
             }
         }
         MergeOperationState::MergePending => {
-            let disposition = match timeout(
+            let disposition = match run_process_stage(
                 LIVE_RUNTIME_STAGE_TIMEOUT,
                 session.drive_merge_pending(operation, source),
             )
             .await
             {
-                Ok(Ok(disposition)) => disposition,
-                Ok(Err(DeliveryLiveRuntimeError::ProcessCleanupUnproven)) => {
+                ProcessStageCompletion::Completed(Ok(disposition)) => disposition,
+                ProcessStageCompletion::Completed(Err(
+                    DeliveryLiveRuntimeError::ProcessCleanupUnproven,
+                )) => {
                     return LiveStageOutcome::Retain;
                 }
-                Ok(Err(DeliveryLiveRuntimeError::ReconciliationRequired(reason))) => {
+                ProcessStageCompletion::Completed(Err(
+                    DeliveryLiveRuntimeError::ReconciliationRequired(reason),
+                )) => {
                     return reconcile_operation(dependencies, operation, reason).await;
                 }
-                Ok(Err(DeliveryLiveRuntimeError::Unavailable)) | Err(_) => {
+                ProcessStageCompletion::Completed(Err(DeliveryLiveRuntimeError::Unavailable)) => {
                     return LiveStageOutcome::Release;
+                }
+                ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                    return LiveStageOutcome::Retain;
                 }
             };
             match disposition {

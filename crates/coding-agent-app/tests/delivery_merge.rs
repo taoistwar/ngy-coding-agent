@@ -591,6 +591,27 @@ async fn live_open_auth_and_merge_stages_may_exceed_orchestration_budget() {
 }
 
 #[tokio::test]
+async fn outer_runtime_timeout_during_actual_merge_retains_repository_ownership() {
+    let fixture = DeliveryMergeFixture::new(None).await;
+    let prepared = fixture.prepare_accept().await;
+    let gate = fixture.live_runtime.install_gate(LiveStage::ActualMerge);
+
+    fixture.accept(&prepared).await;
+    gate.wait_until_reached().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11 * 60 + 1)).await;
+    tokio::time::resume();
+    gate.wait_until_exited().await;
+
+    assert_eq!(
+        fixture.operation(prepared.operation_id).await.state,
+        MergeOperationState::MergePending
+    );
+    assert_retained_worker(&fixture, "outer actual-merge runtime timeout").await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn restart_recovers_every_durable_pending_stage() {
     assert_restart_recovery(LiveStage::SourceObject, false).await;
     assert_restart_recovery(LiveStage::SourceCommit, false).await;

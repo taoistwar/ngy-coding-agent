@@ -130,10 +130,24 @@ fn finish_runtime_binding_error(
     permit: OwnedSemaphorePermit,
     lease: RepositoryControlLease,
     response: &CleanupResponseSlot,
-    error: DeliveryLiveCleanupRuntimeError,
+    error: FreshCleanupRuntimeBindingError,
 ) -> WorkerFinish {
     match error {
-        DeliveryLiveCleanupRuntimeError::TargetWorktreeDirty => clean_accept(
+        FreshCleanupRuntimeBindingError::TimedOutWithCleanupUnproven => {
+            let outcome = DeliveryCleanupAcceptanceOutcome::Unavailable(
+                DeliveryPreflightUnavailableReason::RuntimeUnavailable,
+            );
+            send_cleanup_response(response, outcome.clone());
+            WorkerFinish::retained(
+                DeliveryOperationRecoveryOutcome::RetainedFailClosed,
+                permit,
+                lease,
+            )
+            .with_accept_fallback(outcome)
+        }
+        FreshCleanupRuntimeBindingError::Runtime(
+            DeliveryLiveCleanupRuntimeError::TargetWorktreeDirty,
+        ) => clean_accept(
             permit,
             lease,
             response,
@@ -141,7 +155,9 @@ fn finish_runtime_binding_error(
                 DeliveryEligibilityReason::TargetWorktreeDirty,
             ]),
         ),
-        DeliveryLiveCleanupRuntimeError::ProcessCleanupUnproven => {
+        FreshCleanupRuntimeBindingError::Runtime(
+            DeliveryLiveCleanupRuntimeError::ProcessCleanupUnproven,
+        ) => {
             let outcome = DeliveryCleanupAcceptanceOutcome::Unavailable(
                 DeliveryPreflightUnavailableReason::ProcessProofUnavailable,
             );
@@ -153,19 +169,23 @@ fn finish_runtime_binding_error(
             )
             .with_accept_fallback(outcome)
         }
-        DeliveryLiveCleanupRuntimeError::ReconciliationRequired(reason) => poison_accept(
+        FreshCleanupRuntimeBindingError::Runtime(
+            DeliveryLiveCleanupRuntimeError::ReconciliationRequired(reason),
+        ) => poison_accept(
             permit,
             lease,
             response,
             cleanup_reconciliation_admission_outcome(reason),
         ),
-        DeliveryLiveCleanupRuntimeError::Unavailable => clean_accept(
-            permit,
-            lease,
-            response,
-            DeliveryCleanupAcceptanceOutcome::Unavailable(
-                DeliveryPreflightUnavailableReason::RuntimeUnavailable,
-            ),
-        ),
+        FreshCleanupRuntimeBindingError::Runtime(DeliveryLiveCleanupRuntimeError::Unavailable) => {
+            clean_accept(
+                permit,
+                lease,
+                response,
+                DeliveryCleanupAcceptanceOutcome::Unavailable(
+                    DeliveryPreflightUnavailableReason::RuntimeUnavailable,
+                ),
+            )
+        }
     }
 }

@@ -1,4 +1,5 @@
 use super::super::runtime::DeliveryRuntimeAuthentication;
+use super::super::runtime_stage::{ProcessStageCompletion, run_process_stage};
 use super::validation::ValidatedAccept;
 use super::*;
 
@@ -55,31 +56,39 @@ pub(super) async fn authenticate(
             ));
         }
     };
-    let authentication = match timeout(
+    let authentication = match run_process_stage(
         LIVE_RUNTIME_STAGE_TIMEOUT,
         session.authenticate_accept(&flow.command),
     )
     .await
     {
-        Ok(Ok(authentication)) => authentication,
-        Ok(Err(DeliveryAcceptAuthenticationError::Rejected(reason))) => {
+        ProcessStageCompletion::Completed(Ok(authentication)) => authentication,
+        ProcessStageCompletion::Completed(Err(DeliveryAcceptAuthenticationError::Rejected(
+            reason,
+        ))) => {
             return Err(validated
                 .routed
                 .admission
                 .clean(&flow.response, rejected_accept_outcome(reason)));
         }
-        Ok(Err(DeliveryAcceptAuthenticationError::Stale(reason))) => {
+        ProcessStageCompletion::Completed(Err(DeliveryAcceptAuthenticationError::Stale(
+            reason,
+        ))) => {
             return Err(
                 super::persist::persist_stale_authentication(flow, validated, reason).await,
             );
         }
-        Ok(Err(DeliveryAcceptAuthenticationError::MergeConflict)) => {
+        ProcessStageCompletion::Completed(Err(
+            DeliveryAcceptAuthenticationError::MergeConflict,
+        )) => {
             return Err(validated.routed.admission.clean(
                 &flow.response,
                 DeliveryMergeAcceptanceOutcome::Conflict(DeliveryCommandConflict::MergeConflict),
             ));
         }
-        Ok(Err(DeliveryAcceptAuthenticationError::CommandTimedOut)) => {
+        ProcessStageCompletion::Completed(Err(
+            DeliveryAcceptAuthenticationError::CommandTimedOut,
+        )) => {
             return Err(validated.routed.admission.clean(
                 &flow.response,
                 DeliveryMergeAcceptanceOutcome::Unavailable(
@@ -87,7 +96,9 @@ pub(super) async fn authenticate(
                 ),
             ));
         }
-        Ok(Err(DeliveryAcceptAuthenticationError::ProcessCleanupUnproven)) => {
+        ProcessStageCompletion::Completed(Err(
+            DeliveryAcceptAuthenticationError::ProcessCleanupUnproven,
+        )) => {
             return Err(validated.routed.admission.retain(
                 &flow.response,
                 DeliveryMergeAcceptanceOutcome::Unavailable(
@@ -95,7 +106,9 @@ pub(super) async fn authenticate(
                 ),
             ));
         }
-        Ok(Err(DeliveryAcceptAuthenticationError::ReconciliationRequired(reason))) => {
+        ProcessStageCompletion::Completed(Err(
+            DeliveryAcceptAuthenticationError::ReconciliationRequired(reason),
+        )) => {
             let stage = reconcile_operation(flow.dependencies.as_ref(), operation, reason).await;
             let outcome = merge_reconciliation_admission_outcome(reason);
             send_accept_response(&flow.response, outcome.clone());
@@ -105,8 +118,16 @@ pub(super) async fn authenticate(
                 .finish(stage)
                 .with_accept_fallback(outcome));
         }
-        Ok(Err(DeliveryAcceptAuthenticationError::Unavailable)) | Err(_) => {
+        ProcessStageCompletion::Completed(Err(DeliveryAcceptAuthenticationError::Unavailable)) => {
             return Err(validated.routed.admission.clean(
+                &flow.response,
+                DeliveryMergeAcceptanceOutcome::Unavailable(
+                    DeliveryPreflightUnavailableReason::RuntimeUnavailable,
+                ),
+            ));
+        }
+        ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+            return Err(validated.routed.admission.retain(
                 &flow.response,
                 DeliveryMergeAcceptanceOutcome::Unavailable(
                     DeliveryPreflightUnavailableReason::RuntimeUnavailable,

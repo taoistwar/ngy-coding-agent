@@ -221,6 +221,25 @@ pub(super) async fn persist_prepared_failure(
     .await
 }
 
+pub(super) async fn persist_prepared_runtime_timeout(
+    dependencies: &DeliveryManagerLiveDependencies,
+    task_id: coding_agent_domain::TaskId,
+    operation_id: coding_agent_store::DeliveryOperationId,
+    durability: DeliveryPreflightDurability,
+    lease: RepositoryControlLease,
+) -> PreflightAttemptResult {
+    persist_prepared_result(
+        dependencies,
+        task_id,
+        operation_id,
+        durability,
+        DeliveryRuntimeFailure::Unavailable.prepared_failure(),
+        true,
+        lease,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn persist_prepared_result(
     dependencies: &DeliveryManagerLiveDependencies,
@@ -241,7 +260,9 @@ pub(super) async fn persist_prepared_result(
         result,
     ) {
         Ok(request) => request,
-        Err(_) => return poison_and_release(lease, inconsistent_outcome()),
+        Err(_) => {
+            return retain_or_poison_inconsistent(lease, retained_process_cleanup);
+        }
     };
     let write =
         DeliveryWriteCommand::Merge(DeliveryMergeWriteCommand::RecordPreflightResult(request));
@@ -281,7 +302,7 @@ pub(super) async fn persist_prepared_result(
             ),
         ),
         ExactWriteResult::InvariantConflict | ExactWriteResult::Confirmed(_) => {
-            poison_and_release(lease, inconsistent_outcome())
+            retain_or_poison_inconsistent(lease, retained_process_cleanup)
         }
     }
 }
@@ -295,6 +316,47 @@ pub(super) async fn persist_unbound_failure(
     lease: RepositoryControlLease,
 ) -> PreflightAttemptResult {
     let retained_process_cleanup = failure.requires_retained_repository_ownership();
+    persist_unbound_failure_with_retention(
+        dependencies,
+        task_id,
+        operation_id,
+        durability,
+        failure,
+        retained_process_cleanup,
+        lease,
+    )
+    .await
+}
+
+pub(super) async fn persist_unbound_runtime_timeout(
+    dependencies: &DeliveryManagerLiveDependencies,
+    task_id: coding_agent_domain::TaskId,
+    operation_id: coding_agent_store::DeliveryOperationId,
+    durability: DeliveryPreflightDurability,
+    lease: RepositoryControlLease,
+) -> PreflightAttemptResult {
+    persist_unbound_failure_with_retention(
+        dependencies,
+        task_id,
+        operation_id,
+        durability,
+        DeliveryRuntimeFailure::Unavailable,
+        true,
+        lease,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_unbound_failure_with_retention(
+    dependencies: &DeliveryManagerLiveDependencies,
+    task_id: coding_agent_domain::TaskId,
+    operation_id: coding_agent_store::DeliveryOperationId,
+    durability: DeliveryPreflightDurability,
+    failure: DeliveryRuntimeFailure,
+    retained_process_cleanup: bool,
+    lease: RepositoryControlLease,
+) -> PreflightAttemptResult {
     let expected_state = runtime_failure_state(failure);
     let reconciliation_required = matches!(
         failure,
@@ -309,7 +371,9 @@ pub(super) async fn persist_unbound_failure(
         failure.unbound_failure(),
     ) {
         Ok(request) => request,
-        Err(_) => return poison_and_release(lease, inconsistent_outcome()),
+        Err(_) => {
+            return retain_or_poison_inconsistent(lease, retained_process_cleanup);
+        }
     };
     let write =
         DeliveryWriteCommand::Merge(DeliveryMergeWriteCommand::FailUnboundPreflight(request));
@@ -348,8 +412,19 @@ pub(super) async fn persist_unbound_failure(
             ),
         ),
         ExactWriteResult::InvariantConflict | ExactWriteResult::Confirmed(_) => {
-            poison_and_release(lease, inconsistent_outcome())
+            retain_or_poison_inconsistent(lease, retained_process_cleanup)
         }
+    }
+}
+
+fn retain_or_poison_inconsistent(
+    lease: RepositoryControlLease,
+    retained_process_cleanup: bool,
+) -> PreflightAttemptResult {
+    if retained_process_cleanup {
+        retain_and_fail_closed(lease, inconsistent_outcome())
+    } else {
+        poison_and_release(lease, inconsistent_outcome())
     }
 }
 

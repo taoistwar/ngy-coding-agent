@@ -29,6 +29,7 @@ use coding_agent_store::{
     DeleteBranchCommandRequest, DeliveryEligibilitySnapshot, DeliveryOperationId,
     DeliveryOperationSnapshot, GitCommitOid, RemoveWorktreeCommandRequest,
 };
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 
 use crate::delivery_merge_support::teardown::{
@@ -46,6 +47,61 @@ pub enum CleanupStage {
     Remove,
     BindBranch,
     Delete,
+}
+
+pub struct CleanupStageGate {
+    reached: Semaphore,
+    release: Semaphore,
+    exited: Semaphore,
+}
+
+struct CleanupStageExitProof<'a>(&'a Semaphore);
+
+impl Drop for CleanupStageExitProof<'_> {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
+}
+
+impl CleanupStageGate {
+    fn new() -> Self {
+        Self {
+            reached: Semaphore::new(0),
+            release: Semaphore::new(0),
+            exited: Semaphore::new(0),
+        }
+    }
+
+    pub async fn wait_until_reached(&self) {
+        self.reached
+            .acquire()
+            .await
+            .expect("cleanup stage gate remains open")
+            .forget();
+    }
+
+    #[allow(dead_code)]
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    pub async fn wait_until_exited(&self) {
+        timeout(Duration::from_secs(5), self.exited.acquire())
+            .await
+            .expect("cleanup stage exits after release or cancellation")
+            .expect("cleanup stage exit proof remains open")
+            .forget();
+    }
+
+    async fn enter(&self) {
+        self.reached.add_permits(1);
+        let _exit_proof = CleanupStageExitProof(&self.exited);
+        self.release
+            .acquire()
+            .await
+            .expect("cleanup stage gate remains open")
+            .forget();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +140,7 @@ struct CleanupRuntimeState {
     branch_steps: Mutex<VecDeque<BranchStep>>,
     enter_remove_steps: Mutex<VecDeque<DeliveryUnlockedPendingRemoveDisposition>>,
     remove_steps: Mutex<VecDeque<DeliveryRemovePendingDisposition>>,
+    gate: Mutex<Option<(CleanupStage, Arc<CleanupStageGate>)>>,
     next_identity: AtomicU64,
 }
 
@@ -101,6 +158,7 @@ impl Default for CleanupRuntimeControl {
                 branch_steps: Mutex::new(VecDeque::new()),
                 enter_remove_steps: Mutex::new(VecDeque::new()),
                 remove_steps: Mutex::new(VecDeque::new()),
+                gate: Mutex::new(None),
                 next_identity: AtomicU64::new(100),
             }),
         }
@@ -114,6 +172,13 @@ impl CleanupRuntimeControl {
             .lock()
             .expect("lock cleanup faults")
             .push_back((stage, fault));
+    }
+
+    pub fn install_gate(&self, stage: CleanupStage) -> Arc<CleanupStageGate> {
+        let gate = Arc::new(CleanupStageGate::new());
+        *self.state.gate.lock().expect("lock cleanup stage gate") =
+            Some((stage, Arc::clone(&gate)));
+        gate
     }
 
     pub fn push_branch_step(&self, step: BranchStep) {
@@ -154,6 +219,19 @@ impl CleanupRuntimeControl {
             .lock()
             .expect("lock cleanup calls")
             .push(call);
+    }
+
+    async fn enter_gate(&self, stage: CleanupStage) {
+        let gate = self
+            .state
+            .gate
+            .lock()
+            .expect("lock cleanup stage gate")
+            .as_ref()
+            .and_then(|(expected, gate)| (*expected == stage).then(|| Arc::clone(gate)));
+        if let Some(gate) = gate {
+            gate.enter().await;
+        }
     }
 
     fn take_fault(&self, stage: CleanupStage) -> Result<(), DeliveryLiveCleanupRuntimeError> {
@@ -207,6 +285,7 @@ impl DeliveryCleanupRuntimeSession for CleanupRuntimeSession {
         _snapshot: &DeliveryEligibilitySnapshot,
         binding: DeliveryWorktreeCleanupBinding<'_>,
     ) -> Result<DeliveryLiveWorktreeCleanupIntent, DeliveryLiveCleanupRuntimeError> {
+        self.control.enter_gate(CleanupStage::BindWorktree).await;
         self.control.take_fault(CleanupStage::BindWorktree)?;
         self.control.record(match binding {
             DeliveryWorktreeCleanupBinding::Acceptance(_) => CleanupCall::BindWorktreeAcceptance,
@@ -224,6 +303,7 @@ impl DeliveryCleanupRuntimeSession for CleanupRuntimeSession {
         _snapshot: &DeliveryEligibilitySnapshot,
         binding: DeliveryBranchCleanupBinding<'_>,
     ) -> Result<DeliveryLiveBranchCleanupIntent, DeliveryLiveCleanupRuntimeError> {
+        self.control.enter_gate(CleanupStage::BindBranch).await;
         self.control.take_fault(CleanupStage::BindBranch)?;
         self.control.record(match binding {
             DeliveryBranchCleanupBinding::Acceptance(_) => CleanupCall::BindBranchAcceptance,
@@ -240,6 +320,7 @@ impl DeliveryCleanupRuntimeSession for CleanupRuntimeSession {
         &self,
         capability: DeliveryLiveUnlockPendingCapability,
     ) -> Result<DeliveryUnlockPendingDisposition, DeliveryLiveCleanupRuntimeError> {
+        self.control.enter_gate(CleanupStage::Unlock).await;
         self.control.take_fault(CleanupStage::Unlock)?;
         self.control.record(CleanupCall::Unlock(
             capability
@@ -253,6 +334,7 @@ impl DeliveryCleanupRuntimeSession for CleanupRuntimeSession {
         &self,
         capability: DeliveryLiveUnlockedPendingRemoveCapability,
     ) -> Result<DeliveryUnlockedPendingRemoveDisposition, DeliveryLiveCleanupRuntimeError> {
+        self.control.enter_gate(CleanupStage::EnterRemove).await;
         self.control.take_fault(CleanupStage::EnterRemove)?;
         self.control.record(CleanupCall::EnterRemove(
             capability
@@ -273,6 +355,7 @@ impl DeliveryCleanupRuntimeSession for CleanupRuntimeSession {
         &self,
         capability: DeliveryLiveRemovePendingCapability,
     ) -> Result<DeliveryRemovePendingDisposition, DeliveryLiveCleanupRuntimeError> {
+        self.control.enter_gate(CleanupStage::Remove).await;
         self.control.take_fault(CleanupStage::Remove)?;
         self.control.record(CleanupCall::Remove(
             capability
@@ -293,6 +376,7 @@ impl DeliveryCleanupRuntimeSession for CleanupRuntimeSession {
         &self,
         capability: DeliveryLiveDeletePendingCapability,
     ) -> Result<DeliveryLiveDeletePendingDisposition, DeliveryLiveCleanupRuntimeError> {
+        self.control.enter_gate(CleanupStage::Delete).await;
         self.control.take_fault(CleanupStage::Delete)?;
         let identity = capability
             .identity_for_test()

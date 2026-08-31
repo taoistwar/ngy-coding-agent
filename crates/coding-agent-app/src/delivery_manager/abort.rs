@@ -1,11 +1,9 @@
-use coding_agent_store::{
-    CompleteMergeAbortRequest, DeliverySourceState, MergeOperationState, MergeTransitionOutcome,
-};
-use tokio::time::timeout;
-
 use crate::{
     DeliveryMergeWriteCommand, DeliveryMergeWriteOutcome, DeliveryWriteCommand,
     DeliveryWriteOutcome,
+};
+use coding_agent_store::{
+    CompleteMergeAbortRequest, DeliverySourceState, MergeOperationState, MergeTransitionOutcome,
 };
 
 use super::DeliveryManagerLiveDependencies;
@@ -17,6 +15,7 @@ use super::recovery::{
     DeliveryRecoveryContext, ExactDeliveryWriteResult, LIVE_RUNTIME_STAGE_TIMEOUT,
     LiveStageOutcome, execute_exact_delivery_write,
 };
+use super::runtime_stage::{ProcessStageCompletion, run_process_stage};
 
 pub(super) async fn drive_abort_stage(
     dependencies: &DeliveryManagerLiveDependencies,
@@ -32,22 +31,27 @@ pub(super) async fn drive_abort_stage(
     {
         return LiveStageOutcome::Poison;
     }
-    let disposition = match timeout(
+    let disposition = match run_process_stage(
         LIVE_RUNTIME_STAGE_TIMEOUT,
         session.drive_abort_pending(operation, source),
     )
     .await
     {
-        Ok(Ok(disposition)) => disposition,
-        Ok(Err(DeliveryLiveRuntimeError::ProcessCleanupUnproven)) => {
+        ProcessStageCompletion::Completed(Ok(disposition)) => disposition,
+        ProcessStageCompletion::Completed(Err(
+            DeliveryLiveRuntimeError::ProcessCleanupUnproven,
+        )) => {
             return LiveStageOutcome::Retain;
         }
-        Ok(Err(DeliveryLiveRuntimeError::ReconciliationRequired(reason))) => {
+        ProcessStageCompletion::Completed(Err(
+            DeliveryLiveRuntimeError::ReconciliationRequired(reason),
+        )) => {
             return reconcile_operation(dependencies, operation, reason).await;
         }
-        Ok(Err(DeliveryLiveRuntimeError::Unavailable)) | Err(_) => {
+        ProcessStageCompletion::Completed(Err(DeliveryLiveRuntimeError::Unavailable)) => {
             return LiveStageOutcome::Release;
         }
+        ProcessStageCompletion::TimedOutWithCleanupUnproven => return LiveStageOutcome::Retain,
     };
     match disposition {
         DeliveryLiveAbortDisposition::Applied(proof) => {

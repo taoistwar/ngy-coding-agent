@@ -62,6 +62,15 @@ pub enum LiveFault {
 pub struct StageGate {
     reached: Semaphore,
     release: Semaphore,
+    exited: Semaphore,
+}
+
+struct StageGateExitProof<'a>(&'a Semaphore);
+
+impl Drop for StageGateExitProof<'_> {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
 }
 
 type StageGateSlot = Arc<Mutex<Option<(LiveStage, Arc<StageGate>)>>>;
@@ -78,6 +87,7 @@ impl StageGate {
         Self {
             reached: Semaphore::new(0),
             release: Semaphore::new(0),
+            exited: Semaphore::new(0),
         }
     }
 
@@ -93,8 +103,17 @@ impl StageGate {
         self.release.add_permits(1);
     }
 
+    pub async fn wait_until_exited(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.exited.acquire())
+            .await
+            .expect("live stage exits after release or cancellation")
+            .expect("live stage exit proof remains open")
+            .forget();
+    }
+
     async fn enter(&self) {
         self.reached.add_permits(1);
+        let _exit_proof = StageGateExitProof(&self.exited);
         self.release
             .acquire()
             .await

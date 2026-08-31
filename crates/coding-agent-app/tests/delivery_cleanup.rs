@@ -606,6 +606,26 @@ async fn known_not_applied_worktree_unlock_record_retains_repository_ownership()
 }
 
 #[tokio::test]
+async fn outer_runtime_timeout_during_worktree_unlock_retains_repository_ownership() {
+    let fixture = DeliveryCleanupFixture::new(None).await;
+    let gate = fixture.runtime.install_gate(CleanupStage::Unlock);
+
+    let accepted = fixture.remove().await;
+    gate.wait_until_reached().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11 * 60 + 1)).await;
+    tokio::time::resume();
+    gate.wait_until_exited().await;
+
+    assert_eq!(
+        fixture.operation(accepted.operation_id()).await.state,
+        CleanupOperationState::UnlockPending
+    );
+    assert_retained_cleanup_worker(&fixture, "outer worktree-unlock runtime timeout").await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn worktree_unlock_kna_then_runtime_unavailable_keeps_retention_obligation() {
     let controller = busy_controller(StoreWriterOperationKind::RecordWorktreeUnlocked, 6);
     let fixture = DeliveryCleanupFixture::new(Some(controller.clone())).await;

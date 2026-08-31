@@ -1,5 +1,6 @@
 use super::transitions::*;
 use super::*;
+use crate::delivery_manager::runtime_stage::{ProcessStageCompletion, run_process_stage};
 
 pub(super) async fn drive_worktree_stage(
     dependencies: &DeliveryManagerLiveDependencies,
@@ -7,7 +8,7 @@ pub(super) async fn drive_worktree_stage(
     context: &DeliveryCleanupRecoveryContext,
 ) -> LiveStageOutcome {
     let operation = &context.operation;
-    let intent = match timeout(
+    let intent = match run_process_stage(
         LIVE_RUNTIME_STAGE_TIMEOUT,
         session.bind_worktree_cleanup(
             &context.snapshot,
@@ -16,9 +17,13 @@ pub(super) async fn drive_worktree_stage(
     )
     .await
     {
-        Ok(Ok(intent)) => intent,
-        Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
-        Err(_) => return LiveStageOutcome::Release,
+        ProcessStageCompletion::Completed(Ok(intent)) => intent,
+        ProcessStageCompletion::Completed(Err(error)) => {
+            return runtime_error(dependencies, context, error).await;
+        }
+        ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+            return LiveStageOutcome::Retain;
+        }
     };
     match operation.state {
         CleanupOperationState::UnlockPending => {
@@ -32,15 +37,19 @@ pub(super) async fn drive_worktree_stage(
                 Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
                 Err(_) => return LiveStageOutcome::Release,
             };
-            let disposition = match timeout(
+            let disposition = match run_process_stage(
                 LIVE_RUNTIME_STAGE_TIMEOUT,
                 session.drive_unlock_pending(capability),
             )
             .await
             {
-                Ok(Ok(disposition)) => disposition,
-                Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
-                Err(_) => return LiveStageOutcome::Release,
+                ProcessStageCompletion::Completed(Ok(disposition)) => disposition,
+                ProcessStageCompletion::Completed(Err(error)) => {
+                    return runtime_error(dependencies, context, error).await;
+                }
+                ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                    return LiveStageOutcome::Retain;
+                }
             };
             match disposition {
                 coding_agent_runtime::DeliveryUnlockPendingDisposition::RetryExactUnlock => {
@@ -70,15 +79,19 @@ pub(super) async fn drive_worktree_stage(
                 Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
                 Err(_) => return LiveStageOutcome::Release,
             };
-            let disposition = match timeout(
+            let disposition = match run_process_stage(
                 LIVE_RUNTIME_STAGE_TIMEOUT,
                 session.drive_unlocked_pending_remove(capability),
             )
             .await
             {
-                Ok(Ok(disposition)) => disposition,
-                Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
-                Err(_) => return LiveStageOutcome::Release,
+                ProcessStageCompletion::Completed(Ok(disposition)) => disposition,
+                ProcessStageCompletion::Completed(Err(error)) => {
+                    return runtime_error(dependencies, context, error).await;
+                }
+                ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                    return LiveStageOutcome::Retain;
+                }
             };
             match disposition {
                 coding_agent_runtime::DeliveryUnlockedPendingRemoveDisposition::EnterRemovePending => {
@@ -105,15 +118,19 @@ pub(super) async fn drive_worktree_stage(
                 Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
                 Err(_) => return LiveStageOutcome::Release,
             };
-            let disposition = match timeout(
+            let disposition = match run_process_stage(
                 LIVE_RUNTIME_STAGE_TIMEOUT,
                 session.drive_remove_pending(capability),
             )
             .await
             {
-                Ok(Ok(disposition)) => disposition,
-                Ok(Err(error)) => return runtime_error(dependencies, context, error).await,
-                Err(_) => return LiveStageOutcome::Release,
+                ProcessStageCompletion::Completed(Ok(disposition)) => disposition,
+                ProcessStageCompletion::Completed(Err(error)) => {
+                    return runtime_error(dependencies, context, error).await;
+                }
+                ProcessStageCompletion::TimedOutWithCleanupUnproven => {
+                    return LiveStageOutcome::Retain;
+                }
             };
             match disposition {
                 coding_agent_runtime::DeliveryRemovePendingDisposition::RetryExactRemove => {

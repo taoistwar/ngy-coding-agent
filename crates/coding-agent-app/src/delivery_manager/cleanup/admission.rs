@@ -10,7 +10,7 @@ use fresh::run_fresh_acceptance;
 use outcome::{cleanup_reconciliation_admission_outcome, inconsistent_cleanup_outcome};
 pub(super) use outcome::{send_cleanup_response, unavailable_cleanup_outcome};
 use receipt::{cleanup_known_not_applied, durable_acceptance, inspect_cleanup_receipt};
-use runtime::bind_fresh_cleanup_runtime;
+use runtime::{FreshCleanupRuntimeBindingError, bind_fresh_cleanup_runtime};
 use validation::{load_cleanup_acceptance_snapshot, validate_cleanup_acceptance};
 
 pub(super) async fn run_accept_worker(
